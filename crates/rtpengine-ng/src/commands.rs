@@ -105,13 +105,18 @@ impl NgClient {
         Self::build(cookie, d)
     }
 
-    pub fn parse_reply(datagram: &[u8]) -> Result<NgReply, NgError> {
+    pub fn split_cookie(datagram: &[u8]) -> Result<(&[u8], &[u8]), NgError> {
         let space = datagram
             .iter()
             .position(|&b| b == b' ')
             .ok_or(NgError::NoCookie)?;
-        let cookie = datagram[..space].to_vec();
-        let body = Value::decode(&datagram[space + 1..])?;
+        Ok((&datagram[..space], &datagram[space + 1..]))
+    }
+
+    pub fn parse_reply(datagram: &[u8]) -> Result<NgReply, NgError> {
+        let (cookie_bytes, body_bytes) = Self::split_cookie(datagram)?;
+        let cookie = cookie_bytes.to_vec();
+        let body = Value::decode(body_bytes)?;
         match body.get("result").and_then(Value::as_str) {
             Some("error") => {
                 let reason = body
@@ -184,5 +189,15 @@ mod tests {
     fn garbage_is_error_not_panic() {
         assert!(NgClient::parse_reply(b"no-space-datagram").is_err());
         assert!(NgClient::parse_reply(b"c1 not-bencode").is_err());
+    }
+
+    #[test]
+    fn split_cookie_survives_error_replies_so_they_stay_correlatable() {
+        let wire = b"c9 d12:error-reason15:Unknown call-id6:result5:errore";
+        let (cookie, body) = NgClient::split_cookie(wire).unwrap();
+        assert_eq!(cookie, b"c9");
+        assert!(body.starts_with(b"d12:error-reason"));
+        assert!(NgClient::parse_reply(wire).is_err());
+        assert_eq!(NgClient::split_cookie(b"no-space"), Err(NgError::NoCookie));
     }
 }

@@ -62,16 +62,36 @@ Playout semantics as decided (each pinned by a test named after it):
 - `samples_per_packet` returns `None` on zero ptime/rate rather than
   dividing by zero (mediagateway crashed on `a=ptime:0`).
 
-## crates/rtpengine-ng — sans-IO layer complete; transport is M2
+## crates/rtpengine-ng — sans-IO layer complete, SDP included
 - bencode encode/decode with malformed-input tests; command builders for
   `ping`, `subscribe request` (from-tags, mix flag, codec accept list,
   set-label), `subscribe answer`, `unsubscribe`; reply parsing with
   cookie extraction and `result=error` surfacing.
-- **M2:** async UDP transport in mediaserverd (cookie correlation map,
-  timeout, retry, node health), SDP answer construction for the
-  subscription leg, and re-subscribe orchestration on pod recovery.
+- `split_cookie` exists because `parse_reply` returns `Err` for
+  `result=error` replies and therefore cannot tell a caller *which*
+  request failed. The transport splits the cookie first, then parses, so
+  an error reply is delivered to the waiter that asked for it instead of
+  being dropped into a timeout.
 - Unlike mediagateway's fire-and-forget MI client, every request must
   await its correlated reply.
+
+### sdp.rs — subscription-leg offer/answer
+- Parses rtpengine's subscribe offer: per-stream ports, payload-type
+  lists, `a=ptime`, `a=label`, and session- vs media-level `c=` lines
+  (`stream_address` resolves media-level over session-level, which is
+  what a two-leg tap offer needs).
+- Builds the `recvonly` answer with one local receive port per offered
+  stream; the count must match or it is an error, since an answer with a
+  different number of m= sections is not a legal answer.
+- Deliberate limits, each with a test: audio-only (a non-audio m= line is
+  a loud error, not a silently skipped section), static payload types
+  only (L16/Opus answers need dynamic rtpmap — `NoStaticPayloadType`),
+  mono only, and a zero ptime/sample rate is rejected via the same
+  `samples_per_packet` guard `frame.rs` uses.
+- Depends on `media-core` for `AudioFormat`/`Encoding` rather than
+  restating the codec table; `Encoding::rtpmap_name` was added there so
+  the vocabulary lives in one crate.
+- **M3:** dynamic rtpmap so L16/Opus can be signalled on the tap leg.
 
 ## crates/protocol — frozen wire contracts
 - `twilio.rs` and `fork_events.rs` serialization tests are the contract
@@ -96,6 +116,43 @@ Playout semantics as decided (each pinned by a test named after it):
   migrates (architecture.md risk #4).
 
 ## crates/mediaserverd
+
+### ng_transport.rs — async NG transport, tested against a fake node
+Control-world only (Tokio): one UDP socket per rtpengine node, a reader
+task that dispatches each datagram to the waiter registered under its
+cookie, per-request `oneshot`, timeout, retry, and node health counters.
+- **Retries reuse the same cookie.** rtpengine caches replies by cookie,
+  so a retransmit is idempotent and a slow-but-alive node returns the
+  cached reply instead of executing the command twice. Pinned by
+  `retransmits_the_same_cookie_until_the_node_answers`.
+- Cookies are `{prefix:x}-{serial:x}` with the prefix supplied by the
+  caller (`main` derives it from the wall clock), so a restarted pod does
+  not collide with its own pre-restart cookies in rtpengine's reply
+  cache. `CookieSequence` itself takes no clock, keeping it testable.
+- A `PendingGuard` removes the waiter on every exit path, so a timed-out
+  request cannot leak an entry into the correlation map
+  (`pending_waiters_are_released_when_a_request_ends`).
+- Stray datagrams (unknown cookie, no separator) are counted at debug and
+  dropped; they must not disturb an in-flight request (Article IV).
+- The `Mutex` around the correlation map is legal because this is the
+  control world; nothing here touches a packet deadline (Article II).
+- Tests run against a fake rtpengine on `127.0.0.1:0` that can be told to
+  swallow datagrams, reply with errors, or reply out of order — no lab
+  needed for the protocol behavior.
+- Known limits: one node per transport (no pool or node registry yet), no
+  re-subscribe orchestration, and `#[allow(dead_code)]` on the module
+  until the control plane calls the subscribe verbs — same pattern as
+  `supervisor.rs`.
+- **M2 remaining:** real lab validation against rtpengine.
+  **M4:** node registry keyed by call→node discovery, re-subscribe on pod
+  loss.
+
+### main.rs — optional NG reachability probe
+`MSS_RTPENGINE_NODE=ip:port` makes the daemon ping that node at startup
+and log the result, which is how the Phase-0 "does our deployed rtpengine
+answer NG at all" question gets answered without any other wiring. Unset
+skips the probe; an unparseable value logs an error and the daemon still
+starts (a diagnostic must not be able to stop the service).
 
 ### media_rt.rs — thread/tick skeleton real; session work is M2/M3
 The worker loop currently only ticks and counts. Per-iteration plan:
