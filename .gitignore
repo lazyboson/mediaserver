@@ -1,0 +1,8 @@
+/target
+**/target
+Cargo.lock.orig
+*.pcap
+*.wav
+.idea/
+.vscode/
+.env

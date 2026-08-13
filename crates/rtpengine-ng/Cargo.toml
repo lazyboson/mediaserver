@@ -1,0 +1,9 @@
+[package]
+name = "rtpengine-ng"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Sans-IO client for the RTPEngine NG control protocol (bencode over UDP): subscribe request/answer, unsubscribe, ping. Transport is owned by the caller."
+
+[dependencies]
+thiserror = { workspace = true }

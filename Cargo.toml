@@ -1,0 +1,32 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/media-core",
+    "crates/rtpengine-ng",
+    "crates/protocol",
+    "crates/mediaserverd",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "UNLICENSED"
+repository = "https://github.com/the upstream platformInc/mediaserver"
+
+[workspace.dependencies]
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time", "signal"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+
+# The media hot path must stay allocation-free; keep debug assertions
+# cheap enough to run soak tests against this profile.
+[profile.release-with-debug]
+inherits = "release"
+debug = true
