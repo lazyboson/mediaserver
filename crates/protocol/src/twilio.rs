@@ -1,9 +1,3 @@
-//! Twilio Media Streams dialect — wire-compatible with the legacy media gateway.
-//!
-//! Outbound (MSS -> consumer): `start`, `media`, `dtmf`, `mark`, `stop`.
-//! Inbound (consumer -> MSS): `media`, `mark`, `clear`, `endOfInteraction`.
-//! Field names and shapes must not drift: existing endpoints depend on them.
-
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -31,9 +25,7 @@ pub struct StartInfo {
 #[serde(rename_all = "camelCase")]
 pub struct MediaPayload {
     pub track: String,
-    /// Milliseconds since the stream connected.
     pub timestamp: u64,
-    /// Base64-encoded audio.
     pub payload: String,
 }
 
@@ -50,7 +42,6 @@ pub struct MarkInfo {
     pub name: String,
 }
 
-/// Outbound messages (MSS -> consumer), tagged by `event`.
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "event", rename_all = "camelCase")]
 pub enum Outbound {
@@ -81,7 +72,6 @@ pub enum Outbound {
     },
 }
 
-/// Inbound messages (consumer -> MSS), tagged by `event`.
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "event", rename_all = "camelCase")]
 pub enum Inbound {
@@ -164,6 +154,6 @@ mod tests {
     #[test]
     fn unknown_inbound_event_is_an_error_we_can_ignore_upstream() {
         let res: Result<Inbound, _> = serde_json::from_str(r#"{"event":"connected"}"#);
-        assert!(res.is_err()); // caller logs-and-ignores, mirroring the legacy media gateway
+        assert!(res.is_err());
     }
 }

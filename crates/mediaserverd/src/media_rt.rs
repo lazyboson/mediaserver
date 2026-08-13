@@ -1,14 +1,3 @@
-//! The media world: dedicated real-time worker threads.
-//!
-//! Each worker owns a set of sessions end-to-end (UDP sockets, jitter
-//! buffers, codec state, fan-out queues). Sessions are pinned to one
-//! worker for their lifetime — no cross-thread packet handoff, no locks
-//! on the packet path.
-//!
-//! Scaffold status: the worker loop, shutdown plumbing, and heartbeat are
-//! real; session ingest lands in milestone 2 (recvmmsg batching, then the
-//! media-core pipeline per packet).
-
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
@@ -18,10 +7,6 @@ use tracing::info;
 #[derive(Debug, Clone)]
 pub struct MediaConfig {
     pub workers: usize,
-    /// Worker loop cadence. The playout scheduler wakes at this interval
-    /// and releases every packet whose deadline (t0 + n*ptime) has passed —
-    /// deadlines are computed from wall clock, so cadence jitter does not
-    /// accumulate into audio drift (the legacy media gateway lesson #2).
     pub tick: Duration,
 }
 
@@ -86,25 +71,15 @@ fn worker_loop(worker_id: usize, tick: Duration, stop: &AtomicBool, ticks: &Atom
     info!(worker_id, "media worker started");
     let mut next = Instant::now() + tick;
     while !stop.load(Ordering::Relaxed) {
-        // TODO(milestone 2), per iteration:
-        //   1. drain control-plane commands (add/remove session, pause…)
-        //   2. recvmmsg on owned sockets -> media_core::rtp::RtpPacket
-        //      -> per-session JitterBuffer::push / DtmfDetector::push
-        //   3. release due playout frames: pop() per session whose
-        //      deadline passed; encode per consumer format; enqueue to
-        //      consumer bridges (drop-oldest on full, count it)
-        //   4. publish per-session heartbeats for the audio-flow watchdog
         ticks.fetch_add(1, Ordering::Relaxed);
 
         let now = Instant::now();
         if next > now {
             std::thread::sleep(next - now);
         }
-        // Deadline-anchored, not sleep-anchored: a late wakeup shortens
-        // the next sleep instead of shifting every subsequent tick.
         next += tick;
         if next < Instant::now() {
-            next = Instant::now() + tick; // fell badly behind; re-anchor
+            next = Instant::now() + tick;
         }
     }
     info!(worker_id, "media worker stopping");
@@ -122,6 +97,6 @@ mod tests {
         });
         std::thread::sleep(Duration::from_millis(30));
         assert!(world.ticks.load(Ordering::Relaxed) > 10);
-        world.shutdown(); // must not hang
+        world.shutdown();
     }
 }
