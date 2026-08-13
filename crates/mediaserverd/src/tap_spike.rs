@@ -1,5 +1,5 @@
 use media_core::jitter;
-use media_core::pipeline::{PipelineError, PipelineStats, Playout, StreamPipeline};
+use media_core::pipeline::{IngestOutcome, PipelineError, PipelineStats, Playout, StreamPipeline};
 use media_core::{AudioFormat, Track};
 use std::io::ErrorKind;
 use std::net::UdpSocket;
@@ -10,6 +10,7 @@ use thiserror::Error;
 
 const MAX_DATAGRAM: usize = 2048;
 const MAX_DATAGRAMS_PER_DRAIN: usize = 64;
+const MAX_RECORDED_DIGITS: usize = 32;
 
 #[derive(Debug, Error)]
 pub enum SpikeError {
@@ -44,6 +45,8 @@ pub struct TapLeg {
     pipeline: StreamPipeline,
     samples: Vec<i16>,
     capacity_samples: usize,
+    digits: [char; MAX_RECORDED_DIGITS],
+    digits_recorded: usize,
     stats: LegStats,
 }
 
@@ -66,8 +69,14 @@ impl TapLeg {
             pipeline,
             samples: Vec::with_capacity(capacity_samples),
             capacity_samples,
+            digits: [' '; MAX_RECORDED_DIGITS],
+            digits_recorded: 0,
             stats: LegStats::default(),
         })
+    }
+
+    pub fn digits_seen(&self) -> String {
+        self.digits[..self.digits_recorded].iter().collect()
     }
 
     pub fn track(&self) -> Track {
@@ -90,7 +99,12 @@ impl TapLeg {
         for received in 0..MAX_DATAGRAMS_PER_DRAIN {
             match self.socket.recv_from(buf) {
                 Ok((len, _from)) => {
-                    self.pipeline.ingest(&buf[..len]);
+                    if let IngestOutcome::Dtmf(digit) = self.pipeline.ingest(&buf[..len]) {
+                        if self.digits_recorded < MAX_RECORDED_DIGITS {
+                            self.digits[self.digits_recorded] = digit;
+                            self.digits_recorded += 1;
+                        }
+                    }
                     self.stats.datagrams += 1;
                 }
                 Err(error) if error.kind() == ErrorKind::WouldBlock => return,
@@ -327,6 +341,33 @@ mod tests {
             assert_eq!(stats.recv_errors, 0);
             assert!(!stats.capture_full);
         }
+    }
+
+    #[test]
+    fn records_dtmf_digits_arriving_on_the_tap() {
+        let max_capture = Duration::from_millis(300);
+        let (socket, addr) = loopback_pair();
+        let mut legs = vec![leg(Track::Customer, socket, max_capture)];
+
+        let sender = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let mut stream = G711StreamGenerator::new(AudioFormat::pcmu_8k_20ms(), 3, 100).unwrap();
+        sender.send_to(&stream.next_datagram(), addr).unwrap();
+        for _ in 0..3 {
+            let pressing = stream.next_event_datagram(TELEPHONE_EVENT_PT, [7, 0x0A, 0x01, 0x40]);
+            sender.send_to(&pressing, addr).unwrap();
+        }
+        for _ in 0..3 {
+            let released = stream.next_event_datagram(TELEPHONE_EVENT_PT, [7, 0x8A, 0x03, 0x20]);
+            sender.send_to(&released, addr).unwrap();
+        }
+
+        let stop = AtomicBool::new(false);
+        capture(&mut legs, AudioFormat::pcmu_8k_20ms(), max_capture, &stop);
+
+        assert_eq!(legs[0].digits_seen(), "7");
+        assert_eq!(legs[0].stats().pipeline.dtmf_digits, 1);
+        assert_eq!(legs[0].stats().pipeline.telephone_events, 6);
+        assert_eq!(legs[0].stats().pipeline.unknown_payload_type, 0);
     }
 
     #[test]
