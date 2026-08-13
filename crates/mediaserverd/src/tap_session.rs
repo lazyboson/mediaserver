@@ -20,7 +20,6 @@ const SECONDS_ENV: &str = "MSS_TAP_SECONDS";
 const DEFAULT_OUTPUT: &str = "tap.wav";
 const DEFAULT_SECONDS: u64 = 30;
 const TARGET_DEPTH_PACKETS: u16 = 3;
-const TELEPHONE_EVENT_PAYLOAD_TYPE: u8 = 101;
 const MAX_TAPPED_STREAMS: usize = 2;
 
 #[derive(Debug, Error)]
@@ -181,12 +180,17 @@ pub async fn run(request: TapSpikeRequest, cookie_prefix: u64) -> Result<(), Tap
 
     let mut legs = Vec::with_capacity(sockets.len());
     for (index, socket) in sockets.into_iter().enumerate() {
+        let telephone_event_payload_type = offer
+            .streams
+            .get(index)
+            .and_then(|stream| stream.telephone_event())
+            .map(|event| event.payload_type);
         legs.push(TapLeg::new(
             track_for_stream(index),
             socket,
             request.format,
             TARGET_DEPTH_PACKETS,
-            Some(TELEPHONE_EVENT_PAYLOAD_TYPE),
+            telephone_event_payload_type,
             request.duration,
         )?);
     }
