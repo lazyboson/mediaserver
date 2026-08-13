@@ -87,7 +87,8 @@ cargo fmt --all --check
 grep -rn '//' crates --include='*.rs'   # must output nothing
 ```
 
-CI mirrors exactly these plus cargo-deny and RustSec audit. The release
+CI mirrors exactly these plus `cargo deny check all`, which covers the
+RustSec advisory database as well as licenses, bans and sources. The release
 pipeline triggers on `v*` tags.
 
 ## Where work continues
