@@ -49,6 +49,10 @@ injection) and finally conference mixing.
    ecosystem map (Appendix A).
 4. [docs/roadmap.md](docs/roadmap.md) — the phased execution plan with
    exit criteria and current status. **Update it when a milestone lands.**
+5. [docs/implementation-notes.md](docs/implementation-notes.md) — per-module
+   scaffold status, known limitations, and pending work. Since source files
+   carry no comments, this file is where that context lives — **update it
+   in the same PR that changes a module.**
 
 ## Architecture in three sentences
 
