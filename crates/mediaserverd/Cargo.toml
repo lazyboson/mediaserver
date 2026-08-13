@@ -1,0 +1,19 @@
+[package]
+name = "mediaserverd"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "The MSS daemon: Tokio control plane + dedicated real-time media worker threads (the 'two-world' architecture)."
+
+[[bin]]
+name = "mediaserverd"
+path = "src/main.rs"
+
+[dependencies]
+media-core = { path = "../media-core" }
+rtpengine-ng = { path = "../rtpengine-ng" }
+protocol = { path = "../protocol" }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+thiserror = { workspace = true }

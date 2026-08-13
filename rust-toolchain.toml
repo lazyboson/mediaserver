@@ -1,0 +1,5 @@
+[toolchain]
+# Pin to the version CI and local builds are verified against.
+# (1.95.0 at scaffold time — bump deliberately, not accidentally.)
+channel = "1.95.0"
+components = ["rustfmt", "clippy"]
