@@ -122,6 +122,18 @@ the DTMF detector and the G.711 decode, and allocates nothing per packet
 - Builds the `recvonly` answer with one local receive port per offered
   stream; the count must match or it is an error, since an answer with a
   different number of m= sections is not a legal answer.
+- **The answer must echo the offered `telephone-event` payload type.** Real
+  rtpengine 14.1.1.8 rejects a subscription answer that drops it with
+  `Failed to process subscription answer` — proven by `lab/ng_answer_probe.py`
+  (see [lab.md](lab.md)). `a=rtpmap:` is parsed per stream so the answer can
+  echo the payload type and clock rate rtpengine actually offered, and so the
+  negotiated telephone-event type feeds `StreamPipeline` instead of a hardcoded
+  101. Without this there would be no RFC 4733 on any tap, silently breaking
+  the frozen `firstDtmf`/`dtmfResult` contracts.
+- The real rtpengine offer is pinned as a fixture
+  (`parses_a_real_rtpengine_14_subscribe_offer`). It has **no session-level
+  `c=` line** — only media-level — so media-level precedence is the only
+  source of the source address, not a refinement.
 - Deliberate limits, each with a test: audio-only (a non-audio m= line is
   a loud error, not a silently skipped section), static payload types
   only (L16/Opus answers need dynamic rtpmap — `NoStaticPayloadType`),
