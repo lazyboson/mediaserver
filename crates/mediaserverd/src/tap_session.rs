@@ -231,10 +231,12 @@ pub async fn run(request: TapSpikeRequest, cookie_prefix: u64) -> Result<(), Tap
         info!(
             track = ?leg.track(),
             samples_captured = leg.samples().len(),
+            digits_seen = %leg.digits_seen(),
             datagrams = stats.datagrams,
             frames_played = stats.pipeline.frames_played,
             frames_concealed = stats.pipeline.frames_concealed,
             underruns = stats.underruns,
+            telephone_event_packets = stats.pipeline.telephone_events,
             dtmf_digits = stats.pipeline.dtmf_digits,
             unknown_payload_type = stats.pipeline.unknown_payload_type,
             unparsable = stats.pipeline.unparsable,
