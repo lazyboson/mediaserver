@@ -7,3 +7,10 @@ description = "Sans-IO media pipeline core: RTP, G.711, RFC 2833 DTMF, jitter bu
 
 [dependencies]
 thiserror = { workspace = true }
+
+[dev-dependencies]
+criterion = { version = "0.8.2", default-features = false }
+
+[[bench]]
+name = "ingest_pipeline"
+harness = false
