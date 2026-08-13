@@ -1,0 +1,72 @@
+name: mss-lab
+
+services:
+  rtpengine:
+    image: jambonz/rtpengine
+    command: ["rtpengine", "--table=-1"]
+    tmpfs:
+      - /rec:mode=1777
+    networks:
+      lab:
+        ipv4_address: 172.31.99.10
+
+  call-driver:
+    image: python:3-slim
+    depends_on: [rtpengine]
+    volumes:
+      - ./call_driver.py:/call_driver.py:ro
+    command: ["python3", "/call_driver.py"]
+    environment:
+      NG_NODE: 172.31.99.10
+      NG_PORT: "22222"
+      SELF_IP: 172.31.99.20
+      CALL_ID: lab-call-1
+      FROM_TAG: tagA
+      TO_TAG: tagB
+      PUMP_SECONDS: "60"
+      READY_FILE: /tmp/call-ready
+    healthcheck:
+      test: ["CMD", "test", "-f", "/tmp/call-ready"]
+      interval: 2s
+      timeout: 2s
+      retries: 20
+      start_period: 2s
+    networks:
+      lab:
+        ipv4_address: 172.31.99.20
+
+  mediaserverd:
+    image: rust:1.95-slim-bookworm
+    working_dir: /build
+    command: ["cargo", "run", "--quiet", "-p", "mediaserverd"]
+    depends_on:
+      call-driver:
+        condition: service_healthy
+    volumes:
+      - ..:/build:ro
+      - lab-target:/target
+      - lab-registry:/usr/local/cargo/registry
+      - ./out:/out
+    environment:
+      CARGO_TARGET_DIR: /target
+      RUST_LOG: info
+      MSS_RTPENGINE_NODE: 172.31.99.10:22222
+      MSS_TAP_LOCAL_IP: 172.31.99.30
+      MSS_TAP_CALL_ID: lab-call-1
+      MSS_TAP_FROM_TAGS: tagA,tagB
+      MSS_TAP_SECONDS: "15"
+      MSS_TAP_OUTPUT: /out/tap.wav
+    networks:
+      lab:
+        ipv4_address: 172.31.99.30
+
+volumes:
+  lab-target:
+  lab-registry:
+
+networks:
+  lab:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.31.99.0/24
