@@ -316,6 +316,22 @@ fan-out, which is where the next measurement should go.
   1.93.0 locally vs 1.95.0 in CI). If local and CI results ever disagree,
   check `rustc --version` first. Installing via rustup is what makes the
   pin real on a workstation.
+- **Dependabot merges can silently revert workflow edits.** The
+  `@1.95.0` pin was dropped once already: a dependabot PR branched from an
+  older `main` bumped `actions/checkout` on adjacent lines, and its merge
+  kept its own copy of `ci.yml`. After any dependabot merge that touches a
+  workflow, `grep -n 'rust-toolchain@' .github/workflows/*.yml` is worth
+  one second of checking.
+- **There is deliberately no `cargo audit` job.** `cargo deny check all`
+  already reads the same RustSec advisory database, so the second tool
+  added no coverage — but it did break repeatedly for a reason unrelated to
+  our dependencies: `rustsec/audit-check` runs `cargo install cargo-audit`
+  *without* `--locked`, which resolves the tool's own deps to their newest
+  versions, and one of them (`kstring 2.0.4`) requires rustc 1.96.0 while
+  this repo pins 1.95.0. The install aborted before checking a single
+  advisory. If cargo-audit is ever wanted back, it needs `--locked` and a
+  toolchain decoupled from the repo pin — the tool's build compiler has
+  nothing to do with our MSRV, since auditing only reads `Cargo.lock`.
 - `criterion` is a dev-dependency with `default-features = false`, which
   drops plotters/rayon and keeps the added third-party crate count and
   license surface small. All 77 third-party crates resolve to a license in
@@ -325,6 +341,6 @@ fan-out, which is where the next measurement should go.
   crates for licensing and allows wildcard *path* deps only.
 - Dockerfile builds only `mediaserverd` and ships distroless nonroot. It
   copies `Cargo.lock` and builds `--locked`, so the image ships exactly
-  the dependency set cargo-deny and the RustSec audit ran against;
+  the dependency set cargo-deny checked, advisories included;
   without it the image re-resolved dependencies and could ship versions
   CI never saw.
