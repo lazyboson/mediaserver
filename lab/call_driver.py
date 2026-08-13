@@ -24,6 +24,12 @@ READY_FILE = os.environ.get("READY_FILE", "/tmp/call-ready")
 
 CALLER_RTP_PORT = 40000
 CALLEE_RTP_PORT = 40002
+PCMU_PAYLOAD_TYPE = 0
+TELEPHONE_EVENT_PT = int(os.environ.get("TELEPHONE_EVENT_PT", "101"))
+CALLER_DIGIT = int(os.environ.get("CALLER_DIGIT", "1"))
+CALLEE_DIGIT = int(os.environ.get("CALLEE_DIGIT", "2"))
+DIGIT_AFTER_SECONDS = float(os.environ.get("DIGIT_AFTER_SECONDS", "3"))
+DIGIT_INTERVAL_SECONDS = float(os.environ.get("DIGIT_INTERVAL_SECONDS", "4"))
 
 
 def log(message):
@@ -103,6 +109,31 @@ def media_port(sdp):
     return ports[0] if ports else None
 
 
+def send_rtp(leg, payload_type, payload, timestamp):
+    header = struct.pack(
+        "!BBHII", 0x80, payload_type, leg["seq"] & 0xFFFF, timestamp, leg["ssrc"]
+    )
+    leg["sock"].sendto(header + payload, leg["dest"])
+    leg["seq"] += 1
+
+
+def send_digit(leg, event):
+    """One RFC 4733 press: repeats at a fixed timestamp, then end-bit retransmits.
+
+    The detector must report the digit exactly once despite the retransmissions,
+    which is the frozen firstDtmf/dtmfResult behaviour.
+    """
+    start = leg["ts"]
+    duration = 160
+    for _ in range(4):
+        send_rtp(leg, TELEPHONE_EVENT_PT, struct.pack("!BBH", event, 10, duration), start)
+        duration += 160
+    for _ in range(3):
+        send_rtp(leg, TELEPHONE_EVENT_PT, struct.pack("!BBH", event, 0x80 | 10, duration), start)
+    leg["ts"] = start + duration
+    log(f"sent digit {event} on {leg['name']}")
+
+
 def pump(caller_dest, callee_dest, stop):
     caller = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     caller.bind(("0.0.0.0", CALLER_RTP_PORT))
@@ -110,20 +141,23 @@ def pump(caller_dest, callee_dest, stop):
     callee.bind(("0.0.0.0", CALLEE_RTP_PORT))
 
     legs = [
-        {"sock": caller, "dest": caller_dest, "seq": 1000, "ts": 0, "ssrc": 0x11111111, "byte": 0},
-        {"sock": callee, "dest": callee_dest, "seq": 9000, "ts": 0, "ssrc": 0x22222222, "byte": 128},
+        {"name": "caller/tagA", "sock": caller, "dest": caller_dest, "seq": 1000,
+         "ts": 0, "ssrc": 0x11111111, "byte": 0, "digit": CALLER_DIGIT},
+        {"name": "callee/tagB", "sock": callee, "dest": callee_dest, "seq": 9000,
+         "ts": 0, "ssrc": 0x22222222, "byte": 128, "digit": CALLEE_DIGIT},
     ]
     sent = 0
+    next_digits_at = time.monotonic() + DIGIT_AFTER_SECONDS
     deadline = time.monotonic() + PUMP_SECONDS
     while not stop.is_set() and time.monotonic() < deadline:
+        if time.monotonic() >= next_digits_at:
+            for leg in legs:
+                send_digit(leg, leg["digit"])
+            next_digits_at = time.monotonic() + DIGIT_INTERVAL_SECONDS
         for leg in legs:
             payload = bytes((leg["byte"] + n) % 256 for n in range(160))
             leg["byte"] = (leg["byte"] + 160) % 256
-            header = struct.pack(
-                "!BBHII", 0x80, 0, leg["seq"] & 0xFFFF, leg["ts"], leg["ssrc"]
-            )
-            leg["sock"].sendto(header + payload, leg["dest"])
-            leg["seq"] += 1
+            send_rtp(leg, PCMU_PAYLOAD_TYPE, payload, leg["ts"])
             leg["ts"] += 160
             sent += 1
         time.sleep(0.02)

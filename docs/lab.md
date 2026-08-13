@@ -101,16 +101,46 @@ releases, 0 reanchors, and a 2-channel 8 kHz WAV of 14.98s carrying distinct
 audio per channel. The 58 underruns per leg are the driver pumping slightly
 under 50 packets/s against the pacer, not a pipeline fault.
 
+## DTMF and leg identity, both now proven
+
+`call_driver.py` sends a distinct digit per leg on a repeating interval —
+caller `1`, callee `2` — and `TapLeg` records the digits each leg reports.
+One run settles two questions at once:
+
+| Leg | digits seen | telephone-event packets | digits reported |
+| --- | --- | --- | --- |
+| Customer (stream 0) | `111` | 21 | 3 |
+| Agent (stream 1) | `222` | 21 | 3 |
+
+- **RFC 4733 survives a real rtpengine subscription** now that the answer
+  negotiates telephone-event, and 21 packets produce exactly 3 reported
+  digits — the once-per-press dedupe the frozen `firstDtmf`/`dtmfResult`
+  contract requires.
+- **Leg-to-track mapping follows `from-tags` order.** The caller's digit
+  arrived on stream 0 and the callee's on stream 1, so `track_for_stream`
+  assigning stream 0 to Customer is correct rather than merely assumed. This
+  is a channel-independent proof: it does not depend on interpreting audio.
+- One timing lesson: digits must repeat. A single press three seconds in was
+  missed entirely, because the healthcheck plus process start means the
+  subscription does not exist yet — `telephone_event_packets` was 0 and it
+  looked like rtpengine was stripping DTMF. `lab/ng_dtmf_probe.py` was what
+  disproved that: with `codec accept PCMU` it showed pt101 arriving on both
+  tap streams, which pointed at our timing rather than rtpengine.
+
 ## Findings still open
 
-1. **No `a=label:` in the subscription offer.** `set-label` was sent on the
-   `subscribe request` and the reply carries no label attribute, so
-   `OfferedStream::label` is `None` and the label logging in `tap_session.rs`
-   cannot confirm which leg is which. Track assignment by offer order is the
-   only option available; it is presumed to follow `from-tags` order, and
-   that presumption is still untested — a two-leg tap with deliberately
-   different audio per leg would settle it.
-2. **DTMF has not actually been observed on a tap.** The answer now
-   negotiates telephone-event, but the driver never sends RFC 4733, so
-   `dtmf_digits` stayed 0. Teaching `call_driver.py` to send a digit is the
-   direct way to prove the frozen contract end to end.
+1. **Telephone-event packets are counted as lost audio.** Both legs above
+   report `jitter_lost: 21` and `frames_concealed: 21` — exactly the DTMF
+   packet count. RFC 4733 packets consume RTP sequence numbers, and
+   `StreamPipeline` deliberately routes them to the DTMF detector instead of
+   the jitter buffer, so the buffer sees each one as a missing audio packet.
+   Playing silence for the event is roughly right (endpoints suppress audio
+   during a press), but **counting it as loss is not**: every DTMF press
+   inflates the loss metric, so an IVR-heavy tenant would look like a lossy
+   network and real loss would be hidden in the noise. Article VIII wants
+   these counters truthful. The fix belongs in the jitter buffer — a
+   sequence number can be *accounted for* without carrying audio — and is
+   tracked with the jitter hardening work, not patched around here.
+2. **The `mix` flag is untested.** `SubscribeRequest` supports it and the
+   architecture proposes it for cheap supervisor listen, but no lab run has
+   asked for a mixed mono feed.
