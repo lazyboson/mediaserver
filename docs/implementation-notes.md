@@ -186,6 +186,65 @@ cookie, per-request `oneshot`, timeout, retry, and node health counters.
   **M4:** node registry keyed by call→node discovery, re-subscribe on pod
   loss.
 
+### tap_spike.rs — the Phase-0 capture (media world)
+Owns the sockets and the pacing for one tap: drain both legs, release one
+frame per leg every `ptime` on a wall-clock-anchored deadline, accumulate
+PCM, and write the WAV once capture ends.
+- **No file I/O on the media thread.** PCM accumulates into per-leg buffers
+  preallocated from `max_capture`, and `write_wav` runs afterwards on the
+  caller's thread. Writing a WAV frame-by-frame from the release loop would
+  be exactly the blocking I/O Article I forbids. The cost is that capture
+  length is bounded by memory: 8 kHz × 2 B × 2 legs ≈ 32 KB/s, so a
+  10-minute tap is ~19 MB.
+- Every cap is surfaced rather than silent (Article VIII): `capture_full`
+  when the preallocated buffer is reached, `drain_batches_filled` when a
+  drain hits `MAX_DATAGRAMS_PER_DRAIN` (64, which bounds how long a flood
+  can starve the pacer), `recv_errors`, and `reanchors` when the release
+  deadline falls more than one `ptime` behind and re-anchors instead of
+  bursting.
+- `Playout::Waiting` appends a frame of silence and counts an underrun, so
+  both legs stay sample-aligned and the stereo file keeps real time. That
+  is why a source slower than the pacer shows up as underruns plus silence
+  rather than as a shortened file.
+- Stereo mapping is Customer left, Agent right (matching FS
+  `RECORD_STEREO`); one leg writes mono; duplicate tracks and more than two
+  legs are errors.
+
+### tap_session.rs — the Phase-0 orchestration (control world)
+Drives the whole subscribe lifecycle and is env-configured, so the spike
+needs no CLI or config plumbing: `MSS_TAP_CALL_ID` (presence selects spike
+mode instead of the daemon loop), `MSS_RTPENGINE_NODE`, `MSS_TAP_LOCAL_IP`
+(must be routable *from* rtpengine — it goes into the answer SDP),
+`MSS_TAP_FROM_TAGS`, `MSS_TAP_OUTPUT`, `MSS_TAP_SECONDS`.
+- **Order matters:** subscribe request first, *then* bind sockets, then
+  answer. The offer is what tells us how many streams rtpengine will send,
+  so binding first would mean guessing the count.
+- Track assignment follows offer order (stream 0 = customer), and each
+  offered stream's `a=label` and source address are logged so an operator
+  can confirm the mapping instead of trusting it. Label-based assignment is
+  a later refinement.
+- `unsubscribe` failure is a warning, not an error return: the WAV artifact
+  is the point of the exercise and must not be lost because teardown
+  failed. rtpengine expires the subscription on its own.
+- Known limits: at most 2 streams (`TooManyStreams`), PCMU/8k/20ms fixed
+  (we request PCMU in `accept_codecs` and let rtpengine transcode), and the
+  process exits after the spike rather than continuing as a daemon.
+
+### Verified end to end without a lab (2026-08-14)
+The spike was run against a scripted fake rtpengine on loopback that
+answers `subscribe request` with a two-stream sendonly offer, reads our
+answer SDP for the receive ports, streams G.711 to them, and answers
+`unsubscribe`. Result: both labels parsed, ports bound and advertised, 160
+datagrams per leg received with 0 unparsable and 0 recv errors, 159 frames
+played + 40 underruns = 199 releases on both legs, 0 reanchors, both legs
+sample-aligned at 31,840 samples, and a 2-channel 8 kHz WAV of 3.98 s with
+distinct content per channel. The underruns are the fake sending at ~40
+packets/s against a 50/s pacer — the expected shape, and useful proof that
+underrun accounting and silence-fill alignment work.
+**This does not close M2:** it proves our side of the protocol. The exit
+criteria still need a real rtpengine (version support, re-INVITE/hold
+behavior, transcoding at the tap) and the rtpengine-host CPU measurement.
+
 ### main.rs — optional NG reachability probe
 `MSS_RTPENGINE_NODE=ip:port` makes the daemon ping that node at startup
 and log the result, which is how the Phase-0 "does our deployed rtpengine
