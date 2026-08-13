@@ -2,7 +2,7 @@
 name = "protocol"
 version.workspace = true
 edition.workspace = true
-license.workspace = true
+publish.workspace = true
 description = "Wire types for consumer-facing protocols: the Twilio Media Streams WebSocket dialect (the legacy media gateway-compatible) and audio_fork send_text control events."
 
 [dependencies]
