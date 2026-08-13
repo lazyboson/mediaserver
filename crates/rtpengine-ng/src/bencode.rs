@@ -1,9 +1,3 @@
-//! Minimal bencode encoder/decoder — just what the NG protocol needs.
-//!
-//! NG dictionaries contain byte strings, integers, lists, and nested
-//! dictionaries. Keys are byte strings. We keep values as raw bytes and
-//! let callers interpret them (SDP bodies are not UTF-8-guaranteed).
-
 use std::collections::BTreeMap;
 use thiserror::Error;
 
@@ -45,7 +39,6 @@ impl Value {
         std::str::from_utf8(self.as_bytes()?).ok()
     }
 
-    /// Dictionary lookup by string key.
     pub fn get(&self, key: &str) -> Option<&Value> {
         match self {
             Value::Dict(d) => d.get(key.as_bytes()),
@@ -207,12 +200,12 @@ mod tests {
     #[test]
     fn malformed_input_is_error_not_panic() {
         for bad in [
-            &b"d3:fooe"[..],       // key without value
-            &b"i42"[..],           // unterminated int
-            &b"9999:ab"[..],       // length overruns input
-            &b"x"[..],             // bogus token
-            &b"d1:ai1ee junk"[..], // trailing bytes
-            &b""[..],              // empty
+            &b"d3:fooe"[..],
+            &b"i42"[..],
+            &b"9999:ab"[..],
+            &b"x"[..],
+            &b"d1:ai1ee junk"[..],
+            &b""[..],
         ] {
             assert!(Value::decode(bad).is_err(), "accepted {bad:?}");
         }

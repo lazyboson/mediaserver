@@ -1,13 +1,3 @@
-//! Control events streamfsm sends today via `uuid_audio_fork send_text`.
-//!
-//! Exact wire shapes from cigol's streamfsm (fsm.go):
-//! `{"event":"firstDtmf","callSid":"<uuid>"}`
-//! `{"event":"dtmfResult","callSid":"<uuid>","digits":"123#"}`
-//! `{"event":"playbackStop","callSid":"<uuid>"}`
-//!
-//! The MSS forwards these verbatim to WS consumers (SendText verb) and as
-//! `TextEvent` on gRPC consumers.
-
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
