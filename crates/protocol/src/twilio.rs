@@ -111,22 +111,125 @@ pub struct InboundMedia {
 mod tests {
     use super::*;
 
-    #[test]
-    fn media_message_matches_the legacy media gateway_shape() {
-        let msg = Outbound::Media {
+    fn assert_serializes_to(msg: &Outbound, expected: &str) {
+        assert_eq!(serde_json::to_string(msg).unwrap(), expected);
+    }
+
+    fn start(custom_parameters: HashMap<String, String>) -> Outbound {
+        Outbound::Start {
+            sequence_number: "1".into(),
+            stream_sid: "MZ-1".into(),
+            start: StartInfo {
+                account_id: "acct-1".into(),
+                stream_sid: "MZ-1".into(),
+                call_sid: "call-1".into(),
+                tracks: vec!["inbound".into(), "outbound".into()],
+                media_format: MediaFormat {
+                    encoding: "audio/x-mulaw".into(),
+                    sample_rate: 8000,
+                    channels: 1,
+                },
+                custom_parameters,
+            },
+        }
+    }
+
+    fn media() -> Outbound {
+        Outbound::Media {
             sequence_number: "5".into(),
-            stream_sid: "sid-1".into(),
+            stream_sid: "MZ-1".into(),
             media: MediaPayload {
                 track: "outbound".into(),
                 timestamp: 1200,
                 payload: "AAAA".into(),
             },
-        };
-        let json = serde_json::to_value(&msg).unwrap();
-        assert_eq!(json["event"], "media");
-        assert_eq!(json["media"]["track"], "outbound");
-        assert_eq!(json["media"]["timestamp"], 1200);
-        assert_eq!(json["streamSid"], "sid-1");
+        }
+    }
+
+    fn dtmf() -> Outbound {
+        Outbound::Dtmf {
+            sequence_number: "7".into(),
+            stream_sid: "MZ-1".into(),
+            dtmf: DtmfInfo {
+                track: "inbound".into(),
+                digit: "5".into(),
+            },
+        }
+    }
+
+    fn mark() -> Outbound {
+        Outbound::Mark {
+            stream_sid: "MZ-1".into(),
+            mark: MarkInfo {
+                name: "prompt-done".into(),
+            },
+        }
+    }
+
+    fn stop() -> Outbound {
+        Outbound::Stop {
+            sequence_number: "9".into(),
+            stream_sid: "MZ-1".into(),
+        }
+    }
+
+    #[test]
+    fn start_matches_the legacy media gateway_bytes() {
+        assert_serializes_to(
+            &start(HashMap::new()),
+            r#"{"event":"start","sequenceNumber":"1","streamSid":"MZ-1","start":{"accountId":"acct-1","streamSid":"MZ-1","callSid":"call-1","tracks":["inbound","outbound"],"mediaFormat":{"encoding":"audio/x-mulaw","sampleRate":8000,"channels":1}}}"#,
+        );
+    }
+
+    #[test]
+    fn start_custom_parameters_are_emitted_only_when_present() {
+        let one = HashMap::from([("agentId".to_string(), "a-7".to_string())]);
+        assert_serializes_to(
+            &start(one),
+            r#"{"event":"start","sequenceNumber":"1","streamSid":"MZ-1","start":{"accountId":"acct-1","streamSid":"MZ-1","callSid":"call-1","tracks":["inbound","outbound"],"mediaFormat":{"encoding":"audio/x-mulaw","sampleRate":8000,"channels":1},"customParameters":{"agentId":"a-7"}}}"#,
+        );
+    }
+
+    #[test]
+    fn media_matches_the legacy media gateway_bytes() {
+        assert_serializes_to(
+            &media(),
+            r#"{"event":"media","sequenceNumber":"5","streamSid":"MZ-1","media":{"track":"outbound","timestamp":1200,"payload":"AAAA"}}"#,
+        );
+    }
+
+    #[test]
+    fn dtmf_matches_the legacy media gateway_bytes() {
+        assert_serializes_to(
+            &dtmf(),
+            r#"{"event":"dtmf","sequenceNumber":"7","streamSid":"MZ-1","dtmf":{"track":"inbound","digit":"5"}}"#,
+        );
+    }
+
+    #[test]
+    fn mark_matches_the legacy media gateway_bytes() {
+        assert_serializes_to(
+            &mark(),
+            r#"{"event":"mark","streamSid":"MZ-1","mark":{"name":"prompt-done"}}"#,
+        );
+    }
+
+    #[test]
+    fn stop_matches_the legacy media gateway_bytes() {
+        assert_serializes_to(
+            &stop(),
+            r#"{"event":"stop","sequenceNumber":"9","streamSid":"MZ-1"}"#,
+        );
+    }
+
+    #[test]
+    fn mark_omits_sequence_number_while_start_media_dtmf_stop_carry_it() {
+        let marked = serde_json::to_string(&mark()).unwrap();
+        assert!(!marked.contains("sequenceNumber"), "{marked}");
+        for carrier in [start(HashMap::new()), media(), dtmf(), stop()] {
+            let json = serde_json::to_string(&carrier).unwrap();
+            assert!(json.contains(r#""sequenceNumber":"#), "{json}");
+        }
     }
 
     #[test]

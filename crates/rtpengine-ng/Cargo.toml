@@ -6,4 +6,5 @@ publish.workspace = true
 description = "Sans-IO client for the RTPEngine NG control protocol (bencode over UDP): subscribe request/answer, unsubscribe, ping. Transport is owned by the caller."
 
 [dependencies]
+media-core = { path = "../media-core" }
 thiserror = { workspace = true }

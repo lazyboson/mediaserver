@@ -14,6 +14,15 @@ impl Encoding {
             _ => None,
         }
     }
+
+    pub fn rtpmap_name(self) -> &'static str {
+        match self {
+            Encoding::Pcmu => "PCMU",
+            Encoding::Pcma => "PCMA",
+            Encoding::L16 => "L16",
+            Encoding::Opus => "opus",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -70,6 +79,22 @@ mod tests {
     fn samples_per_packet_basics() {
         assert_eq!(AudioFormat::pcmu_8k_20ms().samples_per_packet(), Some(160));
         assert_eq!(AudioFormat::l16_16k_20ms().samples_per_packet(), Some(320));
+    }
+
+    #[test]
+    fn rtpmap_names_match_iana_registrations() {
+        assert_eq!(Encoding::Pcmu.rtpmap_name(), "PCMU");
+        assert_eq!(Encoding::Pcma.rtpmap_name(), "PCMA");
+        assert_eq!(Encoding::L16.rtpmap_name(), "L16");
+        assert_eq!(Encoding::Opus.rtpmap_name(), "opus");
+    }
+
+    #[test]
+    fn only_g711_has_static_payload_types() {
+        assert_eq!(Encoding::Pcmu.static_payload_type(), Some(0));
+        assert_eq!(Encoding::Pcma.static_payload_type(), Some(8));
+        assert_eq!(Encoding::L16.static_payload_type(), None);
+        assert_eq!(Encoding::Opus.static_payload_type(), None);
     }
 
     #[test]
