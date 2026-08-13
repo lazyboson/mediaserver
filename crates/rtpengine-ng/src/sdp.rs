@@ -25,13 +25,31 @@ pub enum SdpError {
     UnusableFormat,
 }
 
+pub const TELEPHONE_EVENT: &str = "telephone-event";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RtpMap {
+    pub payload_type: u8,
+    pub encoding_name: String,
+    pub clock_rate_hz: u32,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct OfferedStream {
     pub port: u16,
     pub payload_types: Vec<u8>,
+    pub rtpmaps: Vec<RtpMap>,
     pub ptime_ms: Option<u32>,
     pub label: Option<String>,
     pub connection_address: Option<String>,
+}
+
+impl OfferedStream {
+    pub fn telephone_event(&self) -> Option<&RtpMap> {
+        self.rtpmaps
+            .iter()
+            .find(|map| map.encoding_name.eq_ignore_ascii_case(TELEPHONE_EVENT))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -115,9 +133,19 @@ fn parse_media_line(rest: &str) -> Result<OfferedStream, SdpError> {
     Ok(OfferedStream {
         port,
         payload_types,
-        ptime_ms: None,
-        label: None,
-        connection_address: None,
+        ..Default::default()
+    })
+}
+
+fn parse_rtpmap(value: &str) -> Option<RtpMap> {
+    let (payload_type, description) = value.trim().split_once(' ')?;
+    let mut parts = description.split('/');
+    let encoding_name = parts.next()?.to_string();
+    let clock_rate_hz = parts.next()?.parse().ok()?;
+    Some(RtpMap {
+        payload_type: payload_type.parse().ok()?,
+        encoding_name,
+        clock_rate_hz,
     })
 }
 
@@ -132,6 +160,10 @@ fn apply_media_attribute(stream: &mut OfferedStream, rest: &str) {
         }
     } else if let Some(value) = rest.strip_prefix("label:") {
         stream.label = Some(value.trim().to_string());
+    } else if let Some(value) = rest.strip_prefix("rtpmap:") {
+        if let Some(map) = parse_rtpmap(value) {
+            stream.rtpmaps.push(map);
+        }
     }
 }
 
@@ -173,13 +205,26 @@ impl SubscriptionAnswer<'_> {
         sdp.push_str("s=mss-tap\r\n");
         sdp.push_str(&format!("c=IN IP4 {}\r\n", self.local_address));
         sdp.push_str("t=0 0\r\n");
-        for port in self.receive_ports {
-            sdp.push_str(&format!("m=audio {port} RTP/AVP {payload_type}\r\n"));
+        for (port, stream) in self.receive_ports.iter().zip(&offer.streams) {
+            let telephone_event = stream.telephone_event();
+            match telephone_event {
+                Some(event) => sdp.push_str(&format!(
+                    "m=audio {port} RTP/AVP {payload_type} {}\r\n",
+                    event.payload_type
+                )),
+                None => sdp.push_str(&format!("m=audio {port} RTP/AVP {payload_type}\r\n")),
+            }
             sdp.push_str(&format!(
                 "a=rtpmap:{payload_type} {name}/{rate}\r\n",
                 name = self.format.encoding.rtpmap_name(),
                 rate = self.format.sample_rate_hz
             ));
+            if let Some(event) = telephone_event {
+                sdp.push_str(&format!(
+                    "a=rtpmap:{} {TELEPHONE_EVENT}/{}\r\n",
+                    event.payload_type, event.clock_rate_hz
+                ));
+            }
             sdp.push_str(&format!("a=ptime:{}\r\n", self.format.ptime_ms));
             sdp.push_str("a=recvonly\r\n");
         }
@@ -207,6 +252,48 @@ c=IN IP4 10.0.0.9\r\n\
 a=rtpmap:8 PCMA/8000\r\n\
 a=label:agent\r\n\
 a=sendonly\r\n";
+
+    const RTPENGINE_14_SUBSCRIBE_OFFER: &str = "v=0\r\n\
+o=- 1 1 IN IP4 172.31.98.20\r\n\
+s=probe\r\n\
+t=0 0\r\n\
+m=audio 25058 RTP/AVP 0 101\r\n\
+c=IN IP4 172.31.98.10\r\n\
+a=rtpmap:0 PCMU/8000\r\n\
+a=rtpmap:101 telephone-event/8000\r\n\
+a=sendonly\r\n\
+a=rtcp:25059\r\n\
+a=ptime:20\r\n\
+m=audio 29114 RTP/AVP 0 101\r\n\
+c=IN IP4 172.31.98.10\r\n\
+a=rtpmap:0 PCMU/8000\r\n\
+a=rtpmap:101 telephone-event/8000\r\n\
+a=sendonly\r\n\
+a=rtcp:29115\r\n\
+a=ptime:20\r\n";
+
+    #[test]
+    fn parses_a_real_rtpengine_14_subscribe_offer() {
+        let offer = SubscriptionOffer::parse(RTPENGINE_14_SUBSCRIBE_OFFER).unwrap();
+        assert_eq!(offer.connection_address, None);
+        assert_eq!(offer.streams.len(), 2);
+        assert_eq!(offer.streams[0].port, 25058);
+        assert_eq!(offer.streams[1].port, 29114);
+        assert_eq!(offer.streams[0].payload_types, vec![0, 101]);
+        assert_eq!(offer.streams[0].ptime_ms, Some(20));
+        assert_eq!(offer.streams[0].label, None);
+        assert_eq!(offer.stream_address(0), Some("172.31.98.10"));
+        assert_eq!(offer.stream_address(1), Some("172.31.98.10"));
+
+        let ports = [40000u16, 40002];
+        let answer = SubscriptionAnswer {
+            session_id: 7,
+            local_address: "172.31.99.30",
+            receive_ports: &ports,
+            format: AudioFormat::pcmu_8k_20ms(),
+        };
+        assert!(answer.to_sdp(&offer).is_ok());
+    }
 
     #[test]
     fn parses_both_tapped_legs_with_ports_ptime_and_labels() {
@@ -247,14 +334,82 @@ o=- 42 42 IN IP4 10.1.2.3\r\n\
 s=mss-tap\r\n\
 c=IN IP4 10.1.2.3\r\n\
 t=0 0\r\n\
-m=audio 40000 RTP/AVP 0\r\n\
+m=audio 40000 RTP/AVP 0 101\r\n\
 a=rtpmap:0 PCMU/8000\r\n\
+a=rtpmap:101 telephone-event/8000\r\n\
 a=ptime:20\r\n\
 a=recvonly\r\n\
 m=audio 40002 RTP/AVP 0\r\n\
 a=rtpmap:0 PCMU/8000\r\n\
 a=ptime:20\r\n\
 a=recvonly\r\n"
+        );
+    }
+
+    #[test]
+    fn answer_echoes_offered_telephone_event_because_rtpengine_rejects_dropping_it() {
+        let offer = SubscriptionOffer::parse(RTPENGINE_14_SUBSCRIBE_OFFER).unwrap();
+        assert_eq!(
+            offer.streams[0].telephone_event(),
+            Some(&RtpMap {
+                payload_type: 101,
+                encoding_name: TELEPHONE_EVENT.to_string(),
+                clock_rate_hz: 8000,
+            })
+        );
+
+        let ports = [40000u16, 40002];
+        let sdp = SubscriptionAnswer {
+            session_id: 1,
+            local_address: "172.31.99.30",
+            receive_ports: &ports,
+            format: AudioFormat::pcmu_8k_20ms(),
+        }
+        .to_sdp(&offer)
+        .unwrap();
+
+        assert_eq!(sdp.matches("m=audio").count(), 2);
+        assert_eq!(sdp.matches("RTP/AVP 0 101").count(), 2);
+        assert_eq!(sdp.matches("a=rtpmap:101 telephone-event/8000").count(), 2);
+    }
+
+    #[test]
+    fn answer_omits_telephone_event_when_the_offer_has_none() {
+        let offer = SubscriptionOffer::parse(
+            "m=audio 30000 RTP/AVP 8\r\na=rtpmap:8 PCMA/8000\r\na=sendonly\r\n",
+        )
+        .unwrap();
+        assert_eq!(offer.streams[0].telephone_event(), None);
+
+        let ports = [40000u16];
+        let sdp = SubscriptionAnswer {
+            session_id: 1,
+            local_address: "10.0.0.1",
+            receive_ports: &ports,
+            format: AudioFormat::pcmu_8k_20ms(),
+        }
+        .to_sdp(&offer)
+        .unwrap();
+
+        assert!(sdp.contains("m=audio 40000 RTP/AVP 0\r\n"), "{sdp}");
+        assert!(!sdp.contains(TELEPHONE_EVENT), "{sdp}");
+    }
+
+    #[test]
+    fn rtpmaps_are_parsed_per_stream_and_malformed_ones_ignored() {
+        let offer = SubscriptionOffer::parse(
+            "m=audio 30000 RTP/AVP 0 101\r\n\
+a=rtpmap:0 PCMU/8000\r\n\
+a=rtpmap:nonsense\r\n\
+a=rtpmap:101 telephone-event/8000/1\r\n\
+a=sendonly\r\n",
+        )
+        .unwrap();
+        assert_eq!(offer.streams[0].rtpmaps.len(), 2);
+        assert_eq!(offer.streams[0].rtpmaps[0].encoding_name, "PCMU");
+        assert_eq!(
+            offer.streams[0].telephone_event().map(|m| m.payload_type),
+            Some(101)
         );
     }
 
