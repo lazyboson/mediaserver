@@ -40,6 +40,7 @@ pub struct JitterBuffer {
     play_seq: u16,
     max_seq: u16,
     started: bool,
+    primed: bool,
     target_depth: u16,
     stats: Stats,
 }
@@ -60,6 +61,7 @@ impl JitterBuffer {
             play_seq: 0,
             max_seq: 0,
             started: false,
+            primed: false,
             target_depth: target_depth_packets.max(1),
             stats: Stats::default(),
         }
@@ -100,6 +102,7 @@ impl JitterBuffer {
             }
             self.play_seq = seq;
             self.max_seq = seq;
+            self.primed = false;
             self.stats.resets += 1;
             let slot = &mut self.slots[Self::idx(seq)];
             slot.occupied = true;
@@ -123,14 +126,24 @@ impl JitterBuffer {
     }
 
     pub fn depth(&self) -> u16 {
-        Self::seq_delta(self.max_seq, self.play_seq).max(0) as u16 + 1
+        if !self.started {
+            return 0;
+        }
+        (Self::seq_delta(self.max_seq, self.play_seq) + 1).max(0) as u16
     }
 
     pub fn pop(&mut self) -> PopOutcome<'_> {
-        if !self.started {
+        let depth = self.depth();
+        if depth == 0 {
             return PopOutcome::Waiting;
         }
-        if self.depth() < self.target_depth && !self.slots[Self::idx(self.play_seq)].occupied {
+        if !self.primed {
+            if depth < self.target_depth {
+                return PopOutcome::Waiting;
+            }
+            self.primed = true;
+        }
+        if depth < self.target_depth && !self.slots[Self::idx(self.play_seq)].occupied {
             return PopOutcome::Waiting;
         }
         let seq = self.play_seq;
@@ -155,13 +168,8 @@ mod tests {
         vec![tag; 160]
     }
 
-    #[test]
-    fn reorders_out_of_order_arrival() {
-        let mut jb = JitterBuffer::new(3);
-        jb.push(100, &payload(0));
-        jb.push(102, &payload(2));
-        jb.push(101, &payload(1));
-        for expect in [0u8, 1, 2] {
+    fn assert_pops_payloads(jb: &mut JitterBuffer, tags: &[u8]) {
+        for &expect in tags {
             match jb.pop() {
                 PopOutcome::Packet(p) => assert_eq!(p[0], expect),
                 other => panic!("expected packet {expect}, got {other:?}"),
@@ -170,12 +178,54 @@ mod tests {
     }
 
     #[test]
+    fn reorders_out_of_order_arrival() {
+        let mut jb = JitterBuffer::new(3);
+        jb.push(100, &payload(0));
+        jb.push(102, &payload(2));
+        jb.push(101, &payload(1));
+        assert_pops_payloads(&mut jb, &[0, 1, 2]);
+    }
+
+    #[test]
     fn primes_before_playout() {
         let mut jb = JitterBuffer::new(3);
+        assert_eq!(jb.depth(), 0);
         assert_eq!(jb.pop(), PopOutcome::Waiting);
         jb.push(10, &payload(0));
-        assert!(matches!(jb.pop(), PopOutcome::Packet(_)));
         assert_eq!(jb.pop(), PopOutcome::Waiting);
+        jb.push(11, &payload(1));
+        assert_eq!(jb.pop(), PopOutcome::Waiting);
+        jb.push(12, &payload(2));
+        assert_pops_payloads(&mut jb, &[0, 1, 2]);
+        assert_eq!(jb.pop(), PopOutcome::Waiting);
+        assert_eq!(jb.stats().lost, 0);
+    }
+
+    #[test]
+    fn drained_stream_waits_instead_of_counting_loss() {
+        let mut jb = JitterBuffer::new(1);
+        jb.push(200, &payload(1));
+        assert_pops_payloads(&mut jb, &[1]);
+        assert_eq!(jb.depth(), 0);
+        for _ in 0..5 {
+            assert_eq!(jb.pop(), PopOutcome::Waiting);
+        }
+        assert_eq!(jb.stats().lost, 0);
+        jb.push(201, &payload(2));
+        assert_pops_payloads(&mut jb, &[2]);
+        assert_eq!(jb.stats().lost, 0);
+    }
+
+    #[test]
+    fn reset_reprimes_before_playout_resumes() {
+        let mut jb = JitterBuffer::new(2);
+        jb.push(100, &payload(1));
+        jb.push(101, &payload(2));
+        assert_pops_payloads(&mut jb, &[1]);
+        assert_eq!(jb.push(10_000, &payload(3)), PushOutcome::Reset);
+        assert_eq!(jb.pop(), PopOutcome::Waiting);
+        jb.push(10_001, &payload(4));
+        assert_pops_payloads(&mut jb, &[3, 4]);
     }
 
     #[test]
