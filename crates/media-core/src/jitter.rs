@@ -1,23 +1,6 @@
-//! Sans-IO adaptive jitter buffer.
-//!
-//! mediagateway forwarded packets in arrival order, ignoring sequence and
-//! timestamp entirely. This buffer is the replacement: it reorders by
-//! sequence number, drops duplicates, detects loss, and releases packets
-//! on the caller's clock ("give me everything due as of tick N").
-//!
-//! Sans-IO contract: `push` takes packets, `pop_due` takes the caller's
-//! playout tick. No threads, no clocks, no allocation per packet (payloads
-//! are stored in fixed slots).
-//!
-//! Scaffold status: fixed target depth, sequence-only ordering, G.711-sized
-//! slots. TODO before Phase-1 pilot: adaptive depth from observed jitter,
-//! timestamp-aware gap handling across silence, and PLC hook on loss.
-
-/// Maximum payload one slot can hold. Sized for G.711 at ptime 60 —
-/// bigger payloads are rejected (they indicate a misnegotiated stream).
 pub const MAX_PAYLOAD: usize = 480;
 
-const CAPACITY: usize = 64; // power of two; ~1.28 s of 20 ms packets
+const CAPACITY: usize = 64;
 
 #[derive(Clone, Copy)]
 struct Slot {
@@ -36,37 +19,27 @@ impl Default for Slot {
     }
 }
 
-/// Outcome of pushing a packet.
 #[derive(Debug, PartialEq, Eq)]
 pub enum PushOutcome {
     Buffered,
     Duplicate,
     TooLate,
     TooBig,
-    /// Sequence jumped further than the buffer can represent; the buffer
-    /// reset itself around the new sequence (stream restart / SSRC change).
     Reset,
 }
 
-/// What the playout side gets each tick.
 #[derive(Debug, PartialEq, Eq)]
 pub enum PopOutcome<'a> {
-    /// A packet, in sequence order.
     Packet(&'a [u8]),
-    /// The packet due this tick never arrived (caller runs PLC / silence).
     Lost,
-    /// Buffer is still filling to its target depth (prime with silence).
     Waiting,
 }
 
 pub struct JitterBuffer {
     slots: Box<[Slot; CAPACITY]>,
-    /// Next sequence number the playout side will consume.
     play_seq: u16,
-    /// Highest sequence seen (for depth accounting).
     max_seq: u16,
     started: bool,
-    /// How many packets we hold before starting playout.
     target_depth: u16,
     stats: Stats,
 }
@@ -81,8 +54,6 @@ pub struct Stats {
 }
 
 impl JitterBuffer {
-    /// `target_depth_packets`: initial buffering before playout starts
-    /// (e.g. 2–3 packets = 40–60 ms at ptime 20).
     pub fn new(target_depth_packets: u16) -> Self {
         JitterBuffer {
             slots: Box::new([Slot::default(); CAPACITY]),
@@ -102,7 +73,6 @@ impl JitterBuffer {
         seq as usize % CAPACITY
     }
 
-    /// Signed distance a - b in sequence space (RFC 3550 wraparound).
     fn seq_delta(a: u16, b: u16) -> i32 {
         (a.wrapping_sub(b) as i16) as i32
     }
@@ -125,7 +95,6 @@ impl JitterBuffer {
             return PushOutcome::TooLate;
         }
         if ahead >= CAPACITY as i32 {
-            // Stream discontinuity: re-center on the new sequence.
             for s in self.slots.iter_mut() {
                 s.occupied = false;
             }
@@ -153,17 +122,14 @@ impl JitterBuffer {
         PushOutcome::Buffered
     }
 
-    /// Depth currently buffered ahead of the playout point, in packets.
     pub fn depth(&self) -> u16 {
         Self::seq_delta(self.max_seq, self.play_seq).max(0) as u16 + 1
     }
 
-    /// Advance one playout tick and return what is due.
     pub fn pop(&mut self) -> PopOutcome<'_> {
         if !self.started {
             return PopOutcome::Waiting;
         }
-        // Hold playout until the buffer primed to target depth once.
         if self.depth() < self.target_depth && !self.slots[Self::idx(self.play_seq)].occupied {
             return PopOutcome::Waiting;
         }
@@ -194,7 +160,7 @@ mod tests {
         let mut jb = JitterBuffer::new(3);
         jb.push(100, &payload(0));
         jb.push(102, &payload(2));
-        jb.push(101, &payload(1)); // late but in window
+        jb.push(101, &payload(1));
         for expect in [0u8, 1, 2] {
             match jb.pop() {
                 PopOutcome::Packet(p) => assert_eq!(p[0], expect),
@@ -208,15 +174,15 @@ mod tests {
         let mut jb = JitterBuffer::new(3);
         assert_eq!(jb.pop(), PopOutcome::Waiting);
         jb.push(10, &payload(0));
-        assert!(matches!(jb.pop(), PopOutcome::Packet(_))); // slot occupied → plays
-        assert_eq!(jb.pop(), PopOutcome::Waiting); // next not here, depth < target
+        assert!(matches!(jb.pop(), PopOutcome::Packet(_)));
+        assert_eq!(jb.pop(), PopOutcome::Waiting);
     }
 
     #[test]
     fn reports_loss_once_playout_started() {
         let mut jb = JitterBuffer::new(1);
         jb.push(5, &payload(5));
-        jb.push(7, &payload(7)); // 6 missing
+        jb.push(7, &payload(7));
         assert!(matches!(jb.pop(), PopOutcome::Packet(_)));
         assert_eq!(jb.pop(), PopOutcome::Lost);
         assert!(matches!(jb.pop(), PopOutcome::Packet(_)));

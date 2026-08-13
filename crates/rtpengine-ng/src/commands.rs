@@ -1,10 +1,3 @@
-//! NG command builders and reply parsing (sans-IO).
-//!
-//! Datagram format: `<cookie> <bencoded dict>`. The cookie correlates a
-//! reply to its request — the caller supplies it (monotonic counter +
-//! node id is fine) and matches it on receive. This is the correlation
-//! discipline mediagateway's fire-and-forget UDP MI client lacked.
-
 use crate::bencode::Value;
 use std::collections::BTreeMap;
 use thiserror::Error;
@@ -21,22 +14,15 @@ pub enum NgError {
     MissingField(&'static str),
 }
 
-/// Parameters for `subscribe request` — the tap-creation command.
 #[derive(Debug, Clone, Default)]
 pub struct SubscribeRequest {
     pub call_id: String,
-    /// Participants to copy. Empty = all participants (rtpengine default).
     pub from_tags: Vec<String>,
-    /// Ask rtpengine to mix the selected sources into one output stream.
     pub mix: bool,
-    /// Codec(s) we accept on the subscription leg, in preference order
-    /// (rtpengine transcodes the tap if the call codec differs).
     pub accept_codecs: Vec<String>,
-    /// Optional label rtpengine attaches to the subscription monologue.
     pub label: Option<String>,
 }
 
-/// A parsed, `result=ok` NG reply.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NgReply {
     pub cookie: Vec<u8>,
@@ -53,7 +39,6 @@ impl NgReply {
     }
 }
 
-/// Stateless datagram builder/parser. One per rtpengine peer is typical.
 #[derive(Debug, Default)]
 pub struct NgClient;
 
@@ -66,15 +51,12 @@ impl NgClient {
         out
     }
 
-    /// `ping` — liveness probe; reply body is `{"result": "pong"}`.
     pub fn ping(cookie: &[u8]) -> Vec<u8> {
         let mut d = BTreeMap::new();
         d.insert(b"command".to_vec(), Value::str("ping"));
         Self::build(cookie, d)
     }
 
-    /// `subscribe request` — create a tap. The reply carries rtpengine's
-    /// offer SDP (`a=sendonly`) and the subscription's `to-tag`.
     pub fn subscribe_request(cookie: &[u8], req: &SubscribeRequest) -> Vec<u8> {
         let mut d = BTreeMap::new();
         d.insert(b"command".to_vec(), Value::str("subscribe request"));
@@ -106,7 +88,6 @@ impl NgClient {
         Self::build(cookie, d)
     }
 
-    /// `subscribe answer` — complete the tap with our `a=recvonly` SDP.
     pub fn subscribe_answer(cookie: &[u8], call_id: &str, to_tag: &str, sdp: &str) -> Vec<u8> {
         let mut d = BTreeMap::new();
         d.insert(b"command".to_vec(), Value::str("subscribe answer"));
@@ -116,7 +97,6 @@ impl NgClient {
         Self::build(cookie, d)
     }
 
-    /// `unsubscribe` — tear the tap down.
     pub fn unsubscribe(cookie: &[u8], call_id: &str, to_tag: &str) -> Vec<u8> {
         let mut d = BTreeMap::new();
         d.insert(b"command".to_vec(), Value::str("unsubscribe"));
@@ -125,8 +105,6 @@ impl NgClient {
         Self::build(cookie, d)
     }
 
-    /// Parse a reply datagram. Returns the cookie (for correlation) and the
-    /// body; `result=error` becomes `NgError::Remote`.
     pub fn parse_reply(datagram: &[u8]) -> Result<NgReply, NgError> {
         let space = datagram
             .iter()

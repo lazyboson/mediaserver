@@ -23,6 +23,14 @@ legs + injection (voice AI) → Phase 4 mixing/conferencing.
 | `proto/` | gRPC contracts for `MediaControl` / `MediaStream` (wired with tonic in milestone 2). |
 | `docs/` | Architecture proposal & decision records. |
 
+## Governance
+
+- [CONSTITUTION.md](CONSTITUTION.md) — the project's binding principles;
+  everything below derives from it.
+- [docs/rust-guidelines.md](docs/rust-guidelines.md) — coding rules,
+  including the **strictly-no-comments policy** (CI-enforced): intent lives
+  in names, types, tests, and `docs/`, never in source comments.
+
 ## Architecture rules (enforced in review)
 
 1. **Two worlds.** Tokio owns everything latency-tolerant (session API, NG
