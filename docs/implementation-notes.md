@@ -54,6 +54,45 @@ Playout semantics as decided (each pinned by a test named after it):
   attenuate; Opus PLC comes free with the decoder later).
 - **M3:** slot sizing revisit when Opus lands (payloads up to ~1275 B).
 
+### pipeline.rs — one tapped stream, end to end, sans-IO
+`StreamPipeline` is the whole per-stream ingest path as a state machine:
+`ingest(datagram)` classifies and buffers, `release()` emits one frame of
+PCM when the caller's pacing deadline says so. It owns the jitter buffer,
+the DTMF detector and the G.711 decode, and allocates nothing per packet
+(one reusable `[i16; MAX_PAYLOAD]`).
+- **Telephone-event packets never enter the jitter buffer.** They are
+  routed to `DtmfDetector` by payload type and counted separately;
+  decoding RFC 4733 payloads as G.711 audio would emit noise into every
+  consumer. `telephone_events_never_reach_the_audio_path` is the guard.
+- An unexpected payload type is counted and dropped, never decoded:
+  mediagateway's codec mismatch silently passed garbage bytes through.
+- Loss is `Playout::Concealed` filled with silence, counted separately
+  from `Playout::Pcm`, so a caller writing a recording keeps timing while
+  the metric still says "this was a gap, not audio". **M3:** replace the
+  silence fill with real PLC — the variant is the seam for it.
+- Known limitation, pinned by
+  `reorder_before_playout_starts_strands_the_earlier_packet`: playout
+  anchors on the first packet that arrives, so if the first two packets of
+  a stream arrive swapped, the earlier one is a late drop. **M3
+  candidate:** allow `play_seq` to rewind while still priming, which would
+  make start-of-stream reorder recoverable. Deferred because it changes
+  jitter admission on the sacred path and wants its own benchmark.
+
+### replay.rs — the packet-replay harness (Article III)
+- `G711StreamGenerator` emits deterministic G.711 streams whose payload
+  bytes are a counter, so decoded output is exactly assertable; it can
+  also emit telephone-event packets and `skip_one` to leave a real
+  sequence gap.
+- `disturb(datagrams, script)` applies `Deliver / Drop / DeliverTwice /
+  DelayOne` to model loss, duplication and reorder in one reusable place.
+- `DatagramLog` reads a length-prefixed (`u32` big-endian) log of raw
+  datagrams from a byte slice, with malformed logs surfaced as
+  `ReplayError`, not panics. It takes a slice rather than a path because
+  `media-core` stays sans-IO — the caller does the `fs::read`. Converting
+  a real pcap into this format is the intended path once we have
+  production captures; the format is deliberately trivial so the
+  converter is throwaway.
+
 ### dtmf.rs — complete for RFC 4733 digit reporting
 - Reports once per press on end-bit, deduped by (digit, RTP timestamp);
   events ≥16 (flash-hook etc.) deliberately ignored.
@@ -177,6 +216,31 @@ Redis session registry with ownership leases, Kafka producers (reuse
 `MEDIAGATEWAY_BILLING_TOPIC` / `KAFKA_VOICE_AI_AGENT_TOPIC` schemas),
 health endpoint, graceful drain.
 
+## Phase-0 measurements so far (Article VIII)
+
+`cargo bench -p media-core` (criterion, `benches/ingest_pipeline.rs`),
+first run 2026-08-14 on an **Apple M2, 8 cores, arm64, rustc 1.93.0** —
+note that is *not* the pinned 1.95.0 (see the toolchain note below), and
+not the production Linux/x86 target, so treat these as order-of-magnitude:
+
+| Benchmark | Per 1000 packets | Per packet |
+| --- | --- | --- |
+| `ingest_only_per_packet` (parse + jitter push) | 10.89 µs | **10.9 ns** |
+| `parse_jitter_decode_per_packet` (+ pop + G.711 decode) | 164.9 µs | **165 ns** |
+
+Reading: decode dominates the sans-IO path (~154 of the 165 ns). One
+G.711/20 ms leg is 50 packets/s, so a leg costs ~8.3 µs of CPU per second
+and a two-leg passive session ~16.5 µs/s — about 0.002% of one core.
+
+**What this does and does not price.** It prices exactly the sans-IO
+pipeline on a clean single stream with a hot cache. It excludes the socket
+syscalls (the thing `recvmmsg` would address), per-consumer encode,
+resampling to 16 kHz, fan-out queueing, and everything on the rtpengine
+host. The Phase-0 exit criteria still need the real tap. The useful
+conclusion for now is a negative one: the decode/jitter path is nowhere
+near the constraint, so the per-tap ceiling will be set by syscalls and
+fan-out, which is where the next measurement should go.
+
 ## Cross-cutting decisions already made (do not relitigate casually)
 - Codec interchange is L16 internally; one decode per ingest stream,
   N encodes shared per consumer format.
@@ -187,6 +251,17 @@ health endpoint, graceful drain.
   `@stable`; the toolchain file still won in practice, so the workflow
   read as if the pin did not exist. Bumping the pin now means editing the
   toolchain file *and* the workflow refs in the same PR.
+- **The pin only binds rustup-managed toolchains.** A Homebrew-installed
+  `rustc` ignores `rust-toolchain.toml` entirely, so a developer can run
+  the whole local gate on a different compiler than CI uses (observed:
+  1.93.0 locally vs 1.95.0 in CI). If local and CI results ever disagree,
+  check `rustc --version` first. Installing via rustup is what makes the
+  pin real on a workstation.
+- `criterion` is a dev-dependency with `default-features = false`, which
+  drops plotters/rayon and keeps the added third-party crate count and
+  license surface small. All 77 third-party crates resolve to a license in
+  the `deny.toml` allowlist (several use the legacy `MIT/Apache-2.0`
+  spelling, which cargo-deny normalizes).
 - Workspace crates are `publish = false`; cargo-deny ignores private
   crates for licensing and allows wildcard *path* deps only.
 - Dockerfile builds only `mediaserverd` and ships distroless nonroot. It
