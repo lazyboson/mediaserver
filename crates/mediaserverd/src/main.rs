@@ -1,10 +1,11 @@
 #![forbid(unsafe_code)]
 
 mod media_rt;
-#[allow(dead_code)]
 mod ng_transport;
 #[allow(dead_code)]
 mod supervisor;
+mod tap_session;
+mod tap_spike;
 
 use ng_transport::{NgTransport, NgTransportConfig};
 use std::net::SocketAddr;
@@ -32,6 +33,26 @@ fn main() {
         .expect("failed to build control-plane runtime");
 
     runtime.block_on(async {
+        match tap_session::request_from_env(cookie_prefix()) {
+            Ok(Some(request)) => {
+                info!(
+                    call_id = %request.call_id,
+                    output = %request.output.display(),
+                    seconds = request.duration.as_secs(),
+                    "running the phase-0 tap spike instead of the daemon loop"
+                );
+                if let Err(error) = tap_session::run(request, cookie_prefix()).await {
+                    error!(%error, "tap spike failed");
+                }
+                return;
+            }
+            Ok(None) => {}
+            Err(error) => {
+                error!(%error, "tap spike configuration rejected");
+                return;
+            }
+        }
+
         probe_configured_rtpengine_node().await;
         info!("control plane up (session API and tap orchestration land in milestone 4)");
         tokio::signal::ctrl_c()
@@ -81,13 +102,24 @@ async fn probe_configured_rtpengine_node() {
         }
     };
 
-    match transport.ping().await {
+    let outcome = transport.ping().await;
+    let health = transport.health();
+    match outcome {
         Ok(_) => info!(
             %node,
             local = ?transport.local_addr().ok(),
+            healthy = health.healthy,
+            replies = health.replies,
             "rtpengine NG node answered ping"
         ),
-        Err(error) => error!(%node, %error, "rtpengine NG node did not answer ping"),
+        Err(error) => error!(
+            %node,
+            %error,
+            healthy = health.healthy,
+            timeouts = health.timeouts,
+            consecutive_timeouts = health.consecutive_timeouts,
+            "rtpengine NG node did not answer ping"
+        ),
     }
 }
 

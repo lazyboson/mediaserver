@@ -165,10 +165,6 @@ impl NgTransport {
         Ok(self.socket.local_addr()?)
     }
 
-    pub fn node(&self) -> SocketAddr {
-        self.node
-    }
-
     pub fn health(&self) -> NodeHealth {
         self.health
             .snapshot(self.config.unhealthy_after_consecutive_timeouts)
