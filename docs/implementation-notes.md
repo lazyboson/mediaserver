@@ -47,6 +47,11 @@ Playout semantics as decided (each pinned by a test named after it):
   re-prime: re-priming after an underrun on a continuous sequence would
   ratchet playout delay upward for the rest of a live call, which is worse
   than the single gap it would paper over.
+- Telephone-event sequence numbers are *accounted*, not lost:
+  `account(seq)` occupies the slot without audio, `pop()` returns
+  `Accounted` for it, and `lost` counts only real gaps. This closed the
+  IVR-inflates-loss finding from the lab; the DTMF-on-a-clean-link
+  acceptance test lives in pipeline.rs.
 - **M2:** adaptive target depth driven by observed inter-arrival jitter.
 - **M2:** timestamp-aware gap handling so silence-suppression gaps
   (marker bit, big TS jump, small seq jump) are not misread as loss.
@@ -60,10 +65,13 @@ Playout semantics as decided (each pinned by a test named after it):
 PCM when the caller's pacing deadline says so. It owns the jitter buffer,
 the DTMF detector and the G.711 decode, and allocates nothing per packet
 (one reusable `[i16; MAX_PAYLOAD]`).
-- **Telephone-event packets never enter the jitter buffer.** They are
-  routed to `DtmfDetector` by payload type and counted separately;
-  decoding RFC 4733 payloads as G.711 audio would emit noise into every
-  consumer. `telephone_events_never_reach_the_audio_path` is the guard.
+- **Telephone-event payloads never reach the audio path**, but their
+  sequence numbers are accounted to the jitter buffer, so a DTMF press is
+  neither decoded as noise nor miscounted as loss. Playout emits
+  `Playout::Suppressed` silence for those slots, counted as
+  `frames_suppressed` — endpoints suppress audio during a press, and the
+  recording keeps wall-clock timing.
+  `telephone_events_never_reach_the_audio_path` is the guard.
 - An unexpected payload type is counted and dropped, never decoded:
   the legacy media gateway's codec mismatch silently passed garbage bytes through.
 - Loss is `Playout::Concealed` filled with silence, counted separately

@@ -28,6 +28,7 @@ const CONSUMER_ACCOUNT_ENV: &str = "MSS_CONSUMER_ACCOUNT_ID";
 const CONSUMER_STREAM_SID_ENV: &str = "MSS_CONSUMER_STREAM_SID";
 const INJECT_TARGET_ENV: &str = "MSS_INJECT_TARGET";
 const CONSUMER_TRACKS_ENV: &str = "MSS_CONSUMER_TRACKS";
+const DATAGRAM_LOG_DIR_ENV: &str = "MSS_TAP_DATAGRAM_LOG_DIR";
 
 const DEFAULT_OUTPUT: &str = "tap.wav";
 const DEFAULT_SECONDS: u64 = 30;
@@ -38,6 +39,7 @@ const CONSUMER_QUEUE_FRAMES: usize = 200;
 const INJECT_EVERYONE: &str = "everyone";
 const CONSUMER_BOTH_TRACKS: &str = "both";
 const BLOB_SAMPLES_PER_DATAGRAM: usize = 24_000;
+const DATAGRAM_LOG_BYTES_PER_SECOND: usize = 16_000;
 
 #[derive(Debug, Error)]
 pub enum TapSessionError {
@@ -208,7 +210,7 @@ pub async fn run(request: TapSpikeRequest, cookie_prefix: u64) -> Result<(), Tap
             .get(index)
             .and_then(|stream| stream.telephone_event())
             .map(|event| event.payload_type);
-        let leg = TapLeg::new(
+        let mut leg = TapLeg::new(
             track_for_stream(index),
             socket,
             request.format,
@@ -216,6 +218,11 @@ pub async fn run(request: TapSpikeRequest, cookie_prefix: u64) -> Result<(), Tap
             telephone_event_payload_type,
             request.duration,
         )?;
+        if datagram_log_dir().is_some() {
+            leg = leg.with_datagram_log(
+                request.duration.as_secs().max(1) as usize * DATAGRAM_LOG_BYTES_PER_SECOND,
+            );
+        }
         legs.push(
             if consumer.is_some() && streams_to_consumer(track_for_stream(index)) {
                 leg.with_consumer(sink.clone())
@@ -289,6 +296,7 @@ pub async fn run(request: TapSpikeRequest, cookie_prefix: u64) -> Result<(), Tap
             datagrams = stats.datagrams,
             frames_played = stats.pipeline.frames_played,
             frames_concealed = stats.pipeline.frames_concealed,
+            frames_suppressed = stats.pipeline.frames_suppressed,
             underruns = stats.underruns,
             telephone_event_packets = stats.pipeline.telephone_events,
             dtmf_digits = stats.pipeline.dtmf_digits,
@@ -303,6 +311,21 @@ pub async fn run(request: TapSpikeRequest, cookie_prefix: u64) -> Result<(), Tap
             recv_errors = stats.recv_errors,
             "tap leg finished"
         );
+    }
+
+    if let Some(dir) = datagram_log_dir() {
+        for leg in &legs {
+            let path = dir.join(format!("tap-{:?}.dglog", leg.track()).to_lowercase());
+            match std::fs::write(&path, leg.datagram_log()) {
+                Ok(()) => info!(
+                    path = %path.display(),
+                    bytes = leg.datagram_log().len(),
+                    truncated = leg.stats().datagram_log_full,
+                    "wrote the datagram log for replay fixtures"
+                ),
+                Err(error) => warn!(%error, path = %path.display(), "datagram log not written"),
+            }
+        }
     }
 
     let wav = write_wav(&request.output, request.format, &legs)?;
@@ -371,6 +394,10 @@ fn streams_to_consumer(track: Track) -> bool {
 
 fn consumer_wants_both_tracks() -> bool {
     std::env::var(CONSUMER_TRACKS_ENV).unwrap_or_default() == CONSUMER_BOTH_TRACKS
+}
+
+fn datagram_log_dir() -> Option<PathBuf> {
+    std::env::var(DATAGRAM_LOG_DIR_ENV).ok().map(PathBuf::from)
 }
 
 fn inject_target(request: &TapSpikeRequest) -> PlayTarget {
