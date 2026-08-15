@@ -189,12 +189,26 @@ the DTMF detector and the G.711 decode, and allocates nothing per packet
   allocation, hence `clippy::large_enum_variant` is allowed on `TapEvent`)
   and `try_send`s it. A full queue increments a counter that is reported as
   `media_dropped` — never a silent drop, which was the legacy media gateway defect 4.
-- Inbound audio accumulates until a `mark`, then goes out as
+- Inbound audio accumulates until the utterance ends, then goes out as
   `BridgeCommand::Speak`; `clear` discards the buffer and raises
   `BridgeCommand::Barge`. `tap_session::inject_bridge_speech` wraps the
   utterance as a WAV blob and plays it with `play media`, targeted by
   default at the first from-tag so only the customer hears the agent.
   `MSS_INJECT_TARGET=everyone` widens it.
+- **The end of an utterance is inferred, not signalled.** stream-llm-bridge
+  streams TTS as a run of `media` events and never sends `mark`, so the
+  consumer flushes after `UTTERANCE_IDLE` (700 ms) without inbound audio.
+  `mark` and `endOfInteraction` still flush immediately when they do arrive.
+- **`play media` blobs are capped by the UDP datagram size.** NG is UDP, so
+  anything over ~64 KB fails with `EMSGSIZE`; that is roughly 4s of 16-bit
+  8 kHz WAV. Utterances are split into `BLOB_SAMPLES_PER_DATAGRAM` pieces
+  played back to back, sleeping each piece's duration so a piece does not
+  truncate the one before it. `play media {file}` avoids the cap but needs
+  storage shared with the rtpengine host.
+- The dialect values are the ones the real bridge accepts, verified with
+  `lab/bridge_probe.py`: `encoding` is `PCMU` (not `audio/x-mulaw`) and
+  `media.timestamp` is a **string**. A numeric timestamp makes the bridge
+  answer `invalid_json` and close the connection.
 - Utterance-shaped, so latency is one whole utterance. Barge-in is a
   `stop media`, and its cut-through time is still unmeasured.
 - **Bot speech is not observable in the tap**, because a subscription
