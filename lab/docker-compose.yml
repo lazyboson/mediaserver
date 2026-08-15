@@ -19,6 +19,7 @@ services:
     command: ["python3", "/call_driver.py"]
     environment:
       EAR_DIR: /out
+      PUMP_SILENCE: ${PUMP_SILENCE:-}
       NG_NODE: 172.31.99.10
       NG_PORT: "22222"
       SELF_IP: 172.31.99.20
@@ -37,8 +38,11 @@ services:
       lab:
         ipv4_address: 172.31.99.20
 
+  # The offline stand-in. Start it with --profile mock when the real bridge
+  # is unavailable or you do not want to spend external API calls.
   bridge:
     image: python:3-slim
+    profiles: [mock]
     volumes:
       - ./mock_bridge.py:/mock_bridge.py:ro
     command: ["python3", "/mock_bridge.py"]
@@ -50,12 +54,29 @@ services:
       lab:
         ipv4_address: 172.31.99.40
 
+  # The real thing, built from ../../stream-llm-bridge with:
+  #   docker build -t stream-llm-bridge:local .
+  # Keys come from lab/.env, which is gitignored.
+  llm-bridge:
+    image: stream-llm-bridge:local
+    environment:
+      SERVER_PORT: "8080"
+      LOG_LEVEL: debug
+      USE_LLM: "false"
+      ELEVENLABS_API_KEY: ${ELEVENLABS_API_KEY:?set it in lab/.env}
+      DEEPGRAM_API_KEY: ${DEEPGRAM_API_KEY:-}
+      DEEPGRAM_MODEL: ${DEEPGRAM_MODEL:-nova-3}
+      WELCOME_MESSAGE: ${WELCOME_MESSAGE:-Hello from the media server.}
+    networks:
+      lab:
+        ipv4_address: 172.31.99.50
+
   mediaserverd:
     image: rust:1.95-slim-bookworm
     working_dir: /build
     command: ["cargo", "run", "--quiet", "-p", "mediaserverd"]
     depends_on:
-      bridge:
+      llm-bridge:
         condition: service_started
       call-driver:
         condition: service_healthy
@@ -63,6 +84,7 @@ services:
       - ..:/build:ro
       - lab-target:/target
       - lab-registry:/usr/local/cargo/registry
+      - lab-rustup:/usr/local/rustup
       - ./out:/out
     environment:
       CARGO_TARGET_DIR: /target
@@ -73,7 +95,7 @@ services:
       MSS_TAP_FROM_TAGS: tagA,tagB
       MSS_TAP_SECONDS: "15"
       MSS_TAP_OUTPUT: /out/tap.wav
-      MSS_CONSUMER_URL: ws://172.31.99.40:8080
+      MSS_CONSUMER_URL: ws://172.31.99.50:8080/ws
       MSS_CONSUMER_ACCOUNT_ID: lab-account
       MSS_CONSUMER_STREAM_SID: MZ-lab-1
     networks:
@@ -83,6 +105,7 @@ services:
 volumes:
   lab-target:
   lab-registry:
+  lab-rustup:
 
 networks:
   lab:

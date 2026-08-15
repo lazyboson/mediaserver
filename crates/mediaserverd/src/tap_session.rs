@@ -35,6 +35,7 @@ const TARGET_DEPTH_PACKETS: u16 = 3;
 const MAX_TAPPED_STREAMS: usize = 2;
 const CONSUMER_QUEUE_FRAMES: usize = 200;
 const INJECT_EVERYONE: &str = "everyone";
+const BLOB_SAMPLES_PER_DATAGRAM: usize = 24_000;
 
 #[derive(Debug, Error)]
 pub enum TapSessionError {
@@ -379,30 +380,39 @@ async fn inject_bridge_speech(
     while let Some(command) = commands.recv().await {
         match command {
             BridgeCommand::Speak(pcm) => {
-                let samples = pcm.len();
-                let blob = match wav_blob(format, &pcm) {
-                    Ok(blob) => blob,
-                    Err(error) => {
-                        warn!(%error, "could not wrap bridge speech as a wav blob");
-                        continue;
+                let pieces = pcm.chunks(BLOB_SAMPLES_PER_DATAGRAM).count();
+                if pieces > 1 {
+                    info!(
+                        samples = pcm.len(),
+                        pieces, "utterance exceeds one NG datagram; playing it in pieces"
+                    );
+                }
+                for piece in pcm.chunks(BLOB_SAMPLES_PER_DATAGRAM) {
+                    let blob = match wav_blob(format, piece) {
+                        Ok(blob) => blob,
+                        Err(error) => {
+                            warn!(%error, "could not wrap bridge speech as a wav blob");
+                            continue;
+                        }
+                    };
+                    let play = PlayMedia {
+                        call_id: call_id.clone(),
+                        target: target.clone(),
+                        source: PlaySource::Blob(blob),
+                        repeat_times: None,
+                    };
+                    match transport.play_media(&play).await {
+                        Ok(_) => {
+                            played += 1;
+                            info!(
+                                samples = piece.len(),
+                                ?target,
+                                "played an utterance from the bridge into the call"
+                            );
+                        }
+                        Err(error) => warn!(%error, "rtpengine refused the utterance"),
                     }
-                };
-                let play = PlayMedia {
-                    call_id: call_id.clone(),
-                    target: target.clone(),
-                    source: PlaySource::Blob(blob),
-                    repeat_times: None,
-                };
-                match transport.play_media(&play).await {
-                    Ok(_) => {
-                        played += 1;
-                        info!(
-                            samples,
-                            ?target,
-                            "played an utterance from the bridge into the call"
-                        );
-                    }
-                    Err(error) => warn!(%error, "rtpengine refused the utterance"),
+                    tokio::time::sleep(piece_duration(format, piece.len())).await;
                 }
             }
             BridgeCommand::Barge => match transport.stop_media(&call_id, &target).await {
@@ -412,6 +422,11 @@ async fn inject_bridge_speech(
         }
     }
     played
+}
+
+fn piece_duration(format: AudioFormat, samples: usize) -> Duration {
+    let rate = format.sample_rate_hz.max(1) as u64;
+    Duration::from_millis(samples as u64 * 1000 / rate)
 }
 
 fn track_for_stream(index: usize) -> Track {
