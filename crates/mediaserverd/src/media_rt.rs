@@ -95,7 +95,10 @@ mod tests {
             workers: 2,
             tick: Duration::from_millis(1),
         });
-        std::thread::sleep(Duration::from_millis(30));
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while world.ticks.load(Ordering::Relaxed) <= 10 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
         assert!(world.ticks.load(Ordering::Relaxed) > 10);
         world.shutdown();
     }

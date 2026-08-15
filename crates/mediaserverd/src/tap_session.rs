@@ -1,13 +1,19 @@
+use crate::consumer_ws::{self, BridgeCommand, ConsumerConfig};
 use crate::ng_transport::{NgTransport, NgTransportConfig, TransportError};
-use crate::tap_spike::{capture, write_wav, SpikeError, TapLeg};
+use crate::tap_spike::{capture, wav_blob, write_wav, SpikeError, TapLeg};
 use media_core::{AudioFormat, Track};
-use rtpengine_ng::{SdpError, SubscribeRequest, SubscriptionAnswer, SubscriptionOffer};
+use rtpengine_ng::{
+    PlayMedia, PlaySource, PlayTarget, SdpError, SubscribeRequest, SubscriptionAnswer,
+    SubscriptionOffer,
+};
+use std::collections::{HashMap, VecDeque};
 use std::net::{IpAddr, SocketAddr, UdpSocket};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
+use tokio::sync::mpsc;
 use tracing::{info, warn};
 
 const NODE_ENV: &str = "MSS_RTPENGINE_NODE";
@@ -17,10 +23,23 @@ const LOCAL_IP_ENV: &str = "MSS_TAP_LOCAL_IP";
 const OUTPUT_ENV: &str = "MSS_TAP_OUTPUT";
 const SECONDS_ENV: &str = "MSS_TAP_SECONDS";
 
+const CONSUMER_URL_ENV: &str = "MSS_CONSUMER_URL";
+const CONSUMER_ACCOUNT_ENV: &str = "MSS_CONSUMER_ACCOUNT_ID";
+const CONSUMER_STREAM_SID_ENV: &str = "MSS_CONSUMER_STREAM_SID";
+const INJECT_TARGET_ENV: &str = "MSS_INJECT_TARGET";
+const CONSUMER_TRACKS_ENV: &str = "MSS_CONSUMER_TRACKS";
+const DATAGRAM_LOG_DIR_ENV: &str = "MSS_TAP_DATAGRAM_LOG_DIR";
+
 const DEFAULT_OUTPUT: &str = "tap.wav";
 const DEFAULT_SECONDS: u64 = 30;
+const DEFAULT_ACCOUNT_ID: &str = "lab";
 const TARGET_DEPTH_PACKETS: u16 = 3;
 const MAX_TAPPED_STREAMS: usize = 2;
+const CONSUMER_QUEUE_FRAMES: usize = 200;
+const INJECT_EVERYONE: &str = "everyone";
+const CONSUMER_BOTH_TRACKS: &str = "both";
+const BLOB_SAMPLES_PER_DATAGRAM: usize = 24_000;
+const DATAGRAM_LOG_BYTES_PER_SECOND: usize = 16_000;
 
 #[derive(Debug, Error)]
 pub enum TapSessionError {
@@ -112,19 +131,22 @@ fn required_env(env: &'static str) -> Result<String, TapSessionError> {
 }
 
 pub async fn run(request: TapSpikeRequest, cookie_prefix: u64) -> Result<(), TapSessionError> {
-    let transport = NgTransport::bind(
-        SocketAddr::from(([0, 0, 0, 0], 0)),
-        request.node,
-        NgTransportConfig::default(),
-        cookie_prefix,
-    )
-    .await?;
+    let transport = Arc::new(
+        NgTransport::bind(
+            SocketAddr::from(([0, 0, 0, 0], 0)),
+            request.node,
+            NgTransportConfig::default(),
+            cookie_prefix,
+        )
+        .await?,
+    );
 
     let subscribe = SubscribeRequest {
         call_id: request.call_id.clone(),
         from_tags: request.from_tags.clone(),
         mix: false,
-        accept_codecs: vec![request.format.encoding.rtpmap_name().to_string()],
+        accept_codecs: Vec::new(),
+        transcode_codecs: vec![request.format.encoding.rtpmap_name().to_string()],
         label: Some("mss-tap".to_string()),
     };
     info!(
@@ -178,6 +200,9 @@ pub async fn run(request: TapSpikeRequest, cookie_prefix: u64) -> Result<(), Tap
         .subscribe_answer(&request.call_id, &to_tag, &answer_sdp)
         .await?;
 
+    let consumer = consumer_config_from_env(&request);
+    let (sink, feed) = consumer_ws::channel(CONSUMER_QUEUE_FRAMES);
+
     let mut legs = Vec::with_capacity(sockets.len());
     for (index, socket) in sockets.into_iter().enumerate() {
         let telephone_event_payload_type = offer
@@ -185,14 +210,50 @@ pub async fn run(request: TapSpikeRequest, cookie_prefix: u64) -> Result<(), Tap
             .get(index)
             .and_then(|stream| stream.telephone_event())
             .map(|event| event.payload_type);
-        legs.push(TapLeg::new(
+        let mut leg = TapLeg::new(
             track_for_stream(index),
             socket,
             request.format,
             TARGET_DEPTH_PACKETS,
             telephone_event_payload_type,
             request.duration,
-        )?);
+        )?;
+        if datagram_log_dir().is_some() {
+            leg = leg.with_datagram_log(
+                request.duration.as_secs().max(1) as usize * DATAGRAM_LOG_BYTES_PER_SECOND,
+            );
+        }
+        legs.push(
+            if consumer.is_some() && streams_to_consumer(track_for_stream(index)) {
+                leg.with_consumer(sink.clone())
+            } else {
+                leg
+            },
+        );
+    }
+    drop(sink);
+
+    let mut consumer_task = None;
+    let mut injection_task = None;
+    if let Some(config) = consumer {
+        let (commands_tx, commands_rx) = mpsc::channel(8);
+        info!(
+            url = %config.url,
+            stream_sid = %config.stream_sid,
+            "streaming this tap to a consumer bridge"
+        );
+        injection_task = Some(tokio::spawn(inject_bridge_speech(
+            Arc::clone(&transport),
+            request.call_id.clone(),
+            inject_target(&request),
+            request.format,
+            commands_rx,
+        )));
+        consumer_task = Some(tokio::spawn(consumer_ws::run(
+            config,
+            feed,
+            Some(commands_tx),
+        )));
     }
 
     let stop = Arc::new(AtomicBool::new(false));
@@ -235,6 +296,7 @@ pub async fn run(request: TapSpikeRequest, cookie_prefix: u64) -> Result<(), Tap
             datagrams = stats.datagrams,
             frames_played = stats.pipeline.frames_played,
             frames_concealed = stats.pipeline.frames_concealed,
+            frames_suppressed = stats.pipeline.frames_suppressed,
             underruns = stats.underruns,
             telephone_event_packets = stats.pipeline.telephone_events,
             dtmf_digits = stats.pipeline.dtmf_digits,
@@ -251,7 +313,25 @@ pub async fn run(request: TapSpikeRequest, cookie_prefix: u64) -> Result<(), Tap
         );
     }
 
-    let wav = write_wav(&request.output, request.format, &legs)?;
+    let wav = tokio::task::block_in_place(|| {
+        if let Some(dir) = datagram_log_dir() {
+            for leg in &legs {
+                let path = dir.join(format!("tap-{:?}.dglog", leg.track()).to_lowercase());
+                match std::fs::write(&path, leg.datagram_log()) {
+                    Ok(()) => info!(
+                        path = %path.display(),
+                        bytes = leg.datagram_log().len(),
+                        truncated = leg.stats().datagram_log_full,
+                        "wrote the datagram log for replay fixtures"
+                    ),
+                    Err(error) => {
+                        warn!(%error, path = %path.display(), "datagram log not written")
+                    }
+                }
+            }
+        }
+        write_wav(&request.output, request.format, &legs)
+    })?;
     info!(
         output = %request.output.display(),
         channels = wav.channels,
@@ -261,7 +341,188 @@ pub async fn run(request: TapSpikeRequest, cookie_prefix: u64) -> Result<(), Tap
         elapsed_ms = summary.elapsed.as_millis() as u64,
         "tap spike wrote its wav artifact"
     );
+
+    drop(legs);
+    if let Some(task) = consumer_task {
+        match task.await {
+            Ok(Ok(stats)) => info!(
+                media_sent = stats.media_sent,
+                dtmf_sent = stats.dtmf_sent,
+                media_dropped = stats.media_dropped,
+                inbound_media = stats.inbound_media,
+                inbound_unknown_encoding = stats.inbound_unknown_encoding,
+                utterances = stats.utterances,
+                barges = stats.barges,
+                "consumer bridge finished"
+            ),
+            Ok(Err(error)) => warn!(%error, "consumer bridge failed"),
+            Err(_) => warn!("the consumer bridge task was lost"),
+        }
+    }
+    if let Some(task) = injection_task {
+        match task.await {
+            Ok(played) => info!(
+                utterances_played = played,
+                "bridge speech injection finished"
+            ),
+            Err(_) => warn!("the injection task was lost"),
+        }
+    }
     Ok(())
+}
+
+fn consumer_config_from_env(request: &TapSpikeRequest) -> Option<ConsumerConfig> {
+    let url = std::env::var(CONSUMER_URL_ENV).ok()?;
+    let stream_sid = std::env::var(CONSUMER_STREAM_SID_ENV)
+        .unwrap_or_else(|_| format!("MZ-{}", request.call_id));
+    Some(ConsumerConfig {
+        url,
+        account_id: std::env::var(CONSUMER_ACCOUNT_ENV)
+            .unwrap_or_else(|_| DEFAULT_ACCOUNT_ID.to_string()),
+        call_sid: request.call_id.clone(),
+        stream_sid,
+        format: request.format,
+        tracks: (0..request.from_tags.len().max(1))
+            .map(track_for_stream)
+            .filter(|track| streams_to_consumer(*track))
+            .map(|track| consumer_ws::track_name(track).to_string())
+            .collect(),
+        custom_parameters: HashMap::new(),
+    })
+}
+
+fn streams_to_consumer(track: Track) -> bool {
+    consumer_wants_both_tracks() || track == Track::Customer
+}
+
+fn consumer_wants_both_tracks() -> bool {
+    std::env::var(CONSUMER_TRACKS_ENV).unwrap_or_default() == CONSUMER_BOTH_TRACKS
+}
+
+fn datagram_log_dir() -> Option<PathBuf> {
+    std::env::var(DATAGRAM_LOG_DIR_ENV).ok().map(PathBuf::from)
+}
+
+fn inject_target(request: &TapSpikeRequest) -> PlayTarget {
+    let configured = std::env::var(INJECT_TARGET_ENV).unwrap_or_default();
+    if configured == INJECT_EVERYONE {
+        return PlayTarget::HeardByEveryone;
+    }
+    match request.from_tags.first() {
+        Some(tag) => PlayTarget::HeardBy(tag.clone()),
+        None => PlayTarget::HeardByEveryone,
+    }
+}
+
+async fn inject_bridge_speech(
+    transport: Arc<NgTransport>,
+    call_id: String,
+    target: PlayTarget,
+    format: AudioFormat,
+    mut commands: mpsc::Receiver<BridgeCommand>,
+) -> u64 {
+    let mut played = 0;
+    let mut pending = VecDeque::new();
+    loop {
+        let command = match pending.pop_front() {
+            Some(command) => command,
+            None => match commands.recv().await {
+                Some(command) => command,
+                None => break,
+            },
+        };
+        match command {
+            BridgeCommand::Speak(pcm) => {
+                let pieces = pcm.chunks(BLOB_SAMPLES_PER_DATAGRAM).count();
+                if pieces > 1 {
+                    info!(
+                        samples = pcm.len(),
+                        pieces, "utterance exceeds one NG datagram; playing it in pieces"
+                    );
+                }
+                for piece in pcm.chunks(BLOB_SAMPLES_PER_DATAGRAM) {
+                    let blob = match wav_blob(format, piece) {
+                        Ok(blob) => blob,
+                        Err(error) => {
+                            warn!(%error, "could not wrap bridge speech as a wav blob");
+                            continue;
+                        }
+                    };
+                    let play = PlayMedia {
+                        call_id: call_id.clone(),
+                        target: target.clone(),
+                        source: PlaySource::Blob(blob),
+                        repeat_times: None,
+                        block_egress: true,
+                    };
+                    match transport.play_media(&play).await {
+                        Ok(_) => {
+                            played += 1;
+                            info!(
+                                samples = piece.len(),
+                                ?target,
+                                "played an utterance from the bridge into the call"
+                            );
+                        }
+                        Err(error) => warn!(%error, "rtpengine refused the utterance"),
+                    }
+                    let barged = !wait_out_piece(
+                        &transport,
+                        &call_id,
+                        &target,
+                        piece_duration(format, piece.len()),
+                        &mut commands,
+                        &mut pending,
+                    )
+                    .await;
+                    if barged {
+                        break;
+                    }
+                }
+            }
+            BridgeCommand::Barge => match transport.stop_media(&call_id, &target).await {
+                Ok(_) => info!(?target, "barge-in stopped the utterance"),
+                Err(error) => warn!(%error, "rtpengine refused the barge-in"),
+            },
+        }
+    }
+    played
+}
+
+async fn wait_out_piece(
+    transport: &NgTransport,
+    call_id: &str,
+    target: &PlayTarget,
+    duration: Duration,
+    commands: &mut mpsc::Receiver<BridgeCommand>,
+    pending: &mut VecDeque<BridgeCommand>,
+) -> bool {
+    let piece_done = tokio::time::sleep(duration);
+    tokio::pin!(piece_done);
+    loop {
+        tokio::select! {
+            _ = &mut piece_done => return true,
+            command = commands.recv() => match command {
+                Some(BridgeCommand::Barge) => {
+                    match transport.stop_media(call_id, target).await {
+                        Ok(_) => info!(?target, "barge-in cut the utterance short"),
+                        Err(error) => warn!(%error, "rtpengine refused the barge-in"),
+                    }
+                    return false;
+                }
+                Some(command) => pending.push_back(command),
+                None => {
+                    piece_done.as_mut().await;
+                    return true;
+                }
+            }
+        }
+    }
+}
+
+fn piece_duration(format: AudioFormat, samples: usize) -> Duration {
+    let rate = format.sample_rate_hz.max(1) as u64;
+    Duration::from_millis(samples as u64 * 1000 / rate)
 }
 
 fn track_for_stream(index: usize) -> Track {

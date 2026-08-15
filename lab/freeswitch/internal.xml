@@ -1,0 +1,35 @@
+<profile name="internal">
+  <gateways/>
+  <settings>
+    <param name="sip-port" value="5060"/>
+    <param name="context" value="default"/>
+    <param name="dialplan" value="XML"/>
+
+    <param name="sip-ip" value="$${local_ip_v4}"/>
+    <param name="rtp-ip" value="$${local_ip_v4}"/>
+    <param name="ext-sip-ip" value="$${external_ip}"/>
+    <param name="ext-rtp-ip" value="$${external_ip}"/>
+
+    <!-- Under Docker Desktop the phone's packets arrive NAT'd from the bridge
+         gateway (an RFC1918 address), so FreeSWITCH's auto local-net detection
+         classifies the phone as local and advertises its container-internal
+         RTP IP, which the phone cannot route to. Forcing an empty local
+         network makes every peer external, so ext-rtp-ip is always used. -->
+    <param name="local-network-acl" value="none"/>
+
+    <param name="auth-calls" value="false"/>
+    <!-- Zoiper registers against a bare IP, so the realm has to follow the
+         From domain rather than a configured hostname. -->
+    <param name="challenge-realm" value="auto_from"/>
+    <param name="force-register-domain" value="$${domain}"/>
+
+    <param name="inbound-codec-negotiation" value="generous"/>
+    <param name="inbound-codec-prefs" value="$${global_codec_prefs}"/>
+    <param name="outbound-codec-prefs" value="$${outbound_codec_prefs}"/>
+
+    <param name="dtmf-duration" value="2000"/>
+    <param name="rfc2833-pt" value="101"/>
+    <param name="manage-presence" value="false"/>
+    <param name="rtp-timer-name" value="soft"/>
+  </settings>
+</profile>

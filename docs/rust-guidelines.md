@@ -60,8 +60,14 @@ allowed only for domain vocabulary (RTP, SDP, SSRC, DTMF, NG).
 
 - `media-core` and `rtpengine-ng` are sans-IO: adding a socket, clock, or
   `async fn` to them is an architecture violation, not a style issue.
-- `#![forbid(unsafe_code)]` in every crate; FFI, when it arrives (libopus),
-  lives in a dedicated `-sys`-wrapping crate that is the only exception.
+- `#![forbid(unsafe_code)]` in every logic crate; FFI, when it arrives
+  (libopus), lives in a dedicated `-sys`-wrapping crate that is the only
+  exception. Constitution Article XI fixes the preference order for
+  anything codec- or DSP-shaped: out-of-process engine (rtpengine
+  transcodes at the tap) over vetted C-library bindings over in-tree code,
+  and in-tree only for trivial algorithms or the session machinery no
+  library provides. Reimplementing a hardened library is a rejected PR,
+  not a style choice.
 - Dependencies require justification in the PR that adds them and must
   pass `cargo deny` (licenses: permissive only; no unmaintained advisories).
 - Public API surface is `pub` only where another crate consumes it.
