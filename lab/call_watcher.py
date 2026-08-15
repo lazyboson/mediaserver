@@ -140,12 +140,20 @@ def main():
             time.sleep(POLL_SECONDS)
             continue
 
-        call_id = calls[0]
+        newest, newest_created = None, -1
+        for candidate in calls:
+            queried = ng.send({"command": "query", "call-id": candidate})
+            created = (queried or {}).get("created", 0)
+            if isinstance(created, int) and created > newest_created:
+                newest, newest_created = (candidate, queried), created
+        if newest is None:
+            time.sleep(POLL_SECONDS)
+            continue
+        call_id, query = newest
         if call_id == announced:
             time.sleep(POLL_SECONDS)
             continue
 
-        query = ng.send({"command": "query", "call-id": call_id})
         tags = tags_of(query or {})
         if len(tags) < 2:
             log(f"call {call_id} has {len(tags)} tag(s) so far, waiting for the answer")
