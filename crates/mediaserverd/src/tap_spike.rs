@@ -550,7 +550,9 @@ mod tests {
         let max_capture = Duration::from_millis(200);
         let (socket, _) = loopback_pair();
         let (mut hub, client) = Hub::new();
-        let mut subscription = client.attach(64, crate::hub::TrackSelection::All).unwrap();
+        let mut subscription = client
+            .attach(64, crate::hub::TrackSelection::Only(Track::Customer))
+            .unwrap();
         let mut legs = vec![leg(Track::Customer, socket, max_capture)];
 
         let stop = AtomicBool::new(false);
