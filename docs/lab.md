@@ -5,6 +5,10 @@ the tap path can be exercised without the production stack — and, on a Mac,
 without native rtpengine at all (there is none: its kernel fast path is a
 Linux netfilter module and no Homebrew formula exists).
 
+This documents what exists today. [testing.md](testing.md) is the plan for
+what testing must become — the Linux functional box, the impairment matrix,
+and the separate rig the M2 capacity number requires.
+
 Nothing here needs OpenSIPS or FreeSWITCH. rtpengine accepts `offer`/`answer`
 over NG directly, so `lab/call_driver.py` plays both endpoints and the
 signalling proxy between them, then pumps G.711 for both legs.
