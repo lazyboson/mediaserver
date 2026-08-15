@@ -26,7 +26,9 @@ fn parse_jitter_decode(c: &mut Criterion) {
             for datagram in &stream {
                 pipeline.ingest(black_box(datagram));
                 match pipeline.release() {
-                    Playout::Pcm(pcm) | Playout::Concealed(pcm) => samples += pcm.len(),
+                    Playout::Pcm(pcm) | Playout::Concealed(pcm) | Playout::Suppressed(pcm) => {
+                        samples += pcm.len()
+                    }
                     Playout::Waiting => {}
                 }
             }

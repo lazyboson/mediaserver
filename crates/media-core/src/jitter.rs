@@ -5,6 +5,7 @@ const CAPACITY: usize = 64;
 #[derive(Clone, Copy)]
 struct Slot {
     occupied: bool,
+    accounted: bool,
     len: u16,
     data: [u8; MAX_PAYLOAD],
 }
@@ -13,6 +14,7 @@ impl Default for Slot {
     fn default() -> Self {
         Slot {
             occupied: false,
+            accounted: false,
             len: 0,
             data: [0; MAX_PAYLOAD],
         }
@@ -31,6 +33,7 @@ pub enum PushOutcome {
 #[derive(Debug, PartialEq, Eq)]
 pub enum PopOutcome<'a> {
     Packet(&'a [u8]),
+    Accounted,
     Lost,
     Waiting,
 }
@@ -80,6 +83,14 @@ impl JitterBuffer {
     }
 
     pub fn push(&mut self, seq: u16, payload: &[u8]) -> PushOutcome {
+        self.admit(seq, payload, false)
+    }
+
+    pub fn account(&mut self, seq: u16) -> PushOutcome {
+        self.admit(seq, &[], true)
+    }
+
+    fn admit(&mut self, seq: u16, payload: &[u8], accounted: bool) -> PushOutcome {
         if payload.len() > MAX_PAYLOAD {
             return PushOutcome::TooBig;
         }
@@ -104,10 +115,7 @@ impl JitterBuffer {
             self.max_seq = seq;
             self.primed = false;
             self.stats.resets += 1;
-            let slot = &mut self.slots[Self::idx(seq)];
-            slot.occupied = true;
-            slot.len = payload.len() as u16;
-            slot.data[..payload.len()].copy_from_slice(payload);
+            Self::fill(&mut self.slots[Self::idx(seq)], payload, accounted);
             return PushOutcome::Reset;
         }
 
@@ -116,13 +124,18 @@ impl JitterBuffer {
             self.stats.duplicates += 1;
             return PushOutcome::Duplicate;
         }
-        slot.occupied = true;
-        slot.len = payload.len() as u16;
-        slot.data[..payload.len()].copy_from_slice(payload);
+        Self::fill(slot, payload, accounted);
         if Self::seq_delta(seq, self.max_seq) > 0 {
             self.max_seq = seq;
         }
         PushOutcome::Buffered
+    }
+
+    fn fill(slot: &mut Slot, payload: &[u8], accounted: bool) {
+        slot.occupied = true;
+        slot.accounted = accounted;
+        slot.len = payload.len() as u16;
+        slot.data[..payload.len()].copy_from_slice(payload);
     }
 
     pub fn depth(&self) -> u16 {
@@ -151,6 +164,9 @@ impl JitterBuffer {
         let idx = Self::idx(seq);
         if self.slots[idx].occupied {
             self.slots[idx].occupied = false;
+            if self.slots[idx].accounted {
+                return PopOutcome::Accounted;
+            }
             let len = self.slots[idx].len as usize;
             PopOutcome::Packet(&self.slots[idx].data[..len])
         } else {

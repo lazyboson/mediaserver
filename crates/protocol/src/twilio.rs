@@ -25,7 +25,7 @@ pub struct StartInfo {
 #[serde(rename_all = "camelCase")]
 pub struct MediaPayload {
     pub track: String,
-    pub timestamp: u64,
+    pub timestamp: String,
     pub payload: String,
 }
 
@@ -125,7 +125,7 @@ mod tests {
                 call_sid: "call-1".into(),
                 tracks: vec!["inbound".into(), "outbound".into()],
                 media_format: MediaFormat {
-                    encoding: "audio/x-mulaw".into(),
+                    encoding: "PCMU".into(),
                     sample_rate: 8000,
                     channels: 1,
                 },
@@ -140,7 +140,7 @@ mod tests {
             stream_sid: "MZ-1".into(),
             media: MediaPayload {
                 track: "outbound".into(),
-                timestamp: 1200,
+                timestamp: "1200".into(),
                 payload: "AAAA".into(),
             },
         }
@@ -177,7 +177,7 @@ mod tests {
     fn start_matches_the legacy media gateway_bytes() {
         assert_serializes_to(
             &start(HashMap::new()),
-            r#"{"event":"start","sequenceNumber":"1","streamSid":"MZ-1","start":{"accountId":"acct-1","streamSid":"MZ-1","callSid":"call-1","tracks":["inbound","outbound"],"mediaFormat":{"encoding":"audio/x-mulaw","sampleRate":8000,"channels":1}}}"#,
+            r#"{"event":"start","sequenceNumber":"1","streamSid":"MZ-1","start":{"accountId":"acct-1","streamSid":"MZ-1","callSid":"call-1","tracks":["inbound","outbound"],"mediaFormat":{"encoding":"PCMU","sampleRate":8000,"channels":1}}}"#,
         );
     }
 
@@ -186,15 +186,15 @@ mod tests {
         let one = HashMap::from([("agentId".to_string(), "a-7".to_string())]);
         assert_serializes_to(
             &start(one),
-            r#"{"event":"start","sequenceNumber":"1","streamSid":"MZ-1","start":{"accountId":"acct-1","streamSid":"MZ-1","callSid":"call-1","tracks":["inbound","outbound"],"mediaFormat":{"encoding":"audio/x-mulaw","sampleRate":8000,"channels":1},"customParameters":{"agentId":"a-7"}}}"#,
+            r#"{"event":"start","sequenceNumber":"1","streamSid":"MZ-1","start":{"accountId":"acct-1","streamSid":"MZ-1","callSid":"call-1","tracks":["inbound","outbound"],"mediaFormat":{"encoding":"PCMU","sampleRate":8000,"channels":1},"customParameters":{"agentId":"a-7"}}}"#,
         );
     }
 
     #[test]
-    fn media_matches_the legacy media gateway_bytes() {
+    fn media_timestamp_is_a_string_because_the legacy media gateway_sends_one() {
         assert_serializes_to(
             &media(),
-            r#"{"event":"media","sequenceNumber":"5","streamSid":"MZ-1","media":{"track":"outbound","timestamp":1200,"payload":"AAAA"}}"#,
+            r#"{"event":"media","sequenceNumber":"5","streamSid":"MZ-1","media":{"track":"outbound","timestamp":"1200","payload":"AAAA"}}"#,
         );
     }
 

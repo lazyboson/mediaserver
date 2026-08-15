@@ -38,7 +38,7 @@ injection) and finally conference mixing.
 
 ## Binding documents (in order of authority)
 
-1. [CONSTITUTION.md](CONSTITUTION.md) — eleven articles; reviews are
+1. [CONSTITUTION.md](CONSTITUTION.md) — twelve articles; reviews are
    judged against it.
 2. [docs/rust-guidelines.md](docs/rust-guidelines.md) — coding rules.
    **The one that surprises people: strictly no comments in Rust sources**
@@ -78,8 +78,10 @@ placement a scheduling decision instead of an SDP-routing problem.
   (`fork_events.rs`), and the recording identity scheme
   `${accountID}/${recordingID}.${format}` are contracts (Constitution,
   Article VII). Their serialization tests are the spec.
-- No comments in `.rs` files. No `unsafe`. No panics on network input.
-  No allocation per packet. No async in `media-core`/`rtpengine-ng`.
+- No comments in `.rs` files. No `unsafe` outside dedicated FFI wrapper
+  crates — codec/DSP math is adopted from proven C libraries, never
+  reimplemented (Article XI). No panics on network input. No allocation
+  per packet. No async in `media-core`/`rtpengine-ng`.
 
 ## Working on this repo
 

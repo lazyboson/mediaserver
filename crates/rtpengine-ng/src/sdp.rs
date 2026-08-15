@@ -206,24 +206,36 @@ impl SubscriptionAnswer<'_> {
         sdp.push_str(&format!("c=IN IP4 {}\r\n", self.local_address));
         sdp.push_str("t=0 0\r\n");
         for (port, stream) in self.receive_ports.iter().zip(&offer.streams) {
-            let telephone_event = stream.telephone_event();
-            match telephone_event {
-                Some(event) => sdp.push_str(&format!(
-                    "m=audio {port} RTP/AVP {payload_type} {}\r\n",
-                    event.payload_type
-                )),
-                None => sdp.push_str(&format!("m=audio {port} RTP/AVP {payload_type}\r\n")),
-            }
+            let mut retained = vec![payload_type];
+            retained.extend(
+                stream
+                    .payload_types
+                    .iter()
+                    .copied()
+                    .filter(|offered| *offered != payload_type),
+            );
+            let formats = retained
+                .iter()
+                .map(|pt| pt.to_string())
+                .collect::<Vec<_>>()
+                .join(" ");
+            sdp.push_str(&format!("m=audio {port} RTP/AVP {formats}\r\n"));
             sdp.push_str(&format!(
                 "a=rtpmap:{payload_type} {name}/{rate}\r\n",
                 name = self.format.encoding.rtpmap_name(),
                 rate = self.format.sample_rate_hz
             ));
-            if let Some(event) = telephone_event {
-                sdp.push_str(&format!(
-                    "a=rtpmap:{} {TELEPHONE_EVENT}/{}\r\n",
-                    event.payload_type, event.clock_rate_hz
-                ));
+            for offered in retained.iter().skip(1) {
+                if let Some(rtpmap) = stream
+                    .rtpmaps
+                    .iter()
+                    .find(|map| map.payload_type == *offered)
+                {
+                    sdp.push_str(&format!(
+                        "a=rtpmap:{} {}/{}\r\n",
+                        rtpmap.payload_type, rtpmap.encoding_name, rtpmap.clock_rate_hz
+                    ));
+                }
             }
             sdp.push_str(&format!("a=ptime:{}\r\n", self.format.ptime_ms));
             sdp.push_str("a=recvonly\r\n");
@@ -339,10 +351,41 @@ a=rtpmap:0 PCMU/8000\r\n\
 a=rtpmap:101 telephone-event/8000\r\n\
 a=ptime:20\r\n\
 a=recvonly\r\n\
-m=audio 40002 RTP/AVP 0\r\n\
+m=audio 40002 RTP/AVP 0 8\r\n\
 a=rtpmap:0 PCMU/8000\r\n\
+a=rtpmap:8 PCMA/8000\r\n\
 a=ptime:20\r\n\
 a=recvonly\r\n"
+        );
+    }
+
+    #[test]
+    fn answer_keeps_every_offered_payload_type_with_ours_first() {
+        let offer = SubscriptionOffer::parse(
+            "m=audio 30000 RTP/AVP 8 0 101\r\n\
+a=rtpmap:8 PCMA/8000\r\n\
+a=rtpmap:0 PCMU/8000\r\n\
+a=rtpmap:101 telephone-event/8000\r\n\
+a=sendonly\r\n",
+        )
+        .unwrap();
+
+        let ports = [40000u16];
+        let sdp = SubscriptionAnswer {
+            session_id: 1,
+            local_address: "172.31.99.30",
+            receive_ports: &ports,
+            format: AudioFormat::pcmu_8k_20ms(),
+        }
+        .to_sdp(&offer)
+        .unwrap();
+
+        assert!(sdp.contains("m=audio 40000 RTP/AVP 0 8 101\r\n"), "{sdp}");
+        assert!(sdp.contains("a=rtpmap:0 PCMU/8000\r\n"), "{sdp}");
+        assert!(sdp.contains("a=rtpmap:8 PCMA/8000\r\n"), "{sdp}");
+        assert!(
+            sdp.contains("a=rtpmap:101 telephone-event/8000\r\n"),
+            "{sdp}"
         );
     }
 
@@ -391,7 +434,7 @@ a=recvonly\r\n"
         .to_sdp(&offer)
         .unwrap();
 
-        assert!(sdp.contains("m=audio 40000 RTP/AVP 0\r\n"), "{sdp}");
+        assert!(sdp.contains("m=audio 40000 RTP/AVP 0 8\r\n"), "{sdp}");
         assert!(!sdp.contains(TELEPHONE_EVENT), "{sdp}");
     }
 
