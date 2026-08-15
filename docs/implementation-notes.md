@@ -47,6 +47,11 @@ Playout semantics as decided (each pinned by a test named after it):
   re-prime: re-priming after an underrun on a continuous sequence would
   ratchet playout delay upward for the rest of a live call, which is worse
   than the single gap it would paper over.
+- Telephone-event sequence numbers are *accounted*, not lost:
+  `account(seq)` occupies the slot without audio, `pop()` returns
+  `Accounted` for it, and `lost` counts only real gaps. This closed the
+  IVR-inflates-loss finding from the lab; the DTMF-on-a-clean-link
+  acceptance test lives in pipeline.rs.
 - **M2:** adaptive target depth driven by observed inter-arrival jitter.
 - **M2:** timestamp-aware gap handling so silence-suppression gaps
   (marker bit, big TS jump, small seq jump) are not misread as loss.
@@ -60,10 +65,13 @@ Playout semantics as decided (each pinned by a test named after it):
 PCM when the caller's pacing deadline says so. It owns the jitter buffer,
 the DTMF detector and the G.711 decode, and allocates nothing per packet
 (one reusable `[i16; MAX_PAYLOAD]`).
-- **Telephone-event packets never enter the jitter buffer.** They are
-  routed to `DtmfDetector` by payload type and counted separately;
-  decoding RFC 4733 payloads as G.711 audio would emit noise into every
-  consumer. `telephone_events_never_reach_the_audio_path` is the guard.
+- **Telephone-event payloads never reach the audio path**, but their
+  sequence numbers are accounted to the jitter buffer, so a DTMF press is
+  neither decoded as noise nor miscounted as loss. Playout emits
+  `Playout::Suppressed` silence for those slots, counted as
+  `frames_suppressed` — endpoints suppress audio during a press, and the
+  recording keeps wall-clock timing.
+  `telephone_events_never_reach_the_audio_path` is the guard.
 - An unexpected payload type is counted and dropped, never decoded:
   mediagateway's codec mismatch silently passed garbage bytes through.
 - Loss is `Playout::Concealed` filled with silence, counted separately
@@ -113,6 +121,29 @@ the DTMF detector and the G.711 decode, and allocates nothing per packet
   being dropped into a timeout.
 - Unlike mediagateway's fire-and-forget MI client, every request must
   await its correlated reply.
+- `SubscribeRequest` carries both `accept_codecs` and `transcode_codecs`,
+  and the tap sends **transcode**. `accept` only means "use this codec if
+  the leg already has it", so against an A-law call rtpengine offered PCMA
+  alone and rejected the PCMU answer. `transcode` makes it offer both and
+  convert, which keeps the whole pipeline PCMU whatever the carrier picked.
+  A real softphone found this; every synthetic lab call had been PCMU.
+- `play media` / `stop media` builders exist so audio can be pushed *into*
+  a tapped call without an inline leg. `PlayTarget` is named for what the
+  lab measured rather than for the wire key: `HeardBy(tag)` emits
+  `from-tag` and only that participant hears the audio, `HeardByEveryone`
+  emits `all: "all"` and both do. `PlaySource::Blob` carries the audio as
+  raw `Value::Bytes`; `blob64` is **not** supported by rtpengine 14.1.1.8
+  (it answers `No media file specified`), so base64 is not an option.
+- These are utterance-shaped, not a stream: rtpengine plays a complete
+  ffmpeg-decodable file or blob. Streaming TTS with barge-in still needs
+  the Phase-3 inline leg. `stop media` is the barge-in primitive and its
+  cut-through latency has not been measured yet.
+- `PlayMedia.block_egress` emits `flags: [block-egress]`, and injection
+  always sets it. Without it the listener receives the peer's stream and
+  the player concurrently — two SSRCs and two sequence spaces through one
+  softphone jitter buffer, which is inaudible mush. With it rtpengine
+  pauses the peer for the playback and resumes after, measured in
+  `lab/host_test_caller.py` runs as complementary packet counts.
 
 ### sdp.rs — subscription-leg offer/answer
 - Parses rtpengine's subscribe offer: per-stream ports, payload-type
@@ -122,6 +153,12 @@ the DTMF detector and the G.711 decode, and allocates nothing per packet
 - Builds the `recvonly` answer with one local receive port per offered
   stream; the count must match or it is an error, since an answer with a
   different number of m= sections is not a legal answer.
+- **The answer may not drop any payload type the offer carried.** It lists
+  our codec first and then echoes every other offered payload type with its
+  rtpmap. The telephone-event rule found earlier was a special case of this;
+  an A-law call from a real softphone exposed the general one. Listing our
+  codec first is what makes rtpengine transcode to it, measured as PCMA in,
+  payload type 0 out.
 - **The answer must echo the offered `telephone-event` payload type.** Real
   rtpengine 14.1.1.8 rejects a subscription answer that drops it with
   `Failed to process subscription answer` — proven by `lab/ng_answer_probe.py`
@@ -167,6 +204,58 @@ the DTMF detector and the G.711 decode, and allocates nothing per packet
   migrates (architecture.md risk #4).
 
 ## crates/mediaserverd
+
+### consumer_ws.rs — the first consumer bridge, and the speech path back
+- WebSocket client speaking the frozen Twilio dialect from
+  `protocol::twilio`, so a mediagateway-compatible endpoint accepts it
+  unchanged. `MSS_CONSUMER_URL` turns it on; without it the tap behaves
+  exactly as before.
+- The media thread never blocks on it. `ConsumerSink::offer_*` encodes the
+  released frame to mu-law into a fixed `[u8; MAX_FRAME_BYTES]` (no
+  allocation, hence `clippy::large_enum_variant` is allowed on `TapEvent`)
+  and `try_send`s it. A full queue increments a counter that is reported as
+  `media_dropped` — never a silent drop, which was mediagateway defect 4.
+- Inbound audio accumulates until the utterance ends, then goes out as
+  `BridgeCommand::Speak`; `clear` discards the buffer and raises
+  `BridgeCommand::Barge`. `tap_session::inject_bridge_speech` wraps the
+  utterance as a WAV blob and plays it with `play media`, targeted by
+  default at the first from-tag so only the customer hears the agent.
+  `MSS_INJECT_TARGET=everyone` widens it.
+- **The end of an utterance is inferred, not signalled.** stream-llm-bridge
+  streams TTS as a run of `media` events and never sends `mark`, so the
+  consumer flushes after `UTTERANCE_IDLE` (700 ms) without inbound audio.
+  `mark` and `endOfInteraction` still flush immediately when they do arrive.
+- **Underruns feed the consumer silence, not nothing.** A
+  silence-suppressing caller (MicroSIP) stops sending RTP between
+  utterances; skipping those frames made Deepgram time out and close. The
+  Twilio dialect implies a continuous stream.
+- **Only the Customer track streams by default.** stream-llm-bridge feeds
+  every media packet to the ASR regardless of `track`, so sending both legs
+  interleaves two sources at double rate and transcribes as nothing.
+  `MSS_CONSUMER_TRACKS=both` restores dual-track; the `start` event's
+  `tracks` list reflects what is actually sent.
+- **`play media` blobs are capped by the UDP datagram size.** NG is UDP, so
+  anything over ~64 KB fails with `EMSGSIZE`; that is roughly 4s of 16-bit
+  8 kHz WAV. Utterances are split into `BLOB_SAMPLES_PER_DATAGRAM` pieces
+  played back to back, sleeping each piece's duration so a piece does not
+  truncate the one before it. `play media {file}` avoids the cap but needs
+  storage shared with the rtpengine host.
+- The dialect values are the ones the real bridge accepts, verified with
+  `lab/bridge_probe.py`: `encoding` is `PCMU` (not `audio/x-mulaw`) and
+  `media.timestamp` is a **string**. A numeric timestamp makes the bridge
+  answer `invalid_json` and close the connection.
+- Utterance-shaped, so latency is one whole utterance. Barge-in is a
+  `stop media`, and its cut-through time is still unmeasured — but a barge
+  arriving mid-playback no longer waits out the piece pacing sleep:
+  `wait_out_piece` keeps receiving commands while a piece plays, stops the
+  playback immediately on `Barge`, and queues anything else. Artifact
+  writes (WAV, datagram logs) run under `block_in_place` so the control
+  runtime is never blocked on the filesystem.
+- **Bot speech is not observable in the tap**, because a subscription
+  carries what a party sends and injection reaches what it hears. Verify at
+  the endpoint (`lab/out/caller_ear.wav`), not in `tap.wav`.
+- Plain `ws` only: `tokio-tungstenite` is built without TLS. A `wss`
+  endpoint needs a TLS feature and a rustls review against `cargo deny`.
 
 ### ng_transport.rs — async NG transport, tested against a fake node
 Control-world only (Tokio): one UDP socket per rtpengine node, a reader
