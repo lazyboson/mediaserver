@@ -113,6 +113,12 @@ the DTMF detector and the G.711 decode, and allocates nothing per packet
   being dropped into a timeout.
 - Unlike the legacy media gateway's fire-and-forget MI client, every request must
   await its correlated reply.
+- `SubscribeRequest` carries both `accept_codecs` and `transcode_codecs`,
+  and the tap sends **transcode**. `accept` only means "use this codec if
+  the leg already has it", so against an A-law call rtpengine offered PCMA
+  alone and rejected the PCMU answer. `transcode` makes it offer both and
+  convert, which keeps the whole pipeline PCMU whatever the carrier picked.
+  A real softphone found this; every synthetic lab call had been PCMU.
 - `play media` / `stop media` builders exist so audio can be pushed *into*
   a tapped call without an inline leg. `PlayTarget` is named for what the
   lab measured rather than for the wire key: `HeardBy(tag)` emits
@@ -124,6 +130,12 @@ the DTMF detector and the G.711 decode, and allocates nothing per packet
   ffmpeg-decodable file or blob. Streaming TTS with barge-in still needs
   the Phase-3 inline leg. `stop media` is the barge-in primitive and its
   cut-through latency has not been measured yet.
+- `PlayMedia.block_egress` emits `flags: [block-egress]`, and injection
+  always sets it. Without it the listener receives the peer's stream and
+  the player concurrently — two SSRCs and two sequence spaces through one
+  softphone jitter buffer, which is inaudible mush. With it rtpengine
+  pauses the peer for the playback and resumes after, measured in
+  `lab/host_test_caller.py` runs as complementary packet counts.
 
 ### sdp.rs — subscription-leg offer/answer
 - Parses rtpengine's subscribe offer: per-stream ports, payload-type
@@ -133,6 +145,12 @@ the DTMF detector and the G.711 decode, and allocates nothing per packet
 - Builds the `recvonly` answer with one local receive port per offered
   stream; the count must match or it is an error, since an answer with a
   different number of m= sections is not a legal answer.
+- **The answer may not drop any payload type the offer carried.** It lists
+  our codec first and then echoes every other offered payload type with its
+  rtpmap. The telephone-event rule found earlier was a special case of this;
+  an A-law call from a real softphone exposed the general one. Listing our
+  codec first is what makes rtpengine transcode to it, measured as PCMA in,
+  payload type 0 out.
 - **The answer must echo the offered `telephone-event` payload type.** Real
   rtpengine 14.1.1.8 rejects a subscription answer that drops it with
   `Failed to process subscription answer` — proven by `lab/ng_answer_probe.py`
@@ -199,6 +217,15 @@ the DTMF detector and the G.711 decode, and allocates nothing per packet
   streams TTS as a run of `media` events and never sends `mark`, so the
   consumer flushes after `UTTERANCE_IDLE` (700 ms) without inbound audio.
   `mark` and `endOfInteraction` still flush immediately when they do arrive.
+- **Underruns feed the consumer silence, not nothing.** A
+  silence-suppressing caller (MicroSIP) stops sending RTP between
+  utterances; skipping those frames made Deepgram time out and close. The
+  Twilio dialect implies a continuous stream.
+- **Only the Customer track streams by default.** stream-llm-bridge feeds
+  every media packet to the ASR regardless of `track`, so sending both legs
+  interleaves two sources at double rate and transcribes as nothing.
+  `MSS_CONSUMER_TRACKS=both` restores dual-track; the `start` event's
+  `tracks` list reflects what is actually sent.
 - **`play media` blobs are capped by the UDP datagram size.** NG is UDP, so
   anything over ~64 KB fails with `EMSGSIZE`; that is roughly 4s of 16-bit
   8 kHz WAV. Utterances are split into `BLOB_SAMPLES_PER_DATAGRAM` pieces

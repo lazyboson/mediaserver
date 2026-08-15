@@ -78,6 +78,13 @@ pub struct ConsumerFeed {
     dropped: Arc<AtomicU64>,
 }
 
+impl ConsumerFeed {
+    #[cfg(test)]
+    pub fn try_next(&mut self) -> Option<TapEvent> {
+        self.events.try_recv().ok()
+    }
+}
+
 pub fn channel(capacity: usize) -> (ConsumerSink, ConsumerFeed) {
     let (events_tx, events_rx) = mpsc::channel(capacity);
     let dropped = Arc::new(AtomicU64::new(0));

@@ -20,6 +20,7 @@ pub struct SubscribeRequest {
     pub from_tags: Vec<String>,
     pub mix: bool,
     pub accept_codecs: Vec<String>,
+    pub transcode_codecs: Vec<String>,
     pub label: Option<String>,
 }
 
@@ -41,6 +42,7 @@ pub struct PlayMedia {
     pub target: PlayTarget,
     pub source: PlaySource,
     pub repeat_times: Option<i64>,
+    pub block_egress: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -94,12 +96,20 @@ impl NgClient {
         if !flags.is_empty() {
             d.insert(b"flags".to_vec(), Value::List(flags));
         }
+        let mut codec = BTreeMap::new();
         if !req.accept_codecs.is_empty() {
-            let mut codec = BTreeMap::new();
             codec.insert(
                 b"accept".to_vec(),
                 Value::List(req.accept_codecs.iter().map(|c| Value::str(c)).collect()),
             );
+        }
+        if !req.transcode_codecs.is_empty() {
+            codec.insert(
+                b"transcode".to_vec(),
+                Value::List(req.transcode_codecs.iter().map(|c| Value::str(c)).collect()),
+            );
+        }
+        if !codec.is_empty() {
             d.insert(b"codec".to_vec(), Value::Dict(codec));
         }
         if let Some(label) = &req.label {
@@ -152,6 +162,12 @@ impl NgClient {
         if let Some(times) = play.repeat_times {
             d.insert(b"repeat-times".to_vec(), Value::Int(times));
         }
+        if play.block_egress {
+            d.insert(
+                b"flags".to_vec(),
+                Value::List(vec![Value::str("block-egress")]),
+            );
+        }
         Self::build(cookie, d)
     }
 
@@ -201,6 +217,7 @@ mod tests {
             from_tags: vec!["tagA".into()],
             mix: false,
             accept_codecs: vec!["PCMU".into()],
+            transcode_codecs: Vec::new(),
             label: Some("mss-tap".into()),
         };
         let wire = NgClient::subscribe_request(b"c1", &req);
@@ -211,6 +228,35 @@ mod tests {
         assert!(s.contains("9:from-tagsl4:tagAe"), "{s}");
         assert!(s.contains("5:codecd6:acceptl4:PCMUee"), "{s}");
         assert!(!s.contains("3:mix"), "{s}");
+    }
+
+    #[test]
+    fn transcode_is_what_makes_rtpengine_convert_an_alaw_leg() {
+        let req = SubscribeRequest {
+            call_id: "c".into(),
+            transcode_codecs: vec!["PCMU".into()],
+            ..Default::default()
+        };
+        let wire = NgClient::subscribe_request(b"c3", &req);
+        let s = String::from_utf8_lossy(&wire);
+        assert!(s.contains("5:codecd9:transcodel4:PCMUee"), "{s}");
+        assert!(!s.contains("6:accept"), "{s}");
+    }
+
+    #[test]
+    fn accept_and_transcode_can_be_asked_for_together() {
+        let req = SubscribeRequest {
+            call_id: "c".into(),
+            accept_codecs: vec!["PCMU".into()],
+            transcode_codecs: vec!["PCMU".into()],
+            ..Default::default()
+        };
+        let wire = NgClient::subscribe_request(b"c4", &req);
+        let s = String::from_utf8_lossy(&wire);
+        assert!(
+            s.contains("5:codecd6:acceptl4:PCMUe9:transcodel4:PCMUee"),
+            "{s}"
+        );
     }
 
     #[test]
@@ -236,6 +282,7 @@ mod tests {
             target: PlayTarget::HeardBy("tagA".into()),
             source: PlaySource::File("/srv/prompt.wav".into()),
             repeat_times: None,
+            block_egress: false,
         };
         let wire = NgClient::play_media(b"p1", &play);
         let s = String::from_utf8_lossy(&wire);
@@ -246,6 +293,7 @@ mod tests {
         assert!(s.contains("4:file15:/srv/prompt.wav"), "{s}");
         assert!(!s.contains("3:all"), "{s}");
         assert!(!s.contains("12:repeat-times"), "{s}");
+        assert!(!s.contains("5:flags"), "{s}");
     }
 
     #[test]
@@ -255,6 +303,7 @@ mod tests {
             target: PlayTarget::HeardByEveryone,
             source: PlaySource::File("x.wav".into()),
             repeat_times: Some(2),
+            block_egress: false,
         };
         let wire = NgClient::play_media(b"p2", &play);
         let s = String::from_utf8_lossy(&wire);
@@ -271,12 +320,14 @@ mod tests {
             target: PlayTarget::HeardBy("tagB".into()),
             source: PlaySource::Blob(wav.clone()),
             repeat_times: None,
+            block_egress: true,
         };
         let wire = NgClient::play_media(b"p3", &play);
         let mut expected = b"4:blob7:".to_vec();
         expected.extend_from_slice(&wav);
         assert!(contains(&wire, &expected), "{wire:?}");
         assert!(!contains(&wire, b"4:file"), "{wire:?}");
+        assert!(contains(&wire, b"5:flagsl12:block-egresse"), "{wire:?}");
     }
 
     #[test]

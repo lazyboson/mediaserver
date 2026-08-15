@@ -242,6 +242,108 @@ The alternative — `play media {file}` on storage rtpengine can read — has
 no size limit but needs a filesystem shared with the rtpengine host, which
 across pods is not a given.
 
+## A real softphone found the codec assumption
+
+`docker-compose.microsip.yml` puts MicroSIP in front of the stack through
+OpenSIPS and FreeSWITCH. The first real call failed the tap outright:
+
+```
+rtpengine offered a tap stream  payload_types: [8, 101]
+tap spike failed: "Failed to process subscription answer"
+```
+
+Payload type 8 is **PCMA**. Every synthetic lab call had been PCMU, so the
+hard-coded PCMU answer had never been wrong before. rtpengine rejects an
+answer offering a codec it did not put in the offer, exactly as it did for
+the missing telephone-event.
+
+The subscribe request already asked for a codec, but with the wrong flag.
+Measured against 14.1.1.8 on an A-law call:
+
+| Subscription request | rtpengine offers |
+| --- | --- |
+| `codec: {accept: [PCMU]}` | `RTP/AVP 8 101` — PCMA only, so a PCMU answer is rejected |
+| `codec: {transcode: [PCMU]}` | `RTP/AVP 8 0 101` — PCMA **and** PCMU |
+
+`accept` means "use this if the leg already has it"; only `transcode` makes
+rtpengine convert. `SubscribeRequest` now sends `transcode`, which is what
+architecture.md section 4 always described ("requesting a codec on the
+subscription leg so rtpengine transcodes at the tap").
+
+That alone was not enough. With the offer widened to `8 0 101`, the answer
+was still rejected, and `lab/ng_alaw_answer_probe.py` shows why:
+
+| Subscription answer | rtpengine 14.1.1.8 |
+| --- | --- |
+| `RTP/AVP 0 101`, dropping the offered PCMA | **REJECTED** |
+| `RTP/AVP 0 8 101`, ours first, PCMA kept | ACCEPTED |
+
+So the rule found with telephone-event is more general than it looked:
+**an answer may not drop any payload type the offer carried.** It was never
+about telephone-event specifically. `SubscriptionAnswer::to_sdp` now lists
+our codec first and then echoes every other offered payload type with its
+rtpmap.
+
+Preference order is honoured. Pumping PCMA into a call whose tap answered
+`0 8 101` delivered 298 packets of payload type **0** to the tap: rtpengine
+transcodes to the codec we listed first, so the pipeline stays PCMU whatever
+the carrier negotiated.
+
+**FreeSWITCH extension 9196 is not a test of this project.** It is FS's own
+`echo()` application and answers instantly by design. If you hear yourself
+there it proves SIP and RTP reachability and nothing else; 9000 answers with
+`silence_stream://-1` so the only audio is what MSS injects.
+
+## The echo loop, proven without a human
+
+`lab/host_test_caller.py` plays the part of MicroSIP from the WSL host: SIP
+to the published 127.0.0.1:5060, PCMA RTP to the published 30000-30020
+range, a wav of real speech spoken five times, everything received recorded
+per SSRC. It exists because "dial and tell me what you hear" was burning a
+human retry on every fix. One run measures the whole loop:
+
+- Deepgram transcribed the spoken sentence **verbatim, five out of five**
+  through host → published port → rtpengine PCMA→PCMU transcode → tap →
+  bridge. The caller-to-ASR path is intelligible, not merely connected.
+- The TTS replies reached the caller's socket, and
+  `lab/ear_intelligibility_probe.py` (which feeds the recorded ear back
+  through the bridge) transcribed them **verbatim too** — the injected
+  audio is objectively intelligible at the caller.
+
+### Why a human still heard garbage: two simultaneous RTP streams
+
+The test caller received the replies fine because it demultiplexes by SSRC.
+A real softphone does not: it feeds one jitter buffer, and during injection
+the caller was receiving **two concurrent streams** — FreeSWITCH's
+`silence_stream` forwarded by rtpengine, and the media player, each with its
+own SSRC and sequence space. Interleaving two sequence spaces through one
+jitter buffer is why MicroSIP played a mangled first utterance and then
+nothing.
+
+`play media` with `flags: [block-egress]` fixes it, measured: without the
+flag the peer stream keeps flowing during playback (97 packets vs 99
+injected in the probe window); with it the peer stream pauses (2 vs 100)
+and resumes afterwards. The caller then sees exactly one stream at a time,
+and every injection arrives on one stable player SSRC — a plain source
+switch, which softphones handle. Injection always sets it.
+
+Two more findings from the same debugging arc, both invisible in the
+synthetic lab:
+
+- **A silence-suppressing caller starved the ASR.** MicroSIP stops sending
+  RTP when the caller is quiet; the consumer used to forward nothing on
+  jitter underrun, so Deepgram saw a 40s gap and closed with a timeout
+  (`net0001`). The consumer now sends a silence frame per underrun — the
+  stream a Twilio-dialect consumer receives is continuous, as the legacy media gateway's
+  was.
+- **Both legs down one WebSocket is garbage to a consumer that does not
+  demultiplex.** stream-llm-bridge logs `media.track` but feeds every
+  packet to Deepgram, so two interleaved tracks at 100 pkt/s transcribed as
+  nothing. MSS now streams only the Customer track by default;
+  `MSS_CONSUMER_TRACKS=both` restores dual-track for consumers that split
+  by track. the legacy media gateway only ever sent one track, so this is also the
+  wire-compatible behaviour.
+
 ## Findings still open
 
 1. **Telephone-event packets are counted as lost audio.** Both legs above

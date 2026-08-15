@@ -158,4 +158,5 @@ def main():
             theirs_start, ours_media)
 
 
-main()
+if __name__ == "__main__":
+    main()
