@@ -60,7 +60,7 @@ services:
     image: stream-llm-bridge:local
     environment:
       SERVER_PORT: "8080"
-      LOG_LEVEL: info
+      LOG_LEVEL: debug
       USE_LLM: "false"
       ELEVENLABS_API_KEY: ${ELEVENLABS_API_KEY:?set it in lab/.env}
       DEEPGRAM_API_KEY: ${DEEPGRAM_API_KEY:?deepgram is what turns your speech into the echo}
