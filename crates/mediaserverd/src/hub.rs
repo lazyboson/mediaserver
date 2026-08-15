@@ -7,6 +7,7 @@ use tokio::sync::Notify;
 pub const MAX_FRAME_BYTES: usize = 320;
 const COMMAND_CAPACITY: usize = 64;
 const INJECTED_CAPACITY: usize = 16;
+const INJECT_SILENCE: [i16; 480] = [0; 480];
 
 #[derive(Clone, Copy)]
 #[allow(clippy::large_enum_variant)]
@@ -153,15 +154,19 @@ impl Hub {
         if self.injecting.is_none() {
             self.injecting = self.injected.pop().map(|pcm| (pcm, 0));
         }
-        let Some((pcm, at)) = self.injecting.as_mut() else {
-            return;
+        let frame = samples_per_frame.max(1).min(INJECT_SILENCE.len());
+        let event = match self.injecting.as_mut() {
+            Some((pcm, at)) => {
+                let end = (*at + frame).min(pcm.len());
+                let event = TapEvent::media(Track::Mixed, timestamp_ms, &pcm[*at..end], true);
+                *at = end;
+                if *at >= pcm.len() {
+                    self.injecting = None;
+                }
+                event
+            }
+            None => TapEvent::media(Track::Mixed, timestamp_ms, &INJECT_SILENCE[..frame], true),
         };
-        let end = (*at + samples_per_frame.max(1)).min(pcm.len());
-        let event = TapEvent::media(Track::Mixed, timestamp_ms, &pcm[*at..end], true);
-        *at = end;
-        if *at >= pcm.len() {
-            self.injecting = None;
-        }
         self.publish(event);
     }
 
@@ -361,30 +366,35 @@ mod tests {
 
         hub.release_injected(160, 20);
         assert!(client.inject(vec![100i16; 400]));
-        for _ in 0..4 {
+        for _ in 0..3 {
             hub.release_injected(160, 20);
         }
+        hub.release_injected(160, 20);
+        let voiced = |bytes: &[u8], len: usize| bytes[..len].iter().any(|b| *b != 0xFF);
 
         let mut sizes = Vec::new();
         let mut stamps = Vec::new();
+        let mut speech = Vec::new();
         while let Some(event) = bot_only.try_next() {
             match event {
                 TapEvent::Media {
                     track,
                     timestamp_ms,
                     len,
-                    ..
+                    bytes,
                 } => {
                     assert_eq!(track, Track::Mixed);
                     stamps.push(timestamp_ms);
                     sizes.push(len);
+                    speech.push(voiced(&bytes, len));
                 }
                 TapEvent::Dtmf { .. } => panic!("expected media"),
             }
         }
-        assert_eq!(sizes, vec![160, 160, 80]);
-        assert_eq!(stamps, vec![20, 40, 60]);
-        assert_eq!(std::iter::from_fn(|| listener.try_next()).count(), 3);
+        assert_eq!(sizes, vec![160, 160, 160, 80, 160]);
+        assert_eq!(stamps, vec![0, 20, 40, 60, 80]);
+        assert_eq!(speech, vec![false, true, true, true, false]);
+        assert_eq!(std::iter::from_fn(|| listener.try_next()).count(), 5);
     }
 
     #[tokio::test]
