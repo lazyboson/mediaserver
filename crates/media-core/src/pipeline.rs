@@ -32,6 +32,7 @@ pub enum IngestOutcome {
 pub enum Playout<'a> {
     Pcm(&'a [i16]),
     Concealed(&'a [i16]),
+    Suppressed(&'a [i16]),
     Waiting,
 }
 
@@ -44,6 +45,7 @@ pub struct PipelineStats {
     pub dtmf_digits: u64,
     pub frames_played: u64,
     pub frames_concealed: u64,
+    pub frames_suppressed: u64,
 }
 
 fn companion_payload_type(encoding: Encoding) -> Option<u8> {
@@ -123,6 +125,7 @@ impl StreamPipeline {
         };
         if Some(packet.payload_type) == self.telephone_event_payload_type {
             self.stats.telephone_events += 1;
+            self.jitter.account(packet.sequence);
             return match self.dtmf.push(packet.timestamp, packet.payload) {
                 Some(digit) => {
                     self.stats.dtmf_digits += 1;
@@ -173,6 +176,12 @@ impl StreamPipeline {
                 let decoded = g711::decode_into(*ulaw, payload, pcm);
                 stats.frames_played += 1;
                 Playout::Pcm(&pcm[..decoded])
+            }
+            PopOutcome::Accounted => {
+                let suppressed = *samples_per_packet;
+                pcm[..suppressed].fill(0);
+                stats.frames_suppressed += 1;
+                Playout::Suppressed(&pcm[..suppressed])
             }
             PopOutcome::Lost => {
                 let concealed = *samples_per_packet;
@@ -406,7 +415,49 @@ mod tests {
 
         assert_eq!(pipeline.stats().telephone_events, 2);
         assert_eq!(pipeline.stats().dtmf_digits, 1);
-        assert_eq!(pipeline.jitter_stats().received, 1);
+        assert_eq!(pipeline.jitter_stats().received, 3);
+
+        assert!(matches!(pipeline.release(), Playout::Pcm(_)));
+        for _ in 0..2 {
+            match pipeline.release() {
+                Playout::Suppressed(pcm) => assert!(pcm.iter().all(|&s| s == 0)),
+                other => panic!("expected suppression, got {other:?}"),
+            }
+        }
+        assert_eq!(pipeline.stats().frames_suppressed, 2);
+        assert_eq!(pipeline.stats().frames_concealed, 0);
+        assert_eq!(pipeline.jitter_stats().lost, 0);
+    }
+
+    #[test]
+    fn a_dtmf_press_on_a_clean_link_reports_zero_loss() {
+        let mut pipeline = pipeline();
+        let mut generator = generator();
+        let mut wire = vec![generator.next_datagram(), generator.next_datagram()];
+        for _ in 0..3 {
+            wire.push(generator.next_event_datagram(TELEPHONE_EVENT_PT, [7, 0x0A, 0x01, 0x40]));
+        }
+        for _ in 0..3 {
+            wire.push(generator.next_event_datagram(TELEPHONE_EVENT_PT, [7, 0x8A, 0x03, 0x20]));
+        }
+        wire.push(generator.next_datagram());
+        wire.push(generator.next_datagram());
+
+        let mut digits = 0;
+        for datagram in &wire {
+            if matches!(pipeline.ingest(datagram), IngestOutcome::Dtmf(_)) {
+                digits += 1;
+            }
+        }
+        for _ in 0..wire.len() {
+            pipeline.release();
+        }
+
+        assert_eq!(digits, 1);
+        assert_eq!(pipeline.jitter_stats().lost, 0);
+        assert_eq!(pipeline.stats().frames_concealed, 0);
+        assert_eq!(pipeline.stats().frames_suppressed, 6);
+        assert_eq!(pipeline.stats().frames_played, 4);
     }
 
     #[test]
