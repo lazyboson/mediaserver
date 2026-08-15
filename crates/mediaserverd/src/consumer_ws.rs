@@ -1,11 +1,10 @@
+use crate::hub::{Subscription, TapEvent};
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
 use futures_util::{SinkExt, StreamExt};
 use media_core::{g711, AudioFormat, Track};
 use protocol::twilio::{DtmfInfo, Inbound, MediaFormat, MediaPayload, Outbound, StartInfo};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
 use tokio::sync::mpsc;
@@ -13,7 +12,6 @@ use tokio::time::Instant;
 use tokio_tungstenite::tungstenite::Message;
 use tracing::{info, warn};
 
-pub const MAX_FRAME_BYTES: usize = 320;
 const PCMU_ENCODING: &str = "PCMU";
 const UTTERANCE_IDLE: Duration = Duration::from_millis(700);
 
@@ -23,21 +21,6 @@ pub enum ConsumerError {
     WebSocket(#[from] tokio_tungstenite::tungstenite::Error),
     #[error("could not serialize the {0} event")]
     Serialize(&'static str),
-}
-
-#[derive(Clone, Copy)]
-#[allow(clippy::large_enum_variant)]
-pub enum TapEvent {
-    Media {
-        track: Track,
-        timestamp_ms: u64,
-        len: usize,
-        bytes: [u8; MAX_FRAME_BYTES],
-    },
-    Dtmf {
-        track: Track,
-        digit: char,
-    },
 }
 
 #[derive(Debug, Clone)]
@@ -67,62 +50,6 @@ pub struct ConsumerConfig {
     pub custom_parameters: HashMap<String, String>,
 }
 
-#[derive(Clone)]
-pub struct ConsumerSink {
-    events: mpsc::Sender<TapEvent>,
-    dropped: Arc<AtomicU64>,
-}
-
-pub struct ConsumerFeed {
-    events: mpsc::Receiver<TapEvent>,
-    dropped: Arc<AtomicU64>,
-}
-
-impl ConsumerFeed {
-    #[cfg(test)]
-    pub fn try_next(&mut self) -> Option<TapEvent> {
-        self.events.try_recv().ok()
-    }
-}
-
-pub fn channel(capacity: usize) -> (ConsumerSink, ConsumerFeed) {
-    let (events_tx, events_rx) = mpsc::channel(capacity);
-    let dropped = Arc::new(AtomicU64::new(0));
-    (
-        ConsumerSink {
-            events: events_tx,
-            dropped: Arc::clone(&dropped),
-        },
-        ConsumerFeed {
-            events: events_rx,
-            dropped,
-        },
-    )
-}
-
-impl ConsumerSink {
-    pub fn offer_media(&self, track: Track, timestamp_ms: u64, pcm: &[i16], ulaw: bool) {
-        let mut bytes = [0u8; MAX_FRAME_BYTES];
-        let len = g711::encode_into(ulaw, pcm, &mut bytes);
-        self.offer(TapEvent::Media {
-            track,
-            timestamp_ms,
-            len,
-            bytes,
-        });
-    }
-
-    pub fn offer_dtmf(&self, track: Track, digit: char) {
-        self.offer(TapEvent::Dtmf { track, digit });
-    }
-
-    fn offer(&self, event: TapEvent) {
-        if self.events.try_send(event).is_err() {
-            self.dropped.fetch_add(1, Ordering::Relaxed);
-        }
-    }
-}
-
 pub fn track_name(track: Track) -> &'static str {
     match track {
         Track::Customer => "inbound",
@@ -133,13 +60,9 @@ pub fn track_name(track: Track) -> &'static str {
 
 pub async fn run(
     config: ConsumerConfig,
-    feed: ConsumerFeed,
+    mut events: Subscription,
     commands: Option<mpsc::Sender<BridgeCommand>>,
 ) -> Result<ConsumerStats, ConsumerError> {
-    let ConsumerFeed {
-        mut events,
-        dropped,
-    } = feed;
     let (stream, _) = tokio_tungstenite::connect_async(&config.url).await?;
     info!(url = %config.url, stream_sid = %config.stream_sid, "consumer websocket connected");
     let (mut writer, mut reader) = stream.split();
@@ -169,7 +92,7 @@ pub async fn run(
 
     loop {
         tokio::select! {
-            event = events.recv() => {
+            event = events.next() => {
                 let Some(event) = event else { break };
                 sequence += 1;
                 let message = match event {
@@ -228,7 +151,7 @@ pub async fn run(
     writer.send(encode(&stop, "stop")?).await?;
     writer.close().await.ok();
 
-    stats.media_dropped = dropped.load(Ordering::Relaxed);
+    stats.media_dropped = events.dropped_oldest();
     Ok(stats)
 }
 
@@ -321,19 +244,8 @@ mod tests {
     }
 
     #[test]
-    fn a_full_queue_drops_and_counts_instead_of_blocking_the_media_thread() {
-        let (sink, feed) = channel(2);
-        for _ in 0..10 {
-            sink.offer_media(Track::Customer, 0, &pcm_frame(1000), true);
-        }
-        assert_eq!(feed.dropped.load(Ordering::Relaxed), 8);
-    }
-
-    #[test]
-    fn media_is_encoded_to_ulaw_before_it_reaches_the_queue() {
-        let (sink, mut feed) = channel(4);
-        sink.offer_media(Track::Customer, 40, &pcm_frame(0), true);
-        match feed.events.try_recv().unwrap() {
+    fn media_events_carry_ulaw_encoded_frames() {
+        match TapEvent::media(Track::Customer, 40, &pcm_frame(0), true) {
             TapEvent::Media {
                 track,
                 timestamp_ms,
@@ -368,7 +280,9 @@ mod tests {
             seen
         });
 
-        let (sink, feed) = channel(8);
+        let (mut hub, client) = crate::hub::Hub::new();
+        let subscription = client.attach(8, crate::hub::TrackSelection::All).unwrap();
+        hub.poll_commands();
         let config = ConsumerConfig {
             url: format!("ws:{}127.0.0.1:{port}", URL_SCHEME_SEPARATOR),
             account_id: "acct-1".into(),
@@ -378,10 +292,11 @@ mod tests {
             tracks: vec!["inbound".into(), "outbound".into()],
             custom_parameters: HashMap::new(),
         };
-        let consumer = tokio::spawn(run(config, feed, None));
+        let consumer = tokio::spawn(run(config, subscription, None));
 
-        sink.offer_media(Track::Agent, 20, &pcm_frame(0), true);
-        drop(sink);
+        hub.publish(TapEvent::media(Track::Agent, 20, &pcm_frame(0), true));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        drop(hub);
 
         let seen = server.await.unwrap();
         let stats = consumer.await.unwrap().unwrap();
