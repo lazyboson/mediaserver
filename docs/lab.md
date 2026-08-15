@@ -131,6 +131,33 @@ One run settles two questions at once:
   disproved that: with `codec accept PCMU` it showed pt101 arriving on both
   tap streams, which pointed at our timing rather than rtpengine.
 
+## Audio can go back into a tapped call — but only as an utterance
+
+A subscription is one-way, so the question of how bot speech reaches the
+caller decides whether interactive voice-AI needs a Phase-3 inline leg.
+`lab/ng_inject_probe.py` answers it by driving both legs itself: each leg
+transmits mu-law silence, so any non-silent payload a leg receives can only
+have come from the injection.
+
+| Mechanism | rtpengine 14.1.1.8 |
+| --- | --- |
+| `play media`, `blob`, `from-tag: tagA` | **only tagA hears it** — 100 injected packets on the caller, 0 on the callee |
+| `play media`, `all: "all"` | both legs hear it |
+| `play media`, `blob64` | **rejected** — `No media file specified` |
+| `publish` + continuous RTP | accepted, rtpengine receives our RTP, **no leg ever hears it** |
+
+Two things follow. First, `from-tag` targeting is whisper-shaped for free:
+the injected audio goes to exactly one participant, which is the primitive
+Phase 4 needs for whisper/coach. Second, `publish` is **not** the
+offer/answer-free injector §6 of the architecture hoped for — it is a
+broadcast source for subscribers. 98 packets pushed into the port it
+offered us, zero heard by either leg.
+
+So injection into a live call is `play media` (hand rtpengine a complete
+ffmpeg-decodable blob) or an inline leg (continuous stream), with nothing
+in between. An AI agent can speak into a tapped call today, one utterance
+at a time; streaming TTS with barge-in still needs Phase 3.
+
 ## Findings still open
 
 1. **Telephone-event packets are counted as lost audio.** Both legs above
@@ -148,3 +175,14 @@ One run settles two questions at once:
 2. **The `mix` flag is untested.** `SubscribeRequest` supports it and the
    architecture proposes it for cheap supervisor listen, but no lab run has
    asked for a mixed mono feed.
+3. **`stop media` cut-through latency is unmeasured.** It is the barge-in
+   primitive for `play media` injection — how fast an utterance stops once
+   the caller starts talking decides whether utterance-shaped bot speech
+   feels interactive or not. The probe issues `stop media` but does not
+   time it.
+4. **Injected audio arrives alongside the peer's, not instead of it.** In
+   the targeted run the caller received 245 packets, 100 of them the
+   injected tone and the rest the callee's silence, so `play media` did not
+   block egress. Whether an AI utterance and live caller audio should mix
+   or the peer should be suppressed is a product question, and the
+   `block egress` flag is the knob for it — untested.

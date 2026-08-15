@@ -113,6 +113,17 @@ the DTMF detector and the G.711 decode, and allocates nothing per packet
   being dropped into a timeout.
 - Unlike mediagateway's fire-and-forget MI client, every request must
   await its correlated reply.
+- `play media` / `stop media` builders exist so audio can be pushed *into*
+  a tapped call without an inline leg. `PlayTarget` is named for what the
+  lab measured rather than for the wire key: `HeardBy(tag)` emits
+  `from-tag` and only that participant hears the audio, `HeardByEveryone`
+  emits `all: "all"` and both do. `PlaySource::Blob` carries the audio as
+  raw `Value::Bytes`; `blob64` is **not** supported by rtpengine 14.1.1.8
+  (it answers `No media file specified`), so base64 is not an option.
+- These are utterance-shaped, not a stream: rtpengine plays a complete
+  ffmpeg-decodable file or blob. Streaming TTS with barge-in still needs
+  the Phase-3 inline leg. `stop media` is the barge-in primitive and its
+  cut-through latency has not been measured yet.
 
 ### sdp.rs — subscription-leg offer/answer
 - Parses rtpengine's subscribe offer: per-stream ports, payload-type

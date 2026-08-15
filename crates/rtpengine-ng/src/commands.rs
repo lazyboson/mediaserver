@@ -24,6 +24,26 @@ pub struct SubscribeRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PlayTarget {
+    HeardBy(String),
+    HeardByEveryone,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PlaySource {
+    Blob(Vec<u8>),
+    File(String),
+}
+
+#[derive(Debug, Clone)]
+pub struct PlayMedia {
+    pub call_id: String,
+    pub target: PlayTarget,
+    pub source: PlaySource,
+    pub repeat_times: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NgReply {
     pub cookie: Vec<u8>,
     pub body: Value,
@@ -105,6 +125,44 @@ impl NgClient {
         Self::build(cookie, d)
     }
 
+    fn insert_target(d: &mut BTreeMap<Vec<u8>, Value>, target: &PlayTarget) {
+        match target {
+            PlayTarget::HeardBy(tag) => {
+                d.insert(b"from-tag".to_vec(), Value::str(tag));
+            }
+            PlayTarget::HeardByEveryone => {
+                d.insert(b"all".to_vec(), Value::str("all"));
+            }
+        }
+    }
+
+    pub fn play_media(cookie: &[u8], play: &PlayMedia) -> Vec<u8> {
+        let mut d = BTreeMap::new();
+        d.insert(b"command".to_vec(), Value::str("play media"));
+        d.insert(b"call-id".to_vec(), Value::str(&play.call_id));
+        Self::insert_target(&mut d, &play.target);
+        match &play.source {
+            PlaySource::Blob(bytes) => {
+                d.insert(b"blob".to_vec(), Value::Bytes(bytes.clone()));
+            }
+            PlaySource::File(path) => {
+                d.insert(b"file".to_vec(), Value::str(path));
+            }
+        }
+        if let Some(times) = play.repeat_times {
+            d.insert(b"repeat-times".to_vec(), Value::Int(times));
+        }
+        Self::build(cookie, d)
+    }
+
+    pub fn stop_media(cookie: &[u8], call_id: &str, target: &PlayTarget) -> Vec<u8> {
+        let mut d = BTreeMap::new();
+        d.insert(b"command".to_vec(), Value::str("stop media"));
+        d.insert(b"call-id".to_vec(), Value::str(call_id));
+        Self::insert_target(&mut d, target);
+        Self::build(cookie, d)
+    }
+
     pub fn split_cookie(datagram: &[u8]) -> Result<(&[u8], &[u8]), NgError> {
         let space = datagram
             .iter()
@@ -165,6 +223,73 @@ mod tests {
         let wire = NgClient::subscribe_request(b"c2", &req);
         let s = String::from_utf8_lossy(&wire);
         assert!(s.contains("5:flagsl3:mixe"), "{s}");
+    }
+
+    fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+        haystack.windows(needle.len()).any(|w| w == needle)
+    }
+
+    #[test]
+    fn play_media_reaches_only_the_targeted_listener() {
+        let play = PlayMedia {
+            call_id: "call-1".into(),
+            target: PlayTarget::HeardBy("tagA".into()),
+            source: PlaySource::File("/srv/prompt.wav".into()),
+            repeat_times: None,
+        };
+        let wire = NgClient::play_media(b"p1", &play);
+        let s = String::from_utf8_lossy(&wire);
+        assert!(s.starts_with("p1 d"), "{s}");
+        assert!(s.contains("7:command10:play media"), "{s}");
+        assert!(s.contains("7:call-id6:call-1"), "{s}");
+        assert!(s.contains("8:from-tag4:tagA"), "{s}");
+        assert!(s.contains("4:file15:/srv/prompt.wav"), "{s}");
+        assert!(!s.contains("3:all"), "{s}");
+        assert!(!s.contains("12:repeat-times"), "{s}");
+    }
+
+    #[test]
+    fn play_media_to_everyone_uses_the_all_key_and_not_a_from_tag() {
+        let play = PlayMedia {
+            call_id: "c".into(),
+            target: PlayTarget::HeardByEveryone,
+            source: PlaySource::File("x.wav".into()),
+            repeat_times: Some(2),
+        };
+        let wire = NgClient::play_media(b"p2", &play);
+        let s = String::from_utf8_lossy(&wire);
+        assert!(s.contains("3:all3:all"), "{s}");
+        assert!(!s.contains("8:from-tag"), "{s}");
+        assert!(s.contains("12:repeat-timesi2e"), "{s}");
+    }
+
+    #[test]
+    fn play_media_carries_a_binary_blob_byte_for_byte() {
+        let wav = vec![0x52, 0x49, 0x46, 0x46, 0x00, 0xFF, 0x80];
+        let play = PlayMedia {
+            call_id: "c".into(),
+            target: PlayTarget::HeardBy("tagB".into()),
+            source: PlaySource::Blob(wav.clone()),
+            repeat_times: None,
+        };
+        let wire = NgClient::play_media(b"p3", &play);
+        let mut expected = b"4:blob7:".to_vec();
+        expected.extend_from_slice(&wav);
+        assert!(contains(&wire, &expected), "{wire:?}");
+        assert!(!contains(&wire, b"4:file"), "{wire:?}");
+    }
+
+    #[test]
+    fn stop_media_mirrors_the_play_target() {
+        let one = NgClient::stop_media(b"s1", "call-1", &PlayTarget::HeardBy("tagA".into()));
+        let s = String::from_utf8_lossy(&one);
+        assert!(s.contains("7:command10:stop media"), "{s}");
+        assert!(s.contains("8:from-tag4:tagA"), "{s}");
+
+        let every = NgClient::stop_media(b"s2", "call-1", &PlayTarget::HeardByEveryone);
+        let s = String::from_utf8_lossy(&every);
+        assert!(s.contains("3:all3:all"), "{s}");
+        assert!(!s.contains("8:from-tag"), "{s}");
     }
 
     #[test]
