@@ -1,3 +1,4 @@
+use crate::consumer_ws::ConsumerSink;
 use media_core::jitter;
 use media_core::pipeline::{IngestOutcome, PipelineError, PipelineStats, Playout, StreamPipeline};
 use media_core::{AudioFormat, Track};
@@ -48,6 +49,9 @@ pub struct TapLeg {
     digits: [char; MAX_RECORDED_DIGITS],
     digits_recorded: usize,
     stats: LegStats,
+    consumer: Option<ConsumerSink>,
+    ptime_ms: u64,
+    frames_released: u64,
 }
 
 impl TapLeg {
@@ -72,7 +76,15 @@ impl TapLeg {
             digits: [' '; MAX_RECORDED_DIGITS],
             digits_recorded: 0,
             stats: LegStats::default(),
+            consumer: None,
+            ptime_ms: format.ptime_ms.max(1) as u64,
+            frames_released: 0,
         })
+    }
+
+    pub fn with_consumer(mut self, consumer: ConsumerSink) -> Self {
+        self.consumer = Some(consumer);
+        self
     }
 
     pub fn digits_seen(&self) -> String {
@@ -104,6 +116,9 @@ impl TapLeg {
                             self.digits[self.digits_recorded] = digit;
                             self.digits_recorded += 1;
                         }
+                        if let Some(consumer) = &self.consumer {
+                            consumer.offer_dtmf(self.track, digit);
+                        }
                     }
                     self.stats.datagrams += 1;
                 }
@@ -121,15 +136,24 @@ impl TapLeg {
 
     fn release_frame(&mut self) {
         let Self {
+            track,
             pipeline,
             samples,
             capacity_samples,
             stats,
+            consumer,
+            ptime_ms,
+            frames_released,
             ..
         } = self;
         let frame_samples = pipeline.samples_per_packet();
+        let timestamp_ms = *frames_released * *ptime_ms;
+        *frames_released += 1;
         match pipeline.release() {
             Playout::Pcm(pcm) | Playout::Concealed(pcm) => {
+                if let Some(consumer) = consumer {
+                    consumer.offer_media(*track, timestamp_ms, pcm, true);
+                }
                 append_within_capacity(samples, *capacity_samples, pcm, stats)
             }
             Playout::Waiting => {
@@ -215,6 +239,22 @@ pub fn capture(
         reanchors,
         elapsed: started.elapsed(),
     }
+}
+
+pub fn wav_blob(format: AudioFormat, pcm: &[i16]) -> Result<Vec<u8>, SpikeError> {
+    let spec = hound::WavSpec {
+        channels: 1,
+        sample_rate: format.sample_rate_hz,
+        bits_per_sample: 16,
+        sample_format: hound::SampleFormat::Int,
+    };
+    let mut cursor = std::io::Cursor::new(Vec::new());
+    let mut writer = hound::WavWriter::new(&mut cursor, spec)?;
+    for sample in pcm {
+        writer.write_sample(*sample)?;
+    }
+    writer.finalize()?;
+    Ok(cursor.into_inner())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

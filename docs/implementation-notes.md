@@ -179,6 +179,30 @@ the DTMF detector and the G.711 decode, and allocates nothing per packet
 
 ## crates/mediaserverd
 
+### consumer_ws.rs — the first consumer bridge, and the speech path back
+- WebSocket client speaking the frozen Twilio dialect from
+  `protocol::twilio`, so a mediagateway-compatible endpoint accepts it
+  unchanged. `MSS_CONSUMER_URL` turns it on; without it the tap behaves
+  exactly as before.
+- The media thread never blocks on it. `ConsumerSink::offer_*` encodes the
+  released frame to mu-law into a fixed `[u8; MAX_FRAME_BYTES]` (no
+  allocation, hence `clippy::large_enum_variant` is allowed on `TapEvent`)
+  and `try_send`s it. A full queue increments a counter that is reported as
+  `media_dropped` — never a silent drop, which was mediagateway defect 4.
+- Inbound audio accumulates until a `mark`, then goes out as
+  `BridgeCommand::Speak`; `clear` discards the buffer and raises
+  `BridgeCommand::Barge`. `tap_session::inject_bridge_speech` wraps the
+  utterance as a WAV blob and plays it with `play media`, targeted by
+  default at the first from-tag so only the customer hears the agent.
+  `MSS_INJECT_TARGET=everyone` widens it.
+- Utterance-shaped, so latency is one whole utterance. Barge-in is a
+  `stop media`, and its cut-through time is still unmeasured.
+- **Bot speech is not observable in the tap**, because a subscription
+  carries what a party sends and injection reaches what it hears. Verify at
+  the endpoint (`lab/out/caller_ear.wav`), not in `tap.wav`.
+- Plain `ws` only: `tokio-tungstenite` is built without TLS. A `wss`
+  endpoint needs a TLS feature and a rustls review against `cargo deny`.
+
 ### ng_transport.rs — async NG transport, tested against a fake node
 Control-world only (Tokio): one UDP socket per rtpengine node, a reader
 task that dispatches each datagram to the waiter registered under its
