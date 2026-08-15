@@ -6,7 +6,7 @@ use rtpengine_ng::{
     PlayMedia, PlaySource, PlayTarget, SdpError, SubscribeRequest, SubscriptionAnswer,
     SubscriptionOffer,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::net::{IpAddr, SocketAddr, UdpSocket};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -313,22 +313,25 @@ pub async fn run(request: TapSpikeRequest, cookie_prefix: u64) -> Result<(), Tap
         );
     }
 
-    if let Some(dir) = datagram_log_dir() {
-        for leg in &legs {
-            let path = dir.join(format!("tap-{:?}.dglog", leg.track()).to_lowercase());
-            match std::fs::write(&path, leg.datagram_log()) {
-                Ok(()) => info!(
-                    path = %path.display(),
-                    bytes = leg.datagram_log().len(),
-                    truncated = leg.stats().datagram_log_full,
-                    "wrote the datagram log for replay fixtures"
-                ),
-                Err(error) => warn!(%error, path = %path.display(), "datagram log not written"),
+    let wav = tokio::task::block_in_place(|| {
+        if let Some(dir) = datagram_log_dir() {
+            for leg in &legs {
+                let path = dir.join(format!("tap-{:?}.dglog", leg.track()).to_lowercase());
+                match std::fs::write(&path, leg.datagram_log()) {
+                    Ok(()) => info!(
+                        path = %path.display(),
+                        bytes = leg.datagram_log().len(),
+                        truncated = leg.stats().datagram_log_full,
+                        "wrote the datagram log for replay fixtures"
+                    ),
+                    Err(error) => {
+                        warn!(%error, path = %path.display(), "datagram log not written")
+                    }
+                }
             }
         }
-    }
-
-    let wav = write_wav(&request.output, request.format, &legs)?;
+        write_wav(&request.output, request.format, &legs)
+    })?;
     info!(
         output = %request.output.display(),
         channels = wav.channels,
@@ -419,7 +422,15 @@ async fn inject_bridge_speech(
     mut commands: mpsc::Receiver<BridgeCommand>,
 ) -> u64 {
     let mut played = 0;
-    while let Some(command) = commands.recv().await {
+    let mut pending = VecDeque::new();
+    loop {
+        let command = match pending.pop_front() {
+            Some(command) => command,
+            None => match commands.recv().await {
+                Some(command) => command,
+                None => break,
+            },
+        };
         match command {
             BridgeCommand::Speak(pcm) => {
                 let pieces = pcm.chunks(BLOB_SAMPLES_PER_DATAGRAM).count();
@@ -455,7 +466,18 @@ async fn inject_bridge_speech(
                         }
                         Err(error) => warn!(%error, "rtpengine refused the utterance"),
                     }
-                    tokio::time::sleep(piece_duration(format, piece.len())).await;
+                    let barged = !wait_out_piece(
+                        &transport,
+                        &call_id,
+                        &target,
+                        piece_duration(format, piece.len()),
+                        &mut commands,
+                        &mut pending,
+                    )
+                    .await;
+                    if barged {
+                        break;
+                    }
                 }
             }
             BridgeCommand::Barge => match transport.stop_media(&call_id, &target).await {
@@ -465,6 +487,37 @@ async fn inject_bridge_speech(
         }
     }
     played
+}
+
+async fn wait_out_piece(
+    transport: &NgTransport,
+    call_id: &str,
+    target: &PlayTarget,
+    duration: Duration,
+    commands: &mut mpsc::Receiver<BridgeCommand>,
+    pending: &mut VecDeque<BridgeCommand>,
+) -> bool {
+    let piece_done = tokio::time::sleep(duration);
+    tokio::pin!(piece_done);
+    loop {
+        tokio::select! {
+            _ = &mut piece_done => return true,
+            command = commands.recv() => match command {
+                Some(BridgeCommand::Barge) => {
+                    match transport.stop_media(call_id, target).await {
+                        Ok(_) => info!(?target, "barge-in cut the utterance short"),
+                        Err(error) => warn!(%error, "rtpengine refused the barge-in"),
+                    }
+                    return false;
+                }
+                Some(command) => pending.push_back(command),
+                None => {
+                    piece_done.as_mut().await;
+                    return true;
+                }
+            }
+        }
+    }
 }
 
 fn piece_duration(format: AudioFormat, samples: usize) -> Duration {
