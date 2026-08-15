@@ -103,6 +103,7 @@ services:
       MSS_TAP_LOCAL_IP: 172.31.99.30
       MSS_TAP_SECONDS: "120"
       MSS_TAP_OUTPUT: /out/microsip_tap.wav
+      MSS_TAP_DATAGRAM_LOG_DIR: /out
       MSS_CONSUMER_URL: ws://172.31.99.50:8080/ws
       MSS_CONSUMER_ACCOUNT_ID: lab-account
       MSS_CONSUMER_STREAM_SID: MZ-microsip

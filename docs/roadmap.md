@@ -12,7 +12,7 @@ is boringly stable in production).
 | Phase | Name | Retires from FreeSWITCH | Status |
 | --- | --- | --- | --- |
 | — | M1 scaffold | — | ✅ done (2026-08-13) |
-| 0 | Groundwork spike | — (de-risking only) | ⬜ next |
+| 0 | Groundwork spike | — (de-risking only) | 🔶 in progress |
 | 1 | Passive fan-out | `uuid_audio_fork`, `uuid_google_transcribe2` media bugs | ⬜ |
 | 2 | Recording | `record_session` bugs, shared-FS recording pipeline | ⬜ |
 | 3 | Interactive media | dummy leg + conference-per-AI-interaction; mediagateway service | ⬜ |
@@ -29,15 +29,24 @@ code depends on it.
 
 Work:
 - Confirm deployed rtpengine version supports `subscribe request/answer`
-  / `unsubscribe`; establish upgrade path if not.
-- Async NG transport in `mediaserverd` wrapping the sans-IO
+  / `unsubscribe`; establish upgrade path if not. **Open** — 14.1.1.8
+  proven in the lab; the production version is unverified.
+- ✅ Async NG transport in `mediaserverd` wrapping the sans-IO
   `rtpengine-ng` crate (UDP, cookie correlation, timeout/retry).
-- Lab test: subscribe to a live call, receive both legs, run them through
-  `media_core::jitter`, decode G.711, write stereo WAV.
+- ✅ Lab test: subscribe to a live call, receive both legs, run them
+  through `media_core::jitter`, decode G.711, write stereo WAV — done
+  against synthetic calls (2026-08-14) and against a real softphone
+  through OpenSIPS + FreeSWITCH (2026-08-15), with the codec, silence
+  and injection lessons recorded in [lab.md](lab.md).
 - Ingest benchmark: `recvmmsg` batching, packets/sec/core, per-tap CPU on
-  the rtpengine host at 100/500/1000 concurrent taps.
+  the rtpengine host at 100/500/1000 concurrent taps. **Partial** — the
+  WSL2 rough shape is recorded in [testing.md](testing.md) (pipeline
+  244 ns/packet, ~41k taps/core pipeline-only); the socket path and the
+  rtpengine-side delta still need the namespace rig.
 - Decide call→rtpengine-node discovery (recommended: OpenSIPS writes
-  call-id → node + tags to Redis at call setup).
+  call-id → node + tags to Redis at call setup). **Open** — a polling
+  stand-in (`lab/call_watcher.py`) works in the lab; the Redis design
+  needs agreement with the OpenSIPS config owners.
 
 Exit criteria: WAV artifact from a real tapped call; measured per-tap
 cost on both MSS and rtpengine sides; discovery mechanism agreed with the

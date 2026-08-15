@@ -344,29 +344,33 @@ synthetic lab:
   by track. mediagateway only ever sent one track, so this is also the
   wire-compatible behaviour.
 
+## Findings resolved
+
+- **Telephone-event packets are no longer counted as lost audio.** RFC 4733
+  packets consume RTP sequence numbers while carrying no audio, so routing
+  them past the jitter buffer made every DTMF press inflate `jitter_lost`
+  and `frames_concealed` — an IVR-heavy tenant would have looked like a
+  lossy network. The fix landed where the original finding said it
+  belonged: the jitter buffer now *accounts for* a sequence number without
+  carrying audio (`JitterBuffer::account`), playout emits a suppressed
+  silence frame counted as `frames_suppressed`, and `jitter_lost` means
+  loss again. The acceptance test from the impairment matrix — DTMF on a
+  clean link reports **zero** loss, digits still deduped once per press —
+  is `a_dtmf_press_on_a_clean_link_reports_zero_loss` and runs in CI.
+  A clean lab run now shows `jitter_lost: 0`, `frames_concealed: 0`, and
+  `frames_suppressed` equal to the telephone-event packet count.
+
 ## Findings still open
 
-1. **Telephone-event packets are counted as lost audio.** Both legs above
-   report `jitter_lost: 21` and `frames_concealed: 21` — exactly the DTMF
-   packet count. RFC 4733 packets consume RTP sequence numbers, and
-   `StreamPipeline` deliberately routes them to the DTMF detector instead of
-   the jitter buffer, so the buffer sees each one as a missing audio packet.
-   Playing silence for the event is roughly right (endpoints suppress audio
-   during a press), but **counting it as loss is not**: every DTMF press
-   inflates the loss metric, so an IVR-heavy tenant would look like a lossy
-   network and real loss would be hidden in the noise. Article VIII wants
-   these counters truthful. The fix belongs in the jitter buffer — a
-   sequence number can be *accounted for* without carrying audio — and is
-   tracked with the jitter hardening work, not patched around here.
-2. **The `mix` flag is untested.** `SubscribeRequest` supports it and the
+1. **The `mix` flag is untested.** `SubscribeRequest` supports it and the
    architecture proposes it for cheap supervisor listen, but no lab run has
    asked for a mixed mono feed.
-3. **`stop media` cut-through latency is unmeasured.** It is the barge-in
+2. **`stop media` cut-through latency is unmeasured.** It is the barge-in
    primitive for `play media` injection — how fast an utterance stops once
    the caller starts talking decides whether utterance-shaped bot speech
    feels interactive or not. The probe issues `stop media` but does not
    time it.
-4. **Injected audio arrives alongside the peer's, not instead of it.** In
+3. **Injected audio arrives alongside the peer's, not instead of it.** In
    the targeted run the caller received 245 packets, 100 of them the
    injected tone and the rest the callee's silence, so `play media` did not
    block egress. Whether an AI utterance and live caller audio should mix

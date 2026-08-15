@@ -25,12 +25,14 @@ should end up in a `media_core::replay::DatagramLog` and become a test that
 runs in CI forever. Article III's "capture, replay, fix, keep the capture"
 only works if capture is routine.
 
-Today it is not. `tap_spike` writes a WAV and discards the datagrams
-(`crates/mediaserverd/src/tap_spike.rs:226`), so `replay.rs` — the whole
-point of which is replaying real traffic — has a corpus of hand-written
-fixtures only. **The first change this plan asks for is a datagram-log dump
-alongside the WAV**, gated by an env var, so that every lab run since the
-beginning of Phase 0 leaves behind evidence.
+That change landed 2026-08-16: with `MSS_TAP_DATAGRAM_LOG_DIR` set (both
+compose files set it to `/out`), every tap writes `tap-<track>.dglog` in
+the `DatagramLog` length-prefixed format alongside the WAV, bounded and
+truncation-flagged so logging can never become the hot-path problem.
+`captured_datagrams_round_trip_into_the_replay_tier_byte_exact` proves a
+capture replays byte-for-byte. Every lab run now leaves behind evidence;
+the remaining habit is promoting interesting captures into committed
+fixtures.
 
 ## The split: WSL2 for behavior, a quiet box for the number
 
@@ -207,7 +209,7 @@ different things:
 | Reorder beyond buffer depth | `delay 120ms 60ms reorder 25% 50%` | Counted as late, not as loss — the counter partition must be exhaustive and non-overlapping |
 | Duplication | `duplicate 1%` | Deduped; total sample count unchanged |
 | Jitter, no loss | `delay 20ms 15ms distribution normal` | Zero loss; underruns bounded; pacer deadline misses stay inside budget |
-| **DTMF on a clean link** | none | **Zero reported loss.** This is the acceptance test for the open telephone-event miscounting finding |
+| **DTMF on a clean link** | none | **Zero reported loss.** ✅ closed 2026-08-16: events are accounted, not lost (`a_dtmf_press_on_a_clean_link_reports_zero_loss` in CI; lab run shows `jitter_lost: 0`, `frames_suppressed` = event count) |
 | DTMF under loss | `loss 2%` + repeating digits | Digits still deduped once per press; loss count excludes telephone-event sequence numbers |
 
 Every run in this matrix should dump its datagram log. The interesting ones
@@ -321,10 +323,25 @@ folds in fixed overhead and flatters the result.
 
 | Criterion (roadmap M2) | Where it comes from | Status |
 | --- | --- | --- |
-| WAV artifact from a real tapped call | Existing docker lab | ✅ done 2026-08-14 |
-| Measured per-tap cost, MSS side | `mss` namespace, slope across steps | ⬜ |
+| WAV artifact from a real tapped call | Existing docker lab | ✅ done 2026-08-14; a real-softphone call via OpenSIPS 2026-08-15 |
+| Measured per-tap cost, MSS side | `mss` namespace, slope across steps | 🔶 WSL2 rough shape 2026-08-16, see below |
 | Measured per-tap cost, rtpengine side | `rtpe` namespace, delta vs step 0 | ⬜ |
-| Discovery mechanism agreed | Organizational — OpenSIPS config owners | ⬜ |
+| Discovery mechanism agreed | Organizational — OpenSIPS config owners | ⬜ prototyped in the lab (`call_watcher.py` polls rtpengine; the real design stays OpenSIPS → Redis) |
+
+### The WSL2 rough shape, recorded
+
+Criterion on this box, 2026-08-16 (`cargo bench -p media-core`): the full
+per-packet pipeline — RTP parse, jitter admission, pop, G.711 decode —
+costs **244 ns/packet** (`parse_jitter_decode_per_packet`); admission alone
+is 18 ns, so decode dominates. A two-leg tap is 100 packets/s, so pipeline
+work is ~24 µs of CPU per tap-second: a **pipeline-only ceiling around
+41,000 taps/core**. That number deliberately excludes the syscall path
+(`recvmmsg` batching is unbuilt), consumer encodes, and everything
+rtpengine-side — but by this plan's own escalation rule the margin is so
+far past "800 taps/core" that the metal box stays unprovisioned until the
+socket-path measurement or the rtpengine-side delta says otherwise. What
+still genuinely needs the namespace rig: the rtpengine-side per-tap delta
+and receive-path behavior at 500–1000 real sockets.
 
 ## What each phase needs
 
