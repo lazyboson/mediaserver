@@ -158,6 +158,35 @@ ffmpeg-decodable blob) or an inline leg (continuous stream), with nothing
 in between. An AI agent can speak into a tapped call today, one utterance
 at a time; streaming TTS with barge-in still needs Phase 3.
 
+## The whole loop, closed in the lab
+
+`lab/mock_bridge.py` stands in for stream-llm-bridge: a stdlib-only
+WebSocket server that speaks the frozen Twilio dialect, logs what MSS sends
+it, and every five seconds answers with an utterance (fifty `media` frames
+then a `mark`). `docker compose up` now runs it alongside the call, so one
+command exercises the full path.
+
+A 15s run:
+
+| Leg of the loop | Measured |
+| --- | --- |
+| tap → bridge | 1490 media frames (746 per leg), 8 dtmf events, **0 dropped** |
+| bridge → MSS | 150 inbound frames, 0 undecodable, assembled into 3 utterances |
+| MSS → call | 3 `play media` calls accepted, targeted at `tagA` |
+| caller's ear | three 660 Hz bursts, 5s apart |
+| callee's ear | nothing |
+
+So an AI agent can hear a tapped call and speak back into it today, with
+no inline leg and no FreeSWITCH conference.
+
+**A tap carries what a party sends, not what it hears.** The injected tone
+appears nowhere in `tap.wav`, which is not a fault: `play media` toward
+`tagA` reaches the caller's *ear*, while the tap of `tagA` carries the
+caller's *source*. This is why `call_driver.py` now records each endpoint's
+received audio to `out/caller_ear.wav` and `out/callee_ear.wav` — injection
+is only observable there. It also means **bot speech never echoes back into
+the ASR feed**, which is a property worth keeping.
+
 ## Findings still open
 
 1. **Telephone-event packets are counted as lost audio.** Both legs above
