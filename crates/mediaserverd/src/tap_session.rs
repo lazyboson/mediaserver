@@ -27,6 +27,7 @@ const CONSUMER_URL_ENV: &str = "MSS_CONSUMER_URL";
 const CONSUMER_ACCOUNT_ENV: &str = "MSS_CONSUMER_ACCOUNT_ID";
 const CONSUMER_STREAM_SID_ENV: &str = "MSS_CONSUMER_STREAM_SID";
 const INJECT_TARGET_ENV: &str = "MSS_INJECT_TARGET";
+const CONSUMER_TRACKS_ENV: &str = "MSS_CONSUMER_TRACKS";
 
 const DEFAULT_OUTPUT: &str = "tap.wav";
 const DEFAULT_SECONDS: u64 = 30;
@@ -35,6 +36,7 @@ const TARGET_DEPTH_PACKETS: u16 = 3;
 const MAX_TAPPED_STREAMS: usize = 2;
 const CONSUMER_QUEUE_FRAMES: usize = 200;
 const INJECT_EVERYONE: &str = "everyone";
+const CONSUMER_BOTH_TRACKS: &str = "both";
 const BLOB_SAMPLES_PER_DATAGRAM: usize = 24_000;
 
 #[derive(Debug, Error)]
@@ -141,7 +143,8 @@ pub async fn run(request: TapSpikeRequest, cookie_prefix: u64) -> Result<(), Tap
         call_id: request.call_id.clone(),
         from_tags: request.from_tags.clone(),
         mix: false,
-        accept_codecs: vec![request.format.encoding.rtpmap_name().to_string()],
+        accept_codecs: Vec::new(),
+        transcode_codecs: vec![request.format.encoding.rtpmap_name().to_string()],
         label: Some("mss-tap".to_string()),
     };
     info!(
@@ -213,11 +216,13 @@ pub async fn run(request: TapSpikeRequest, cookie_prefix: u64) -> Result<(), Tap
             telephone_event_payload_type,
             request.duration,
         )?;
-        legs.push(if consumer.is_some() {
-            leg.with_consumer(sink.clone())
-        } else {
-            leg
-        });
+        legs.push(
+            if consumer.is_some() && streams_to_consumer(track_for_stream(index)) {
+                leg.with_consumer(sink.clone())
+            } else {
+                leg
+            },
+        );
     }
     drop(sink);
 
@@ -352,10 +357,20 @@ fn consumer_config_from_env(request: &TapSpikeRequest) -> Option<ConsumerConfig>
         stream_sid,
         format: request.format,
         tracks: (0..request.from_tags.len().max(1))
-            .map(|index| consumer_ws::track_name(track_for_stream(index)).to_string())
+            .map(track_for_stream)
+            .filter(|track| streams_to_consumer(*track))
+            .map(|track| consumer_ws::track_name(track).to_string())
             .collect(),
         custom_parameters: HashMap::new(),
     })
+}
+
+fn streams_to_consumer(track: Track) -> bool {
+    consumer_wants_both_tracks() || track == Track::Customer
+}
+
+fn consumer_wants_both_tracks() -> bool {
+    std::env::var(CONSUMER_TRACKS_ENV).unwrap_or_default() == CONSUMER_BOTH_TRACKS
 }
 
 fn inject_target(request: &TapSpikeRequest) -> PlayTarget {
@@ -400,6 +415,7 @@ async fn inject_bridge_speech(
                         target: target.clone(),
                         source: PlaySource::Blob(blob),
                         repeat_times: None,
+                        block_egress: true,
                     };
                     match transport.play_media(&play).await {
                         Ok(_) => {

@@ -39,14 +39,24 @@ pub enum Playout<'a> {
 pub struct PipelineStats {
     pub unparsable: u64,
     pub unknown_payload_type: u64,
+    pub companded: u64,
     pub telephone_events: u64,
     pub dtmf_digits: u64,
     pub frames_played: u64,
     pub frames_concealed: u64,
 }
 
+fn companion_payload_type(encoding: Encoding) -> Option<u8> {
+    match encoding {
+        Encoding::Pcmu => Encoding::Pcma.static_payload_type(),
+        Encoding::Pcma => Encoding::Pcmu.static_payload_type(),
+        _ => None,
+    }
+}
+
 pub struct StreamPipeline {
     audio_payload_type: u8,
+    companding_payload_type: Option<u8>,
     telephone_event_payload_type: Option<u8>,
     ulaw: bool,
     samples_per_packet: usize,
@@ -83,6 +93,7 @@ impl StreamPipeline {
         }
         Ok(StreamPipeline {
             audio_payload_type,
+            companding_payload_type: companion_payload_type(format.encoding),
             telephone_event_payload_type,
             ulaw,
             samples_per_packet,
@@ -120,11 +131,26 @@ impl StreamPipeline {
                 None => IngestOutcome::TelephoneEvent,
             };
         }
-        if packet.payload_type != self.audio_payload_type {
+        let mut companded = [0u8; MAX_PAYLOAD];
+        let payload = if packet.payload_type == self.audio_payload_type {
+            packet.payload
+        } else if Some(packet.payload_type) == self.companding_payload_type
+            && packet.payload.len() <= MAX_PAYLOAD
+        {
+            for (out, byte) in companded.iter_mut().zip(packet.payload) {
+                *out = if self.ulaw {
+                    g711::linear_to_ulaw(g711::alaw_to_linear(*byte))
+                } else {
+                    g711::linear_to_alaw(g711::ulaw_to_linear(*byte))
+                };
+            }
+            self.stats.companded += 1;
+            &companded[..packet.payload.len()]
+        } else {
             self.stats.unknown_payload_type += 1;
             return IngestOutcome::UnknownPayloadType(packet.payload_type);
-        }
-        match self.jitter.push(packet.sequence, packet.payload) {
+        };
+        match self.jitter.push(packet.sequence, payload) {
             PushOutcome::Buffered => IngestOutcome::Buffered,
             PushOutcome::Duplicate => IngestOutcome::Duplicate,
             PushOutcome::TooLate => IngestOutcome::TooLate,
@@ -172,6 +198,51 @@ mod tests {
 
     fn generator() -> G711StreamGenerator {
         G711StreamGenerator::new(AudioFormat::pcmu_8k_20ms(), 0xFEED, 1000).unwrap()
+    }
+
+    #[test]
+    fn an_alaw_packet_on_a_pcmu_tap_is_companded_not_discarded() {
+        let mut pipeline = pipeline();
+        let mut stream = G711StreamGenerator::new(AudioFormat::pcmu_8k_20ms(), 7, 0).unwrap();
+        let loud = g711::linear_to_alaw(8000);
+        for _ in 0..4 {
+            let mut datagram = stream.next_datagram();
+            datagram[1] = Encoding::Pcma.static_payload_type().unwrap();
+            for byte in datagram[12..].iter_mut() {
+                *byte = loud;
+            }
+            assert_eq!(pipeline.ingest(&datagram), IngestOutcome::Buffered);
+        }
+        assert_eq!(pipeline.stats().companded, 4);
+        assert_eq!(pipeline.stats().unknown_payload_type, 0);
+
+        let mut played = None;
+        for _ in 0..8 {
+            if let Playout::Pcm(pcm) = pipeline.release() {
+                played = Some(pcm[0]);
+                break;
+            }
+        }
+        let heard = played.expect("the companded packet should reach playout");
+        assert!(
+            (heard - 8000).abs() < 600,
+            "decoded {heard}, too far from 8000 for two companding steps"
+        );
+    }
+
+    #[test]
+    fn a_payload_type_that_is_neither_g711_variant_is_still_unknown() {
+        let mut pipeline = pipeline();
+        let mut stream = G711StreamGenerator::new(AudioFormat::pcmu_8k_20ms(), 7, 0).unwrap();
+        let mut datagram = stream.next_datagram();
+        datagram[1] = 96;
+
+        assert_eq!(
+            pipeline.ingest(&datagram),
+            IngestOutcome::UnknownPayloadType(96)
+        );
+        assert_eq!(pipeline.stats().companded, 0);
+        assert_eq!(pipeline.stats().unknown_payload_type, 1);
     }
 
     #[test]

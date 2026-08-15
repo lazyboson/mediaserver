@@ -152,18 +152,34 @@ def write_ear(leg):
 
     A tap carries what a party sends, so audio played into the call for this
     party is only observable here, at its ear.
+
+    Injected audio arrives as its OWN synchronisation source alongside the
+    peer's, so payloads must be separated by ssrc and placed by rtp timestamp.
+    Concatenating whatever turns up interleaves two streams into one buffer and
+    turns intelligible speech into gibberish.
     """
     import wave
 
-    path = os.path.join(EAR_DIR, f"{leg['name'].split('/')[0]}_ear.wav")
-    with wave.open(path, "wb") as out:
-        out.setnchannels(1)
-        out.setsampwidth(2)
-        out.setframerate(8000)
-        out.writeframes(b"".join(
-            struct.pack("<h", ulaw_to_linear(byte)) for byte in leg["heard"]
-        ))
-    log(f"wrote {path} ({len(leg['heard']) / 8000:.2f}s of what {leg['name']} heard)")
+    name = leg["name"].split("/")[0]
+    for ssrc, packets in sorted(leg["heard"].items()):
+        base = packets[0][0]
+        span = max(ts - base + len(payload) for ts, payload in packets)
+        track = bytearray([0xFF]) * span
+        for ts, payload in packets:
+            at = ts - base
+            track[at:at + len(payload)] = payload
+        voiced = sum(1 for byte in track if byte != 0xFF)
+        suffix = "" if len(leg["heard"]) == 1 else f"_{ssrc:08x}"
+        path = os.path.join(EAR_DIR, f"{name}_ear{suffix}.wav")
+        with wave.open(path, "wb") as out:
+            out.setnchannels(1)
+            out.setsampwidth(2)
+            out.setframerate(8000)
+            out.writeframes(b"".join(struct.pack("<h", ulaw_to_linear(b)) for b in track))
+        log(f"wrote {path}: ssrc {ssrc:08x}, {len(packets)} packets, "
+            f"{span / 8000:.2f}s, {voiced} non-silent bytes")
+    if not leg["heard"]:
+        log(f"{leg['name']} heard nothing at all")
 
 
 def pump(caller_dest, callee_dest, stop):
@@ -177,10 +193,10 @@ def pump(caller_dest, callee_dest, stop):
     legs = [
         {"name": "caller/tagA", "sock": caller, "dest": caller_dest, "seq": 1000,
          "ts": 0, "ssrc": 0x11111111, "byte": 0, "digit": CALLER_DIGIT,
-         "heard": bytearray()},
+         "heard": {}},
         {"name": "callee/tagB", "sock": callee, "dest": callee_dest, "seq": 9000,
          "ts": 0, "ssrc": 0x22222222, "byte": 128, "digit": CALLEE_DIGIT,
-         "heard": bytearray()},
+         "heard": {}},
     ]
     sent = 0
     next_digits_at = time.monotonic() + DIGIT_AFTER_SECONDS
@@ -205,7 +221,8 @@ def pump(caller_dest, callee_dest, stop):
                 except (BlockingIOError, OSError):
                     break
                 if len(datagram) > 12 and datagram[1] & 0x7F == PCMU_PAYLOAD_TYPE:
-                    leg["heard"] += datagram[12:]
+                    timestamp, ssrc = struct.unpack("!II", datagram[4:12])
+                    leg["heard"].setdefault(ssrc, []).append((timestamp, datagram[12:]))
         time.sleep(0.02)
     log(f"pumped {sent} rtp packets")
     if EAR_DIR:
