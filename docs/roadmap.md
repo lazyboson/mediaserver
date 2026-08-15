@@ -13,7 +13,7 @@ is boringly stable in production).
 | --- | --- | --- | --- |
 | — | M1 scaffold | — | ✅ done (2026-08-13) |
 | 0 | Groundwork spike | — (de-risking only) | 🔶 in progress |
-| 1 | Passive fan-out | `uuid_audio_fork`, `uuid_google_transcribe2` media bugs | ⬜ |
+| 1 | Passive fan-out | `uuid_audio_fork`, `uuid_google_transcribe2` media bugs | 🔶 hub core landed |
 | 2 | Recording | `record_session` bugs, shared-FS recording pipeline | ⬜ |
 | 3 | Interactive media | dummy leg + conference-per-AI-interaction; the legacy media gateway service | ⬜ |
 | 4 | Full media plane | conference mixing, monitor/whisper (`relate nospeak`), MOH | ⬜ |
@@ -58,7 +58,9 @@ Objective: every listen-only consumer stops touching FreeSWITCH.
 
 Work:
 - Fan-out hub: per-session pub/sub, N consumers, attach/detach mid-call,
-  per-consumer bounded queues with drop-oldest + metrics.
+  per-consumer bounded queues with drop-oldest + metrics. **Core landed**
+  (`crates/mediaserverd/src/hub.rs`) with the WS consumer ported onto it;
+  metrics are counters surfaced in logs, not yet exported.
 - Codec pipeline: G.711 → L16 → resample (8k/16k) → per-consumer encode;
   Opus via `audiopus` when a consumer needs it.
 - Consumer adapters: WebSocket Twilio dialect first (wire-compatible with

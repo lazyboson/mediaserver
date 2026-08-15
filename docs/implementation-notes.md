@@ -205,16 +205,39 @@ the DTMF detector and the G.711 decode, and allocates nothing per packet
 
 ## crates/mediaserverd
 
+### hub.rs — the fan-out core (M3), first increment
+The per-session pub/sub the roadmap calls the fan-out hub. Two-worlds
+shape: the capture thread owns the consumer list and is the only thing
+that touches it; attach/detach arrive over a bounded lock-free command
+queue (`crossbeam` `ArrayQueue`) polled once per tick, so the media world
+never takes a lock and never waits on the control world.
+- Each consumer gets its own bounded frame ring with **drop-oldest**
+  semantics (`ArrayQueue::force_push`) — a slow consumer loses its own
+  oldest frames, never anyone else's, and every displaced frame increments
+  a per-consumer `dropped_oldest` counter (Article VIII: drops are
+  first-class, never silent). `delivered` counts what actually queued.
+- `TrackSelection` filters at the hub, so a Customer-only consumer costs
+  nothing on the Agent leg. The single-track default and
+  `MSS_CONSUMER_TRACKS=both` behavior carried over unchanged.
+- `Subscription::next()` is async and cancel-safe (pop-then-wait against a
+  `Notify`; a permit stored by a racing publish is consumed on the next
+  poll). Hub drop or detach closes the subscription: `next()` drains what
+  is queued, then returns `None`, which is what tells the WS consumer to
+  send `stop`.
+- Attach is command-queue-bounded; a full queue refuses the attach rather
+  than blocking anyone. `crossbeam-queue` is the one new dependency
+  (Article XI: adopted lock-free structure, not hand-rolled).
+- Still to come in M3: per-consumer codec/resample pipelines (G.711 →
+  L16 → 8k/16k), the gRPC `MediaStream` adapter, and hub metrics exported
+  rather than logged.
+
 ### consumer_ws.rs — the first consumer bridge, and the speech path back
 - WebSocket client speaking the frozen Twilio dialect from
   `protocol::twilio`, so a the legacy media gateway-compatible endpoint accepts it
   unchanged. `MSS_CONSUMER_URL` turns it on; without it the tap behaves
-  exactly as before.
-- The media thread never blocks on it. `ConsumerSink::offer_*` encodes the
-  released frame to mu-law into a fixed `[u8; MAX_FRAME_BYTES]` (no
-  allocation, hence `clippy::large_enum_variant` is allowed on `TapEvent`)
-  and `try_send`s it. A full queue increments a counter that is reported as
-  `media_dropped` — never a silent drop, which was the legacy media gateway defect 4.
+  exactly as before. Since the hub landed it is just another subscriber:
+  it consumes a `hub::Subscription` and reports the hub's per-consumer
+  `dropped_oldest` as `media_dropped`.
 - Inbound audio accumulates until the utterance ends, then goes out as
   `BridgeCommand::Speak`; `clear` discards the buffer and raises
   `BridgeCommand::Barge`. `tap_session::inject_bridge_speech` wraps the
