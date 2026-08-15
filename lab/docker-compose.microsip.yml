@@ -66,9 +66,47 @@ services:
       DEEPGRAM_API_KEY: ${DEEPGRAM_API_KEY:?deepgram is what turns your speech into the echo}
       DEEPGRAM_MODEL: ${DEEPGRAM_MODEL:-nova-3}
       WELCOME_MESSAGE: ${WELCOME_MESSAGE:-Hello, I am listening. Say something and I will repeat it.}
+      AZURE_API_KEY: ${AZURE_API_KEY:-}
+      AZURE_ENDPOINT: ${AZURE_ENDPOINT:-}
+      AZURE_DEPLOYMENT: ${AZURE_DEPLOYMENT:-}
+      AZURE_API_VERSION: ${AZURE_API_VERSION:-}
+      AZURE_SYSTEM_PROMPT: ${AZURE_SYSTEM_PROMPT:-}
     networks:
       lab:
         ipv4_address: 172.31.99.50
+
+  # Consumer 2: real-time transcription. Same fan-out feed, its own Deepgram
+  # stream per track, transcripts appended to out/transcript-<callSid>.txt.
+  rtt-service:
+    image: python:3-slim
+    volumes:
+      - ./rtt_service.py:/rtt_service.py:ro
+      - ./out:/out
+    command: ["python3", "/rtt_service.py"]
+    environment:
+      RTT_PORT: "8091"
+      OUT_DIR: /out
+      DEEPGRAM_API_KEY: ${DEEPGRAM_API_KEY:-}
+      DEEPGRAM_MODEL: ${DEEPGRAM_MODEL:-nova-3}
+    networks:
+      lab:
+        ipv4_address: 172.31.99.100
+
+  # Consumer 3: recording. Writes out/recording-<callSid>.wav, customer left,
+  # agent right, the same channel convention the tap artifact uses.
+  recorder-service:
+    image: python:3-slim
+    volumes:
+      - ./recorder_service.py:/recorder_service.py:ro
+      - ./out:/out
+    command: ["python3", "/recorder_service.py"]
+    environment:
+      RECORDER_PORT: "8090"
+      OUT_DIR: /out
+      RIGHT_TRACK: mixed
+    networks:
+      lab:
+        ipv4_address: 172.31.99.110
 
   call-watcher:
     image: python:3-slim
@@ -87,7 +125,7 @@ services:
     image: rust:1.95-slim-bookworm
     working_dir: /build
     command: ["/lab/tap_live_call.sh"]
-    depends_on: [opensips, freeswitch, llm-bridge, call-watcher]
+    depends_on: [opensips, freeswitch, llm-bridge, call-watcher, rtt-service, recorder-service]
     volumes:
       - ..:/build:ro
       - ./tap_live_call.sh:/lab/tap_live_call.sh:ro
@@ -101,12 +139,13 @@ services:
       RUST_LOG: info
       MSS_RTPENGINE_NODE: 172.31.99.10:22222
       MSS_TAP_LOCAL_IP: 172.31.99.30
-      MSS_TAP_SECONDS: "120"
+      MSS_TAP_SECONDS: "900"
       MSS_TAP_OUTPUT: /out/microsip_tap.wav
       MSS_TAP_DATAGRAM_LOG_DIR: /out
       MSS_CONSUMER_URL: ws://172.31.99.50:8080/ws
       MSS_CONSUMER_ACCOUNT_ID: lab-account
       MSS_CONSUMER_STREAM_SID: MZ-microsip
+      MSS_LISTENERS: rtt=ws://172.31.99.100:8091/ws,recorder=ws://172.31.99.110:8090/ws
     networks:
       lab:
         ipv4_address: 172.31.99.30

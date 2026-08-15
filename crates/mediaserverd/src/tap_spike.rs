@@ -254,6 +254,11 @@ pub fn capture(
             for leg in legs.iter_mut() {
                 leg.release_frame(hub.as_deref_mut());
             }
+            if let Some(hub) = hub.as_deref_mut() {
+                if let Some(samples) = format.samples_per_packet() {
+                    hub.release_injected(samples as usize, format.ptime_ms.max(1) as u64);
+                }
+            }
             releases += 1;
             next_release += ptime;
             let now = Instant::now();

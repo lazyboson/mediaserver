@@ -1,5 +1,5 @@
 use crate::consumer_ws::{self, BridgeCommand, ConsumerConfig};
-use crate::hub::{Hub, TrackSelection};
+use crate::hub::{Hub, HubClient, TrackSelection};
 use crate::ng_transport::{NgTransport, NgTransportConfig, TransportError};
 use crate::tap_spike::{capture, wav_blob, write_wav, SpikeError, TapLeg};
 use media_core::{AudioFormat, Track};
@@ -30,6 +30,7 @@ const CONSUMER_STREAM_SID_ENV: &str = "MSS_CONSUMER_STREAM_SID";
 const INJECT_TARGET_ENV: &str = "MSS_INJECT_TARGET";
 const CONSUMER_TRACKS_ENV: &str = "MSS_CONSUMER_TRACKS";
 const DATAGRAM_LOG_DIR_ENV: &str = "MSS_TAP_DATAGRAM_LOG_DIR";
+const LISTENERS_ENV: &str = "MSS_LISTENERS";
 
 const DEFAULT_OUTPUT: &str = "tap.wav";
 const DEFAULT_SECONDS: u64 = 30;
@@ -227,6 +228,22 @@ pub async fn run(request: TapSpikeRequest, cookie_prefix: u64) -> Result<(), Tap
         legs.push(leg);
     }
 
+    let mut listener_tasks = Vec::new();
+    for (name, config) in listener_configs(&request) {
+        match hub_client.attach(CONSUMER_QUEUE_FRAMES, TrackSelection::All) {
+            Some(subscription) => {
+                info!(listener = %name, url = %config.url, "attaching a listen-only consumer");
+                listener_tasks.push((
+                    name,
+                    tokio::spawn(consumer_ws::run(config, subscription, None)),
+                ));
+            }
+            None => {
+                warn!(listener = %name, "the hub refused this listener; it will not receive audio")
+            }
+        }
+    }
+
     let mut consumer_task = None;
     let mut injection_task = None;
     if let Some(config) = consumer {
@@ -240,6 +257,7 @@ pub async fn run(request: TapSpikeRequest, cookie_prefix: u64) -> Result<(), Tap
                 );
                 injection_task = Some(tokio::spawn(inject_bridge_speech(
                     Arc::clone(&transport),
+                    hub_client.clone(),
                     request.call_id.clone(),
                     inject_target(&request),
                     request.format,
@@ -363,6 +381,19 @@ pub async fn run(request: TapSpikeRequest, cookie_prefix: u64) -> Result<(), Tap
             Err(_) => warn!("the consumer bridge task was lost"),
         }
     }
+    for (name, task) in listener_tasks {
+        match task.await {
+            Ok(Ok(stats)) => info!(
+                listener = %name,
+                media_sent = stats.media_sent,
+                dtmf_sent = stats.dtmf_sent,
+                media_dropped = stats.media_dropped,
+                "listener finished"
+            ),
+            Ok(Err(error)) => warn!(listener = %name, %error, "listener failed"),
+            Err(_) => warn!(listener = %name, "listener task was lost"),
+        }
+    }
     if let Some(task) = injection_task {
         match task.await {
             Ok(played) => info!(
@@ -395,6 +426,33 @@ fn consumer_config_from_env(request: &TapSpikeRequest) -> Option<ConsumerConfig>
     })
 }
 
+fn listener_configs(request: &TapSpikeRequest) -> Vec<(String, ConsumerConfig)> {
+    let account_id =
+        std::env::var(CONSUMER_ACCOUNT_ENV).unwrap_or_else(|_| DEFAULT_ACCOUNT_ID.to_string());
+    std::env::var(LISTENERS_ENV)
+        .unwrap_or_default()
+        .split(',')
+        .filter_map(|entry| entry.trim().split_once('='))
+        .filter(|(name, url)| !name.trim().is_empty() && !url.trim().is_empty())
+        .map(|(name, url)| {
+            let name = name.trim().to_string();
+            let config = ConsumerConfig {
+                url: url.trim().to_string(),
+                account_id: account_id.clone(),
+                call_sid: request.call_id.clone(),
+                stream_sid: format!("MZ-{name}"),
+                format: request.format,
+                tracks: vec![
+                    consumer_ws::track_name(Track::Customer).to_string(),
+                    consumer_ws::track_name(Track::Agent).to_string(),
+                ],
+                custom_parameters: HashMap::new(),
+            };
+            (name, config)
+        })
+        .collect()
+}
+
 fn consumer_selection() -> TrackSelection {
     if std::env::var(CONSUMER_TRACKS_ENV).unwrap_or_default() == CONSUMER_BOTH_TRACKS {
         TrackSelection::All
@@ -420,6 +478,7 @@ fn inject_target(request: &TapSpikeRequest) -> PlayTarget {
 
 async fn inject_bridge_speech(
     transport: Arc<NgTransport>,
+    hub_client: HubClient,
     call_id: String,
     target: PlayTarget,
     format: AudioFormat,
@@ -462,6 +521,9 @@ async fn inject_bridge_speech(
                     match transport.play_media(&play).await {
                         Ok(_) => {
                             played += 1;
+                            if !hub_client.inject(piece.to_vec()) {
+                                warn!("injected-audio queue full; this piece is missing from recordings");
+                            }
                             info!(
                                 samples = piece.len(),
                                 ?target,
@@ -544,6 +606,39 @@ mod tests {
     fn streams_map_to_customer_then_agent() {
         assert_eq!(track_for_stream(0), Track::Customer);
         assert_eq!(track_for_stream(1), Track::Agent);
+    }
+
+    #[test]
+    fn listeners_are_parsed_as_name_equals_url_pairs() {
+        let sep = "\x2f\x2f";
+        std::env::set_var(
+            LISTENERS_ENV,
+            format!(" rtt=ws:{sep}10.0.0.1:9090{slash}ws , recorder=ws:{sep}10.0.0.2:9091{slash}ws ,,broken, ", slash = "\x2f"),
+        );
+        let request = TapSpikeRequest {
+            node: "127.0.0.1:22222".parse().unwrap(),
+            call_id: "call-7".into(),
+            from_tags: vec!["a".into(), "b".into()],
+            local_media_address: "127.0.0.1".parse().unwrap(),
+            output: PathBuf::from("out.wav"),
+            duration: Duration::from_secs(1),
+            sdp_session_id: 1,
+            format: AudioFormat::pcmu_8k_20ms(),
+        };
+
+        let listeners = listener_configs(&request);
+        std::env::remove_var(LISTENERS_ENV);
+
+        assert_eq!(listeners.len(), 2);
+        assert_eq!(listeners[0].0, "rtt");
+        assert_eq!(
+            listeners[0].1.url,
+            format!("ws:{sep}10.0.0.1:9090{slash}ws", slash = "\x2f")
+        );
+        assert_eq!(listeners[0].1.stream_sid, "MZ-rtt");
+        assert_eq!(listeners[0].1.call_sid, "call-7");
+        assert_eq!(listeners[0].1.tracks, vec!["inbound", "outbound"]);
+        assert_eq!(listeners[1].0, "recorder");
     }
 
     #[test]
