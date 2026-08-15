@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 mod consumer_ws;
+mod hub;
 mod media_rt;
 mod ng_transport;
 #[allow(dead_code)]
