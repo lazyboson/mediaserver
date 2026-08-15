@@ -179,6 +179,16 @@ A 15s run:
 So an AI agent can hear a tapped call and speak back into it today, with
 no inline leg and no FreeSWITCH conference.
 
+**Human-confirmed 2026-08-16**: a MicroSIP caller held a live multi-turn
+conversation with the echo bot — "What is your name?", "I guess I am
+Ashutosh", "How are you?" — each sentence transcribed verbatim and the
+reply heard on the phone. The one failed session along the way was
+diagnosed from `tap-customer.dglog` alone: the raw A-law bytes were
+near-zero codes, proving a muted-microphone problem at the phone before
+anyone blamed the pipeline. That is the datagram log paying for itself,
+and the bridge in the softphone compose now logs at debug so Deepgram's
+`Speech started` events are visible during live tests.
+
 **A tap carries what a party sends, not what it hears.** The injected tone
 appears nowhere in `tap.wav`, which is not a fault: `play media` toward
 `tagA` reaches the caller's *ear*, while the tap of `tagA` carries the
