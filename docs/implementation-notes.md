@@ -227,6 +227,19 @@ never takes a lock and never waits on the control world.
 - Attach is command-queue-bounded; a full queue refuses the attach rather
   than blocking anyone. `crossbeam-queue` is the one new dependency
   (Article XI: adopted lock-free structure, not hand-rolled).
+- **Injected bot speech is a hub track.** rtpengine cannot tap the media
+  player (measured: an `egress` subscription mirrors the peer stream but
+  not the player), so the injection path publishes the exact PCM it hands
+  rtpengine. `HubClient::inject` queues an utterance; the capture loop
+  releases it one ptime frame per tick as `Track::Mixed`, with the frame
+  clock advancing every tick whether or not audio is pending, so timestamps
+  are wall-aligned and a recorder placing frames by timestamp gets both
+  sides of the conversation in real time. Consumers opt in by track:
+  the ASR-feeding bridge subscription stays Customer-only, which is also
+  what keeps bot speech out of its own transcription loop.
+- `MSS_LISTENERS=name=url,name=url` attaches N listen-only Twilio-dialect
+  consumers per tap; the lab wires an RTT service and a recorder this way
+  alongside the interactive bridge.
 - Still to come in M3: per-consumer codec/resample pipelines (G.711 →
   L16 → 8k/16k), the gRPC `MediaStream` adapter, and hub metrics exported
   rather than logged.

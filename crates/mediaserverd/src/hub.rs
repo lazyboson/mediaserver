@@ -6,6 +6,7 @@ use tokio::sync::Notify;
 
 pub const MAX_FRAME_BYTES: usize = 320;
 const COMMAND_CAPACITY: usize = 64;
+const INJECTED_CAPACITY: usize = 16;
 
 #[derive(Clone, Copy)]
 #[allow(clippy::large_enum_variant)]
@@ -86,20 +87,28 @@ enum HubCommand {
 pub struct Hub {
     consumers: Vec<Consumer>,
     commands: Arc<ArrayQueue<HubCommand>>,
+    injected: Arc<ArrayQueue<Vec<i16>>>,
+    injecting: Option<(Vec<i16>, usize)>,
+    injected_frames: u64,
     published: u64,
 }
 
 impl Hub {
     pub fn new() -> (Hub, HubClient) {
         let commands = Arc::new(ArrayQueue::new(COMMAND_CAPACITY));
+        let injected = Arc::new(ArrayQueue::new(INJECTED_CAPACITY));
         (
             Hub {
                 consumers: Vec::new(),
                 commands: Arc::clone(&commands),
+                injected: Arc::clone(&injected),
+                injecting: None,
+                injected_frames: 0,
                 published: 0,
             },
             HubClient {
                 commands,
+                injected,
                 next_id: Arc::new(AtomicU64::new(1)),
             },
         )
@@ -138,6 +147,24 @@ impl Hub {
         }
     }
 
+    pub fn release_injected(&mut self, samples_per_frame: usize, ptime_ms: u64) {
+        let timestamp_ms = self.injected_frames * ptime_ms;
+        self.injected_frames += 1;
+        if self.injecting.is_none() {
+            self.injecting = self.injected.pop().map(|pcm| (pcm, 0));
+        }
+        let Some((pcm, at)) = self.injecting.as_mut() else {
+            return;
+        };
+        let end = (*at + samples_per_frame.max(1)).min(pcm.len());
+        let event = TapEvent::media(Track::Mixed, timestamp_ms, &pcm[*at..end], true);
+        *at = end;
+        if *at >= pcm.len() {
+            self.injecting = None;
+        }
+        self.publish(event);
+    }
+
     pub fn published(&self) -> u64 {
         self.published
     }
@@ -159,10 +186,15 @@ impl Drop for Hub {
 #[derive(Clone)]
 pub struct HubClient {
     commands: Arc<ArrayQueue<HubCommand>>,
+    injected: Arc<ArrayQueue<Vec<i16>>>,
     next_id: Arc<AtomicU64>,
 }
 
 impl HubClient {
+    pub fn inject(&self, pcm: Vec<i16>) -> bool {
+        self.injected.push(pcm).is_ok()
+    }
+
     pub fn attach(&self, capacity: usize, selection: TrackSelection) -> Option<Subscription> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let shared = Arc::new(Shared {
@@ -316,6 +348,43 @@ mod tests {
         assert_eq!(hub.consumer_count(), 0);
         hub.publish(frame(Track::Customer, 40));
         assert_eq!(hub.published(), 3);
+    }
+
+    #[test]
+    fn injected_audio_is_paced_out_as_the_mixed_track() {
+        let (mut hub, client) = Hub::new();
+        let mut listener = client.attach(16, TrackSelection::All).unwrap();
+        let mut bot_only = client
+            .attach(16, TrackSelection::Only(Track::Mixed))
+            .unwrap();
+        hub.poll_commands();
+
+        hub.release_injected(160, 20);
+        assert!(client.inject(vec![100i16; 400]));
+        for _ in 0..4 {
+            hub.release_injected(160, 20);
+        }
+
+        let mut sizes = Vec::new();
+        let mut stamps = Vec::new();
+        while let Some(event) = bot_only.try_next() {
+            match event {
+                TapEvent::Media {
+                    track,
+                    timestamp_ms,
+                    len,
+                    ..
+                } => {
+                    assert_eq!(track, Track::Mixed);
+                    stamps.push(timestamp_ms);
+                    sizes.push(len);
+                }
+                TapEvent::Dtmf { .. } => panic!("expected media"),
+            }
+        }
+        assert_eq!(sizes, vec![160, 160, 80]);
+        assert_eq!(stamps, vec![20, 40, 60]);
+        assert_eq!(std::iter::from_fn(|| listener.try_next()).count(), 3);
     }
 
     #[tokio::test]
