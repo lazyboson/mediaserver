@@ -245,7 +245,12 @@ the DTMF detector and the G.711 decode, and allocates nothing per packet
   `media.timestamp` is a **string**. A numeric timestamp makes the bridge
   answer `invalid_json` and close the connection.
 - Utterance-shaped, so latency is one whole utterance. Barge-in is a
-  `stop media`, and its cut-through time is still unmeasured.
+  `stop media`, and its cut-through time is still unmeasured — but a barge
+  arriving mid-playback no longer waits out the piece pacing sleep:
+  `wait_out_piece` keeps receiving commands while a piece plays, stops the
+  playback immediately on `Barge`, and queues anything else. Artifact
+  writes (WAV, datagram logs) run under `block_in_place` so the control
+  runtime is never blocked on the filesystem.
 - **Bot speech is not observable in the tap**, because a subscription
   carries what a party sends and injection reaches what it hears. Verify at
   the endpoint (`lab/out/caller_ear.wav`), not in `tap.wav`.
