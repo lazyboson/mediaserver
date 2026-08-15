@@ -9,6 +9,7 @@ Success is measurable afterwards: the bridge log should transcribe the spoken
 sentence, and one of the recorded SSRCs should carry the TTS reply.
 """
 
+import atexit
 import os
 import re
 import socket
@@ -174,6 +175,7 @@ def main():
                 "Content-Length: 0\r\n\r\n").encode()
 
     sip.sendto(in_dialog("ACK", 1), PROXY)
+    atexit.register(lambda: sip.sendto(in_dialog("BYE", 2), PROXY))
 
     heard = {}
     seq, ts = 100, 0
@@ -213,7 +215,6 @@ def main():
                 heard[ssrc]["packets"].append((rts, pt, datagram[12:]))
         time.sleep(0.02)
 
-    sip.sendto(in_dialog("BYE", 2), PROXY)
     log(f"sent {sent} rtp packets; hanging up")
 
     for ssrc, info in heard.items():
