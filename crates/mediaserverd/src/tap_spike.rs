@@ -12,6 +12,7 @@ use thiserror::Error;
 const MAX_DATAGRAM: usize = 2048;
 const MAX_DATAGRAMS_PER_DRAIN: usize = 64;
 const MAX_RECORDED_DIGITS: usize = 32;
+const SILENCE: [i16; 480] = [0; 480];
 
 #[derive(Debug, Error)]
 pub enum SpikeError {
@@ -158,6 +159,10 @@ impl TapLeg {
             }
             Playout::Waiting => {
                 stats.underruns += 1;
+                if let Some(consumer) = consumer {
+                    let quiet = frame_samples.min(SILENCE.len());
+                    consumer.offer_media(*track, timestamp_ms, &SILENCE[..quiet], true);
+                }
                 if samples.len() + frame_samples > *capacity_samples {
                     stats.capture_full = true;
                 } else {
@@ -423,6 +428,24 @@ mod tests {
         assert_eq!(legs[0].stats().underruns, summary.releases);
         assert!(legs[0].samples().iter().all(|&s| s == 0));
         assert_eq!(legs[0].samples().len(), summary.releases as usize * 160);
+    }
+
+    #[test]
+    fn a_silent_leg_still_feeds_the_consumer_because_asr_disconnects_on_a_gap() {
+        let max_capture = Duration::from_millis(200);
+        let (socket, _) = loopback_pair();
+        let (sink, mut feed) = crate::consumer_ws::channel(64);
+        let mut legs = vec![leg(Track::Customer, socket, max_capture).with_consumer(sink)];
+
+        let stop = AtomicBool::new(false);
+        let summary = capture(&mut legs, AudioFormat::pcmu_8k_20ms(), max_capture, &stop);
+
+        assert_eq!(legs[0].stats().underruns, summary.releases);
+        let mut offered = 0;
+        while feed.try_next().is_some() {
+            offered += 1;
+        }
+        assert_eq!(offered as u64, summary.releases);
     }
 
     #[test]
