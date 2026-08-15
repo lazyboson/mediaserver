@@ -87,7 +87,22 @@ project owners, with the reasoning recorded in the PR description. An
 amendment that weakens Articles I–VI requires a working demonstration that
 the weakened rule cannot cause audible harm.
 
-## Article XI — Code speaks for itself
+## Article XI — Adopt media math, own the machine
+
+Codec, DSP, resampling, and crypto implementations are adopted, never
+written. The order of preference is fixed: first an out-of-process media
+engine (rtpengine transcodes at the tap), then vetted bindings to proven C
+libraries (libopus, spandsp, webrtc-vad — the same code FreeSWITCH wraps),
+and in-tree implementation last — permitted only when the algorithm is
+trivial (a G.711 companding table) or when it is the product itself
+(jitter policy, fan-out, the mixer, for which no library exists in any
+language). `#![forbid(unsafe_code)]` stands in every logic crate; FFI
+`unsafe` is confined to dedicated wrapper crates and answers to
+`cargo deny`. A PR that reimplements what a hardened library already
+provides loses to the binding. The interop bugs live in protocols and
+contracts, not in borrowed math — probe the peers, buy the DSP.
+
+## Article XII — Code speaks for itself
 
 Source files contain no comments of any kind. Intent lives in names, types,
 tests, and `docs/`. If code needs a comment to be understood, the code is
