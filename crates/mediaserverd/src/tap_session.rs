@@ -1,4 +1,5 @@
 use crate::consumer_ws::{self, BridgeCommand, ConsumerConfig};
+use crate::hub::{Hub, TrackSelection};
 use crate::ng_transport::{NgTransport, NgTransportConfig, TransportError};
 use crate::tap_spike::{capture, wav_blob, write_wav, SpikeError, TapLeg};
 use media_core::{AudioFormat, Track};
@@ -201,7 +202,7 @@ pub async fn run(request: TapSpikeRequest, cookie_prefix: u64) -> Result<(), Tap
         .await?;
 
     let consumer = consumer_config_from_env(&request);
-    let (sink, feed) = consumer_ws::channel(CONSUMER_QUEUE_FRAMES);
+    let (mut hub, hub_client) = Hub::new();
 
     let mut legs = Vec::with_capacity(sockets.len());
     for (index, socket) in sockets.into_iter().enumerate() {
@@ -223,37 +224,35 @@ pub async fn run(request: TapSpikeRequest, cookie_prefix: u64) -> Result<(), Tap
                 request.duration.as_secs().max(1) as usize * DATAGRAM_LOG_BYTES_PER_SECOND,
             );
         }
-        legs.push(
-            if consumer.is_some() && streams_to_consumer(track_for_stream(index)) {
-                leg.with_consumer(sink.clone())
-            } else {
-                leg
-            },
-        );
+        legs.push(leg);
     }
-    drop(sink);
 
     let mut consumer_task = None;
     let mut injection_task = None;
     if let Some(config) = consumer {
-        let (commands_tx, commands_rx) = mpsc::channel(8);
-        info!(
-            url = %config.url,
-            stream_sid = %config.stream_sid,
-            "streaming this tap to a consumer bridge"
-        );
-        injection_task = Some(tokio::spawn(inject_bridge_speech(
-            Arc::clone(&transport),
-            request.call_id.clone(),
-            inject_target(&request),
-            request.format,
-            commands_rx,
-        )));
-        consumer_task = Some(tokio::spawn(consumer_ws::run(
-            config,
-            feed,
-            Some(commands_tx),
-        )));
+        match hub_client.attach(CONSUMER_QUEUE_FRAMES, consumer_selection()) {
+            Some(subscription) => {
+                let (commands_tx, commands_rx) = mpsc::channel(8);
+                info!(
+                    url = %config.url,
+                    stream_sid = %config.stream_sid,
+                    "streaming this tap to a consumer bridge"
+                );
+                injection_task = Some(tokio::spawn(inject_bridge_speech(
+                    Arc::clone(&transport),
+                    request.call_id.clone(),
+                    inject_target(&request),
+                    request.format,
+                    commands_rx,
+                )));
+                consumer_task = Some(tokio::spawn(consumer_ws::run(
+                    config,
+                    subscription,
+                    Some(commands_tx),
+                )));
+            }
+            None => warn!("the hub refused the consumer attach; streaming disabled"),
+        }
     }
 
     let stop = Arc::new(AtomicBool::new(false));
@@ -263,8 +262,10 @@ pub async fn run(request: TapSpikeRequest, cookie_prefix: u64) -> Result<(), Tap
     let capture_thread = std::thread::Builder::new()
         .name("mss-tap-spike".to_string())
         .spawn(move || {
-            let summary = capture(&mut legs, format, duration, &capture_stop);
-            (legs, summary)
+            let summary = capture(&mut legs, Some(&mut hub), format, duration, &capture_stop);
+            let fanned_out = (hub.published(), hub.consumer_count());
+            drop(hub);
+            (legs, summary, fanned_out)
         })?;
 
     tokio::select! {
@@ -273,10 +274,11 @@ pub async fn run(request: TapSpikeRequest, cookie_prefix: u64) -> Result<(), Tap
     }
     stop.store(true, Ordering::Relaxed);
 
-    let (legs, summary) = tokio::task::spawn_blocking(move || capture_thread.join())
-        .await
-        .map_err(|_| TapSessionError::CaptureThreadLost)?
-        .map_err(|_| TapSessionError::CaptureThreadLost)?;
+    let (legs, summary, (hub_published, hub_consumers)) =
+        tokio::task::spawn_blocking(move || capture_thread.join())
+            .await
+            .map_err(|_| TapSessionError::CaptureThreadLost)?
+            .map_err(|_| TapSessionError::CaptureThreadLost)?;
 
     match transport.unsubscribe(&request.call_id, &to_tag).await {
         Ok(_) => info!(call_id = %request.call_id, "unsubscribed"),
@@ -338,6 +340,8 @@ pub async fn run(request: TapSpikeRequest, cookie_prefix: u64) -> Result<(), Tap
         frames = wav.frames,
         releases = summary.releases,
         reanchors = summary.reanchors,
+        hub_published,
+        hub_consumers,
         elapsed_ms = summary.elapsed.as_millis() as u64,
         "tap spike wrote its wav artifact"
     );
@@ -384,19 +388,19 @@ fn consumer_config_from_env(request: &TapSpikeRequest) -> Option<ConsumerConfig>
         format: request.format,
         tracks: (0..request.from_tags.len().max(1))
             .map(track_for_stream)
-            .filter(|track| streams_to_consumer(*track))
+            .filter(|track| consumer_selection().wants(*track))
             .map(|track| consumer_ws::track_name(track).to_string())
             .collect(),
         custom_parameters: HashMap::new(),
     })
 }
 
-fn streams_to_consumer(track: Track) -> bool {
-    consumer_wants_both_tracks() || track == Track::Customer
-}
-
-fn consumer_wants_both_tracks() -> bool {
-    std::env::var(CONSUMER_TRACKS_ENV).unwrap_or_default() == CONSUMER_BOTH_TRACKS
+fn consumer_selection() -> TrackSelection {
+    if std::env::var(CONSUMER_TRACKS_ENV).unwrap_or_default() == CONSUMER_BOTH_TRACKS {
+        TrackSelection::All
+    } else {
+        TrackSelection::Only(Track::Customer)
+    }
 }
 
 fn datagram_log_dir() -> Option<PathBuf> {
