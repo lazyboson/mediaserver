@@ -32,6 +32,7 @@ CALLEE_DIGIT = int(os.environ.get("CALLEE_DIGIT", "2"))
 DIGIT_AFTER_SECONDS = float(os.environ.get("DIGIT_AFTER_SECONDS", "3"))
 DIGIT_INTERVAL_SECONDS = float(os.environ.get("DIGIT_INTERVAL_SECONDS", "4"))
 EAR_DIR = os.environ.get("EAR_DIR", "")
+PUMP_SILENCE = os.environ.get("PUMP_SILENCE", "") not in ("", "0", "false")
 
 
 def log(message):
@@ -190,7 +191,10 @@ def pump(caller_dest, callee_dest, stop):
                 send_digit(leg, leg["digit"])
             next_digits_at = time.monotonic() + DIGIT_INTERVAL_SECONDS
         for leg in legs:
-            payload = bytes((leg["byte"] + n) % 256 for n in range(160))
+            if PUMP_SILENCE:
+                payload = bytes([0xFF]) * 160
+            else:
+                payload = bytes((leg["byte"] + n) % 256 for n in range(160))
             leg["byte"] = (leg["byte"] + 160) % 256
             send_rtp(leg, PCMU_PAYLOAD_TYPE, payload, leg["ts"])
             leg["ts"] += 160

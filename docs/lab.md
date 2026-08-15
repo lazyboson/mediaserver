@@ -187,6 +187,61 @@ received audio to `out/caller_ear.wav` and `out/callee_ear.wav` — injection
 is only observable there. It also means **bot speech never echoes back into
 the ASR feed**, which is a property worth keeping.
 
+## Against the real stream-llm-bridge
+
+`lab/docker-compose.yml` runs the actual service (`stream-llm-bridge:local`,
+built from that repo) with `USE_LLM=false`, so ElevenLabs speaks
+`WELCOME_MESSAGE` the moment `start` arrives. Keys live in `lab/.env`, which
+is gitignored. The mock moved behind `--profile mock` for offline work.
+
+A silent-endpoint run (`PUMP_SILENCE=1`, so only injected audio is audible)
+ends with `caller_ear.wav` carrying **real speech** — syllable bursts with
+pauses, peak 14972 — and `callee_ear.wav` peaking at **exactly 0**.
+Deepgram also transcribed the tapped legs live, so both directions work
+against the real service.
+
+### Three things the real bridge corrected
+
+`lab/bridge_probe.py` asks it which wire shape it accepts, the same way
+`ng_answer_probe.py` asked rtpengine:
+
+| Shape | Bridge |
+| --- | --- |
+| what `twilio.rs` emitted (`audio/x-mulaw`, numeric `timestamp`) | `invalid_json`, **connection closed** |
+| what mediagateway emits (`PCMU`, string `timestamp`) | accepted |
+
+1. **`timestamp` must be a string.** mediagateway sends
+   `fmt.Sprintf("%d", ...)` (`pkg/mediaservice/client.go`) into a
+   `Timestamp string` field, and the bridge unmarshals into a string too. A
+   JSON number closes the connection. Our frozen test asserted the number.
+2. **`mediaFormat.encoding` must be `PCMU`, not `audio/x-mulaw`.**
+   mediagateway sends `codec.GetName()`. The bridge branches on
+   `encoding == "PCMU" || "PCMA"` to pick its TTS output format, so
+   `audio/x-mulaw` silently yields 16 kHz PCM instead of mu-law — no error,
+   just wrong audio.
+3. **The bridge never sends `mark`.** TTS arrives as a run of `media`
+   events with no terminator, so utterance assembly cannot wait for one.
+   The consumer now flushes after `UTTERANCE_IDLE` (700 ms) of inbound
+   silence, keeping `mark` and `endOfInteraction` as explicit flushes.
+
+Both wire defects predate this work and would have broken any real
+consumer. The serialization tests now assert the *measured* bytes.
+
+### The NG datagram ceiling
+
+The first real run failed with `Message too long (os error 90)`. **The NG
+protocol is UDP**, so a `play media` blob cannot exceed one datagram
+(~64 KB), which is about 4 seconds of 16-bit 8 kHz WAV. An 11-second
+utterance is ~175 KB and simply cannot be sent.
+
+`inject_bridge_speech` now splits an utterance into
+`BLOB_SAMPLES_PER_DATAGRAM` (3s) pieces and plays them back to back,
+sleeping for each piece's duration so a piece does not cut off its
+predecessor. The earlier probe missed this because its test tone was 32 KB.
+The alternative — `play media {file}` on storage rtpengine can read — has
+no size limit but needs a filesystem shared with the rtpengine host, which
+across pods is not a given.
+
 ## Findings still open
 
 1. **Telephone-event packets are counted as lost audio.** Both legs above

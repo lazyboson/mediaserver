@@ -6,13 +6,16 @@ use protocol::twilio::{DtmfInfo, Inbound, MediaFormat, MediaPayload, Outbound, S
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 use thiserror::Error;
 use tokio::sync::mpsc;
+use tokio::time::Instant;
 use tokio_tungstenite::tungstenite::Message;
 use tracing::{info, warn};
 
 pub const MAX_FRAME_BYTES: usize = 320;
-const MULAW_ENCODING: &str = "audio/x-mulaw";
+const PCMU_ENCODING: &str = "PCMU";
+const UTTERANCE_IDLE: Duration = Duration::from_millis(700);
 
 #[derive(Debug, Error)]
 pub enum ConsumerError {
@@ -137,6 +140,7 @@ pub async fn run(
     let mut stats = ConsumerStats::default();
     let mut sequence: u64 = 1;
     let mut utterance: Vec<i16> = Vec::new();
+    let mut idle_deadline: Option<Instant> = None;
 
     let start = Outbound::Start {
         sequence_number: sequence.to_string(),
@@ -147,7 +151,7 @@ pub async fn run(
             call_sid: config.call_sid.clone(),
             tracks: config.tracks.clone(),
             media_format: MediaFormat {
-                encoding: MULAW_ENCODING.to_string(),
+                encoding: PCMU_ENCODING.to_string(),
                 sample_rate: config.format.sample_rate_hz,
                 channels: 1,
             },
@@ -169,7 +173,7 @@ pub async fn run(
                             stream_sid: config.stream_sid.clone(),
                             media: MediaPayload {
                                 track: track_name(track).to_string(),
-                                timestamp: timestamp_ms,
+                                timestamp: timestamp_ms.to_string(),
                                 payload: BASE64.encode(&bytes[..len]),
                             },
                         }, "media")?
@@ -188,10 +192,18 @@ pub async fn run(
                 };
                 writer.send(message).await?;
             }
+            _ = async {
+                match idle_deadline {
+                    Some(at) => tokio::time::sleep_until(at).await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                flush_utterance(&mut utterance, &mut idle_deadline, &mut stats, commands.as_ref()).await;
+            }
             inbound = reader.next() => {
                 match inbound {
                     Some(Ok(Message::Text(text))) => {
-                        handle_inbound(&text, &mut utterance, &mut stats, commands.as_ref()).await;
+                        handle_inbound(&text, &mut utterance, &mut idle_deadline, &mut stats, commands.as_ref()).await;
                     }
                     Some(Ok(Message::Close(_))) | None => break,
                     Some(Ok(_)) => {}
@@ -219,9 +231,29 @@ fn encode(message: &Outbound, kind: &'static str) -> Result<Message, ConsumerErr
         .map_err(|_| ConsumerError::Serialize(kind))
 }
 
+async fn flush_utterance(
+    utterance: &mut Vec<i16>,
+    idle_deadline: &mut Option<Instant>,
+    stats: &mut ConsumerStats,
+    commands: Option<&mpsc::Sender<BridgeCommand>>,
+) {
+    *idle_deadline = None;
+    if utterance.is_empty() {
+        return;
+    }
+    stats.utterances += 1;
+    let speech = std::mem::take(utterance);
+    if let Some(commands) = commands {
+        if commands.send(BridgeCommand::Speak(speech)).await.is_err() {
+            warn!("nothing is listening for bridge speech; the utterance was discarded");
+        }
+    }
+}
+
 async fn handle_inbound(
     text: &str,
     utterance: &mut Vec<i16>,
+    idle_deadline: &mut Option<Instant>,
     stats: &mut ConsumerStats,
     commands: Option<&mpsc::Sender<BridgeCommand>>,
 ) {
@@ -233,7 +265,7 @@ async fn handle_inbound(
             if media
                 .encoding
                 .as_deref()
-                .is_some_and(|encoding| encoding != MULAW_ENCODING)
+                .is_some_and(|encoding| encoding != PCMU_ENCODING)
             {
                 stats.inbound_unknown_encoding += 1;
                 return;
@@ -244,28 +276,21 @@ async fn handle_inbound(
             };
             stats.inbound_media += 1;
             utterance.extend(bytes.iter().map(|byte| g711::ulaw_to_linear(*byte)));
+            *idle_deadline = Some(Instant::now() + UTTERANCE_IDLE);
         }
         Inbound::Mark { .. } => {
-            if utterance.is_empty() {
-                return;
-            }
-            stats.utterances += 1;
-            let speech = std::mem::take(utterance);
-            if let Some(commands) = commands {
-                if commands.send(BridgeCommand::Speak(speech)).await.is_err() {
-                    warn!("nothing is listening for bridge speech; the utterance was discarded");
-                }
-            }
+            flush_utterance(utterance, idle_deadline, stats, commands).await;
         }
         Inbound::Clear { .. } => {
             utterance.clear();
+            *idle_deadline = None;
             stats.barges += 1;
             if let Some(commands) = commands {
                 commands.send(BridgeCommand::Barge).await.ok();
             }
         }
         Inbound::EndOfInteraction { .. } => {
-            utterance.clear();
+            flush_utterance(utterance, idle_deadline, stats, commands).await;
         }
     }
 }
@@ -355,14 +380,11 @@ mod tests {
         let stats = consumer.await.unwrap().unwrap();
 
         assert!(seen[0].contains(r#""event":"start""#), "{:?}", seen[0]);
-        assert!(
-            seen[0].contains(r#""encoding":"audio/x-mulaw""#),
-            "{:?}",
-            seen[0]
-        );
+        assert!(seen[0].contains(r#""encoding":"PCMU""#), "{:?}", seen[0]);
         assert!(seen[1].contains(r#""event":"media""#), "{:?}", seen[1]);
         assert!(seen[1].contains(r#""track":"outbound""#), "{:?}", seen[1]);
         assert!(seen[1].contains(r#""sequenceNumber":"2""#), "{:?}", seen[1]);
+        assert!(seen[1].contains(r#""timestamp":"20""#), "{:?}", seen[1]);
         assert!(seen[2].contains(r#""event":"stop""#), "{:?}", seen[2]);
         assert_eq!(stats.media_sent, 1);
         assert_eq!(stats.media_dropped, 0);
@@ -372,18 +394,20 @@ mod tests {
     async fn inbound_media_accumulates_until_a_mark_completes_the_utterance() {
         let (tx, mut rx) = mpsc::channel(4);
         let mut utterance = Vec::new();
+        let mut idle = None;
         let mut stats = ConsumerStats::default();
         let payload = BASE64.encode([0xFFu8, 0x7F, 0x00]);
 
         let frame = format!(r#"{{"event":"media","media":{{"payload":"{payload}"}}}}"#);
-        handle_inbound(&frame, &mut utterance, &mut stats, Some(&tx)).await;
-        handle_inbound(&frame, &mut utterance, &mut stats, Some(&tx)).await;
+        handle_inbound(&frame, &mut utterance, &mut idle, &mut stats, Some(&tx)).await;
+        handle_inbound(&frame, &mut utterance, &mut idle, &mut stats, Some(&tx)).await;
         assert_eq!(stats.inbound_media, 2);
         assert!(rx.try_recv().is_err());
 
         handle_inbound(
             r#"{"event":"mark","mark":{"name":"utterance"}}"#,
             &mut utterance,
+            &mut idle,
             &mut stats,
             Some(&tx),
         )
@@ -397,14 +421,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn silence_completes_an_utterance_because_the_bridge_never_sends_a_mark() {
+        let (tx, mut rx) = mpsc::channel(4);
+        let mut utterance = Vec::new();
+        let mut idle = None;
+        let mut stats = ConsumerStats::default();
+        let payload = BASE64.encode([0xFFu8, 0x7F]);
+        let frame =
+            format!(r#"{{"event":"media","media":{{"encoding":"PCMU","payload":"{payload}"}}}}"#);
+
+        handle_inbound(&frame, &mut utterance, &mut idle, &mut stats, Some(&tx)).await;
+        assert!(idle.is_some());
+        assert!(rx.try_recv().is_err());
+
+        tokio::time::sleep(UTTERANCE_IDLE + Duration::from_millis(50)).await;
+        if let Some(at) = idle {
+            tokio::time::sleep_until(at).await;
+        }
+        flush_utterance(&mut utterance, &mut idle, &mut stats, Some(&tx)).await;
+
+        assert!(matches!(rx.try_recv().unwrap(), BridgeCommand::Speak(_)));
+        assert_eq!(stats.utterances, 1);
+        assert!(idle.is_none());
+    }
+
+    #[tokio::test]
     async fn clear_barges_and_discards_the_half_built_utterance() {
         let (tx, mut rx) = mpsc::channel(4);
         let mut utterance = vec![1i16, 2, 3];
+        let mut idle = None;
         let mut stats = ConsumerStats::default();
 
         handle_inbound(
             r#"{"event":"clear","streamSid":"MZ-1"}"#,
             &mut utterance,
+            &mut idle,
             &mut stats,
             Some(&tx),
         )
@@ -419,11 +470,13 @@ mod tests {
     async fn an_encoding_we_cannot_decode_is_counted_not_played() {
         let (tx, _rx) = mpsc::channel(4);
         let mut utterance = Vec::new();
+        let mut idle = None;
         let mut stats = ConsumerStats::default();
 
         handle_inbound(
             r#"{"event":"media","media":{"encoding":"audio/opus","payload":"AAAA"}}"#,
             &mut utterance,
+            &mut idle,
             &mut stats,
             Some(&tx),
         )
