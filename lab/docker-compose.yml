@@ -15,8 +15,10 @@ services:
     depends_on: [rtpengine]
     volumes:
       - ./call_driver.py:/call_driver.py:ro
+      - ./out:/out
     command: ["python3", "/call_driver.py"]
     environment:
+      EAR_DIR: /out
       NG_NODE: 172.31.99.10
       NG_PORT: "22222"
       SELF_IP: 172.31.99.20
@@ -35,11 +37,26 @@ services:
       lab:
         ipv4_address: 172.31.99.20
 
+  bridge:
+    image: python:3-slim
+    volumes:
+      - ./mock_bridge.py:/mock_bridge.py:ro
+    command: ["python3", "/mock_bridge.py"]
+    environment:
+      BRIDGE_PORT: "8080"
+      SPEAK_AFTER_SECONDS: "4"
+      SPEAK_EVERY_SECONDS: "5"
+    networks:
+      lab:
+        ipv4_address: 172.31.99.40
+
   mediaserverd:
     image: rust:1.95-slim-bookworm
     working_dir: /build
     command: ["cargo", "run", "--quiet", "-p", "mediaserverd"]
     depends_on:
+      bridge:
+        condition: service_started
       call-driver:
         condition: service_healthy
     volumes:
@@ -56,6 +73,9 @@ services:
       MSS_TAP_FROM_TAGS: tagA,tagB
       MSS_TAP_SECONDS: "15"
       MSS_TAP_OUTPUT: /out/tap.wav
+      MSS_CONSUMER_URL: ws://172.31.99.40:8080
+      MSS_CONSUMER_ACCOUNT_ID: lab-account
+      MSS_CONSUMER_STREAM_SID: MZ-lab-1
     networks:
       lab:
         ipv4_address: 172.31.99.30

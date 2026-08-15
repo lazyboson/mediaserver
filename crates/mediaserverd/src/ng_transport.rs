@@ -1,4 +1,4 @@
-use rtpengine_ng::{NgClient, NgError, NgReply, SubscribeRequest};
+use rtpengine_ng::{NgClient, NgError, NgReply, PlayMedia, PlayTarget, SubscribeRequest};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -198,6 +198,20 @@ impl NgTransport {
         to_tag: &str,
     ) -> Result<NgReply, TransportError> {
         self.roundtrip(|cookie| NgClient::unsubscribe(cookie, call_id, to_tag))
+            .await
+    }
+
+    pub async fn play_media(&self, play: &PlayMedia) -> Result<NgReply, TransportError> {
+        self.roundtrip(|cookie| NgClient::play_media(cookie, play))
+            .await
+    }
+
+    pub async fn stop_media(
+        &self,
+        call_id: &str,
+        target: &PlayTarget,
+    ) -> Result<NgReply, TransportError> {
+        self.roundtrip(|cookie| NgClient::stop_media(cookie, call_id, target))
             .await
     }
 

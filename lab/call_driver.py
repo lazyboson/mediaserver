@@ -7,6 +7,7 @@ plays the part of both endpoints and of the signalling proxy between them.
 
 import os
 import re
+import signal
 import socket
 import struct
 import sys
@@ -30,6 +31,7 @@ CALLER_DIGIT = int(os.environ.get("CALLER_DIGIT", "1"))
 CALLEE_DIGIT = int(os.environ.get("CALLEE_DIGIT", "2"))
 DIGIT_AFTER_SECONDS = float(os.environ.get("DIGIT_AFTER_SECONDS", "3"))
 DIGIT_INTERVAL_SECONDS = float(os.environ.get("DIGIT_INTERVAL_SECONDS", "4"))
+EAR_DIR = os.environ.get("EAR_DIR", "")
 
 
 def log(message):
@@ -134,17 +136,50 @@ def send_digit(leg, event):
     log(f"sent digit {event} on {leg['name']}")
 
 
+def ulaw_to_linear(byte):
+    byte = ~byte & 0xFF
+    sign = byte & 0x80
+    exponent = (byte >> 4) & 0x07
+    mantissa = byte & 0x0F
+    sample = ((mantissa << 3) + 0x84) << exponent
+    sample -= 0x84
+    return -sample if sign else sample
+
+
+def write_ear(leg):
+    """What this endpoint HEARD, which is where injected bot speech shows up.
+
+    A tap carries what a party sends, so audio played into the call for this
+    party is only observable here, at its ear.
+    """
+    import wave
+
+    path = os.path.join(EAR_DIR, f"{leg['name'].split('/')[0]}_ear.wav")
+    with wave.open(path, "wb") as out:
+        out.setnchannels(1)
+        out.setsampwidth(2)
+        out.setframerate(8000)
+        out.writeframes(b"".join(
+            struct.pack("<h", ulaw_to_linear(byte)) for byte in leg["heard"]
+        ))
+    log(f"wrote {path} ({len(leg['heard']) / 8000:.2f}s of what {leg['name']} heard)")
+
+
 def pump(caller_dest, callee_dest, stop):
     caller = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     caller.bind(("0.0.0.0", CALLER_RTP_PORT))
     callee = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     callee.bind(("0.0.0.0", CALLEE_RTP_PORT))
+    caller.setblocking(False)
+    callee.setblocking(False)
 
     legs = [
         {"name": "caller/tagA", "sock": caller, "dest": caller_dest, "seq": 1000,
-         "ts": 0, "ssrc": 0x11111111, "byte": 0, "digit": CALLER_DIGIT},
+         "ts": 0, "ssrc": 0x11111111, "byte": 0, "digit": CALLER_DIGIT,
+         "heard": bytearray()},
         {"name": "callee/tagB", "sock": callee, "dest": callee_dest, "seq": 9000,
-         "ts": 0, "ssrc": 0x22222222, "byte": 128, "digit": CALLEE_DIGIT},
+         "ts": 0, "ssrc": 0x22222222, "byte": 128, "digit": CALLEE_DIGIT,
+         "heard": bytearray()},
     ]
     sent = 0
     next_digits_at = time.monotonic() + DIGIT_AFTER_SECONDS
@@ -160,8 +195,18 @@ def pump(caller_dest, callee_dest, stop):
             send_rtp(leg, PCMU_PAYLOAD_TYPE, payload, leg["ts"])
             leg["ts"] += 160
             sent += 1
+            while True:
+                try:
+                    datagram, _ = leg["sock"].recvfrom(2048)
+                except (BlockingIOError, OSError):
+                    break
+                if len(datagram) > 12 and datagram[1] & 0x7F == PCMU_PAYLOAD_TYPE:
+                    leg["heard"] += datagram[12:]
         time.sleep(0.02)
     log(f"pumped {sent} rtp packets")
+    if EAR_DIR:
+        for leg in legs:
+            write_ear(leg)
 
 
 def main():
@@ -197,6 +242,7 @@ def main():
         sys.exit(1)
 
     stop = threading.Event()
+    signal.signal(signal.SIGTERM, lambda *_: stop.set())
     pumping = threading.Thread(
         target=pump,
         args=((NODE, caller_dest_port), (NODE, callee_dest_port), stop),

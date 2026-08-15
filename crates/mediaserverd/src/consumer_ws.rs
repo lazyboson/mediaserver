@@ -1,0 +1,436 @@
+use base64::engine::general_purpose::STANDARD as BASE64;
+use base64::Engine;
+use futures_util::{SinkExt, StreamExt};
+use media_core::{g711, AudioFormat, Track};
+use protocol::twilio::{DtmfInfo, Inbound, MediaFormat, MediaPayload, Outbound, StartInfo};
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use thiserror::Error;
+use tokio::sync::mpsc;
+use tokio_tungstenite::tungstenite::Message;
+use tracing::{info, warn};
+
+pub const MAX_FRAME_BYTES: usize = 320;
+const MULAW_ENCODING: &str = "audio/x-mulaw";
+
+#[derive(Debug, Error)]
+pub enum ConsumerError {
+    #[error("websocket: {0}")]
+    WebSocket(#[from] tokio_tungstenite::tungstenite::Error),
+    #[error("could not serialize the {0} event")]
+    Serialize(&'static str),
+}
+
+#[derive(Clone, Copy)]
+#[allow(clippy::large_enum_variant)]
+pub enum TapEvent {
+    Media {
+        track: Track,
+        timestamp_ms: u64,
+        len: usize,
+        bytes: [u8; MAX_FRAME_BYTES],
+    },
+    Dtmf {
+        track: Track,
+        digit: char,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub enum BridgeCommand {
+    Speak(Vec<i16>),
+    Barge,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ConsumerStats {
+    pub media_sent: u64,
+    pub dtmf_sent: u64,
+    pub media_dropped: u64,
+    pub inbound_media: u64,
+    pub inbound_unknown_encoding: u64,
+    pub utterances: u64,
+    pub barges: u64,
+}
+
+pub struct ConsumerConfig {
+    pub url: String,
+    pub account_id: String,
+    pub call_sid: String,
+    pub stream_sid: String,
+    pub format: AudioFormat,
+    pub tracks: Vec<String>,
+    pub custom_parameters: HashMap<String, String>,
+}
+
+#[derive(Clone)]
+pub struct ConsumerSink {
+    events: mpsc::Sender<TapEvent>,
+    dropped: Arc<AtomicU64>,
+}
+
+pub struct ConsumerFeed {
+    events: mpsc::Receiver<TapEvent>,
+    dropped: Arc<AtomicU64>,
+}
+
+pub fn channel(capacity: usize) -> (ConsumerSink, ConsumerFeed) {
+    let (events_tx, events_rx) = mpsc::channel(capacity);
+    let dropped = Arc::new(AtomicU64::new(0));
+    (
+        ConsumerSink {
+            events: events_tx,
+            dropped: Arc::clone(&dropped),
+        },
+        ConsumerFeed {
+            events: events_rx,
+            dropped,
+        },
+    )
+}
+
+impl ConsumerSink {
+    pub fn offer_media(&self, track: Track, timestamp_ms: u64, pcm: &[i16], ulaw: bool) {
+        let mut bytes = [0u8; MAX_FRAME_BYTES];
+        let len = g711::encode_into(ulaw, pcm, &mut bytes);
+        self.offer(TapEvent::Media {
+            track,
+            timestamp_ms,
+            len,
+            bytes,
+        });
+    }
+
+    pub fn offer_dtmf(&self, track: Track, digit: char) {
+        self.offer(TapEvent::Dtmf { track, digit });
+    }
+
+    fn offer(&self, event: TapEvent) {
+        if self.events.try_send(event).is_err() {
+            self.dropped.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+pub fn track_name(track: Track) -> &'static str {
+    match track {
+        Track::Customer => "inbound",
+        Track::Agent => "outbound",
+        Track::Mixed => "mixed",
+    }
+}
+
+pub async fn run(
+    config: ConsumerConfig,
+    feed: ConsumerFeed,
+    commands: Option<mpsc::Sender<BridgeCommand>>,
+) -> Result<ConsumerStats, ConsumerError> {
+    let ConsumerFeed {
+        mut events,
+        dropped,
+    } = feed;
+    let (stream, _) = tokio_tungstenite::connect_async(&config.url).await?;
+    info!(url = %config.url, stream_sid = %config.stream_sid, "consumer websocket connected");
+    let (mut writer, mut reader) = stream.split();
+
+    let mut stats = ConsumerStats::default();
+    let mut sequence: u64 = 1;
+    let mut utterance: Vec<i16> = Vec::new();
+
+    let start = Outbound::Start {
+        sequence_number: sequence.to_string(),
+        stream_sid: config.stream_sid.clone(),
+        start: StartInfo {
+            account_id: config.account_id.clone(),
+            stream_sid: config.stream_sid.clone(),
+            call_sid: config.call_sid.clone(),
+            tracks: config.tracks.clone(),
+            media_format: MediaFormat {
+                encoding: MULAW_ENCODING.to_string(),
+                sample_rate: config.format.sample_rate_hz,
+                channels: 1,
+            },
+            custom_parameters: config.custom_parameters.clone(),
+        },
+    };
+    writer.send(encode(&start, "start")?).await?;
+
+    loop {
+        tokio::select! {
+            event = events.recv() => {
+                let Some(event) = event else { break };
+                sequence += 1;
+                let message = match event {
+                    TapEvent::Media { track, timestamp_ms, len, bytes } => {
+                        stats.media_sent += 1;
+                        encode(&Outbound::Media {
+                            sequence_number: sequence.to_string(),
+                            stream_sid: config.stream_sid.clone(),
+                            media: MediaPayload {
+                                track: track_name(track).to_string(),
+                                timestamp: timestamp_ms,
+                                payload: BASE64.encode(&bytes[..len]),
+                            },
+                        }, "media")?
+                    }
+                    TapEvent::Dtmf { track, digit } => {
+                        stats.dtmf_sent += 1;
+                        encode(&Outbound::Dtmf {
+                            sequence_number: sequence.to_string(),
+                            stream_sid: config.stream_sid.clone(),
+                            dtmf: DtmfInfo {
+                                track: track_name(track).to_string(),
+                                digit: digit.to_string(),
+                            },
+                        }, "dtmf")?
+                    }
+                };
+                writer.send(message).await?;
+            }
+            inbound = reader.next() => {
+                match inbound {
+                    Some(Ok(Message::Text(text))) => {
+                        handle_inbound(&text, &mut utterance, &mut stats, commands.as_ref()).await;
+                    }
+                    Some(Ok(Message::Close(_))) | None => break,
+                    Some(Ok(_)) => {}
+                    Some(Err(error)) => return Err(error.into()),
+                }
+            }
+        }
+    }
+
+    sequence += 1;
+    let stop = Outbound::Stop {
+        sequence_number: sequence.to_string(),
+        stream_sid: config.stream_sid.clone(),
+    };
+    writer.send(encode(&stop, "stop")?).await?;
+    writer.close().await.ok();
+
+    stats.media_dropped = dropped.load(Ordering::Relaxed);
+    Ok(stats)
+}
+
+fn encode(message: &Outbound, kind: &'static str) -> Result<Message, ConsumerError> {
+    serde_json::to_string(message)
+        .map(Message::text)
+        .map_err(|_| ConsumerError::Serialize(kind))
+}
+
+async fn handle_inbound(
+    text: &str,
+    utterance: &mut Vec<i16>,
+    stats: &mut ConsumerStats,
+    commands: Option<&mpsc::Sender<BridgeCommand>>,
+) {
+    let Ok(message) = serde_json::from_str::<Inbound>(text) else {
+        return;
+    };
+    match message {
+        Inbound::Media { media, .. } => {
+            if media
+                .encoding
+                .as_deref()
+                .is_some_and(|encoding| encoding != MULAW_ENCODING)
+            {
+                stats.inbound_unknown_encoding += 1;
+                return;
+            }
+            let Ok(bytes) = BASE64.decode(media.payload.as_bytes()) else {
+                stats.inbound_unknown_encoding += 1;
+                return;
+            };
+            stats.inbound_media += 1;
+            utterance.extend(bytes.iter().map(|byte| g711::ulaw_to_linear(*byte)));
+        }
+        Inbound::Mark { .. } => {
+            if utterance.is_empty() {
+                return;
+            }
+            stats.utterances += 1;
+            let speech = std::mem::take(utterance);
+            if let Some(commands) = commands {
+                if commands.send(BridgeCommand::Speak(speech)).await.is_err() {
+                    warn!("nothing is listening for bridge speech; the utterance was discarded");
+                }
+            }
+        }
+        Inbound::Clear { .. } => {
+            utterance.clear();
+            stats.barges += 1;
+            if let Some(commands) = commands {
+                commands.send(BridgeCommand::Barge).await.ok();
+            }
+        }
+        Inbound::EndOfInteraction { .. } => {
+            utterance.clear();
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::net::TcpListener;
+
+    const URL_SCHEME_SEPARATOR: &str = "\x2f\x2f";
+
+    fn pcm_frame(value: i16) -> Vec<i16> {
+        vec![value; 160]
+    }
+
+    #[test]
+    fn tracks_use_the_the legacy media gateway_names() {
+        assert_eq!(track_name(Track::Customer), "inbound");
+        assert_eq!(track_name(Track::Agent), "outbound");
+        assert_eq!(track_name(Track::Mixed), "mixed");
+    }
+
+    #[test]
+    fn a_full_queue_drops_and_counts_instead_of_blocking_the_media_thread() {
+        let (sink, feed) = channel(2);
+        for _ in 0..10 {
+            sink.offer_media(Track::Customer, 0, &pcm_frame(1000), true);
+        }
+        assert_eq!(feed.dropped.load(Ordering::Relaxed), 8);
+    }
+
+    #[test]
+    fn media_is_encoded_to_ulaw_before_it_reaches_the_queue() {
+        let (sink, mut feed) = channel(4);
+        sink.offer_media(Track::Customer, 40, &pcm_frame(0), true);
+        match feed.events.try_recv().unwrap() {
+            TapEvent::Media {
+                track,
+                timestamp_ms,
+                len,
+                bytes,
+            } => {
+                assert_eq!(track, Track::Customer);
+                assert_eq!(timestamp_ms, 40);
+                assert_eq!(len, 160);
+                assert_eq!(bytes[0], g711::linear_to_ulaw(0));
+            }
+            _ => panic!("expected media"),
+        }
+    }
+
+    #[tokio::test]
+    async fn start_media_and_stop_reach_the_bridge_in_order() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(socket).await.unwrap();
+            let mut seen = Vec::new();
+            while let Some(Ok(message)) = ws.next().await {
+                if let Message::Text(text) = message {
+                    seen.push(text.to_string());
+                    if seen.len() == 3 {
+                        break;
+                    }
+                }
+            }
+            seen
+        });
+
+        let (sink, feed) = channel(8);
+        let config = ConsumerConfig {
+            url: format!("ws:{}127.0.0.1:{port}", URL_SCHEME_SEPARATOR),
+            account_id: "acct-1".into(),
+            call_sid: "call-1".into(),
+            stream_sid: "MZ-1".into(),
+            format: AudioFormat::pcmu_8k_20ms(),
+            tracks: vec!["inbound".into(), "outbound".into()],
+            custom_parameters: HashMap::new(),
+        };
+        let consumer = tokio::spawn(run(config, feed, None));
+
+        sink.offer_media(Track::Agent, 20, &pcm_frame(0), true);
+        drop(sink);
+
+        let seen = server.await.unwrap();
+        let stats = consumer.await.unwrap().unwrap();
+
+        assert!(seen[0].contains(r#""event":"start""#), "{:?}", seen[0]);
+        assert!(
+            seen[0].contains(r#""encoding":"audio/x-mulaw""#),
+            "{:?}",
+            seen[0]
+        );
+        assert!(seen[1].contains(r#""event":"media""#), "{:?}", seen[1]);
+        assert!(seen[1].contains(r#""track":"outbound""#), "{:?}", seen[1]);
+        assert!(seen[1].contains(r#""sequenceNumber":"2""#), "{:?}", seen[1]);
+        assert!(seen[2].contains(r#""event":"stop""#), "{:?}", seen[2]);
+        assert_eq!(stats.media_sent, 1);
+        assert_eq!(stats.media_dropped, 0);
+    }
+
+    #[tokio::test]
+    async fn inbound_media_accumulates_until_a_mark_completes_the_utterance() {
+        let (tx, mut rx) = mpsc::channel(4);
+        let mut utterance = Vec::new();
+        let mut stats = ConsumerStats::default();
+        let payload = BASE64.encode([0xFFu8, 0x7F, 0x00]);
+
+        let frame = format!(r#"{{"event":"media","media":{{"payload":"{payload}"}}}}"#);
+        handle_inbound(&frame, &mut utterance, &mut stats, Some(&tx)).await;
+        handle_inbound(&frame, &mut utterance, &mut stats, Some(&tx)).await;
+        assert_eq!(stats.inbound_media, 2);
+        assert!(rx.try_recv().is_err());
+
+        handle_inbound(
+            r#"{"event":"mark","mark":{"name":"utterance"}}"#,
+            &mut utterance,
+            &mut stats,
+            Some(&tx),
+        )
+        .await;
+        match rx.try_recv().unwrap() {
+            BridgeCommand::Speak(pcm) => assert_eq!(pcm.len(), 6),
+            other => panic!("expected speech, got {other:?}"),
+        }
+        assert_eq!(stats.utterances, 1);
+        assert!(utterance.is_empty());
+    }
+
+    #[tokio::test]
+    async fn clear_barges_and_discards_the_half_built_utterance() {
+        let (tx, mut rx) = mpsc::channel(4);
+        let mut utterance = vec![1i16, 2, 3];
+        let mut stats = ConsumerStats::default();
+
+        handle_inbound(
+            r#"{"event":"clear","streamSid":"MZ-1"}"#,
+            &mut utterance,
+            &mut stats,
+            Some(&tx),
+        )
+        .await;
+
+        assert!(matches!(rx.try_recv().unwrap(), BridgeCommand::Barge));
+        assert!(utterance.is_empty());
+        assert_eq!(stats.barges, 1);
+    }
+
+    #[tokio::test]
+    async fn an_encoding_we_cannot_decode_is_counted_not_played() {
+        let (tx, _rx) = mpsc::channel(4);
+        let mut utterance = Vec::new();
+        let mut stats = ConsumerStats::default();
+
+        handle_inbound(
+            r#"{"event":"media","media":{"encoding":"audio/opus","payload":"AAAA"}}"#,
+            &mut utterance,
+            &mut stats,
+            Some(&tx),
+        )
+        .await;
+
+        assert_eq!(stats.inbound_unknown_encoding, 1);
+        assert_eq!(stats.inbound_media, 0);
+        assert!(utterance.is_empty());
+    }
+}
