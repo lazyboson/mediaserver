@@ -53,6 +53,9 @@ injection) and finally conference mixing.
    scaffold status, known limitations, and pending work. Since source files
    carry no comments, this file is where that context lives — **update it
    in the same PR that changes a module.**
+6. [docs/testing.md](docs/testing.md) — the three test altitudes (replay,
+   lab, benchmark), the impairment matrix, and the M2 benchmark method.
+   [docs/lab.md](docs/lab.md) documents the lab that exists today.
 
 ## Architecture in three sentences
 
