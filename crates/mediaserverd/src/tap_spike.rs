@@ -1,4 +1,4 @@
-use crate::consumer_ws::ConsumerSink;
+use crate::hub::{Hub, TapEvent};
 use media_core::jitter;
 use media_core::pipeline::{IngestOutcome, PipelineError, PipelineStats, Playout, StreamPipeline};
 use media_core::{AudioFormat, Track};
@@ -52,7 +52,6 @@ pub struct TapLeg {
     digits: [char; MAX_RECORDED_DIGITS],
     digits_recorded: usize,
     stats: LegStats,
-    consumer: Option<ConsumerSink>,
     ptime_ms: u64,
     frames_released: u64,
     datagram_log: Vec<u8>,
@@ -80,16 +79,10 @@ impl TapLeg {
             digits: [' '; MAX_RECORDED_DIGITS],
             digits_recorded: 0,
             stats: LegStats::default(),
-            consumer: None,
             ptime_ms: format.ptime_ms.max(1) as u64,
             frames_released: 0,
             datagram_log: Vec::new(),
         })
-    }
-
-    pub fn with_consumer(mut self, consumer: ConsumerSink) -> Self {
-        self.consumer = Some(consumer);
-        self
     }
 
     pub fn with_datagram_log(mut self, capacity_bytes: usize) -> Self {
@@ -121,7 +114,7 @@ impl TapLeg {
         }
     }
 
-    fn drain(&mut self, buf: &mut [u8]) {
+    fn drain(&mut self, buf: &mut [u8], mut hub: Option<&mut Hub>) {
         for received in 0..MAX_DATAGRAMS_PER_DRAIN {
             match self.socket.recv_from(buf) {
                 Ok((len, _from)) => {
@@ -131,8 +124,11 @@ impl TapLeg {
                             self.digits[self.digits_recorded] = digit;
                             self.digits_recorded += 1;
                         }
-                        if let Some(consumer) = &self.consumer {
-                            consumer.offer_dtmf(self.track, digit);
+                        if let Some(hub) = hub.as_deref_mut() {
+                            hub.publish(TapEvent::Dtmf {
+                                track: self.track,
+                                digit,
+                            });
                         }
                     }
                     self.stats.datagrams += 1;
@@ -162,14 +158,13 @@ impl TapLeg {
         self.datagram_log.extend_from_slice(datagram);
     }
 
-    fn release_frame(&mut self) {
+    fn release_frame(&mut self, hub: Option<&mut Hub>) {
         let Self {
             track,
             pipeline,
             samples,
             capacity_samples,
             stats,
-            consumer,
             ptime_ms,
             frames_released,
             ..
@@ -179,16 +174,21 @@ impl TapLeg {
         *frames_released += 1;
         match pipeline.release() {
             Playout::Pcm(pcm) | Playout::Concealed(pcm) | Playout::Suppressed(pcm) => {
-                if let Some(consumer) = consumer {
-                    consumer.offer_media(*track, timestamp_ms, pcm, true);
+                if let Some(hub) = hub {
+                    hub.publish(TapEvent::media(*track, timestamp_ms, pcm, true));
                 }
                 append_within_capacity(samples, *capacity_samples, pcm, stats)
             }
             Playout::Waiting => {
                 stats.underruns += 1;
-                if let Some(consumer) = consumer {
+                if let Some(hub) = hub {
                     let quiet = frame_samples.min(SILENCE.len());
-                    consumer.offer_media(*track, timestamp_ms, &SILENCE[..quiet], true);
+                    hub.publish(TapEvent::media(
+                        *track,
+                        timestamp_ms,
+                        &SILENCE[..quiet],
+                        true,
+                    ));
                 }
                 if samples.len() + frame_samples > *capacity_samples {
                     stats.capture_full = true;
@@ -228,6 +228,7 @@ pub struct CaptureSummary {
 
 pub fn capture(
     legs: &mut [TapLeg],
+    mut hub: Option<&mut Hub>,
     format: AudioFormat,
     max_capture: Duration,
     stop: &AtomicBool,
@@ -241,14 +242,17 @@ pub fn capture(
     let mut reanchors = 0u64;
 
     while !stop.load(Ordering::Relaxed) && started.elapsed() < max_capture {
+        if let Some(hub) = hub.as_deref_mut() {
+            hub.poll_commands();
+        }
         for leg in legs.iter_mut() {
-            leg.drain(&mut buf);
+            leg.drain(&mut buf, hub.as_deref_mut());
         }
 
         let now = Instant::now();
         if now >= next_release {
             for leg in legs.iter_mut() {
-                leg.release_frame();
+                leg.release_frame(hub.as_deref_mut());
             }
             releases += 1;
             next_release += ptime;
@@ -401,7 +405,13 @@ mod tests {
         }
 
         let stop = AtomicBool::new(false);
-        let summary = capture(&mut legs, AudioFormat::pcmu_8k_20ms(), max_capture, &stop);
+        let summary = capture(
+            &mut legs,
+            None,
+            AudioFormat::pcmu_8k_20ms(),
+            max_capture,
+            &stop,
+        );
 
         assert!(summary.releases >= 15, "{summary:?}");
         assert_eq!(legs[0].samples().len(), legs[1].samples().len());
@@ -434,7 +444,13 @@ mod tests {
         }
 
         let stop = AtomicBool::new(false);
-        capture(&mut legs, AudioFormat::pcmu_8k_20ms(), max_capture, &stop);
+        capture(
+            &mut legs,
+            None,
+            AudioFormat::pcmu_8k_20ms(),
+            max_capture,
+            &stop,
+        );
 
         assert_eq!(legs[0].digits_seen(), "7");
         assert_eq!(legs[0].stats().pipeline.dtmf_digits, 1);
@@ -449,7 +465,13 @@ mod tests {
         let mut legs = vec![leg(Track::Customer, socket, max_capture)];
 
         let stop = AtomicBool::new(false);
-        let summary = capture(&mut legs, AudioFormat::pcmu_8k_20ms(), max_capture, &stop);
+        let summary = capture(
+            &mut legs,
+            None,
+            AudioFormat::pcmu_8k_20ms(),
+            max_capture,
+            &stop,
+        );
 
         assert!(summary.releases >= 5, "{summary:?}");
         assert_eq!(legs[0].stats().underruns, summary.releases);
@@ -471,7 +493,13 @@ mod tests {
         }
 
         let stop = AtomicBool::new(false);
-        capture(&mut legs, AudioFormat::pcmu_8k_20ms(), max_capture, &stop);
+        capture(
+            &mut legs,
+            None,
+            AudioFormat::pcmu_8k_20ms(),
+            max_capture,
+            &stop,
+        );
 
         let replayed: Vec<&[u8]> = media_core::replay::DatagramLog::new(legs[0].datagram_log())
             .map(|entry| entry.unwrap())
@@ -496,7 +524,13 @@ mod tests {
         }
 
         let stop = AtomicBool::new(false);
-        capture(&mut legs, AudioFormat::pcmu_8k_20ms(), max_capture, &stop);
+        capture(
+            &mut legs,
+            None,
+            AudioFormat::pcmu_8k_20ms(),
+            max_capture,
+            &stop,
+        );
 
         assert!(legs[0].stats().datagram_log_full);
         assert!(legs[0].datagram_log().len() <= 200);
@@ -510,15 +544,22 @@ mod tests {
     fn a_silent_leg_still_feeds_the_consumer_because_asr_disconnects_on_a_gap() {
         let max_capture = Duration::from_millis(200);
         let (socket, _) = loopback_pair();
-        let (sink, mut feed) = crate::consumer_ws::channel(64);
-        let mut legs = vec![leg(Track::Customer, socket, max_capture).with_consumer(sink)];
+        let (mut hub, client) = Hub::new();
+        let mut subscription = client.attach(64, crate::hub::TrackSelection::All).unwrap();
+        let mut legs = vec![leg(Track::Customer, socket, max_capture)];
 
         let stop = AtomicBool::new(false);
-        let summary = capture(&mut legs, AudioFormat::pcmu_8k_20ms(), max_capture, &stop);
+        let summary = capture(
+            &mut legs,
+            Some(&mut hub),
+            AudioFormat::pcmu_8k_20ms(),
+            max_capture,
+            &stop,
+        );
 
         assert_eq!(legs[0].stats().underruns, summary.releases);
         let mut offered = 0;
-        while feed.try_next().is_some() {
+        while subscription.try_next().is_some() {
             offered += 1;
         }
         assert_eq!(offered as u64, summary.releases);
@@ -532,6 +573,7 @@ mod tests {
         let stop = AtomicBool::new(true);
         let summary = capture(
             &mut legs,
+            None,
             AudioFormat::pcmu_8k_20ms(),
             Duration::from_secs(30),
             &stop,
@@ -551,6 +593,7 @@ mod tests {
         let stop = AtomicBool::new(false);
         capture(
             &mut legs,
+            None,
             AudioFormat::pcmu_8k_20ms(),
             Duration::from_millis(1400),
             &stop,
