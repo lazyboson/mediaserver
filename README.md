@@ -19,6 +19,7 @@ legs + injection (voice AI) → Phase 4 mixing/conferencing.
 | `crates/media-core` | **Sans-IO** media pipeline core: RTP parse/serialize, G.711, RFC 2833 DTMF, jitter buffer, frame/format types. No sockets, no clocks, no async — testable by pcap replay. |
 | `crates/rtpengine-ng` | **Sans-IO** RTPEngine NG protocol client: bencode + `subscribe request/answer`, `unsubscribe`, `ping` datagram builders and reply parsing. |
 | `crates/protocol` | Consumer wire dialects: Twilio Media Streams JSON (the legacy media gateway-compatible) and `audio_fork send_text` control events (the legacy stream fsm-compatible). |
+| `crates/session-core` | **Sans-IO** control-plane core: the `MediaControl` state machine over sessions, attachments, playbacks and events — capability authorization, one authoritative attachment per session, event identity and sequencing, idempotent retries. No sockets, no async. |
 | `crates/mediaserverd` | The daemon: Tokio control plane + dedicated real-time media worker threads (the **two-world** architecture), session supervision / audio-flow watchdog. |
 | `proto/` | gRPC contracts for `MediaControl` / `MediaStream` (wired with tonic in milestone 2). |
 | `docs/` | Architecture proposal & decision records. |

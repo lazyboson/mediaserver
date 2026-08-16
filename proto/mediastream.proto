@@ -1,94 +1,32 @@
-// MSS gRPC contracts — wired with tonic/prost in milestone M4.
-// Sketch from docs/architecture.md §5.1; field numbers are provisional
-// until first release, frozen after.
+// MSS data plane — what actually flows on a gRPC attachment
+// (docs/architecture.md §5.8).
+//
+// Control lives in mediacontrol.proto and says who may attach and with what
+// capability; this file says what bytes move once they have. Binary frames
+// over HTTP/2 remove the per-packet JSON+base64 overhead the WS-Twilio
+// dialect carries (50 marshals+encodes/sec/call; at 1,000 calls that is 50k
+// per second of pure serialization). The WS adapter keeps that cost
+// deliberately — it is the compatibility surface, not the native one.
+//
+// Field numbers are provisional until first release, frozen after
+// (Constitution, Article VII).
 
 syntax = "proto3";
 
 package mss.v1;
 
-service MediaControl {
-  rpc StartTap(StartTapRequest) returns (StartTapResponse);
-  rpc StopTap(StopTapRequest) returns (Ack);
-  rpc AddConsumer(AddConsumerRequest) returns (AddConsumerResponse);
-  rpc RemoveConsumer(ConsumerRef) returns (Ack);
-  rpc PauseConsumer(ConsumerRef) returns (Ack);   // the legacy stream fsm parity
-  rpc ResumeConsumer(ConsumerRef) returns (Ack);  // the legacy stream fsm parity
-  rpc SendText(SendTextRequest) returns (Ack);    // audio_fork send_text parity
-}
+import "mediacontrol.proto";
 
 service MediaStream {
-  // Consumer attaches and receives frames; client messages carry control
-  // and (phase 3, inline sessions) injected audio.
   rpc Subscribe(stream ConsumerToServer) returns (stream ServerToConsumer);
-}
-
-message StartTapRequest {
-  string session_id = 1;       // MSS session (usually = interaction id)
-  string call_id = 2;          // SIP Call-ID at the anchoring rtpengine
-  repeated string from_tags = 3;
-  string rtpengine_node = 4;   // discovered via call->node registry
-  bool mix = 5;
-  repeated ConsumerSpec consumers = 6;
-}
-
-message StartTapResponse {
-  string session_id = 1;
-  string owner_pod = 2;
-}
-
-message StopTapRequest { string session_id = 1; }
-
-message ConsumerSpec {
-  string consumer_id = 1;
-  oneof endpoint {
-    string ws_url = 2;         // Twilio-dialect WebSocket (compat mode)
-    string grpc_target = 3;    // MSS dials out (push mode)
-  }
-  AudioFormat format = 4;
-  map<string, string> metadata = 5;  // audio_fork metadata parity
-}
-
-message AddConsumerRequest {
-  string session_id = 1;
-  ConsumerSpec consumer = 2;
-}
-
-message AddConsumerResponse { string consumer_id = 1; }
-
-message ConsumerRef {
-  string session_id = 1;
-  string consumer_id = 2;
-}
-
-message SendTextRequest {
-  string session_id = 1;
-  string consumer_id = 2;
-  string json = 3;             // forwarded verbatim (fork_events shapes)
-}
-
-message Ack {}
-
-message AudioFormat {
-  Encoding encoding = 1;
-  uint32 sample_rate_hz = 2;
-  uint32 channels = 3;
-  uint32 ptime_ms = 4;
-}
-
-enum Encoding {
-  ENCODING_UNSPECIFIED = 0;
-  ENCODING_PCMU = 1;
-  ENCODING_PCMA = 2;
-  ENCODING_L16 = 3;
-  ENCODING_OPUS = 4;
 }
 
 message ServerToConsumer {
   oneof msg {
     StreamStart start = 1;
     AudioFrame frame = 2;
-    DtmfEvent dtmf = 3;
-    TextEvent text = 4;
+    DtmfFrame dtmf = 3;
+    TextFrame text = 4;
     StreamStop stop = 5;
   }
 }
@@ -96,35 +34,53 @@ message ServerToConsumer {
 message ConsumerToServer {
   oneof msg {
     ConsumerHello hello = 1;
-    AudioFrame inject = 2;     // phase 3, inline sessions only
+    // Honored only when the attachment declared CAPABILITY_INJECT; from any
+    // other attachment this is a protocol violation, not a no-op (§5.2).
+    AudioFrame inject = 2;
     Mark mark = 3;
     Clear clear = 4;
   }
 }
 
+message ConsumerHello {
+  string attachment_id = 1;
+  string token = 2;
+  // MSS re-encodes per consumer, so a consumer asks for what it wants
+  // rather than adapting to whatever the call happens to use.
+  AudioFormat requested_format = 3;
+}
+
 message StreamStart {
   string session_id = 1;
-  string stream_sid = 2;
-  repeated string tracks = 3;
-  AudioFormat format = 4;
-  map<string, string> custom_parameters = 5;
+  string external_id = 2;
+  string attachment_id = 3;
+  string stream_sid = 4;
+  repeated string tracks = 5;
+  AudioFormat format = 6;
+  map<string, string> custom_parameters = 7;
 }
 
 message AudioFrame {
   string track = 1;
   uint64 seq = 2;
   uint64 pts_ms = 3;
-  bytes payload = 4;           // raw audio, NOT base64
+  bytes payload = 4;  // raw audio, NOT base64
 }
 
-message DtmfEvent {
+message DtmfFrame {
   string track = 1;
   string digit = 2;
 }
 
-message TextEvent { string json = 1; }
+// send_text passthrough, in the fork_events shapes.
+message TextFrame {
+  string json = 1;
+}
 
-message Mark { string name = 1; }
+message Mark {
+  string name = 1;
+}
+
 message Clear {}
 
 message StreamStop {

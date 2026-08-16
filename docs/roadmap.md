@@ -69,8 +69,13 @@ Work:
   capability (`SINK` / `+EVENTS` / `+INJECT`) — architecture.md §5.2 — and
   exactly one per session is `authoritative` (§5.3).
 - Control plane: tonic `MediaControl` over the Session/Attachment/Playback
-  nouns (architecture.md §5.1), Redis session registry with ownership
-  leases + re-subscribe on pod loss, and **events published to Kafka**
+  nouns (architecture.md §5.1). **The state machine underneath it has
+  landed** — `crates/session-core`, sans-IO: capability enforcement, the
+  one-authoritative-attachment rule, per-session event sequencing and
+  idempotent retries, with `proto/mediacontrol.proto` as the contract.
+  Still to come: the tonic service itself, Redis session registry with
+  ownership leases + re-subscribe on pod loss, and **events published to
+  Kafka**
   (`mss.events`, typed `MediaEvent`) rather than streamed back over gRPC —
   a translator in the legacy controller renders them onto the existing `eventTopic` in the
   positional format `the application server` already consumes (§5.4).

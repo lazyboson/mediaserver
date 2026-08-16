@@ -1,0 +1,293 @@
+// MSS control plane — the noun-oriented API from docs/architecture.md §5.1,
+// and the event schema from §5.4.
+//
+// This is deliberately NOT a mirror of the legacy controller's the legacy verb API.proto: those names
+// (StreamPause, StreamSendText, StartCallTranscription) describe how
+// FreeSWITCH does it, and Phase 3/4 — inline legs, mixing, whisper — do not
+// fit that vocabulary. TelCompat (§5.6) speaks the legacy controller's verbs onto these nouns
+// until the legacy controller no longer needs them.
+//
+// Field numbers are provisional until first release, frozen after
+// (Constitution, Article VII).
+
+syntax = "proto3";
+
+package mss.v1;
+
+import "google/protobuf/timestamp.proto";
+
+service MediaControl {
+  rpc CreateSession(CreateSessionRequest) returns (Session);
+  rpc DestroySession(SessionRef) returns (Ack);
+  rpc DescribeSession(SessionRef) returns (Session);
+
+  rpc Attach(AttachRequest) returns (Attachment);
+  rpc Detach(AttachmentRef) returns (Ack);
+  rpc UpdateAttachment(UpdateAttachmentRequest) returns (Attachment);
+  rpc SendToAttachment(SendToAttachmentRequest) returns (Ack);
+
+  rpc StartPlayback(StartPlaybackRequest) returns (Playback);
+  rpc StopPlayback(PlaybackRef) returns (Ack);
+
+  // Debug and direct consumers only. The production event path is Kafka
+  // "mss.events" (§5.4) — a gRPC event stream would reintroduce fan-out,
+  // ordering, restart-without-loss and replay, all of which the bus solves.
+  rpc WatchEvents(WatchRequest) returns (stream MediaEvent);
+}
+
+// ---------------------------------------------------------------- sessions
+
+enum SessionKind {
+  SESSION_KIND_UNSPECIFIED = 0;
+  SESSION_KIND_TAP = 1;     // phase 1-2: rtpengine subscription, listen-only
+  SESSION_KIND_INLINE = 2;  // phase 3: MSS is an RTP endpoint in the path
+  SESSION_KIND_MIX = 3;     // phase 4: conference
+}
+
+enum SessionState {
+  SESSION_STATE_UNSPECIFIED = 0;
+  SESSION_STATE_ACTIVE = 1;
+  SESSION_STATE_ENDED = 2;
+}
+
+message CreateSessionRequest {
+  // the legacy controller keys everything by channel UUID because FreeSWITCH owns the
+  // channel; MSS keys by (call_id, from_tags, node) because rtpengine does.
+  // external_id is the legacy controller's request_uuid and the Kafka partition key.
+  string external_id = 1;
+  SessionKind kind = 2;
+  string call_id = 3;
+  repeated string from_tags = 4;
+  // Resolved through the OpenSIPS -> Redis map when empty (M2 discovery).
+  string rtpengine_node = 5;
+  bool mix = 6;
+  // A retry during pod loss must not create a second session.
+  string idempotency_key = 7;
+}
+
+message Session {
+  string session_id = 1;
+  string external_id = 2;
+  SessionKind kind = 3;
+  SessionState state = 4;
+  string call_id = 5;
+  repeated string from_tags = 6;
+  string rtpengine_node = 7;
+  string owner_pod = 8;
+  repeated Attachment attachments = 9;
+}
+
+message SessionRef {
+  oneof id {
+    string session_id = 1;
+    string external_id = 2;
+  }
+}
+
+// ------------------------------------------------------------- attachments
+
+enum Transport {
+  TRANSPORT_UNSPECIFIED = 0;
+  TRANSPORT_WS_TWILIO = 1;   // frozen dialect; what consumers speak today
+  TRANSPORT_GRPC_STREAM = 2; // MediaStream in mediastream.proto
+  TRANSPORT_FILE_S3 = 3;     // recorder; no back channel by construction
+  TRANSPORT_RTP_INLINE = 4;  // phase 3/4 participant leg
+}
+
+// Capability is an authorization boundary, not bookkeeping (§5.2): a
+// recorder must not be able to push audio into a live call, and an
+// analytics sink must not be able to emit end_of_interaction and tear a
+// session down. Declaring at attach makes those structurally impossible.
+enum Capability {
+  CAPABILITY_UNSPECIFIED = 0;
+  CAPABILITY_SINK = 1;    // receives audio
+  CAPABILITY_EVENTS = 2;  // may emit MediaEvents back
+  CAPABILITY_INJECT = 3;  // may put audio into the session
+}
+
+message TrackSelector {
+  oneof select {
+    bool all = 1;
+    string only = 2;  // "customer" | "agent" | "mixed"
+  }
+}
+
+message AttachRequest {
+  SessionRef session = 1;
+  Transport transport = 2;
+  repeated Capability capabilities = 3;
+  TrackSelector selector = 4;
+  AudioFormat format = 5;
+  // Exactly one attachment per session may be authoritative (§5.3). Only its
+  // events are rendered into the legacy mod_audio_fork::* names that drive
+  // the legacy stream fsm; a second authoritative attach is rejected, not resolved.
+  bool authoritative = 6;
+  string label = 7;
+  string endpoint = 8;                // ws url / grpc target / s3 prefix
+  map<string, string> metadata = 9;   // audio_fork metadata parity
+  string idempotency_key = 10;
+}
+
+message Attachment {
+  string attachment_id = 1;
+  string session_id = 2;
+  Transport transport = 3;
+  repeated Capability capabilities = 4;
+  TrackSelector selector = 5;
+  AudioFormat format = 6;
+  bool authoritative = 7;
+  bool paused = 8;
+  string label = 9;
+}
+
+message AttachmentRef {
+  string attachment_id = 1;
+}
+
+// Pause/resume is this, not an RPC pair (§5.1).
+message UpdateAttachmentRequest {
+  string attachment_id = 1;
+  optional bool paused = 2;
+  TrackSelector selector = 3;
+  AudioFormat format = 4;
+  string idempotency_key = 5;
+}
+
+// send_text parity: forwarded verbatim to the far end, which is why the
+// transport must have a back channel.
+message SendToAttachmentRequest {
+  string attachment_id = 1;
+  string json = 2;
+}
+
+// --------------------------------------------------------------- playback
+
+message StartPlaybackRequest {
+  SessionRef session = 1;
+  oneof source {
+    bytes blob = 2;   // raw bytes; rtpengine rejects blob64 (lab-measured)
+    string file = 3;
+    bool stream = 4;  // phase 3: streaming TTS
+  }
+  // Empty means everyone in the session hears it; a from-tag targets one
+  // participant, which is the whisper shape (lab-measured on 14.1.1.8).
+  string target_tag = 5;
+  uint32 repeat_times = 6;
+  bool block_egress = 7;
+  // When set, the playback is attributed to that attachment and requires
+  // its INJECT capability.
+  string requested_by = 8;
+  string idempotency_key = 9;
+}
+
+message Playback {
+  string playback_id = 1;
+  string session_id = 2;
+}
+
+message PlaybackRef {
+  string playback_id = 1;
+}
+
+// ----------------------------------------------------------------- events
+
+message WatchRequest {
+  SessionRef session = 1;
+}
+
+// Published to Kafka topic "mss.events", keyed by external_id, sequence
+// numbered per session, OTel context injected. A small Go translator in
+// the legacy controller renders these onto the legacy eventTopic in the positional
+// Events{repeated string} format the application server already parses.
+//
+// The translator lives in the legacy controller, not MSS: the legacy format IS
+// constants.MapKeyIndex, a positional index table defined in Go. Encoding it
+// here would couple MSS to a Go constant file that changes without our
+// knowing, and the day someone inserts an index MSS silently corrupts every
+// event.
+//
+// Legacy names it renders (only when legacy_eligible is set):
+//   speech_started      -> mod_audio_fork::start_of_transcript
+//   partial             -> mod_audio_fork::partial_speech_result
+//   final (first_final) -> mod_audio_fork::first_transcript
+//   final               -> mod_audio_fork::transcription
+//   end_of_utterance    -> mod_audio_fork::end_of_utterance
+//   end_of_interaction  -> mod_audio_fork::end_of_interaction
+//   playback_started    -> mod_audio_fork::play_audio
+message MediaEvent {
+  string session_id = 1;
+  string external_id = 2;
+  string attachment_id = 3;
+  uint64 seq = 4;
+  google.protobuf.Timestamp at = 5;
+  // False for every non-authoritative attachment: the event still reaches
+  // mss.events for analytics and debugging, but must never drive the legacy stream fsm.
+  bool legacy_eligible = 6;
+
+  oneof payload {
+    SpeechStarted speech_started = 10;
+    PartialTranscript partial = 11;
+    FinalTranscript final = 12;
+    EndOfUtterance end_of_utterance = 13;
+    Dtmf dtmf = 14;
+    PlaybackStarted playback_started = 15;
+    PlaybackStopped playback_stopped = 16;
+    RecordingStarted recording_started = 17;
+    RecordingStopped recording_stopped = 18;
+    UploadCompleted upload_completed = 19;
+    AttachmentUp attachment_up = 20;
+    AttachmentDown attachment_down = 21;
+    SessionEnded session_ended = 22;
+    EndOfInteraction end_of_interaction = 23;
+  }
+}
+
+message SpeechStarted { string track = 1; }
+
+// The highest-rate event in the system, and the one the barge-in budget is
+// measured against (§5.5).
+message PartialTranscript {
+  string track = 1;
+  string text = 2;
+  double confidence = 3;
+}
+
+message FinalTranscript {
+  string track = 1;
+  string text = 2;
+  double confidence = 3;
+  // MSS owns the session, so MSS knows which final is the first one; the
+  // translator does not have to keep that state.
+  bool first_final = 4;
+}
+
+message EndOfUtterance { string track = 1; }
+message Dtmf { string track = 1; string digit = 2; }
+message PlaybackStarted { string playback_id = 1; }
+message PlaybackStopped { string playback_id = 1; string reason = 2; }
+message RecordingStarted { string recording_id = 1; string path = 2; }
+message RecordingStopped { string recording_id = 1; uint64 duration_ms = 2; }
+message UploadCompleted { string recording_id = 1; string uri = 2; }
+message AttachmentUp { string label = 1; }
+message AttachmentDown { string label = 1; string reason = 2; }
+message SessionEnded { string reason = 1; }
+message EndOfInteraction { string reason = 1; }
+
+// ----------------------------------------------------------------- shared
+
+message AudioFormat {
+  Encoding encoding = 1;
+  uint32 sample_rate_hz = 2;
+  uint32 channels = 3;
+  uint32 ptime_ms = 4;
+}
+
+enum Encoding {
+  ENCODING_UNSPECIFIED = 0;
+  ENCODING_PCMU = 1;
+  ENCODING_PCMA = 2;
+  ENCODING_L16 = 3;
+  ENCODING_OPUS = 4;
+}
+
+message Ack {}
