@@ -392,22 +392,41 @@ into something that actually taps calls.
   `MAX_PLAYBACK_BLOB_BYTES` because one NG datagram cannot carry it (the
   lab's `EMSGSIZE` finding), and streaming playback names itself as
   Phase-3 work.
-- **Leg identity is positional, and that is not sound (found 2026-08-16).**
-  `track_for_stream` labels stream 0 Customer and stream 1 Agent. Against
-  rtpengine 14.1.1.8 in the lab, a two-tag subscription came back with
-  **`a=label` absent on both streams** (`label: None`), and the stream order
-  did not follow the order of the `from-tags` we asked for: on the run where
-  the caller spoke, the speech arrived on the stream we had labelled *Agent*,
-  while the stream labelled *Customer* was digital silence. Everything else
-  was healthy — 2555 and 2609 datagrams, every one decoded, zero loss, zero
-  unknown payload types — so this is purely a naming defect, and it lands
-  the caller's voice on the wrong channel of a stereo recording and on the
-  wrong speaker in RTT. The spike shares the bug: same positional helper.
-  **The fix is one subscription per from-tag** so identity is unambiguous
-  (one stream per subscription), which costs an extra NG round trip and one
-  more socket and does not depend on rtpengine labelling anything. Do that
-  before Phase 2 trusts stereo, and before RTT speaker attribution is
-  believed.
+- **Leg identity: one subscription per participant (2026-08-16/17).** The
+  first version asked for both `from-tags` in a single `subscribe request`
+  and named the resulting streams by position. Against 14.1.1.8 that is not
+  sound: rtpengine returns **no `a=label`** on the streams and the order does
+  not follow the order of the tags requested. `subscribe_one_leg` now makes
+  one subscription per tag, so the tag we asked for is the only thing on the
+  socket and identity is never inferred from ordering. If a later leg fails,
+  the earlier ones are unsubscribed before the error returns.
+- **Two lab findings came out of that, both measured, one of them ours:**
+  1. *Every answer needs its own SDP session id.* The per-leg answers
+     initially reused `sdp_session_id`, and rtpengine then delivered roughly
+     twice the datagrams to one leg and silence to the other — consistent
+     with it treating identical `o=` lines as one session. Each leg now
+     answers with `sdp_session_id + index`, and the two legs immediately
+     came back with matched counts (2609 vs 2664).
+  2. *A subscription carries what that participant **hears**, not what it
+     says.* With the counts even, the subscription made with the caller's
+     tag was silent while the one made with FreeSWITCH's tag carried the
+     caller's voice, across three runs. FreeSWITCH was genuinely silent
+     (the caller's own ear recording has zero voiced samples), so both sides
+     agree. `voice_the_participant_hears` encodes this: the leg subscribed
+     with participant *i*'s tag is named for the **other** party's voice.
+     This contradicts the older architecture.md §6 note that `play media`'s
+     `from-tag` picks who *hears* the audio — an injection aimed at the
+     caller showed up on the FreeSWITCH-tag subscription — so one of the two
+     readings is wrong and §6 should not be trusted until re-probed.
+- **Not yet proven end to end, and it must be before Phase 2 trusts stereo.**
+  Media delivery on per-tag subscriptions is **intermittent**: the same code
+  and the same call shape produced 2664 datagrams of speech on the second
+  leg in one run and 0 in the next, and a single-tag session delivered
+  nothing at all. Until that is understood, the naming above rests on the
+  runs where media flowed. The next step is a dedicated probe in the
+  `lab/ng_*_probe.py` style — subscribe per tag repeatedly against one call,
+  with both parties producing distinguishable audio — rather than more
+  guessing from the daemon.
 - **Known gaps:** no Redis registry, so a tap lives and dies with its pod;
   `stop_playback` stops everything on the call rather than one playback,
   because rtpengine's `stop media` targets a participant, not a playback id;
