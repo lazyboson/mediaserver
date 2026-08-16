@@ -56,6 +56,11 @@ injection) and finally conference mixing.
 6. [docs/testing.md](docs/testing.md) — the three test altitudes (replay,
    lab, benchmark), the impairment matrix, and the M2 benchmark method.
    [docs/lab.md](docs/lab.md) documents the lab that exists today.
+7. [docs/session-playbook.md](docs/session-playbook.md) — **read before
+   changing code.** Working rules distilled from real incidents in the
+   sessions that built Phases 0–1: probe vendors before trusting docs,
+   machine-verify before human tests, read artifacts before touching code,
+   verify scripted edits landed, never chain `&&` through the gate.
 
 ## Architecture in three sentences
 
