@@ -4,7 +4,7 @@ use control_api::proto::media_control_client::MediaControlClient;
 const USAGE: &str = "\
 mss_ctl <endpoint> create <external-id> <call-id> <from-tag> [rtpengine-node]
 mss_ctl <endpoint> describe <external-id>
-mss_ctl <endpoint> attach <external-id> <ws-url> [label]
+mss_ctl <endpoint> attach <external-id> <ws-url> [label] [authoritative]
 mss_ctl <endpoint> destroy <external-id>";
 
 fn reference(external_id: &str) -> proto::SessionRef {
@@ -33,7 +33,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     external_id: args[2].clone(),
                     kind: proto::SessionKind::Tap as i32,
                     call_id: args[3].clone(),
-                    from_tags: vec![args[4].clone()],
+                    from_tags: args[4].split(',').map(str::to_string).collect(),
                     rtpengine_node: args.get(5).cloned().unwrap_or_default(),
                     mix: false,
                     idempotency_key: String::new(),
@@ -60,7 +60,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     ],
                     selector: None,
                     format: None,
-                    authoritative: true,
+                    authoritative: args
+                        .get(5)
+                        .map(|flag| flag == "authoritative")
+                        .unwrap_or(false),
                     label: args
                         .get(4)
                         .cloned()
