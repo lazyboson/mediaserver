@@ -16,7 +16,7 @@ Today, every fork-shaped feature routes through FreeSWITCH and costs FS resource
 | Feature today | FS mechanism | FS cost per call |
 | --- | --- | --- |
 | Real-time transcription / RTT | `uuid_audio_fork` (forked mod_audio_fork) | 1 media bug + 1 WS connection + L16 encode |
-| Speech gather / ASR | `uuid_google_transcribe2` | 1 media bug + ASR client |
+| Speech gather / ASR | `uuid_audio_fork` → Deepgram (was `uuid_google_transcribe2`) | 1 media bug + 1 WS connection |
 | Voice AI agent | dummy leg via `originate … &conference(...)` → OpenSIPS B2B → the legacy media gateway | 1 extra SIP leg + **1 full conference mixer** + 1 conference member |
 | Recording | `record_session` media bug (`RECORD_STEREO`) | 1–2 media bugs + local file I/O |
 | Monitor/whisper | conference member + `relate … nospeak` | 1 leg + mixer work per supervisor |
@@ -139,7 +139,7 @@ Three properties this diagram is drawn to make explicit, each argued in §5:
 
 ### 3.1 Components
 
-**Session Controller** — the control plane. Exposes a gRPC API (plus REST for parity with today's callers) with verbs like `StartTap`, `StopTap`, `AddConsumer`, `RemoveConsumer`, `PauseConsumer`, `ResumeConsumer`, `SendText`, `StartRecording`, `StopRecording`. It owns the RTPEngine interaction: for each tap it sends `subscribe request {call-id, from-tag | from-tags, …}` to the RTPEngine instance anchoring that call, receives rtpengine's `a=sendonly` SDP offer, allocates a local RTP port, and replies with `subscribe answer` (`a=recvonly`) — optionally requesting a codec on the subscription leg so rtpengine transcodes at the tap (e.g., ask for PCMU even if the leg is Opus). Teardown is `unsubscribe`. This is the same mechanism SIPREC recording servers use with rtpengine, so it is a stable, supported surface.
+**Session Controller** — the control plane. Exposes the `MediaControl` gRPC API over the Session / Attachment / Playback nouns defined in §5.1 (a `TelCompat` façade translates the legacy controller's the legacy verb API verbs, §5.6). It owns the RTPEngine interaction: for each tap it sends `subscribe request {call-id, from-tag | from-tags, …}` to the RTPEngine instance anchoring that call, receives rtpengine's `a=sendonly` SDP offer, allocates a local RTP port, and replies with `subscribe answer` (`a=recvonly`) — optionally requesting a codec on the subscription leg so rtpengine transcodes at the tap (e.g., ask for PCMU even if the leg is Opus). Teardown is `unsubscribe`. This is the same mechanism SIPREC recording servers use with rtpengine, so it is a stable, supported surface.
 
 **Ingest / codec pipeline** — per subscribed stream: UDP socket → RTP depacketization → **jitter buffer** (sequence reorder, loss detection, PLC for G.711) → decode to linear PCM → resample (8 kHz ↔ 16 kHz ↔ 48 kHz) → per-consumer re-encode (L16/16k for ASR, PCMU/8k for Twilio-dialect consumers, Opus for bandwidth-sensitive consumers). One decode per stream, N encodes shared across consumers wanting the same format.
 
@@ -147,11 +147,11 @@ Three properties this diagram is drawn to make explicit, each argued in §5:
 
 **Consumer adapters:**
 
-- *gRPC bidirectional stream* — the new native interface (sketch in §5). Server-side streaming of audio frames + events; client → server messages carry control (pause/resume/marks) and, in Phase 3, injected audio.
+- *gRPC bidirectional stream* — the new native interface (frame contract in §5.8). Server-side streaming of audio frames + events; client → server messages carry control (marks/clear) and, where the attachment declares `INJECT`, audio.
 - *WebSocket, Twilio Media Streams dialect* — wire-compatible with what the legacy media gateway sends today (`start/media/dtmf/stop/mark` out, `media/mark/clear/endOfInteraction` in), so existing bot/ASR endpoints migrate with zero changes.
 - *Recording sink* — PCM → stereo WAV/OGG segmenter honoring the existing `${accountID}/${recordingID}.${fileFormat}` identity contract, uploading directly to S3 (no shared filesystem, no SQS hop — or keep SQS initially for compatibility).
 
-**State & events** — session registry in Redis (which pod owns which session, consumer list, status) with CAS-safe updates; billing/lifecycle events to Kafka (reuse `LEGACY_MEDIA_GATEWAY_BILLING_TOPIC` / `KAFKA_VOICE_AI_AGENT_TOPIC` schemas so downstream consumers don't change).
+**State & events** — session registry in Redis (which pod owns which session, attachment list, status) with CAS-safe updates and ownership leases. Media events go to Kafka `mss.events` as typed `MediaEvent`, translated into the legacy `eventTopic` format by a shim in the legacy controller (§5.4); billing/lifecycle events reuse `LEGACY_MEDIA_GATEWAY_BILLING_TOPIC` / `KAFKA_VOICE_AI_AGENT_TOPIC` schemas so downstream consumers don't change.
 
 ### 3.2 Why tap-based ingest scales better than everything you do today
 
@@ -173,7 +173,8 @@ sequenceDiagram
     participant RE as RTPEngine (anchoring the call)
     participant RTT as RTT consumer
 
-    CG->>MSS: StartTap(callID, legs=[customer,agent], consumers=[rtt])
+    CG->>MSS: CreateSession{TAP, external_id, call-id, tags}
+    CG->>MSS: Attach{GRPC_STREAM, SINK+EVENTS, tracks}
     MSS->>MSS: pick pod, allocate RTP ports
     MSS->>RE: NG subscribe request {call-id, from-tags:[A,B]}
     RE-->>MSS: SDP offer (a=sendonly, one m= per source)
@@ -182,7 +183,7 @@ sequenceDiagram
     MSS->>MSS: jitter buffer → decode → resample 16k
     MSS->>RTT: gRPC stream: StreamStart{format: L16/16k, tracks}
     MSS->>RTT: AudioFrame(track=customer)… AudioFrame(track=agent)…
-    CG->>MSS: StopTap(callID)
+    CG->>MSS: DestroySession{external_id}
     MSS->>RE: NG unsubscribe {call-id, to-tag}
     MSS->>RTT: StreamStop{reason}
 ```
@@ -190,7 +191,7 @@ sequenceDiagram
 Design details:
 
 - **Leg selection.** `subscribe request` takes `from-tag` / `from-tags` to choose which participant(s) to copy; the `mix` flag can ask rtpengine to combine sources into one output stream if a mixed mono feed is wanted (cheap supervisor-listen). Prefer *separate* per-leg subscriptions for ASR/recording — you keep speaker separation for free (today `RECORD_STEREO` does this inside FS).
-- **Which rtpengine to talk to.** The tap must go to the rtpengine instance anchoring the call. OpenSIPS already knows this (it picked the instance via the rtpengine/rtp_relay module). Expose it to the MSS either (a) by the legacy controller/OpenSIPS passing the rtpengine node + call-id + tags in the `StartTap` request, or (b) by publishing call→rtpengine mapping to Redis at call setup. Direct NG from MSS→rtpengine keeps OpenSIPS out of the media-copy control path entirely; alternatively, recent OpenSIPS releases expose the same rtpengine subscribe mechanics through `rtp_relay`/SIPREC tooling if you'd rather drive it from the proxy.
+- **Which rtpengine to talk to.** The tap must go to the rtpengine instance anchoring the call. OpenSIPS already knows this (it picked the instance via the rtpengine/rtp_relay module). **Decided:** OpenSIPS publishes call-id → rtpengine node + tags to Redis at call setup, and MSS resolves `external_id` through that map (§5.1); passing the node inline in `CreateSession` remains a fallback for callers that already know it. Direct NG from MSS→rtpengine keeps OpenSIPS out of the media-copy control path entirely.
 - **Transcoding at the tap.** Ask for PCMU/PCMA (or even L16 where supported) in the `subscribe answer`; rtpengine transcodes the subscription leg if the call codec differs. Still implement decode/resample in the MSS — you don't want rtpengine spending CPU transcoding when the MSS can, and you need 16 kHz L16 for most ASR anyway, which is best produced from your own resampler.
 - **Two taps per interaction** (customer leg at the interconnect rtpengine, agent leg at the agent-side rtpengine) when both sides are needed; one tap when only the customer side matters (voice-AI pre-agent, IVR-stage ASR — where there is no agent leg yet).
 - **DTMF.** RFC 2833 telephone-events arrive in the tapped RTP; the pipeline surfaces them as DTMF events on the hub (the legacy media gateway's `DecodeDTMF` logic — end-bit + (digit, timestamp) dedupe — is directly reusable).
@@ -307,6 +308,12 @@ legacy `mod_audio_fork::*` names that drive `the legacy stream fsm`. Others stil
 `mss.events` (analytics, debugging, future consumers) but never the FSM.
 A second authoritative attach is rejected, not silently resolved.
 
+Authoritative follows the session's purpose, not a fixed consumer type: in
+a voice-AI session the bridge is authoritative; in a gather session the ASR
+attachment is, because its `first_transcript`/`end_of_utterance` are what
+the FSM's timers run on. The `TelCompat` façade sets it from the verb that
+created the session.
+
 ### 5.4 Commands over gRPC, events over Kafka
 
 Events must **not** stream back over gRPC. the legacy controller's consumption is a Kafka
@@ -422,6 +429,39 @@ RPCs:
 - **A new consumer type** (different ASR vendor, analytics sink) is a new
   transport enum value plus a config blob. No API change.
 
+### 5.8 Data plane: the frame contract
+
+Control (§5.1) says who may attach and with what capability; this is what
+actually flows on a gRPC attachment (`proto/mediastream.proto`):
+
+```proto
+service MediaStream {
+  rpc Subscribe(stream ConsumerToServer) returns (stream ServerToConsumer);
+}
+message ServerToConsumer {
+  oneof msg {
+    StreamStart start = 1;   // session ids, tracks, AudioFormat{encoding, sample_rate_hz, channels, ptime_ms}
+    AudioFrame frame = 2;    // track, seq, pts_ms, payload (raw, NOT base64)
+    DtmfEvent dtmf = 3;
+    TextEvent text = 4;      // send_text passthrough
+    StreamStop stop = 5;
+  }
+}
+message ConsumerToServer {
+  oneof msg {
+    ConsumerHello hello = 1; // auth, requested format (MSS re-encodes per consumer)
+    AudioFrame inject = 2;   // only honored when the attachment declared INJECT
+    Mark mark = 3;
+    Clear clear = 4;
+  }
+}
+```
+
+Binary frames over HTTP/2 remove the per-packet JSON+base64 overhead the
+WS dialect carries (50 marshals+encodes/sec/call; at 1,000 calls that is
+50k/sec of pure serialization). The WS-Twilio adapter keeps that cost
+deliberately — it is the compatibility surface, not the native one.
+
 ---
 
 ## 6. Audio injection (Phase 3) — where the tap isn't enough
@@ -453,8 +493,6 @@ The audit of `the legacy media gateway` produced a concrete list of what the pur
 | 7 | Redis session JSON read-modify-write, no CAS → lost updates | Versioned writes (WATCH/Lua or per-field hashes) |
 | 8 | Per-datagram goroutine for OpenSIPS events → INVITE/BYE races per b2b key | Per-session serialized event queues (the legacy controller's the legacy stream fsm sharding pattern is the right one) |
 | 9 | `ptime=0` parse path → integer divide-by-zero panic; answers Opus with no rtpmap; strips telephone-event from answers | Hardened SDP handling (or lean on rtpengine to normalize — subscription SDP comes from rtpengine, which is well-formed) |
-| 12 | Fan-out has no single event source: N attachments can each claim to be "the call's speech events" and double-drive `the legacy stream fsm` | Exactly one `authoritative` attachment per session; every event carries `attachment_id`; a second authoritative attach is rejected (§5.3) |
-| 13 | MSS is a single writer per session, so it sits on the barge-in path that `partial_speech_result` drives — and the Kafka hop adds latency to it | Measure `partial` → `StopPlayback` cut-through before Phase-1 pilots; co-locate the translator with the legacy gRPC server; fall back to a gRPC stream **for speech events only** if measurement demands it, keeping recording/lifecycle on Kafka |
 | 10 | Pod-crash "recovery" is billing bookkeeping only; orphaned legs never torn down | Session registry with ownership leases; on pod death, controller re-establishes taps on a healthy pod (subscriptions are re-creatable — a *huge* HA advantage over inline legs) and tears down orphaned rtpengine subscriptions |
 | 11 | JSON + base64 per 20 ms frame per consumer | Binary gRPC frames natively; base64/JSON only on the WS-compat adapter |
 | 12 | No SRTP/DTLS/ICE | Fine to keep out of MSS: rtpengine terminates crypto at the edge; subscription legs are plaintext RTP on the private network. Revisit only if taps cross trust boundaries |
@@ -543,7 +581,9 @@ flowchart TD
 5. **the legacy stream fsm timing.** Pause/resume of the MSS consumer replaces pause/resume of the FS media bug. Latency differs slightly (network hop vs in-process bug). Validate barge-in feel (prompt-echo suppression) under load in Phase 1 pilots.
 6. **Recording compliance.** Recording via tap changes the failure domain: if the MSS pod dies, recording gaps until re-subscribe. If you have zero-gap compliance requirements for some tenants, keep `record_session` as a per-tenant fallback through Phase 2, or run dual-recording during the transition.
 7. **Sizing assumptions.** The per-pod session estimates in §8 are engineering estimates; the Phase-0 benchmark exists to replace them with numbers before you commit capacity plans.
-8. **Team surface area.** You'll operate a new stateful-ish media tier. Mitigation: passive taps are stateless-recoverable (re-subscribe), which makes the Phase 1–2 service much more forgiving to operate than a B2BUA; the genuinely stateful part (inline legs) arrives only in Phase 3, after the team has operational experience.
+8. **Fan-out has no single event source.** N attachments can each claim to be "the call's speech events" and double-drive `the legacy stream fsm`. Mitigation: exactly one `authoritative` attachment per session, every event carries `attachment_id`, and a second authoritative attach is rejected (§5.3).
+9. **MSS is a single writer on the barge-in path.** Consumers cannot route around it (§5.5), so the `partial_speech_result` → `StopPlayback` cut-through — including the Kafka hop — must be measured before Phase-1 pilots. Co-locate the events translator with the legacy gRPC server; if measurement demands it, fall back to a gRPC stream *for speech events only*, keeping recording/lifecycle on Kafka.
+10. **Team surface area.** You'll operate a new stateful-ish media tier. Mitigation: passive taps are stateless-recoverable (re-subscribe), which makes the Phase 1–2 service much more forgiving to operate than a B2BUA; the genuinely stateful part (inline legs) arrives only in Phase 3, after the team has operational experience.
 
 ---
 
