@@ -74,10 +74,12 @@ Work:
   one-authoritative-attachment rule, per-session event sequencing and
   idempotent retries, with `proto/mediacontrol.proto` as the contract.
   **The gRPC service has landed too** — `crates/control-api`, served over a
-  real socket and tested through a generated client. Still to come: wiring
-  it into `mediaserverd` behind a `MediaPlane` over the hub, the Redis
-  session registry with ownership leases + re-subscribe on pod loss, and
-  **events published to Kafka**
+  real socket and tested through a generated client — and **`mediaserverd`
+  now serves it** (`MSS_CONTROL_LISTEN`), with `tap_plane::TapPlane` turning
+  `CreateSession`/`Attach` into a real rtpengine subscription and a real
+  consumer websocket. Still to come: the Redis session registry with
+  ownership leases + re-subscribe on pod loss, and **events published to
+  Kafka**
   (`mss.events`, typed `MediaEvent`) rather than streamed back over gRPC —
   a translator in cigol renders them onto the existing `eventTopic` in the
   positional format `appServer` already consumes (§5.4).

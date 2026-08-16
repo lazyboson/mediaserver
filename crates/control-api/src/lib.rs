@@ -10,3 +10,4 @@ pub mod server;
 
 pub use controller::{MediaPlane, MediaPlaneError, PlaybackSource, SessionController};
 pub use server::{serve_on, serve_on_until};
+pub use tonic::async_trait;

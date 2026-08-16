@@ -62,7 +62,12 @@ legs + injection (voice AI) → Phase 4 mixing/conferencing.
 cargo test          # unit tests (all sans-IO cores are tested here)
 cargo clippy --all-targets -- -D warnings
 cargo fmt --check
-cargo run -p mediaserverd   # starts control plane + media workers (skeleton)
+cargo run -p mediaserverd   # media workers; set MSS_CONTROL_LISTEN to serve MediaControl
+
+# drive a running control plane by hand
+MSS_CONTROL_LISTEN=127.0.0.1:50551 cargo run -p mediaserverd
+cargo run -p control-api --example mss_ctl -- http://127.0.0.1:50551 \
+    create req-1 <call-id> <from-tag> <rtpengine-ip:port>
 ```
 
 Toolchain is pinned in `rust-toolchain.toml`.

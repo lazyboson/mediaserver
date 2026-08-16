@@ -38,6 +38,7 @@ pub struct ConsumerStats {
     pub inbound_unknown_encoding: u64,
     pub utterances: u64,
     pub barges: u64,
+    pub text_sent: u64,
 }
 
 pub struct ConsumerConfig {
@@ -62,6 +63,7 @@ pub async fn run(
     config: ConsumerConfig,
     mut events: Subscription,
     commands: Option<mpsc::Sender<BridgeCommand>>,
+    mut text: Option<mpsc::Receiver<String>>,
 ) -> Result<ConsumerStats, ConsumerError> {
     let (stream, _) = tokio_tungstenite::connect_async(&config.url).await?;
     info!(url = %config.url, stream_sid = %config.stream_sid, "consumer websocket connected");
@@ -130,6 +132,10 @@ pub async fn run(
             } => {
                 flush_utterance(&mut utterance, &mut idle_deadline, &mut stats, commands.as_ref()).await;
             }
+            outbound = next_text(&mut text) => {
+                stats.text_sent += 1;
+                writer.send(Message::text(outbound)).await?;
+            }
             inbound = reader.next() => {
                 match inbound {
                     Some(Ok(Message::Text(text))) => {
@@ -153,6 +159,16 @@ pub async fn run(
 
     stats.media_dropped = events.dropped_oldest();
     Ok(stats)
+}
+
+async fn next_text(text: &mut Option<mpsc::Receiver<String>>) -> String {
+    match text.as_mut() {
+        Some(receiver) => match receiver.recv().await {
+            Some(json) => json,
+            None => std::future::pending().await,
+        },
+        None => std::future::pending().await,
+    }
 }
 
 fn encode(message: &Outbound, kind: &'static str) -> Result<Message, ConsumerError> {
@@ -292,7 +308,7 @@ mod tests {
             tracks: vec!["inbound".into(), "outbound".into()],
             custom_parameters: HashMap::new(),
         };
-        let consumer = tokio::spawn(run(config, subscription, None));
+        let consumer = tokio::spawn(run(config, subscription, None, None));
 
         hub.publish(TapEvent::media(Track::Agent, 20, &pcm_frame(0), true));
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -310,6 +326,54 @@ mod tests {
         assert!(seen[2].contains(r#""event":"stop""#), "{:?}", seen[2]);
         assert_eq!(stats.media_sent, 1);
         assert_eq!(stats.media_dropped, 0);
+    }
+
+    #[tokio::test]
+    async fn send_text_reaches_the_far_end_verbatim() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(socket).await.unwrap();
+            let mut seen = Vec::new();
+            while let Some(Ok(message)) = ws.next().await {
+                if let Message::Text(text) = message {
+                    seen.push(text.to_string());
+                    if seen.len() == 3 {
+                        break;
+                    }
+                }
+            }
+            seen
+        });
+
+        let (mut hub, client) = crate::hub::Hub::new();
+        let subscription = client.attach(8, crate::hub::TrackSelection::All).unwrap();
+        hub.poll_commands();
+        let config = ConsumerConfig {
+            url: format!("ws:{}127.0.0.1:{port}", URL_SCHEME_SEPARATOR),
+            account_id: "acct-1".into(),
+            call_sid: "call-1".into(),
+            stream_sid: "MZ-1".into(),
+            format: AudioFormat::pcmu_8k_20ms(),
+            tracks: vec!["inbound".into()],
+            custom_parameters: HashMap::new(),
+        };
+        let (text, inbound) = mpsc::channel(4);
+        let consumer = tokio::spawn(run(config, subscription, None, Some(inbound)));
+
+        let sent = r#"{"event":"send_text","text":"hold please"}"#;
+        text.send(sent.to_string()).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        drop(hub);
+
+        let seen = server.await.unwrap();
+        let stats = consumer.await.unwrap().unwrap();
+
+        assert!(seen[0].contains(r#""event":"start""#), "{:?}", seen[0]);
+        assert_eq!(seen[1], sent);
+        assert!(seen[2].contains(r#""event":"stop""#), "{:?}", seen[2]);
+        assert_eq!(stats.text_sent, 1);
     }
 
     #[tokio::test]

@@ -235,7 +235,7 @@ pub async fn run(request: TapSpikeRequest, cookie_prefix: u64) -> Result<(), Tap
                 info!(listener = %name, url = %config.url, "attaching a listen-only consumer");
                 listener_tasks.push((
                     name,
-                    tokio::spawn(consumer_ws::run(config, subscription, None)),
+                    tokio::spawn(consumer_ws::run(config, subscription, None, None)),
                 ));
             }
             None => {
@@ -267,6 +267,7 @@ pub async fn run(request: TapSpikeRequest, cookie_prefix: u64) -> Result<(), Tap
                     config,
                     subscription,
                     Some(commands_tx),
+                    None,
                 )));
             }
             None => warn!("the hub refused the consumer attach; streaming disabled"),
