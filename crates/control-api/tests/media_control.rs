@@ -1,0 +1,527 @@
+use control_api::proto::media_control_server::MediaControl;
+use control_api::proto::{self, media_event::Payload};
+use control_api::{MediaPlane, MediaPlaneError, PlaybackSource, SessionController};
+use session_core::{AttachmentId, PlaybackId, SessionId};
+use std::sync::{Arc, Mutex};
+use tokio_stream::StreamExt;
+use tonic::{Code, Request};
+
+#[derive(Default)]
+struct RecordingMediaPlane {
+    text: Mutex<Vec<(String, String)>>,
+    playbacks: Mutex<Vec<String>>,
+    refuse: bool,
+}
+
+impl MediaPlane for RecordingMediaPlane {
+    fn send_text(&self, attachment: AttachmentId, json: &str) -> Result<(), MediaPlaneError> {
+        if self.refuse {
+            return Err(MediaPlaneError("the far end is gone".to_string()));
+        }
+        self.text
+            .lock()
+            .unwrap()
+            .push((attachment.to_string(), json.to_string()));
+        Ok(())
+    }
+
+    fn start_playback(
+        &self,
+        _session: SessionId,
+        playback: PlaybackId,
+        _source: PlaybackSource,
+        _target_tag: Option<&str>,
+        _block_egress: bool,
+    ) -> Result<(), MediaPlaneError> {
+        if self.refuse {
+            return Err(MediaPlaneError("nothing is listening".to_string()));
+        }
+        self.playbacks.lock().unwrap().push(playback.to_string());
+        Ok(())
+    }
+
+    fn stop_playback(
+        &self,
+        _session: SessionId,
+        _playback: PlaybackId,
+    ) -> Result<(), MediaPlaneError> {
+        Ok(())
+    }
+}
+
+fn controller() -> SessionController {
+    SessionController::new("test-pod")
+}
+
+fn create(external_id: &str) -> proto::CreateSessionRequest {
+    proto::CreateSessionRequest {
+        external_id: external_id.to_string(),
+        kind: proto::SessionKind::Tap as i32,
+        call_id: "call-abc".to_string(),
+        from_tags: vec!["from-a".to_string()],
+        rtpengine_node: "rtpengine-1".to_string(),
+        mix: false,
+        idempotency_key: String::new(),
+    }
+}
+
+fn attach(
+    session_id: &str,
+    transport: proto::Transport,
+    caps: &[proto::Capability],
+) -> proto::AttachRequest {
+    proto::AttachRequest {
+        session: Some(proto::SessionRef {
+            id: Some(proto::session_ref::Id::SessionId(session_id.to_string())),
+        }),
+        transport: transport as i32,
+        capabilities: caps.iter().map(|capability| *capability as i32).collect(),
+        selector: None,
+        format: None,
+        authoritative: false,
+        label: "consumer".to_string(),
+        endpoint: "wss:".to_string(),
+        metadata: Default::default(),
+        idempotency_key: String::new(),
+    }
+}
+
+async fn session_with(controller: &SessionController, external_id: &str) -> String {
+    controller
+        .create_session(Request::new(create(external_id)))
+        .await
+        .unwrap()
+        .into_inner()
+        .session_id
+}
+
+#[tokio::test]
+async fn a_created_session_describes_itself_with_the_pod_that_owns_it() {
+    let controller = controller();
+    let session = controller
+        .create_session(Request::new(create("req-1")))
+        .await
+        .unwrap()
+        .into_inner();
+
+    assert_eq!(session.external_id, "req-1");
+    assert_eq!(session.owner_pod, "test-pod");
+    assert_eq!(session.kind, proto::SessionKind::Tap as i32);
+    assert_eq!(session.state, proto::SessionState::Active as i32);
+
+    let described = controller
+        .describe_session(Request::new(proto::SessionRef {
+            id: Some(proto::session_ref::Id::ExternalId("req-1".to_string())),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(described.session_id, session.session_id);
+}
+
+#[tokio::test]
+async fn a_retried_create_is_answered_with_the_session_the_first_call_made() {
+    let controller = controller();
+    let mut request = create("req-1");
+    request.idempotency_key = "key-1".to_string();
+
+    let first = controller
+        .create_session(Request::new(request.clone()))
+        .await
+        .unwrap()
+        .into_inner();
+    let retry = controller
+        .create_session(Request::new(request))
+        .await
+        .unwrap()
+        .into_inner();
+
+    assert_eq!(first.session_id, retry.session_id);
+}
+
+#[tokio::test]
+async fn the_same_key_for_a_different_request_is_aborted_rather_than_answered_wrongly() {
+    let controller = controller();
+    let mut first = create("req-1");
+    first.idempotency_key = "key-1".to_string();
+    controller
+        .create_session(Request::new(first))
+        .await
+        .unwrap();
+
+    let mut second = create("req-2");
+    second.idempotency_key = "key-1".to_string();
+
+    let status = controller
+        .create_session(Request::new(second))
+        .await
+        .unwrap_err();
+    assert_eq!(status.code(), Code::Aborted);
+}
+
+#[tokio::test]
+async fn a_recorder_that_asks_to_inject_is_refused_before_it_ever_attaches() {
+    let controller = controller();
+    let session = session_with(&controller, "req-1").await;
+
+    let status = controller
+        .attach(Request::new(attach(
+            &session,
+            proto::Transport::FileS3,
+            &[proto::Capability::Sink, proto::Capability::Inject],
+        )))
+        .await
+        .unwrap_err();
+
+    assert_eq!(status.code(), Code::FailedPrecondition);
+    assert!(status.message().contains("INJECT"));
+}
+
+#[tokio::test]
+async fn a_sink_that_tries_to_inject_after_attaching_is_denied_permission() {
+    let controller = controller();
+    let session = session_with(&controller, "req-1").await;
+    let recorder = controller
+        .attach(Request::new(attach(
+            &session,
+            proto::Transport::FileS3,
+            &[proto::Capability::Sink],
+        )))
+        .await
+        .unwrap()
+        .into_inner();
+
+    let status = controller
+        .start_playback(Request::new(proto::StartPlaybackRequest {
+            session: Some(proto::SessionRef {
+                id: Some(proto::session_ref::Id::SessionId(session.clone())),
+            }),
+            source: Some(proto::start_playback_request::Source::File(
+                "moh".to_string(),
+            )),
+            target_tag: String::new(),
+            repeat_times: 0,
+            block_egress: false,
+            requested_by: recorder.attachment_id,
+            idempotency_key: String::new(),
+        }))
+        .await
+        .unwrap_err();
+
+    assert_eq!(status.code(), Code::PermissionDenied);
+}
+
+#[tokio::test]
+async fn a_second_authoritative_attachment_is_a_failed_precondition() {
+    let controller = controller();
+    let session = session_with(&controller, "req-1").await;
+
+    let mut first = attach(
+        &session,
+        proto::Transport::WsTwilio,
+        &[proto::Capability::Sink, proto::Capability::Events],
+    );
+    first.authoritative = true;
+    controller
+        .attach(Request::new(first.clone()))
+        .await
+        .unwrap();
+
+    let mut second = attach(
+        &session,
+        proto::Transport::GrpcStream,
+        &[proto::Capability::Sink, proto::Capability::Events],
+    );
+    second.authoritative = true;
+    let status = controller.attach(Request::new(second)).await.unwrap_err();
+
+    assert_eq!(status.code(), Code::FailedPrecondition);
+}
+
+#[tokio::test]
+async fn pausing_and_reselecting_an_attachment_is_one_update_call() {
+    let controller = controller();
+    let session = session_with(&controller, "req-1").await;
+    let attachment = controller
+        .attach(Request::new(attach(
+            &session,
+            proto::Transport::GrpcStream,
+            &[proto::Capability::Sink],
+        )))
+        .await
+        .unwrap()
+        .into_inner();
+
+    let updated = controller
+        .update_attachment(Request::new(proto::UpdateAttachmentRequest {
+            attachment_id: attachment.attachment_id.clone(),
+            paused: Some(true),
+            selector: Some(proto::TrackSelector {
+                select: Some(proto::track_selector::Select::Only("customer".to_string())),
+            }),
+            format: None,
+            idempotency_key: String::new(),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+
+    assert!(updated.paused);
+    assert_eq!(
+        updated.selector.unwrap().select,
+        Some(proto::track_selector::Select::Only("customer".to_string()))
+    );
+}
+
+#[tokio::test]
+async fn an_unknown_or_malformed_identifier_is_reported_not_guessed_at() {
+    let controller = controller();
+
+    let missing = controller
+        .describe_session(Request::new(proto::SessionRef {
+            id: Some(proto::session_ref::Id::ExternalId("nobody".to_string())),
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(missing.code(), Code::NotFound);
+
+    let malformed = controller
+        .detach(Request::new(proto::AttachmentRef {
+            attachment_id: "not-an-id".to_string(),
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(malformed.code(), Code::InvalidArgument);
+
+    let unreferenced = controller
+        .describe_session(Request::new(proto::SessionRef { id: None }))
+        .await
+        .unwrap_err();
+    assert_eq!(unreferenced.code(), Code::InvalidArgument);
+}
+
+#[tokio::test]
+async fn work_that_needs_the_media_plane_is_unavailable_until_one_is_attached() {
+    let controller = controller();
+    let session = session_with(&controller, "req-1").await;
+    let bridge = controller
+        .attach(Request::new(attach(
+            &session,
+            proto::Transport::WsTwilio,
+            &[proto::Capability::Sink, proto::Capability::Events],
+        )))
+        .await
+        .unwrap()
+        .into_inner();
+
+    let status = controller
+        .send_to_attachment(Request::new(proto::SendToAttachmentRequest {
+            attachment_id: bridge.attachment_id,
+            json: "{}".to_string(),
+        }))
+        .await
+        .unwrap_err();
+
+    assert_eq!(status.code(), Code::Unavailable);
+}
+
+#[tokio::test]
+async fn text_reaches_the_media_plane_only_for_a_transport_that_can_carry_it() {
+    let media = Arc::new(RecordingMediaPlane::default());
+    let controller = controller().with_media_plane(media.clone());
+    let session = session_with(&controller, "req-1").await;
+
+    let bridge = controller
+        .attach(Request::new(attach(
+            &session,
+            proto::Transport::WsTwilio,
+            &[proto::Capability::Sink, proto::Capability::Events],
+        )))
+        .await
+        .unwrap()
+        .into_inner();
+    let recorder = controller
+        .attach(Request::new(attach(
+            &session,
+            proto::Transport::FileS3,
+            &[proto::Capability::Sink],
+        )))
+        .await
+        .unwrap()
+        .into_inner();
+
+    controller
+        .send_to_attachment(Request::new(proto::SendToAttachmentRequest {
+            attachment_id: bridge.attachment_id.clone(),
+            json: "{\"event\":\"send_text\"}".to_string(),
+        }))
+        .await
+        .unwrap();
+
+    let refused = controller
+        .send_to_attachment(Request::new(proto::SendToAttachmentRequest {
+            attachment_id: recorder.attachment_id,
+            json: "{}".to_string(),
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(refused.code(), Code::FailedPrecondition);
+
+    let delivered = media.text.lock().unwrap().clone();
+    assert_eq!(delivered.len(), 1);
+    assert_eq!(delivered[0].0, bridge.attachment_id);
+}
+
+#[tokio::test]
+async fn a_playback_the_media_plane_refuses_leaves_no_orphan_behind() {
+    let media = Arc::new(RecordingMediaPlane {
+        refuse: true,
+        ..RecordingMediaPlane::default()
+    });
+    let controller = controller().with_media_plane(media);
+    let session = session_with(&controller, "req-1").await;
+    let mut watch = controller.subscribe();
+
+    let status = controller
+        .start_playback(Request::new(proto::StartPlaybackRequest {
+            session: Some(proto::SessionRef {
+                id: Some(proto::session_ref::Id::SessionId(session)),
+            }),
+            source: Some(proto::start_playback_request::Source::Blob(vec![1, 2, 3])),
+            target_tag: "from-a".to_string(),
+            repeat_times: 0,
+            block_egress: true,
+            requested_by: String::new(),
+            idempotency_key: String::new(),
+        }))
+        .await
+        .unwrap_err();
+
+    assert_eq!(status.code(), Code::Unavailable);
+
+    let mut kinds = Vec::new();
+    while let Ok(event) = watch.try_recv() {
+        kinds.push(format!("{:?}", event.kind));
+    }
+    assert!(kinds.iter().any(|kind| kind.starts_with("PlaybackStarted")));
+    assert!(kinds.iter().any(|kind| kind.starts_with("PlaybackStopped")));
+}
+
+#[tokio::test]
+async fn a_playback_source_is_required_rather_than_defaulted() {
+    let controller = controller();
+    let session = session_with(&controller, "req-1").await;
+
+    let status = controller
+        .start_playback(Request::new(proto::StartPlaybackRequest {
+            session: Some(proto::SessionRef {
+                id: Some(proto::session_ref::Id::SessionId(session)),
+            }),
+            source: None,
+            target_tag: String::new(),
+            repeat_times: 0,
+            block_egress: false,
+            requested_by: String::new(),
+            idempotency_key: String::new(),
+        }))
+        .await
+        .unwrap_err();
+
+    assert_eq!(status.code(), Code::InvalidArgument);
+}
+
+#[tokio::test]
+async fn watch_events_carries_one_sessions_events_and_not_anothers() {
+    let controller = controller();
+    let wanted = session_with(&controller, "req-1").await;
+    let other = session_with(&controller, "req-2").await;
+
+    let mut stream = controller
+        .watch_events(Request::new(proto::WatchRequest {
+            session: Some(proto::SessionRef {
+                id: Some(proto::session_ref::Id::SessionId(wanted.clone())),
+            }),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+
+    controller
+        .attach(Request::new(attach(
+            &other,
+            proto::Transport::GrpcStream,
+            &[proto::Capability::Sink],
+        )))
+        .await
+        .unwrap();
+    controller
+        .attach(Request::new(attach(
+            &wanted,
+            proto::Transport::GrpcStream,
+            &[proto::Capability::Sink],
+        )))
+        .await
+        .unwrap();
+
+    let event = stream.next().await.unwrap().unwrap();
+    assert_eq!(event.session_id, wanted);
+    assert_eq!(event.seq, 0);
+    assert!(matches!(event.payload, Some(Payload::AttachmentUp(_))));
+    assert!(event.at.is_some());
+}
+
+#[tokio::test]
+async fn destroying_a_session_announces_the_end_and_frees_the_external_id() {
+    let controller = controller();
+    let session = session_with(&controller, "req-1").await;
+    controller
+        .attach(Request::new(attach(
+            &session,
+            proto::Transport::GrpcStream,
+            &[proto::Capability::Sink],
+        )))
+        .await
+        .unwrap();
+    let mut watch = controller.subscribe();
+
+    controller
+        .destroy_session(Request::new(proto::SessionRef {
+            id: Some(proto::session_ref::Id::SessionId(session.clone())),
+        }))
+        .await
+        .unwrap();
+
+    let mut kinds = Vec::new();
+    while let Ok(event) = watch.try_recv() {
+        kinds.push(format!("{:?}", event.kind));
+    }
+    assert!(kinds.iter().any(|kind| kind.starts_with("AttachmentDown")));
+    assert!(kinds.iter().any(|kind| kind.starts_with("SessionEnded")));
+
+    let gone = controller
+        .describe_session(Request::new(proto::SessionRef {
+            id: Some(proto::session_ref::Id::SessionId(session)),
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(gone.code(), Code::NotFound);
+
+    controller
+        .create_session(Request::new(create("req-1")))
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn a_mixed_subscription_is_refused_rather_than_quietly_ignored() {
+    let controller = controller();
+    let mut request = create("req-1");
+    request.mix = true;
+
+    let status = controller
+        .create_session(Request::new(request))
+        .await
+        .unwrap_err();
+
+    assert_eq!(status.code(), Code::Unimplemented);
+}

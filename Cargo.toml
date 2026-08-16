@@ -5,6 +5,7 @@ members = [
     "crates/rtpengine-ng",
     "crates/protocol",
     "crates/session-core",
+    "crates/control-api",
     "crates/mediaserverd",
 ]
 

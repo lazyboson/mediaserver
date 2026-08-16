@@ -103,6 +103,7 @@ pub struct AttachSpec {
     pub authoritative: bool,
     pub label: String,
     pub endpoint: String,
+    pub metadata: BTreeMap<String, String>,
     pub idempotency_key: Option<String>,
 }
 
@@ -120,6 +121,7 @@ impl AttachSpec {
         self.authoritative.hash(&mut hasher);
         self.label.hash(&mut hasher);
         self.endpoint.hash(&mut hasher);
+        self.metadata.hash(&mut hasher);
         hasher.finish()
     }
 }
@@ -175,6 +177,7 @@ pub struct AttachmentView {
     pub paused: bool,
     pub label: String,
     pub endpoint: String,
+    pub metadata: BTreeMap<String, String>,
 }
 
 struct SessionRecord {
@@ -200,6 +203,7 @@ struct AttachmentRecord {
     paused: bool,
     label: String,
     endpoint: String,
+    metadata: BTreeMap<String, String>,
     seen_final: bool,
 }
 
@@ -405,6 +409,7 @@ impl SessionRegistry {
                 paused: false,
                 label: spec.label.clone(),
                 endpoint: spec.endpoint.clone(),
+                metadata: spec.metadata.clone(),
                 seen_final: false,
             },
         );
@@ -493,6 +498,7 @@ impl SessionRegistry {
             paused: record.paused,
             label: record.label.clone(),
             endpoint: record.endpoint.clone(),
+            metadata: record.metadata.clone(),
         })
     }
 
@@ -559,7 +565,7 @@ impl SessionRegistry {
         &mut self,
         playback: PlaybackId,
         reason: &str,
-    ) -> Result<(), ControlError> {
+    ) -> Result<SessionId, ControlError> {
         let record = self
             .playbacks
             .remove(&playback)
@@ -573,7 +579,7 @@ impl SessionRegistry {
                 reason: reason.to_string(),
             },
         );
-        Ok(())
+        Ok(record.session)
     }
 
     pub fn report(
@@ -787,6 +793,7 @@ mod tests {
             authoritative: false,
             label: label.to_string(),
             endpoint: "wss:".to_string(),
+            metadata: BTreeMap::new(),
             idempotency_key: None,
         }
     }

@@ -1,0 +1,415 @@
+use crate::convert::{
+    attachment_id, capabilities, capabilities_wire, event_wire, format, format_wire, playback_id,
+    selector, selector_wire, session_id, session_kind, session_kind_wire, status_of, transport,
+    transport_wire,
+};
+use crate::proto;
+use crate::proto::media_control_server::{MediaControl, MediaControlServer};
+use session_core::{
+    AttachSpec, AttachmentId, AttachmentUpdate, AttachmentView, ControlError, CreateSession,
+    EventKind, MediaEvent, PlaybackId, PlaybackSpec, SessionId, SessionRegistry,
+};
+use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex, MutexGuard};
+use tokio::sync::{broadcast, mpsc, watch};
+use tokio_stream::wrappers::ReceiverStream;
+use tonic::{Request, Response, Status};
+
+pub const WATCH_CAPACITY: usize = 256;
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum PlaybackSource {
+    Blob(Vec<u8>),
+    File(String),
+    Stream,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub struct MediaPlaneError(pub String);
+
+pub trait MediaPlane: Send + Sync + 'static {
+    fn send_text(&self, attachment: AttachmentId, json: &str) -> Result<(), MediaPlaneError>;
+
+    fn start_playback(
+        &self,
+        session: SessionId,
+        playback: PlaybackId,
+        source: PlaybackSource,
+        target_tag: Option<&str>,
+        block_egress: bool,
+    ) -> Result<(), MediaPlaneError>;
+
+    fn stop_playback(
+        &self,
+        session: SessionId,
+        playback: PlaybackId,
+    ) -> Result<(), MediaPlaneError>;
+}
+
+pub struct SessionController {
+    registry: Mutex<SessionRegistry>,
+    watchers: broadcast::Sender<MediaEvent>,
+    draining: Arc<watch::Sender<bool>>,
+    media: Option<Arc<dyn MediaPlane>>,
+    owner: String,
+}
+
+impl SessionController {
+    pub fn new(owner: impl Into<String>) -> Self {
+        SessionController {
+            registry: Mutex::new(SessionRegistry::default()),
+            watchers: broadcast::Sender::new(WATCH_CAPACITY),
+            draining: Arc::new(watch::Sender::new(false)),
+            media: None,
+            owner: owner.into(),
+        }
+    }
+
+    pub fn drain_handle(&self) -> Arc<watch::Sender<bool>> {
+        Arc::clone(&self.draining)
+    }
+
+    pub fn begin_drain(&self) {
+        let _ = self.draining.send(true);
+    }
+
+    pub fn with_media_plane(mut self, media: Arc<dyn MediaPlane>) -> Self {
+        self.media = Some(media);
+        self
+    }
+
+    pub fn into_service(self) -> MediaControlServer<Self> {
+        MediaControlServer::new(self)
+    }
+
+    pub fn subscribe(&self) -> broadcast::Receiver<MediaEvent> {
+        self.watchers.subscribe()
+    }
+
+    fn lock(&self) -> MutexGuard<'_, SessionRegistry> {
+        self.registry
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn commit<T>(
+        &self,
+        action: impl FnOnce(&mut SessionRegistry) -> Result<T, ControlError>,
+    ) -> Result<T, Status> {
+        let (outcome, events) = {
+            let mut registry = self.lock();
+            let outcome = action(&mut registry);
+            let events = registry.drain_events();
+            (outcome, events)
+        };
+        for event in events {
+            let _ = self.watchers.send(event);
+        }
+        outcome.map_err(status_of)
+    }
+
+    fn media_plane(&self) -> Result<&Arc<dyn MediaPlane>, Status> {
+        self.media
+            .as_ref()
+            .ok_or_else(|| Status::unavailable("this controller has no media plane attached yet"))
+    }
+
+    fn resolve(&self, reference: Option<proto::SessionRef>) -> Result<SessionId, Status> {
+        let id = reference
+            .and_then(|reference| reference.id)
+            .ok_or_else(|| Status::invalid_argument("a session reference is required"))?;
+        match id {
+            proto::session_ref::Id::SessionId(text) => session_id(&text),
+            proto::session_ref::Id::ExternalId(external) => {
+                self.lock().resolve(&external).map_err(status_of)
+            }
+        }
+    }
+
+    fn session_message(&self, session: SessionId) -> Result<proto::Session, Status> {
+        let registry = self.lock();
+        let view = registry.session_view(session).map_err(status_of)?;
+        let attachments = view
+            .attachments
+            .iter()
+            .filter_map(|id| registry.attachment_view(*id).ok())
+            .map(attachment_message)
+            .collect();
+        Ok(proto::Session {
+            session_id: view.id.to_string(),
+            external_id: view.external_id,
+            kind: session_kind_wire(view.kind),
+            state: proto::SessionState::Active as i32,
+            call_id: view.call_id,
+            from_tags: view.from_tags,
+            rtpengine_node: view.rtpengine_node,
+            owner_pod: self.owner.clone(),
+            attachments,
+        })
+    }
+}
+
+fn attachment_message(view: AttachmentView) -> proto::Attachment {
+    proto::Attachment {
+        attachment_id: view.id.to_string(),
+        session_id: view.session.to_string(),
+        transport: transport_wire(view.transport),
+        capabilities: capabilities_wire(view.capabilities),
+        selector: Some(selector_wire(view.selector)),
+        format: Some(format_wire(view.format)),
+        authoritative: view.authoritative,
+        paused: view.paused,
+        label: view.label,
+    }
+}
+
+fn optional(text: String) -> Option<String> {
+    if text.is_empty() {
+        None
+    } else {
+        Some(text)
+    }
+}
+
+#[tonic::async_trait]
+impl MediaControl for SessionController {
+    async fn create_session(
+        &self,
+        request: Request<proto::CreateSessionRequest>,
+    ) -> Result<Response<proto::Session>, Status> {
+        let message = request.into_inner();
+        if message.external_id.is_empty() {
+            return Err(Status::invalid_argument("external_id is required"));
+        }
+        if message.mix {
+            return Err(Status::unimplemented(
+                "mixed subscriptions are not wired to rtpengine yet",
+            ));
+        }
+        let kind = session_kind(message.kind)?;
+        let view = self.commit(|registry| {
+            registry.create_session(CreateSession {
+                external_id: message.external_id,
+                kind,
+                call_id: message.call_id,
+                from_tags: message.from_tags,
+                rtpengine_node: message.rtpengine_node,
+                idempotency_key: optional(message.idempotency_key),
+            })
+        })?;
+        self.session_message(view.id).map(Response::new)
+    }
+
+    async fn destroy_session(
+        &self,
+        request: Request<proto::SessionRef>,
+    ) -> Result<Response<proto::Ack>, Status> {
+        let session = self.resolve(Some(request.into_inner()))?;
+        self.commit(|registry| registry.destroy_session(session, "destroy requested"))?;
+        Ok(Response::new(proto::Ack {}))
+    }
+
+    async fn describe_session(
+        &self,
+        request: Request<proto::SessionRef>,
+    ) -> Result<Response<proto::Session>, Status> {
+        let session = self.resolve(Some(request.into_inner()))?;
+        self.session_message(session).map(Response::new)
+    }
+
+    async fn attach(
+        &self,
+        request: Request<proto::AttachRequest>,
+    ) -> Result<Response<proto::Attachment>, Status> {
+        let message = request.into_inner();
+        let session = self.resolve(message.session)?;
+        let transport = transport(message.transport)?;
+        let capabilities = capabilities(&message.capabilities)?;
+        let selector = selector(message.selector.as_ref())?;
+        let format = format(message.format.as_ref())?;
+        let metadata: BTreeMap<String, String> = message.metadata.into_iter().collect();
+
+        let view = self.commit(|registry| {
+            registry.attach(AttachSpec {
+                session,
+                transport,
+                capabilities,
+                selector,
+                format,
+                authoritative: message.authoritative,
+                label: message.label,
+                endpoint: message.endpoint,
+                metadata,
+                idempotency_key: optional(message.idempotency_key),
+            })
+        })?;
+        Ok(Response::new(attachment_message(view)))
+    }
+
+    async fn detach(
+        &self,
+        request: Request<proto::AttachmentRef>,
+    ) -> Result<Response<proto::Ack>, Status> {
+        let attachment = attachment_id(&request.into_inner().attachment_id)?;
+        self.commit(|registry| registry.detach(attachment, "detach requested"))?;
+        Ok(Response::new(proto::Ack {}))
+    }
+
+    async fn update_attachment(
+        &self,
+        request: Request<proto::UpdateAttachmentRequest>,
+    ) -> Result<Response<proto::Attachment>, Status> {
+        let message = request.into_inner();
+        let attachment = attachment_id(&message.attachment_id)?;
+        let selector = match message.selector.as_ref() {
+            Some(wire) => Some(selector(Some(wire))?),
+            None => None,
+        };
+        let format = match message.format.as_ref() {
+            Some(wire) => Some(format(Some(wire))?),
+            None => None,
+        };
+        let view = self.commit(|registry| {
+            registry.update_attachment(
+                attachment,
+                AttachmentUpdate {
+                    paused: message.paused,
+                    selector,
+                    format,
+                },
+            )
+        })?;
+        Ok(Response::new(attachment_message(view)))
+    }
+
+    async fn send_to_attachment(
+        &self,
+        request: Request<proto::SendToAttachmentRequest>,
+    ) -> Result<Response<proto::Ack>, Status> {
+        let message = request.into_inner();
+        let attachment = attachment_id(&message.attachment_id)?;
+        self.lock()
+            .authorize_send_text(attachment)
+            .map_err(status_of)?;
+        self.media_plane()?
+            .send_text(attachment, &message.json)
+            .map_err(|error| Status::unavailable(error.to_string()))?;
+        Ok(Response::new(proto::Ack {}))
+    }
+
+    async fn start_playback(
+        &self,
+        request: Request<proto::StartPlaybackRequest>,
+    ) -> Result<Response<proto::Playback>, Status> {
+        let message = request.into_inner();
+        let session = self.resolve(message.session)?;
+        let source = match message.source {
+            Some(proto::start_playback_request::Source::Blob(blob)) => PlaybackSource::Blob(blob),
+            Some(proto::start_playback_request::Source::File(file)) => PlaybackSource::File(file),
+            Some(proto::start_playback_request::Source::Stream(true)) => PlaybackSource::Stream,
+            Some(proto::start_playback_request::Source::Stream(false)) | None => {
+                return Err(Status::invalid_argument("a playback source is required"))
+            }
+        };
+        let requested_by = match optional(message.requested_by) {
+            Some(text) => Some(attachment_id(&text)?),
+            None => None,
+        };
+        let target_tag = optional(message.target_tag);
+
+        let playback = self.commit(|registry| {
+            registry.start_playback(PlaybackSpec {
+                session,
+                requested_by,
+                target_tag: target_tag.clone(),
+                block_egress: message.block_egress,
+                idempotency_key: optional(message.idempotency_key),
+            })
+        })?;
+
+        let started = self.media_plane().and_then(|media| {
+            media
+                .start_playback(
+                    session,
+                    playback,
+                    source,
+                    target_tag.as_deref(),
+                    message.block_egress,
+                )
+                .map_err(|error| Status::unavailable(error.to_string()))
+        });
+        if let Err(status) = started {
+            let _ = self.commit(|registry| registry.stop_playback(playback, "start failed"));
+            return Err(status);
+        }
+
+        Ok(Response::new(proto::Playback {
+            playback_id: playback.to_string(),
+            session_id: session.to_string(),
+        }))
+    }
+
+    async fn stop_playback(
+        &self,
+        request: Request<proto::PlaybackRef>,
+    ) -> Result<Response<proto::Ack>, Status> {
+        let playback = playback_id(&request.into_inner().playback_id)?;
+        let session = self.commit(|registry| registry.stop_playback(playback, "stop requested"))?;
+        if let Ok(media) = self.media_plane() {
+            let _ = media.stop_playback(session, playback);
+        }
+        Ok(Response::new(proto::Ack {}))
+    }
+
+    type WatchEventsStream = ReceiverStream<Result<proto::MediaEvent, Status>>;
+
+    async fn watch_events(
+        &self,
+        request: Request<proto::WatchRequest>,
+    ) -> Result<Response<Self::WatchEventsStream>, Status> {
+        let wanted = match request.into_inner().session {
+            Some(reference) => Some(self.resolve(Some(reference))?),
+            None => None,
+        };
+        let mut events = self.watchers.subscribe();
+        let mut draining = self.draining.subscribe();
+        let (sender, receiver) = mpsc::channel(WATCH_CAPACITY);
+
+        tokio::spawn(async move {
+            if *draining.borrow() {
+                return;
+            }
+            loop {
+                tokio::select! {
+                    changed = draining.changed() => {
+                        if changed.is_err() || *draining.borrow() {
+                            return;
+                        }
+                    }
+                    received = events.recv() => match received {
+                        Ok(event) => {
+                            if wanted.is_some_and(|session| session != event.session) {
+                                continue;
+                            }
+                            let ends_the_watch = wanted.is_some()
+                                && matches!(event.kind, EventKind::SessionEnded { .. });
+                            if sender.send(Ok(event_wire(event))).await.is_err() {
+                                return;
+                            }
+                            if ends_the_watch {
+                                return;
+                            }
+                        }
+                        Err(broadcast::error::RecvError::Lagged(missed)) => {
+                            tracing::warn!(missed, "a watch_events subscriber fell behind");
+                        }
+                        Err(broadcast::error::RecvError::Closed) => return,
+                    },
+                }
+            }
+        });
+
+        Ok(Response::new(ReceiverStream::new(receiver)))
+    }
+}
