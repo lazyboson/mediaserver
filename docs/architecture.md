@@ -48,10 +48,12 @@ flowchart LR
     RE1 -->|customer leg RTP| FS[FreeSWITCH]
     RE2 -->|agent leg RTP| FS
 
-    CIGOL[cigol<br/>ESL control, IVR,<br/>streamfsm, telservice gRPC] <-->|ESL 8021<br/>events plain ALL| FS
+    TEL[telServer<br/>telsvc gRPC ~40 RPCs] <-->|ESL 8021<br/>events plain ALL| FS
+    TEL -->|"Events{repeated string}<br/>keyed by UUID + OTel"| K[(Kafka eventTopic)]
+    K --> APP[appServer<br/>consumer group 'eventHandler'<br/>streamfsm · recording · webhooks]
+    APP -->|telsvc gRPC| TEL
 
-    FS -->|"uuid_audio_fork (WS, L16)"| ASR[ASR / transcription]
-    FS -->|uuid_google_transcribe2| GSR[Speech gather]
+    FS -->|"uuid_audio_fork (WS)"| ASR["ASR / RTT / voice-AI<br/>(one mechanism since<br/>the Deepgram move)"]
     FS -->|record_session → file → SQS| S3[(S3)]
     FS -->|"dummy leg INVITE<br/>X-Conversation-ID, X-ccId"| OSB2B[OpenSIPS B2B]
     OSB2B -->|E_UA_SESSION event +<br/>ua_session_reply MI| MG[mediagateway<br/>RTP ⇄ WSS pump]
@@ -61,7 +63,11 @@ flowchart LR
 
 Key structural facts pulled from the two repos:
 
-- **cigol → FS is a single long-lived inbound ESL socket** per cigol process (`eventsocket.Dial`, singleton via `sync.Once`), subscribed with `events plain ALL`, and the event fan-out **drops events when the subscriber channel is full**. Every media feature adds event volume to this one pipe.
+- **cigol is seven binaries, not one.** `telServer` owns the ESL socket and exposes `telsvc.proto` over gRPC; `appServer` consumes events from Kafka; `parserServer`, `executorServer`, `resourceServer`, `voiceServer`, `appWorker` sit around them. The media surface is already service-oriented — which is why MSS can slot in behind a tenant flag.
+- **telServer → FS is a single long-lived inbound ESL socket** (`eventsocket.Dial`, singleton via `sync.Once`), subscribed with `events plain ALL`, and the event fan-out **drops events when the subscriber channel is full**. Every media feature adds event volume to this one pipe.
+- **Events leave telServer on Kafka.** `pkg/telservice/eventproducer` marshals each eventMap into `Events{repeated string}`, keys the message by call UUID and injects OTel context; `appServer` reads it as consumer group `eventHandler`. Per-call ordering, replay and multi-consumer fan-out are therefore already solved by the bus — the reason MSS publishes events rather than streaming them (§5.4).
+- **ASR moved from Google to Deepgram, and became the fork.** `PlayAndDetectSpeechWithGSR` now calls `initiateStream(...)` instead of `uuid_google_transcribe2` (the old call is commented out in `fs_api.go`). RTT, gather-ASR and the voice-AI fork are one mechanism, and the module now emits `mod_audio_fork::{start_of_transcript, partial_speech_result, end_of_utterance, first_transcript}` — a continuous interim-results stream, not one event per finished utterance.
+- **`mod_audio_fork` is a translator, not a pipe.** `FsEventSink::Emit` converts each WebSocket message from the far end into an FS CUSTOM event (`mod_audio_fork::<name>`, `Unique-ID` + `Fork-ID` headers, JSON in the body). Consumers never touch Kafka — the contract MSS must preserve (§5.5).
 - **The voice-AI path is a Rube Goldberg of media hops:** cigol `CreateParticipant` runs `bgapi originate {…, origination_uuid, absolute_codec_string, sip_h_X-Conversation-ID…}<dest> &conference('<name>'@default++flags{…})` — i.e., FS dials a *dummy leg* toward OpenSIPS B2B purely so that the conference's mixed audio flows to mediagateway, which answers via `ua_session_reply` and pumps RTP→WSS to the bot. One AI interaction = 1 conference mixer + 1 extra leg + 1 RTP termination, all for what is conceptually "copy this call's audio to a websocket."
 - **Forking is FS-resident:** `bgapi uuid_audio_fork <uuid> start <wsURL> <mixType> <samplingRate> <streamSid> <accID> <callSid> <track> <metadataJSON>` (your forked mod_audio_fork with 4 custom positional args) and `uuid_google_transcribe2 … start` each attach a media bug to the channel. `streamfsm` then choreographs `pause/resume/send_text` around FS `playback`/`break` timing.
 - **Recording is FS-resident:** `record_session` media bugs writing to a shared filesystem, with recording identity encoded in the file path (`${accountID}/${recordingID}.${fileFormat}`), uploaded via SQS jobs, callbacks driven by FS RECORD_START/STOP events.
@@ -87,29 +93,49 @@ flowchart LR
 
     RE1 -->|RTP| FS[FreeSWITCH<br/>IVR + call control only]
     RE2 -->|RTP| FS
-    CIGOL[cigol / telservice] <-->|ESL| FS
+
+    subgraph cigol [cigol]
+        TEL[telServer<br/>telsvc gRPC]
+        APP[appServer<br/>streamfsm · recording · webhooks]
+        SHIM[events translator<br/>typed → positional eventMap]
+    end
+    TEL <-->|ESL| FS
 
     subgraph mss [Media Streaming Service — independently scalable]
-        CTRL[Session Controller<br/>gRPC + REST API]
-        HUB[Per-session fan-out hub]
+        CTRL["Session Controller<br/>MediaControl gRPC<br/>Session · Attachment · Playback"]
+        HUB[Per-session fan-out hub<br/>bounded queues, drop-oldest]
         PIPE[Codec pipeline<br/>jitter buffer → decode →<br/>resample → re-encode]
         CTRL --> HUB
         PIPE --> HUB
     end
 
-    CIGOL -->|StartTap / StartFork<br/>gRPC| CTRL
+    TEL -->|"CreateSession / Attach /<br/>StartPlayback (gRPC)"| CTRL
     CTRL -->|"NG: subscribe request /<br/>subscribe answer"| RE1
     CTRL -->|NG: subscribe| RE2
     RE1 ==>|RTP copy per leg| PIPE
     RE2 ==>|RTP copy per leg| PIPE
+    CTRL -->|"play media (Ph1-2) /<br/>inline leg (Ph3)"| RE1
 
-    HUB -->|gRPC bidi stream| RTT[RTT service]
-    HUB -->|WSS Twilio-dialect| ASR[ASR / transcription]
-    HUB -->|gRPC / WSS| VAI[Voice AI agents]
-    HUB -->|segmenter → S3| REC[(Recording)]
-    CTRL -->|events| K[(Kafka)]
-    CTRL <-->|session registry| R[(Redis)]
+    HUB <-->|"WSS Twilio dialect<br/>SINK+EVENTS+INJECT"| VAI[Voice-AI bridge<br/>authoritative attachment]
+    HUB -->|"gRPC bidi<br/>SINK+EVENTS"| RTT[RTT / ASR service]
+    HUB -->|"segmenter → S3<br/>SINK"| REC[(Recording)]
+
+    CTRL -->|"MediaEvent (typed)"| KM[(Kafka mss.events)]
+    KM --> SHIM
+    SHIM -->|"Events{repeated string}<br/>mod_audio_fork::* names"| KE[(Kafka eventTopic)]
+    KE --> APP
+    APP -->|telsvc gRPC| TEL
+    CTRL <-->|session registry + leases<br/>call-id → node + tags| R[(Redis)]
 ```
+
+Three properties this diagram is drawn to make explicit, each argued in §5:
+
+- **Commands flow one way over gRPC; events flow the other way over Kafka.**
+  MSS never streams events to cigol in the production path.
+- **Consumers never touch Kafka.** They speak their attachment's transport;
+  MSS is the sole producer of a session's events.
+- **Exactly one attachment is authoritative** — only its events become the
+  legacy `mod_audio_fork::*` names that drive `streamfsm`.
 
 ### 3.1 Components
 
@@ -171,63 +197,230 @@ Design details:
 
 ---
 
-## 5. Consumer interfaces
+## 5. The MSS interface
 
-### 5.1 gRPC (new, native)
+Verified against cigol `development` (2026-08-16). Three facts reshape this
+section from what an earlier draft assumed:
+
+- **cigol is service-oriented already.** `cmd/telServer` exposes
+  `pkg/telservice/proto/telsvc.proto` (~40 RPCs) over gRPC; `cmd/appServer`
+  is a separate process.
+- **Events travel on Kafka, not ESL, once they leave telServer.**
+  `pkg/telservice/eventproducer` subscribes to the ESL stream and publishes
+  every event to a Kafka topic as `Events{repeated string events}` — the
+  positional eventMap indexed by `constants.MapKeyIndex` — keyed by call
+  UUID, with OpenTelemetry context injected. `appServer` consumes it as a
+  consumer group (`sarama.NewConsumerGroup(..., "eventHandler")`).
+- **ASR is no longer a separate mechanism.** Commit *"moved asr from google
+  to deepgram"* rewired `PlayAndDetectSpeechWithGSR` from
+  `uuid_google_transcribe2` to `initiateStream(...)` — the audio fork. RTT,
+  gather-ASR and the voice-AI fork are now **one mechanism** with different
+  far ends, and the speech vocabulary grew accordingly:
+  `mod_audio_fork::{start_of_transcript, partial_speech_result,
+  end_of_utterance, first_transcript, end_of_interaction, play_audio}`.
+
+### 5.1 Design rule: nouns, not FreeSWITCH verbs
+
+MSS does **not** mirror `telsvc.proto`. Those names — `StreamPause`,
+`StreamSendText`, `StartCallTranscription` — describe *how FreeSWITCH does
+it*, and Phase 3/4 (inline legs, mixing, whisper) do not fit that
+vocabulary. MSS exposes a small noun-oriented API, and a thin compatibility
+façade speaks cigol's verbs until cigol no longer needs them.
+
+Four nouns carry every phase:
+
+| Noun | What it is | Kinds |
+| --- | --- | --- |
+| **Session** | a media context MSS owns | `TAP` (Phase 1-2) · `INLINE` (Phase 3) · `MIX` (Phase 4) |
+| **Attachment** | anything bound to a session that consumes or produces audio | transport × direction × selector × format |
+| **Playback** | audio put into a session, targeted at a participant | blob · file · stream (Phase 3) |
+| **Event** | one typed stream out | see 5.4 |
 
 ```proto
-service MediaStream {
-  // Consumer-initiated: attach to a session and receive frames.
-  rpc Subscribe(stream ConsumerToServer) returns (stream ServerToConsumer);
-}
 service MediaControl {
-  rpc StartTap(StartTapRequest) returns (StartTapResponse);
-  rpc StopTap(StopTapRequest) returns (StopTapResponse);
-  rpc AddConsumer(AddConsumerRequest) returns (AddConsumerResponse);     // push mode: MSS dials out
-  rpc PauseConsumer(ConsumerRef) returns (Ack);                          // streamfsm pause/resume parity
-  rpc ResumeConsumer(ConsumerRef) returns (Ack);
-  rpc SendText(SendTextRequest) returns (Ack);                           // parity with uuid_audio_fork send_text
-}
+  rpc CreateSession(CreateSessionRequest) returns (Session);
+  rpc DestroySession(SessionRef) returns (Ack);
+  rpc DescribeSession(SessionRef) returns (Session);
 
-message ServerToConsumer {
-  oneof msg {
-    StreamStart start = 1;      // session ids, tracks, AudioFormat{encoding, sample_rate_hz, channels, ptime_ms}
-    AudioFrame frame = 2;       // track, seq, pts_ms, payload (raw, NOT base64)
-    DtmfEvent dtmf = 3;
-    TextEvent text = 4;         // send_text passthrough: firstDtmf / dtmfResult / playbackStop / custom
-    StreamStop stop = 5;
-  }
+  rpc Attach(AttachRequest) returns (Attachment);              // consumer, recorder, RTT, agent
+  rpc Detach(AttachmentRef) returns (Ack);
+  rpc UpdateAttachment(UpdateAttachmentRequest) returns (Attachment);  // pause/resume/select/format
+  rpc SendToAttachment(SendToAttachmentRequest) returns (Ack);         // send_text parity
+
+  rpc StartPlayback(StartPlaybackRequest) returns (Playback);
+  rpc StopPlayback(PlaybackRef) returns (Ack);                 // barge-in primitive
+
+  rpc WatchEvents(WatchRequest) returns (stream MediaEvent);   // debug/direct consumers, not the prod path
 }
-message ConsumerToServer {
-  oneof msg {
-    ConsumerHello hello = 1;    // auth token, requested format (MSS re-encodes per consumer)
-    AudioFrame inject = 2;      // Phase 3: bot speech toward the call (inline sessions only)
-    Mark mark = 3;              // mark/clear semantics as today
-    Clear clear = 4;
+```
+
+Note the absences: no Pause/Resume RPCs (that is
+`UpdateAttachment{paused}`), no recording API (an attachment with an S3
+sink), no transcription API (an attachment with an ASR sink). Fewer verbs,
+more nouns, is what buys the future phases.
+
+**Dual addressing is mandatory.** cigol keys everything by channel UUID
+because FreeSWITCH owns the channel; MSS keys by (call-id, from-tags,
+rtpengine node) because rtpengine does. Every request carries
+`external_id` (cigol's `request_uuid`), and MSS resolves it through the
+OpenSIPS → Redis map — the discovery item still open in M2 and now on the
+critical path for all of this.
+
+Every mutating RPC takes an idempotency key: a retry during pod loss must
+not double-attach or double-record.
+
+### 5.2 Attachments: capability is declared, not assumed
+
+Fan-out means N consumers of one call, and they are not alike:
+
+| Attachment | Audio out | Back-channel | Capability |
+| --- | --- | --- | --- |
+| Recorder (S3/file) | yes | none | `SINK` |
+| RTT | yes | text → events | `SINK + EVENTS` |
+| ASR / gather | yes | text → events | `SINK + EVENTS` |
+| Voice-AI bridge | yes | text + audio | `SINK + EVENTS + INJECT` |
+| Analytics / QA | yes | none | `SINK` |
+
+The declaration is an **authorization boundary**, not bookkeeping: a
+recorder must not be able to push audio into a live call, and an analytics
+sink must not be able to emit `end_of_interaction` and tear a session down.
+Declaring capability at attach makes those structurally impossible instead
+of politely avoided. The Phase-0 spike already does this in embryo — the
+voice-AI consumer is built with a command channel, listeners with `None`,
+so only the bridge can inject.
+
+Transport is orthogonal to direction: WS-Twilio (frozen, what consumers
+speak today), gRPC bidi (better for new consumers), file/S3 (no
+back-channel at all).
+
+### 5.3 One authoritative attachment per session
+
+Fan-out creates a problem the legacy design never had. There was exactly
+**one** fork per call, so "the fork's events" *were* "the call's events" —
+identity came free. With N consumers it does not: if an RTT service and a
+voice-AI bridge both return `first_transcript`, `streamfsm` sees two, and a
+state machine driven twice corrupts the call silently.
+
+So: every event carries `attachment_id`, and exactly **one attachment per
+session is marked authoritative**. Only its events are rendered into the
+legacy `mod_audio_fork::*` names that drive `streamfsm`. Others still reach
+`mss.events` (analytics, debugging, future consumers) but never the FSM.
+A second authoritative attach is rejected, not silently resolved.
+
+### 5.4 Commands over gRPC, events over Kafka
+
+Events must **not** stream back over gRPC. cigol's consumption is a Kafka
+consumer group, which already solves durably what a gRPC event stream would
+reintroduce badly: fan-out to multiple appServer instances, per-call
+ordering (key = UUID), consumer restart without loss, backpressure, replay.
+
+```
+cigol ──gRPC MediaControl──▶ MSS
+MSS ──Kafka "mss.events"──▶ translator ──Kafka "eventTopic"──▶ appServer (unchanged)
+                            (small Go shim, lives in cigol)
+```
+
+- **`mss.events`** — MSS's own topic, typed protobuf `MediaEvent`, keyed by
+  `external_id`, sequence-numbered per session, OTel context injected. This
+  is MSS's long-term contract and the only format MSS knows.
+- **`eventTopic`** — the existing legacy topic, untouched. A thin Go
+  translator renders the positional `Events{repeated string}` that
+  `appServer` already parses.
+
+**The translator lives in cigol, not MSS.** The legacy format *is*
+`constants.MapKeyIndex` — a positional index table defined in Go — plus
+vendor-specific event names. Encoding that into Rust would couple MSS to a
+Go constant file that changes without our knowing; the day someone inserts
+an index, MSS silently corrupts every event. Keeping the shim beside its
+definitions also means it is ~200 lines you *delete* when cigol's consumers
+move to typed events, rather than a permanent seam in the media plane.
+
+```proto
+message MediaEvent {
+  string session_id = 1; string external_id = 2; string attachment_id = 3;
+  uint64 seq = 4; google.protobuf.Timestamp at = 5;
+  oneof payload {
+    SpeechStarted speech_started = 10;
+    PartialTranscript partial = 11;          // highest-rate event in the system
+    FinalTranscript final = 12;
+    EndOfUtterance end_of_utterance = 13;
+    Dtmf dtmf = 14;
+    PlaybackStarted playback_started = 15;
+    PlaybackStopped playback_stopped = 16;
+    RecordingStarted recording_started = 17;
+    RecordingStopped recording_stopped = 18;
+    UploadCompleted upload_completed = 19;
+    AttachmentUp attachment_up = 20;
+    AttachmentDown attachment_down = 21;
+    SessionEnded session_ended = 22;
   }
 }
 ```
 
-Binary frames over HTTP/2 remove today's per-packet JSON+base64 overhead (mediagateway spends 50 JSON marshals + base64 encodes/sec/call; at 1,000 calls that's 50k/sec of pure serialization work).
+### 5.5 A consumer never writes to Kafka
 
-### 5.2 WebSocket (compatibility)
+`mod_audio_fork` is a **translator, not a pipe**: `FsEventSink::Emit` turns
+a message the far end sent on the WebSocket into a FreeSWITCH CUSTOM event
+with subclass `mod_audio_fork::<name>`, stamps `Unique-ID` and `Fork-ID`,
+carries the JSON in the event body, and hands it to FS — from where
+telServer lifts it to Kafka. **The bridge has never known Kafka exists.**
 
-Keep the exact Twilio-Media-Streams dialect mediagateway speaks today (`start`, `media` with base64 payload + `mediaFormat{encoding, sampleRate, channels}`, `dtmf`, `mark`, `clear`, `stop`, `endOfInteraction`) so current bot endpoints, ASR bridges, and the web-streaming consumer need no changes on day one. Same for the mod_audio_fork consumers: the MSS's WS "fork" mode should emit whatever your forked mod_audio_fork emits today (mixType/samplingRate/streamSid/track semantics), making the FS→MSS switch invisible to the ASR services.
+MSS occupies exactly that position, and the rule generalises:
 
-### 5.3 Control-surface parity with cigol
+> **Media-plane components own event identity.** A consumer speaks only its
+> attachment's transport. MSS is the sole producer of a session's events,
+> because only MSS knows the session, its `external_id`, and its sequence.
 
-The migration is dramatically simplified because **cigol already funnels every media verb through `telservice`'s gRPC API** — of its ~34 RPCs, only 7 are pure call control (`MakeCall/AnswerCall/HangupCall/ParkCall/TransferCallToSleep/SendDtmf/BridgeCall`); essentially everything else (playback/gather, recording, streaming, and 14 conference RPCs) is a media operation. The MSS's control API should mirror the streaming subset one-for-one so `callsvcclient`/`streamfsm` swap backends without FSM redesign:
+Letting consumers write to Kafka directly would break this in five ways:
+they do not reliably know the UUID that keys ordering; two producers per
+call race on a state machine that depends on event order; every vendor
+integration would need broker credentials, the positional format and OTel
+conventions; there would be no validation point for hostile input (Article
+IV); and the same bridge could no longer run behind mediagateway, FS, and
+MSS unchanged.
 
-| telservice RPC today (→ FS) | MSS equivalent |
+The consequence is deliberate: MSS is a single writer per session and
+therefore sits on the barge-in critical path. Nothing can route around it
+to go faster, which makes the `partial_speech_result` → `StopPlayback`
+cut-through a **Phase-1 measurement**, not a Phase-3 nicety.
+
+### 5.6 Compatibility façade: telsvc verbs onto MSS nouns
+
+A `TelCompat` service reuses `telsvc.proto`'s message shapes verbatim, so a
+tenant flag routes calls to `telServer` or `mssServer` with **no client
+change** and rollback is a config flip.
+
+| telservice RPC today (→ FS) | MSS nouns |
 | --- | --- |
-| `StartStream` → `uuid_audio_fork start` | `StartTap` + `AddConsumer(ws)` |
-| `StopStream` → `uuid_audio_fork stop` | `StopTap` / `RemoveConsumer` |
-| `StreamPause` / `StreamResume` | `PauseConsumer` / `ResumeConsumer` |
-| `StreamSendText` → `send_text '<json>'` | `SendText` |
-| `StartCallTranscription` → `uuid_google_transcribe2` | `StartTap` + `AddConsumer(asr-provider)` |
-| `StartRecording` → `record_session` | `StartRecording` (Phase 2) |
+| `StartStream(ws_url, track, stream_sid…)` | `CreateSession{TAP}` + `Attach{WS_TWILIO, SINK+EVENTS+INJECT}` |
+| `StopStream` | `Detach` (+ `DestroySession` if last) |
+| `StreamPause` / `StreamResume` | `UpdateAttachment{paused}` |
+| `StreamSendText` | `SendToAttachment` |
+| `StreamPlayFile` | `StartPlayback{file}` |
+| `StartCallTranscription` (now the fork) | same as `StartStream` — one mechanism since the Deepgram move |
+| `StartRecording(acc_id, record_id, format, channels)` | `Attach{FILE_S3, SINK}` |
+| `StopRecording` | `Detach` |
 
-The `streamfsm` choreography (pause fork during non-bargeable prompts, resume for barge-in, emit `firstDtmf`/`dtmfResult`/`playbackStop`) carries over unchanged — the FSM keeps driving FS `playback`/`break` for prompts while pausing/resuming the *MSS consumer* instead of the FS media bug. The one timing contract to preserve: `PlayBackStopEvent` still comes from FS ESL events, so "stop playback → wait → resume fork" sequencing is unaffected in Phases 1–2.
+`streamfsm` carries over unchanged: it keeps driving FS `playback`/`break`
+for prompts while pausing/resuming the *MSS attachment* instead of the FS
+media bug. `PlayBackStopEvent` still originates from FS in Phases 1-2, so
+the "stop playback → wait → resume fork" sequencing is unaffected.
+
+### 5.7 The same nouns carry Phase 3 and 4
+
+The test of whether the abstraction is real is that later phases add no
+RPCs:
+
+- **Phase 3 inline leg** — `CreateSession{INLINE}`; the voice agent becomes
+  `Attach{DUPLEX}`, the same attachment with direction flipped; streaming
+  TTS is `StartPlayback{stream}`.
+- **Phase 4 conference** — `CreateSession{MIX}`; each participant is
+  `Attach{RTP_INLINE, DUPLEX}`; **monitor** is `Attach{SINK}` on a mixed
+  selector with *no SIP leg at all*; **whisper** is
+  `StartPlayback{target: member_id}`; **barge** is
+  `UpdateAttachment{selector}`. The mix matrix is attachment config.
+- **A new consumer type** (different ASR vendor, analytics sink) is a new
+  transport enum value plus a config blob. No API change.
 
 ---
 
@@ -260,6 +453,8 @@ The audit of `mediagateway` produced a concrete list of what the purpose-built s
 | 7 | Redis session JSON read-modify-write, no CAS → lost updates | Versioned writes (WATCH/Lua or per-field hashes) |
 | 8 | Per-datagram goroutine for OpenSIPS events → INVITE/BYE races per b2b key | Per-session serialized event queues (cigol's streamfsm sharding pattern is the right one) |
 | 9 | `ptime=0` parse path → integer divide-by-zero panic; answers Opus with no rtpmap; strips telephone-event from answers | Hardened SDP handling (or lean on rtpengine to normalize — subscription SDP comes from rtpengine, which is well-formed) |
+| 12 | Fan-out has no single event source: N attachments can each claim to be "the call's speech events" and double-drive `streamfsm` | Exactly one `authoritative` attachment per session; every event carries `attachment_id`; a second authoritative attach is rejected (§5.3) |
+| 13 | MSS is a single writer per session, so it sits on the barge-in path that `partial_speech_result` drives — and the Kafka hop adds latency to it | Measure `partial` → `StopPlayback` cut-through before Phase-1 pilots; co-locate the translator with telServer; fall back to a gRPC stream **for speech events only** if measurement demands it, keeping recording/lifecycle on Kafka |
 | 10 | Pod-crash "recovery" is billing bookkeeping only; orphaned legs never torn down | Session registry with ownership leases; on pod death, controller re-establishes taps on a healthy pod (subscriptions are re-creatable — a *huge* HA advantage over inline legs) and tears down orphaned rtpengine subscriptions |
 | 11 | JSON + base64 per 20 ms frame per consumer | Binary gRPC frames natively; base64/JSON only on the WS-compat adapter |
 | 12 | No SRTP/DTLS/ICE | Fine to keep out of MSS: rtpengine terminates crypto at the edge; subscription legs are plaintext RTP on the private network. Revisit only if taps cross trust boundaries |

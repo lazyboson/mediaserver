@@ -65,18 +65,35 @@ Work:
   Opus via `audiopus` when a consumer needs it.
 - Consumer adapters: WebSocket Twilio dialect first (wire-compatible with
   mediagateway — existing endpoints must not change), then gRPC
-  `MediaStream` (proto/mediastream.proto).
-- Control plane: tonic `MediaControl`, Redis session registry with
-  ownership leases + re-subscribe on pod loss, Kafka billing/lifecycle
-  events (reuse existing topics/schemas).
+  `MediaStream` (proto/mediastream.proto). Each attaches with a declared
+  capability (`SINK` / `+EVENTS` / `+INJECT`) — architecture.md §5.2 — and
+  exactly one per session is `authoritative` (§5.3).
+- Control plane: tonic `MediaControl` over the Session/Attachment/Playback
+  nouns (architecture.md §5.1), Redis session registry with ownership
+  leases + re-subscribe on pod loss, and **events published to Kafka**
+  (`mss.events`, typed `MediaEvent`) rather than streamed back over gRPC —
+  a translator in cigol renders them onto the existing `eventTopic` in the
+  positional format `appServer` already consumes (§5.4).
+- `TelCompat` façade: `telsvc.proto` message shapes verbatim, so a
+  per-tenant flag routes `StartStream`/`StartRecording`/
+  `StartCallTranscription` to `telServer` or `mssServer` with no client
+  change and rollback by config (§5.6).
+- **ASR arrives with streaming, not separately.** Since cigol moved ASR
+  from Google to Deepgram, `PlayAndDetectSpeechWithGSR` *is* the audio
+  fork, so RTT, gather and the voice-AI feed are one mechanism. The
+  vocabulary to emit is `mod_audio_fork::{start_of_transcript,
+  partial_speech_result, end_of_utterance, first_transcript}`.
 - telservice parity: `StartStream/StopStream/StreamPause/StreamResume/
   StreamSendText/StartCallTranscription` route to MSS behind a per-tenant
   feature flag; mod_audio_fork stays installed for rollback.
 - streamfsm keeps driving FS playback; it pauses/resumes the MSS consumer
   instead of the FS media bug — validate barge-in timing in pilot.
 
-Exit criteria: zero `uuid_audio_fork` / `uuid_google_transcribe2`
-invocations at steady state for flagged tenants; measured FS CPU-per-call
+Exit criteria: measured `partial_speech_result` → `StopPlayback`
+cut-through latency inside the barge-in budget (MSS is a single writer per
+session and therefore on that critical path — architecture.md §5.5); zero
+`uuid_audio_fork` / `uuid_google_transcribe2` invocations at steady state
+for flagged tenants; measured FS CPU-per-call
 reduction; one full quarter (or agreed period) of pilot stability;
 audio-flow watchdog + re-subscribe recovery observed working in
 production incidents, not just tests.
