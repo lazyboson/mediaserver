@@ -7,7 +7,7 @@ use crate::proto;
 use crate::proto::media_control_server::{MediaControl, MediaControlServer};
 use session_core::{
     AttachSpec, AttachmentId, AttachmentUpdate, AttachmentView, ControlError, CreateSession,
-    EventKind, MediaEvent, PlaybackId, PlaybackSpec, SessionId, SessionRegistry,
+    EventKind, MediaEvent, PlaybackId, PlaybackSpec, SessionId, SessionRegistry, SessionView,
 };
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -28,19 +28,36 @@ pub enum PlaybackSource {
 #[error("{0}")]
 pub struct MediaPlaneError(pub String);
 
+#[tonic::async_trait]
 pub trait MediaPlane: Send + Sync + 'static {
-    fn send_text(&self, attachment: AttachmentId, json: &str) -> Result<(), MediaPlaneError>;
+    async fn open_session(&self, session: SessionView) -> Result<(), MediaPlaneError>;
 
-    fn start_playback(
+    async fn close_session(&self, session: SessionId) -> Result<(), MediaPlaneError>;
+
+    async fn open_attachment(&self, attachment: AttachmentView) -> Result<(), MediaPlaneError>;
+
+    async fn close_attachment(
+        &self,
+        session: SessionId,
+        attachment: AttachmentId,
+    ) -> Result<(), MediaPlaneError>;
+
+    async fn send_text(
+        &self,
+        attachment: AttachmentId,
+        json: String,
+    ) -> Result<(), MediaPlaneError>;
+
+    async fn start_playback(
         &self,
         session: SessionId,
         playback: PlaybackId,
         source: PlaybackSource,
-        target_tag: Option<&str>,
+        target_tag: Option<String>,
         block_egress: bool,
     ) -> Result<(), MediaPlaneError>;
 
-    fn stop_playback(
+    async fn stop_playback(
         &self,
         session: SessionId,
         playback: PlaybackId,
@@ -198,6 +215,14 @@ impl MediaControl for SessionController {
                 idempotency_key: optional(message.idempotency_key),
             })
         })?;
+        if let Some(media) = self.media.clone() {
+            if let Err(error) = media.open_session(view.clone()).await {
+                let _ = self.commit(|registry| {
+                    registry.destroy_session(view.id, "the media plane refused the session")
+                });
+                return Err(Status::unavailable(error.to_string()));
+            }
+        }
         self.session_message(view.id).map(Response::new)
     }
 
@@ -207,6 +232,11 @@ impl MediaControl for SessionController {
     ) -> Result<Response<proto::Ack>, Status> {
         let session = self.resolve(Some(request.into_inner()))?;
         self.commit(|registry| registry.destroy_session(session, "destroy requested"))?;
+        if let Some(media) = self.media.clone() {
+            if let Err(error) = media.close_session(session).await {
+                tracing::warn!(%session, %error, "the media plane could not close this session");
+            }
+        }
         Ok(Response::new(proto::Ack {}))
     }
 
@@ -244,6 +274,13 @@ impl MediaControl for SessionController {
                 idempotency_key: optional(message.idempotency_key),
             })
         })?;
+        if let Some(media) = self.media.clone() {
+            if let Err(error) = media.open_attachment(view.clone()).await {
+                let _ =
+                    self.commit(|registry| registry.detach(view.id, "the media plane refused it"));
+                return Err(Status::unavailable(error.to_string()));
+            }
+        }
         Ok(Response::new(attachment_message(view)))
     }
 
@@ -252,7 +289,17 @@ impl MediaControl for SessionController {
         request: Request<proto::AttachmentRef>,
     ) -> Result<Response<proto::Ack>, Status> {
         let attachment = attachment_id(&request.into_inner().attachment_id)?;
+        let session = self
+            .lock()
+            .attachment_view(attachment)
+            .map(|view| view.session)
+            .map_err(status_of)?;
         self.commit(|registry| registry.detach(attachment, "detach requested"))?;
+        if let Some(media) = self.media.clone() {
+            if let Err(error) = media.close_attachment(session, attachment).await {
+                tracing::warn!(%attachment, %error, "the media plane could not close this attachment");
+            }
+        }
         Ok(Response::new(proto::Ack {}))
     }
 
@@ -292,8 +339,10 @@ impl MediaControl for SessionController {
         self.lock()
             .authorize_send_text(attachment)
             .map_err(status_of)?;
-        self.media_plane()?
-            .send_text(attachment, &message.json)
+        let media = self.media_plane()?.clone();
+        media
+            .send_text(attachment, message.json)
+            .await
             .map_err(|error| Status::unavailable(error.to_string()))?;
         Ok(Response::new(proto::Ack {}))
     }
@@ -328,17 +377,22 @@ impl MediaControl for SessionController {
             })
         })?;
 
-        let started = self.media_plane().and_then(|media| {
-            media
-                .start_playback(
-                    session,
-                    playback,
-                    source,
-                    target_tag.as_deref(),
-                    message.block_egress,
-                )
-                .map_err(|error| Status::unavailable(error.to_string()))
-        });
+        let started = match self.media_plane() {
+            Ok(media) => {
+                let media = media.clone();
+                media
+                    .start_playback(
+                        session,
+                        playback,
+                        source,
+                        target_tag.clone(),
+                        message.block_egress,
+                    )
+                    .await
+                    .map_err(|error| Status::unavailable(error.to_string()))
+            }
+            Err(status) => Err(status),
+        };
         if let Err(status) = started {
             let _ = self.commit(|registry| registry.stop_playback(playback, "start failed"));
             return Err(status);
@@ -356,8 +410,10 @@ impl MediaControl for SessionController {
     ) -> Result<Response<proto::Ack>, Status> {
         let playback = playback_id(&request.into_inner().playback_id)?;
         let session = self.commit(|registry| registry.stop_playback(playback, "stop requested"))?;
-        if let Ok(media) = self.media_plane() {
-            let _ = media.stop_playback(session, playback);
+        if let Some(media) = self.media.clone() {
+            if let Err(error) = media.stop_playback(session, playback).await {
+                tracing::warn!(%playback, %error, "the media plane could not stop this playback");
+            }
         }
         Ok(Response::new(proto::Ack {}))
     }

@@ -314,11 +314,20 @@ full of doc comments lifted from the `.proto` files).
   yet fails loudly: `mix: true` returns `UNIMPLEMENTED` because mixed
   subscriptions are not wired to rtpengine, and a `StartPlayback` with no
   source is `INVALID_ARGUMENT` rather than a no-op.
-- `MediaPlane` is the seam to the media world (send_text, playback). With
-  no implementation installed those RPCs return `UNAVAILABLE` — honest about
-  being unwired rather than pretending to succeed. If the media plane
-  refuses a playback the registry entry is rolled back, so a failed start
-  leaves no orphan.
+- `MediaPlane` is the seam to the media world, and it covers the whole
+  lifecycle: `open_session` / `close_session`, `open_attachment` /
+  `close_attachment`, `send_text`, `start_playback` / `stop_playback`. It is
+  async because opening a tap means an NG round trip to rtpengine.
+  **Every open is rolled back if the media world refuses it** — a session
+  rtpengine will not tap is destroyed again before the RPC returns, and an
+  attachment whose consumer cannot be reached is detached, so a failed call
+  never leaves a half-built session behind. Teardown runs the other way:
+  the registry is authoritative and media cleanup is best-effort with a
+  warning, because a caller that asked to destroy should not be refused
+  because cleanup hiccuped.
+- With **no** media plane installed the controller is a registry only:
+  lifecycle calls are skipped and `send_text`/playback return `UNAVAILABLE`.
+  That is the mode the unit tests use; `mediaserverd` always installs one.
 
 ### The drain bug this layer already had, and its fix
 
@@ -341,9 +350,6 @@ the controller; broadcast lag is logged with the missed count.
 
 ### Known gaps (M4)
 
-- **Not wired into `mediaserverd`.** The daemon still boots the Phase-0 tap
-  spike; mounting `serve_on` there belongs with the `MediaPlane`
-  implementation over the hub, not before it.
 - `WatchEvents` is the debug path only. The production event path is Kafka
   `mss.events` (§5.4) and has not been built yet — `SessionController`
   currently publishes events only to its in-process broadcast.
@@ -355,6 +361,59 @@ the controller; broadcast lag is logged with the missed count.
   only `MediaControl` is served.
 
 ## crates/mediaserverd
+
+### tap_plane.rs — the control plane's hands in the media world
+
+`TapPlane` implements `control_api::MediaPlane` over the machinery the
+Phase-0 spike proved, which is what turns `MediaControl` from a registry
+into something that actually taps calls.
+
+- `open_session` does the real NG dance — bind transport, `subscribe
+  request`, parse the offer, bind one UDP socket per stream, `subscribe
+  answer` — then builds a `TapLeg` per stream, starts a `Hub`, and spawns
+  the capture thread. The session is only recorded once all of that
+  succeeded, which is what makes the controller's rollback meaningful.
+- **Managed taps retain no local audio.** `TapLeg` sizes its capture buffer
+  from the duration it is given, so the spike's WAV-shaped sizing would
+  allocate hundreds of megabytes per leg for a call-length session. Managed
+  sessions pass `RETAIN_NO_LOCAL_AUDIO` (zero), which floors at one second
+  and then reports `capture_full` — audio goes to consumers through the hub,
+  not into a buffer nobody reads.
+- The capture loop is bounded by `MAX_SESSION_DURATION` (8 h) as well as by
+  its stop flag, so a session whose `DestroySession` never arrives cannot
+  pin a thread forever.
+- `open_attachment` serves `WS_TWILIO` only; every other transport is
+  refused **by name** rather than silently accepted and ignored. Metadata
+  carries `accountId`/`streamSid` through to the Twilio `start` frame, and
+  the `TrackSelector` becomes both the hub's `TrackSelection` and the
+  `tracks` list the consumer is told about.
+- `send_text` reaches the far end through a bounded channel added to
+  `consumer_ws::run`; blob playback is refused above
+  `MAX_PLAYBACK_BLOB_BYTES` because one NG datagram cannot carry it (the
+  lab's `EMSGSIZE` finding), and streaming playback names itself as
+  Phase-3 work.
+- **Known gaps:** no Redis registry, so a tap lives and dies with its pod;
+  `stop_playback` stops everything on the call rather than one playback,
+  because rtpengine's `stop media` targets a participant, not a playback id;
+  `close_attachment` aborts the consumer task rather than closing the
+  websocket politely.
+
+### main.rs — how the daemon chooses what to be
+
+Three modes, in priority order: the Phase-0 tap spike when its env vars are
+set (unchanged scaffolding), the **control plane** when
+`MSS_CONTROL_LISTEN` is an `ip:port`, and otherwise an idle process that
+waits for a signal. `MSS_RTPENGINE_NODE` becomes the default node for
+sessions that do not name one, `MSS_TAP_LOCAL_IP` the media address, and
+`MSS_POD_NAME` the `owner_pod` reported by `DescribeSession`.
+
+Verified against the running binary, not just in tests: `CreateSession`
+toward an unreachable rtpengine returns
+`Unavailable: subscribe request: no reply from rtpengine ... after 3
+attempts`, and the follow-up `DescribeSession` returns `NotFound` — the
+rollback works in the daemon, not only against the test fake.
+`crates/control-api/examples/mss_ctl.rs` is the small client used for that
+and is the quickest way to poke a running control plane by hand.
 
 ### hub.rs — the fan-out core (M3), first increment
 The per-session pub/sub the roadmap calls the fan-out hub. Two-worlds

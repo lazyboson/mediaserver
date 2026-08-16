@@ -6,15 +6,24 @@ mod media_rt;
 mod ng_transport;
 #[allow(dead_code)]
 mod supervisor;
+mod tap_plane;
 mod tap_session;
 mod tap_spike;
 
+use control_api::SessionController;
+use media_core::AudioFormat;
 use ng_transport::{NgTransport, NgTransportConfig};
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
-use tracing::{error, info};
+use tap_plane::{TapPlane, TapPlaneConfig};
+use tracing::{error, info, warn};
 
 const RTPENGINE_NODE_ENV: &str = "MSS_RTPENGINE_NODE";
+const CONTROL_LISTEN_ENV: &str = "MSS_CONTROL_LISTEN";
+const POD_NAME_ENV: &str = "MSS_POD_NAME";
+const LOCAL_MEDIA_IP_ENV: &str = "MSS_TAP_LOCAL_IP";
+const DEFAULT_POD_NAME: &str = "mediaserverd";
 
 fn main() {
     tracing_subscriber::fmt()
@@ -56,11 +65,27 @@ fn main() {
         }
 
         probe_configured_rtpengine_node().await;
-        info!("control plane up (session API and tap orchestration land in milestone 4)");
-        tokio::signal::ctrl_c()
-            .await
-            .expect("failed to listen for shutdown signal");
-        info!("shutdown signal received");
+
+        match control_listen_address() {
+            Some(Ok(listen)) => serve_control_plane(listen).await,
+            Some(Err(configured)) => {
+                error!(
+                    configured,
+                    env = CONTROL_LISTEN_ENV,
+                    "the control plane listen address must be ip:port"
+                );
+            }
+            None => {
+                info!(
+                    env = CONTROL_LISTEN_ENV,
+                    "no control plane listen address configured; idling"
+                );
+                tokio::signal::ctrl_c()
+                    .await
+                    .expect("failed to listen for shutdown signal");
+                info!("shutdown signal received");
+            }
+        }
     });
 
     media.shutdown();
@@ -130,4 +155,54 @@ fn cookie_prefix() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|since_epoch| since_epoch.as_nanos() as u64)
         .unwrap_or_default()
+}
+
+fn control_listen_address() -> Option<Result<SocketAddr, String>> {
+    let configured = std::env::var(CONTROL_LISTEN_ENV).ok()?;
+    Some(configured.parse().map_err(|_| configured))
+}
+
+fn local_media_address() -> IpAddr {
+    std::env::var(LOCAL_MEDIA_IP_ENV)
+        .ok()
+        .and_then(|configured| configured.parse().ok())
+        .unwrap_or(IpAddr::from([0, 0, 0, 0]))
+}
+
+async fn serve_control_plane(listen: SocketAddr) {
+    let plane = Arc::new(TapPlane::new(TapPlaneConfig {
+        default_node: std::env::var(RTPENGINE_NODE_ENV)
+            .ok()
+            .and_then(|configured| configured.parse().ok()),
+        local_media_address: local_media_address(),
+        format: AudioFormat::pcmu_8k_20ms(),
+        cookie_prefix: cookie_prefix(),
+        sdp_session_id: cookie_prefix(),
+    }));
+    let owner = std::env::var(POD_NAME_ENV).unwrap_or_else(|_| DEFAULT_POD_NAME.to_string());
+    let draining = Arc::clone(&plane);
+    let controller = SessionController::new(owner.clone()).with_media_plane(plane);
+
+    let listener = match tokio::net::TcpListener::bind(listen).await {
+        Ok(listener) => listener,
+        Err(error) => {
+            error!(%listen, %error, "could not bind the control plane listener");
+            return;
+        }
+    };
+    info!(%listen, owner = %owner, "MediaControl is serving");
+
+    let served = control_api::serve_on_until(controller, listener, async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("failed to listen for shutdown signal");
+        info!(
+            live_taps = draining.live_sessions(),
+            "shutdown signal received; draining the control plane"
+        );
+    })
+    .await;
+    if let Err(error) = served {
+        warn!(%error, "the control plane stopped with an error");
+    }
 }
