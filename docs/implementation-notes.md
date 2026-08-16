@@ -243,6 +243,14 @@ never takes a lock and never waits on the control world.
 - Still to come in M3: per-consumer codec/resample pipelines (G.711 →
   L16 → 8k/16k), the gRPC `MediaStream` adapter, and hub metrics exported
   rather than logged.
+- **The hub is what architecture.md §5 calls an Attachment set**, and the
+  spike already prefigures two of its rules: capability is structural (the
+  voice-AI consumer is constructed with a command channel, listeners with
+  `None`, so only it can inject) and track selection happens at the hub.
+  What the M4 control plane must add on top: an `attachment_id` on every
+  event, exactly one `authoritative` attachment per session (§5.3), and
+  `external_id` carried from `CreateSession` onto every event so Kafka can
+  key by the legacy controller's `request_uuid`.
 
 ### consumer_ws.rs — the first consumer bridge, and the speech path back
 - WebSocket client speaking the frozen Twilio dialect from
