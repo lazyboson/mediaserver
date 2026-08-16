@@ -5,6 +5,7 @@ const USAGE: &str = "\
 mss_ctl <endpoint> create <external-id> <call-id> <from-tag> [rtpengine-node]
 mss_ctl <endpoint> describe <external-id>
 mss_ctl <endpoint> attach <external-id> <ws-url> [label] [authoritative]
+mss_ctl <endpoint> play <external-id> <wav-path> [target-tag]
 mss_ctl <endpoint> destroy <external-id>";
 
 fn reference(external_id: &str) -> proto::SessionRef {
@@ -70,6 +71,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         .unwrap_or_else(|| "consumer".to_string()),
                     endpoint: args[3].clone(),
                     metadata: Default::default(),
+                    idempotency_key: String::new(),
+                })
+                .await
+                .map(|response| format!("{:?}", response.into_inner()))
+        }
+        "play" => {
+            if args.len() < 4 {
+                eprintln!("{USAGE}");
+                std::process::exit(2);
+            }
+            let blob = std::fs::read(&args[3])?;
+            client
+                .start_playback(proto::StartPlaybackRequest {
+                    session: Some(reference(&args[2])),
+                    source: Some(proto::start_playback_request::Source::Blob(blob)),
+                    target_tag: args.get(4).cloned().unwrap_or_default(),
+                    repeat_times: 0,
+                    block_egress: false,
+                    requested_by: String::new(),
                     idempotency_key: String::new(),
                 })
                 .await
