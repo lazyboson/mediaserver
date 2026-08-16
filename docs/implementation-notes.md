@@ -203,6 +203,79 @@ the DTMF detector and the G.711 decode, and allocates nothing per packet
   pull it and write the byte-exact tests before the first ASR consumer
   migrates (architecture.md risk #4).
 
+## crates/session-core — the control-plane state machine (M4), sans-IO
+
+`SessionRegistry` is the MediaControl API of architecture.md §5.1 as a pure
+state machine: no sockets, no async, no clock of its own. The tonic service
+and the Redis registry are shells around it, which is what makes every rule
+below testable without a lab (Constitution, Article III).
+
+The four nouns are `SessionKind` (Tap/Inline/Mix), `AttachSpec`,
+`PlaybackSpec` and `MediaEvent`. Phase 3/4 add no operations — an inline leg
+is `SessionKind::Inline` and a conference is `SessionKind::Mix`, both already
+accepted by the same calls.
+
+### The invariants it enforces, and where they come from
+
+- **Capability is an authorization boundary (§5.2), checked twice.** Once
+  against the transport (`Transport::carries` — `FileS3` carries `SINK`
+  only, so a recorder cannot even be *granted* `INJECT`), and once against
+  the attachment at use time (`authorize_inject`, `report`). A recorder that
+  tries to inject and an analytics sink that tries to emit
+  `end_of_interaction` both fail structurally rather than by convention.
+- **Exactly one authoritative attachment per session (§5.3).** A second
+  authoritative attach is `AuthoritativeAlreadyBound`, never silently
+  resolved. `legacy_eligible` on each event is that attachment's flag, and
+  `MediaEvent::legacy_name()` returns `None` for everything else — so an RTT
+  service and a voice-AI bridge can both return transcripts while only one
+  drives `streamfsm`. Detaching frees the role for a successor.
+- **A consumer cannot forge event identity (§5.5).** This is why
+  `ConsumerEvent` and `EventKind` are separate types rather than one: a far
+  end can *claim* speech results, but `session`, `external_id`,
+  `attachment`, `seq`, `legacy_eligible` and `first_final` are all supplied
+  by the registry. There is no field a hostile or buggy consumer can set to
+  misattribute an event, because the type it sends has no such field.
+- **`first_final` is tracked per attachment**, not per session: it means
+  "the first final transcript of this fork", which is what
+  `mod_audio_fork::first_transcript` meant. Two attachments each get one.
+- **Idempotency (§5.1).** Every mutating spec carries an optional key. A
+  replay returns the original id; the same key with a *different* request
+  fingerprint is `IdempotencyConflict` rather than silently handing back the
+  wrong resource. Fingerprints deliberately exclude the key itself.
+
+### Bounds, because nothing here may grow without one
+
+- `max_attachments` per session (default 16) → `TooManyAttachments`.
+- Outbox `OUTBOX_CAPACITY` (1024) is drop-oldest with an `events_dropped()`
+  counter, the same policy the hub uses — a dropped event must be a metric,
+  never a silence. Sequence numbers are per session and gapless, so a
+  consumer can *detect* a drop rather than infer it. The shell is expected
+  to `drain_events()` every tick, which keeps this far from the cap.
+- Idempotency cache `IDEMPOTENCY_CAPACITY` (4096) with FIFO eviction. A
+  sans-IO core has no clock, so it cannot expire by TTL; if the shell wants
+  time-based expiry it must drive it.
+
+### Known gaps (M4)
+
+- **Not yet wired to tonic.** `proto/mediacontrol.proto` is the contract;
+  the prost/tonic build and the service impl are the next increment, along
+  with mapping `ControlError` onto gRPC status codes (`CapabilityDenied` →
+  `PERMISSION_DENIED`, `AuthoritativeAlreadyBound` → `FAILED_PRECONDITION`,
+  `Unknown*` → `NOT_FOUND`, `IdempotencyConflict` → `ABORTED`).
+- **Not yet wired to the hub.** `TrackSelector` is the control-world twin of
+  `hub::TrackSelection`; the shell converts. They are deliberately separate
+  types — the media world must not depend on control-plane vocabulary — but
+  if a third copy ever appears, that is the signal to promote one.
+- **No persistence.** Redis session registry with ownership leases and
+  re-subscribe on pod loss is M4; the registry is per-process today, and
+  `SessionId`/`AttachmentId` counters restart with the process (the wire
+  form is prefixed and parse-checked, so a stale id from another pod is
+  rejected as unknown rather than aliased onto a live session).
+- `Observation` covers what MSS witnesses itself (DTMF from the pipeline,
+  recording lifecycle). Playback events are emitted by the registry.
+  Recording is a Phase-2 consumer, so those variants exist ahead of the
+  sink that will raise them.
+
 ## crates/mediaserverd
 
 ### hub.rs — the fan-out core (M3), first increment

@@ -1,0 +1,10 @@
+[package]
+name = "session-core"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+description = "Sans-IO control-plane core: sessions, attachments, capabilities and event identity. The MediaControl state machine with no sockets, no async and no clock of its own."
+
+[dependencies]
+media-core = { path = "../media-core" }
+thiserror = { workspace = true }
