@@ -276,6 +276,84 @@ accepted by the same calls.
   Recording is a Phase-2 consumer, so those variants exist ahead of the
   sink that will raise them.
 
+## crates/control-api — the Session Controller's network surface (M4)
+
+The `MediaControl` gRPC service (`proto/mediacontrol.proto`) over the
+sans-IO `session-core` state machine. The crate exists so the generated
+protobuf code and the gRPC dependency tree stay out of `mediaserverd`, and
+so the service is testable without booting the daemon.
+
+**On the name:** gRPC is served by `tonic`, but that word appears nowhere in
+our vocabulary — the type is `SessionController`, after architecture.md
+§3.1. tonic is a dependency, not a concept.
+
+### Build: no protoc, deliberately
+
+`build.rs` compiles the protos with **`protox`** (a pure-Rust protobuf
+compiler) and hands the descriptors to `tonic-prost-build` via
+`compile_fds`. The obvious route — `tonic_prost_build::compile_protos` —
+shells out to a `protoc` binary, which GitHub's runners do not ship and the
+distroless Docker build does not have. Going through protox keeps the build
+hermetic: CI and the Dockerfile needed no changes at all. Generated code
+lands in `OUT_DIR`, which also keeps it clear of the CI comment scan (it is
+full of doc comments lifted from the `.proto` files).
+
+### Where the design shows up on the wire
+
+- `ControlError` maps to a status a caller can act on, not a generic
+  failure: `CapabilityDenied` → `PERMISSION_DENIED`,
+  `AuthoritativeAlreadyBound` / `TransportCannotCarry` →
+  `FAILED_PRECONDITION`, `ExternalIdInUse` → `ALREADY_EXISTS`,
+  `IdempotencyConflict` → `ABORTED`, `TooManyAttachments` →
+  `RESOURCE_EXHAUSTED`, `Unknown*` → `NOT_FOUND`, malformed ids and
+  unspecified enums → `INVALID_ARGUMENT`.
+- **Unspecified enum values are refused, never defaulted.** proto3 cannot
+  distinguish "absent" from "zero", so accepting `SESSION_KIND_UNSPECIFIED`
+  would silently create a TAP session for a caller who meant INLINE.
+- **Nothing is silently ignored.** A request field this layer cannot honour
+  yet fails loudly: `mix: true` returns `UNIMPLEMENTED` because mixed
+  subscriptions are not wired to rtpengine, and a `StartPlayback` with no
+  source is `INVALID_ARGUMENT` rather than a no-op.
+- `MediaPlane` is the seam to the media world (send_text, playback). With
+  no implementation installed those RPCs return `UNAVAILABLE` — honest about
+  being unwired rather than pretending to succeed. If the media plane
+  refuses a playback the registry entry is rolled back, so a failed start
+  leaves no orphan.
+
+### The drain bug this layer already had, and its fix
+
+The first wire test hung forever. tonic's graceful shutdown waits for
+in-flight requests, and a `WatchEvents` stream is in-flight until it ends —
+so **one debug watcher would have pinned a pod open through its entire
+drain**. Two changes, both regression-tested
+(`a_watcher_that_never_reads_does_not_pin_the_server_open_on_drain`,
+`a_watch_on_one_session_ends_when_that_session_does`):
+
+- A session-scoped watch **ends when that session ends**, which is the
+  correct semantics anyway.
+- The controller carries a drain signal (`begin_drain`, wired by
+  `serve_on_until`) that ends every watcher, including watch-everything
+  streams that have no natural end.
+
+Watchers are served by a spawned task feeding a bounded `mpsc`, so a
+subscriber that stops reading applies backpressure to itself rather than to
+the controller; broadcast lag is logged with the missed count.
+
+### Known gaps (M4)
+
+- **Not wired into `mediaserverd`.** The daemon still boots the Phase-0 tap
+  spike; mounting `serve_on` there belongs with the `MediaPlane`
+  implementation over the hub, not before it.
+- `WatchEvents` is the debug path only. The production event path is Kafka
+  `mss.events` (§5.4) and has not been built yet — `SessionController`
+  currently publishes events only to its in-process broadcast.
+- `owner_pod` is whatever string the controller was constructed with; real
+  placement and Redis ownership leases are still ahead.
+- No auth interceptor yet. `ConsumerHello.token` exists in the data-plane
+  proto and nothing verifies it.
+- The `MediaStream` data-plane service is generated but not implemented;
+  only `MediaControl` is served.
+
 ## crates/mediaserverd
 
 ### hub.rs — the fan-out core (M3), first increment
