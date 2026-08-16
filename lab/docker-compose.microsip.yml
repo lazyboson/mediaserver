@@ -36,8 +36,11 @@ services:
   opensips:
     image: opensips/opensips:3.4
     depends_on: [rtpengine]
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - sed "s/__ADVERTISED_IP__/${ADVERTISED_IP:-127.0.0.1}/" /etc/opensips/opensips.cfg.tmpl > /tmp/opensips.cfg && exec /usr/sbin/opensips -F -f /tmp/opensips.cfg
     volumes:
-      - ./opensips/opensips.cfg:/etc/opensips/opensips.cfg:ro
+      - ./opensips/opensips.cfg:/etc/opensips/opensips.cfg.tmpl:ro
     ports:
       - "5060:5060/udp"
     networks:
