@@ -392,6 +392,22 @@ into something that actually taps calls.
   `MAX_PLAYBACK_BLOB_BYTES` because one NG datagram cannot carry it (the
   lab's `EMSGSIZE` finding), and streaming playback names itself as
   Phase-3 work.
+- **Leg identity is positional, and that is not sound (found 2026-08-16).**
+  `track_for_stream` labels stream 0 Customer and stream 1 Agent. Against
+  rtpengine 14.1.1.8 in the lab, a two-tag subscription came back with
+  **`a=label` absent on both streams** (`label: None`), and the stream order
+  did not follow the order of the `from-tags` we asked for: on the run where
+  the caller spoke, the speech arrived on the stream we had labelled *Agent*,
+  while the stream labelled *Customer* was digital silence. Everything else
+  was healthy — 2555 and 2609 datagrams, every one decoded, zero loss, zero
+  unknown payload types — so this is purely a naming defect, and it lands
+  the caller's voice on the wrong channel of a stereo recording and on the
+  wrong speaker in RTT. The spike shares the bug: same positional helper.
+  **The fix is one subscription per from-tag** so identity is unambiguous
+  (one stream per subscription), which costs an extra NG round trip and one
+  more socket and does not depend on rtpengine labelling anything. Do that
+  before Phase 2 trusts stereo, and before RTT speaker attribution is
+  believed.
 - **Known gaps:** no Redis registry, so a tap lives and dies with its pod;
   `stop_playback` stops everything on the call rather than one playback,
   because rtpengine's `stop media` targets a participant, not a playback id;

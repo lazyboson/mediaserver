@@ -164,6 +164,17 @@ impl MediaPlane for TapPlane {
             )));
         }
 
+        for (index, stream) in offer.streams.iter().enumerate() {
+            info!(
+                index,
+                label = ?stream.label,
+                source_port = stream.port,
+                payload_types = ?stream.payload_types,
+                requested_tags = ?view.from_tags,
+                "rtpengine offered a tap stream"
+            );
+        }
+
         let mut sockets = Vec::with_capacity(offer.streams.len());
         let mut receive_ports = Vec::with_capacity(offer.streams.len());
         for _ in &offer.streams {
@@ -226,6 +237,28 @@ impl MediaPlane for TapPlane {
                     MAX_SESSION_DURATION,
                     &capture_stop,
                 );
+                for leg in legs.iter() {
+                    let stats = leg.stats();
+                    info!(
+                        track = ?leg.track(),
+                        datagrams = stats.datagrams,
+                        frames_played = stats.pipeline.frames_played,
+                        frames_concealed = stats.pipeline.frames_concealed,
+                        frames_suppressed = stats.pipeline.frames_suppressed,
+                        underruns = stats.underruns,
+                        companded = stats.pipeline.companded,
+                        unknown_payload_type = stats.pipeline.unknown_payload_type,
+                        unparsable = stats.pipeline.unparsable,
+                        telephone_event_packets = stats.pipeline.telephone_events,
+                        dtmf_digits = stats.pipeline.dtmf_digits,
+                        jitter_lost = stats.jitter.lost,
+                        jitter_duplicates = stats.jitter.duplicates,
+                        jitter_late_drops = stats.jitter.late_drops,
+                        jitter_resets = stats.jitter.resets,
+                        recv_errors = stats.recv_errors,
+                        "tap leg finished"
+                    );
+                }
                 info!(
                     releases = summary.releases,
                     reanchors = summary.reanchors,
