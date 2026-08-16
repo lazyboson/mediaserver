@@ -1,7 +1,7 @@
 use control_api::proto::media_control_server::MediaControl;
 use control_api::proto::{self, media_event::Payload};
 use control_api::{MediaPlane, MediaPlaneError, PlaybackSource, SessionController};
-use session_core::{AttachmentId, PlaybackId, SessionId};
+use session_core::{AttachmentId, AttachmentView, PlaybackId, SessionId, SessionView};
 use std::sync::{Arc, Mutex};
 use tokio_stream::StreamExt;
 use tonic::{Code, Request};
@@ -10,37 +10,85 @@ use tonic::{Code, Request};
 struct RecordingMediaPlane {
     text: Mutex<Vec<(String, String)>>,
     playbacks: Mutex<Vec<String>>,
-    refuse: bool,
+    opened_sessions: Mutex<Vec<String>>,
+    opened_attachments: Mutex<Vec<String>>,
+    closed_attachments: Mutex<Vec<String>>,
+    refuse_sessions: bool,
+    refuse_attachments: bool,
+    refuse_playback: bool,
 }
 
+#[tonic::async_trait]
 impl MediaPlane for RecordingMediaPlane {
-    fn send_text(&self, attachment: AttachmentId, json: &str) -> Result<(), MediaPlaneError> {
-        if self.refuse {
+    async fn open_session(&self, session: SessionView) -> Result<(), MediaPlaneError> {
+        if self.refuse_sessions {
+            return Err(MediaPlaneError("no rtpengine here".to_string()));
+        }
+        self.opened_sessions
+            .lock()
+            .unwrap()
+            .push(session.id.to_string());
+        Ok(())
+    }
+
+    async fn close_session(&self, _session: SessionId) -> Result<(), MediaPlaneError> {
+        Ok(())
+    }
+
+    async fn open_attachment(&self, attachment: AttachmentView) -> Result<(), MediaPlaneError> {
+        if self.refuse_attachments {
+            return Err(MediaPlaneError("the consumer refused us".to_string()));
+        }
+        self.opened_attachments
+            .lock()
+            .unwrap()
+            .push(attachment.id.to_string());
+        Ok(())
+    }
+
+    async fn close_attachment(
+        &self,
+        _session: SessionId,
+        attachment: AttachmentId,
+    ) -> Result<(), MediaPlaneError> {
+        self.closed_attachments
+            .lock()
+            .unwrap()
+            .push(attachment.to_string());
+        Ok(())
+    }
+
+    async fn send_text(
+        &self,
+        attachment: AttachmentId,
+        json: String,
+    ) -> Result<(), MediaPlaneError> {
+        if self.refuse_playback {
             return Err(MediaPlaneError("the far end is gone".to_string()));
         }
         self.text
             .lock()
             .unwrap()
-            .push((attachment.to_string(), json.to_string()));
+            .push((attachment.to_string(), json));
         Ok(())
     }
 
-    fn start_playback(
+    async fn start_playback(
         &self,
         _session: SessionId,
         playback: PlaybackId,
         _source: PlaybackSource,
-        _target_tag: Option<&str>,
+        _target_tag: Option<String>,
         _block_egress: bool,
     ) -> Result<(), MediaPlaneError> {
-        if self.refuse {
+        if self.refuse_playback {
             return Err(MediaPlaneError("nothing is listening".to_string()));
         }
         self.playbacks.lock().unwrap().push(playback.to_string());
         Ok(())
     }
 
-    fn stop_playback(
+    async fn stop_playback(
         &self,
         _session: SessionId,
         _playback: PlaybackId,
@@ -375,7 +423,7 @@ async fn text_reaches_the_media_plane_only_for_a_transport_that_can_carry_it() {
 #[tokio::test]
 async fn a_playback_the_media_plane_refuses_leaves_no_orphan_behind() {
     let media = Arc::new(RecordingMediaPlane {
-        refuse: true,
+        refuse_playback: true,
         ..RecordingMediaPlane::default()
     });
     let controller = controller().with_media_plane(media);
@@ -524,4 +572,90 @@ async fn a_mixed_subscription_is_refused_rather_than_quietly_ignored() {
         .unwrap_err();
 
     assert_eq!(status.code(), Code::Unimplemented);
+}
+
+#[tokio::test]
+async fn a_session_the_media_plane_cannot_open_is_not_left_behind_in_the_registry() {
+    let media = Arc::new(RecordingMediaPlane {
+        refuse_sessions: true,
+        ..RecordingMediaPlane::default()
+    });
+    let controller = controller().with_media_plane(media);
+
+    let status = controller
+        .create_session(Request::new(create("req-1")))
+        .await
+        .unwrap_err();
+    assert_eq!(status.code(), Code::Unavailable);
+
+    let gone = controller
+        .describe_session(Request::new(proto::SessionRef {
+            id: Some(proto::session_ref::Id::ExternalId("req-1".to_string())),
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(gone.code(), Code::NotFound);
+}
+
+#[tokio::test]
+async fn an_attachment_the_media_plane_cannot_open_is_rolled_back() {
+    let media = Arc::new(RecordingMediaPlane {
+        refuse_attachments: true,
+        ..RecordingMediaPlane::default()
+    });
+    let controller = controller().with_media_plane(media);
+    let session = session_with(&controller, "req-1").await;
+
+    let status = controller
+        .attach(Request::new(attach(
+            &session,
+            proto::Transport::GrpcStream,
+            &[proto::Capability::Sink],
+        )))
+        .await
+        .unwrap_err();
+    assert_eq!(status.code(), Code::Unavailable);
+
+    let described = controller
+        .describe_session(Request::new(proto::SessionRef {
+            id: Some(proto::session_ref::Id::SessionId(session)),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(described.attachments.is_empty());
+}
+
+#[tokio::test]
+async fn the_media_plane_is_told_to_open_and_close_what_the_api_creates() {
+    let media = Arc::new(RecordingMediaPlane::default());
+    let controller = controller().with_media_plane(media.clone());
+    let session = session_with(&controller, "req-1").await;
+
+    let attachment = controller
+        .attach(Request::new(attach(
+            &session,
+            proto::Transport::GrpcStream,
+            &[proto::Capability::Sink],
+        )))
+        .await
+        .unwrap()
+        .into_inner();
+
+    controller
+        .detach(Request::new(proto::AttachmentRef {
+            attachment_id: attachment.attachment_id.clone(),
+        }))
+        .await
+        .unwrap();
+
+    assert_eq!(media.opened_sessions.lock().unwrap().as_slice(), [session]);
+    assert_eq!(
+        media.opened_attachments.lock().unwrap().as_slice(),
+        std::slice::from_ref(&attachment.attachment_id)
+    );
+    assert_eq!(
+        media.closed_attachments.lock().unwrap().as_slice(),
+        std::slice::from_ref(&attachment.attachment_id)
+    );
 }

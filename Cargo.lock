@@ -754,6 +754,7 @@ name = "mediaserverd"
 version = "0.1.0"
 dependencies = [
  "base64 0.23.1",
+ "control-api",
  "crossbeam-queue",
  "futures-util",
  "hound",
@@ -761,6 +762,7 @@ dependencies = [
  "protocol",
  "rtpengine-ng",
  "serde_json",
+ "session-core",
  "thiserror",
  "tokio",
  "tokio-tungstenite",
