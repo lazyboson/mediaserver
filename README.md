@@ -20,8 +20,9 @@ legs + injection (voice AI) → Phase 4 mixing/conferencing.
 | `crates/rtpengine-ng` | **Sans-IO** RTPEngine NG protocol client: bencode + `subscribe request/answer`, `unsubscribe`, `ping` datagram builders and reply parsing. |
 | `crates/protocol` | Consumer wire dialects: Twilio Media Streams JSON (the legacy media gateway-compatible) and `audio_fork send_text` control events (the legacy stream fsm-compatible). |
 | `crates/session-core` | **Sans-IO** control-plane core: the `MediaControl` state machine over sessions, attachments, playbacks and events — capability authorization, one authoritative attachment per session, event identity and sequencing, idempotent retries. No sockets, no async. |
+| `crates/control-api` | The Session Controller's network surface: the `MediaControl` gRPC service over `session-core`, plus the generated `mss.v1` types. Built with a pure-Rust protobuf compiler, so no `protoc` is needed. |
 | `crates/mediaserverd` | The daemon: Tokio control plane + dedicated real-time media worker threads (the **two-world** architecture), session supervision / audio-flow watchdog. |
-| `proto/` | gRPC contracts for `MediaControl` / `MediaStream` (wired with tonic in milestone 2). |
+| `proto/` | gRPC contracts: `mediacontrol.proto` (control plane, served by `control-api`) and `mediastream.proto` (data plane, not yet implemented). |
 | `docs/` | Architecture proposal & decision records. |
 
 ## Governance & docs
@@ -75,6 +76,7 @@ Toolchain is pinned in `rust-toolchain.toml`.
   `recvmmsg` ingest benchmark. *Exit: measured per-tap cost.*
 - [ ] **M3 — fan-out hub**: per-session pub/sub, consumer bridges
   (WS Twilio dialect first), pause/resume/send_text parity with the legacy verb API.
-- [ ] **M4 — control plane**: tonic `MediaControl`, Redis session registry
-  with ownership leases, Kafka billing/lifecycle events, pilot behind a
-  tenant feature flag.
+- [ ] **M4 — control plane**: `MediaControl` gRPC service and its sans-IO
+  state machine ✅ (`session-core` + `control-api`); still open — wiring into
+  `mediaserverd`, Redis session registry with ownership leases, Kafka
+  lifecycle events, pilot behind a tenant feature flag.

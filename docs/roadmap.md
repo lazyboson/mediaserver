@@ -73,9 +73,11 @@ Work:
   landed** — `crates/session-core`, sans-IO: capability enforcement, the
   one-authoritative-attachment rule, per-session event sequencing and
   idempotent retries, with `proto/mediacontrol.proto` as the contract.
-  Still to come: the tonic service itself, Redis session registry with
-  ownership leases + re-subscribe on pod loss, and **events published to
-  Kafka**
+  **The gRPC service has landed too** — `crates/control-api`, served over a
+  real socket and tested through a generated client. Still to come: wiring
+  it into `mediaserverd` behind a `MediaPlane` over the hub, the Redis
+  session registry with ownership leases + re-subscribe on pod loss, and
+  **events published to Kafka**
   (`mss.events`, typed `MediaEvent`) rather than streamed back over gRPC —
   a translator in the legacy controller renders them onto the existing `eventTopic` in the
   positional format `the application server` already consumes (§5.4).

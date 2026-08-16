@@ -1,0 +1,12 @@
+#![forbid(unsafe_code)]
+
+pub mod proto {
+    tonic::include_proto!("mss.v1");
+}
+
+pub mod controller;
+pub mod convert;
+pub mod server;
+
+pub use controller::{MediaPlane, MediaPlaneError, PlaybackSource, SessionController};
+pub use server::{serve_on, serve_on_until};
