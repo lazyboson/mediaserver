@@ -423,3 +423,28 @@ Findings against rtpengine 14.1.1.8:
 The last row cannot be reconciled with architecture.md §6, which says
 `from-tag` selects who *hears* injected audio. One of the two readings is
 wrong; neither should be trusted until re-probed.
+
+
+### Correction (2026-08-17, evening)
+
+Two findings in the table above are void, and the lesson is bigger than
+either: **the stereo recorder's `RIGHT_TRACK` env was still `mixed`** from
+the voice-AI demo, so every channel-based verdict mapped "right" to the
+injection track, not the agent leg. Through that lens a healthy tap looked
+inverted. `lab/track_dump.py` (one wav per track *name*) replaced
+channel-based analysis, and with it:
+
+- A subscription leg carries what the participant **sends**, stamped with
+  the sender's SSRC — the "carries what X hears" conclusion is retracted.
+- The `play media` row (tone on the "other" participant's subscription) was
+  measured through the same broken lens plus a probe that answered with an
+  unoffered payload type; treat it as unmeasured until re-probed.
+- The call-death and 20-40x flood rows came from that same malformed-answer
+  probe. The daemon's own subscriptions (correct answers) have never killed
+  a call. rtpengine may still dislike concurrent subscriptions — unproven
+  either way.
+
+Leg identity is now solved in the daemon by SSRC correlation with
+elimination; see implementation-notes. When a mock's env var can invert an
+experiment's conclusion, the mock is part of the experiment: verify the
+instrument before trusting a surprising result.

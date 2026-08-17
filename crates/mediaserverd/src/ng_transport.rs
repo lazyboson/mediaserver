@@ -201,6 +201,11 @@ impl NgTransport {
             .await
     }
 
+    pub async fn query(&self, call_id: &str) -> Result<NgReply, TransportError> {
+        self.roundtrip(|cookie| NgClient::query(cookie, call_id))
+            .await
+    }
+
     pub async fn play_media(&self, play: &PlayMedia) -> Result<NgReply, TransportError> {
         self.roundtrip(|cookie| NgClient::play_media(cookie, play))
             .await

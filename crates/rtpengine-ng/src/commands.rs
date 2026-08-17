@@ -59,6 +59,34 @@ impl NgReply {
     pub fn to_tag(&self) -> Option<&str> {
         self.body.get("to-tag").and_then(Value::as_str)
     }
+
+    pub fn ssrc_by_tag(&self) -> Vec<(String, u32)> {
+        let mut found = Vec::new();
+        let Some(Value::Dict(tags)) = self.body.get("tags") else {
+            return found;
+        };
+        for (tag, detail) in tags {
+            let Ok(tag) = std::str::from_utf8(tag) else {
+                continue;
+            };
+            let Some(Value::List(medias)) = detail.get("medias") else {
+                continue;
+            };
+            for media in medias {
+                let Some(Value::List(streams)) = media.get("streams") else {
+                    continue;
+                };
+                for stream in streams {
+                    if let Some(Value::Int(ssrc)) = stream.get("SSRC") {
+                        if let Ok(ssrc) = u32::try_from(*ssrc) {
+                            found.push((tag.to_string(), ssrc));
+                        }
+                    }
+                }
+            }
+        }
+        found
+    }
 }
 
 #[derive(Debug, Default)]
@@ -124,6 +152,13 @@ impl NgClient {
         d.insert(b"call-id".to_vec(), Value::str(call_id));
         d.insert(b"to-tag".to_vec(), Value::str(to_tag));
         d.insert(b"sdp".to_vec(), Value::str(sdp));
+        Self::build(cookie, d)
+    }
+
+    pub fn query(cookie: &[u8], call_id: &str) -> Vec<u8> {
+        let mut d = BTreeMap::new();
+        d.insert(b"command".to_vec(), Value::str("query"));
+        d.insert(b"call-id".to_vec(), Value::str(call_id));
         Self::build(cookie, d)
     }
 
@@ -375,5 +410,51 @@ mod tests {
         assert!(body.starts_with(b"d12:error-reason"));
         assert!(NgClient::parse_reply(wire).is_err());
         assert_eq!(NgClient::split_cookie(b"no-space"), Err(NgError::NoCookie));
+    }
+}
+
+#[cfg(test)]
+mod query_tests {
+    use super::*;
+
+    fn reply_from(body: &str) -> NgReply {
+        NgReply {
+            cookie: b"c1".to_vec(),
+            body: Value::decode(body.as_bytes()).unwrap(),
+        }
+    }
+
+    #[test]
+    fn query_asks_for_exactly_one_call() {
+        let datagram = NgClient::query(b"q1", "call-abc");
+        let text = String::from_utf8_lossy(&datagram);
+        assert!(text.starts_with("q1 d"));
+        assert!(text.contains("7:call-id8:call-abc"));
+        assert!(text.contains("7:command5:query"));
+    }
+
+    #[test]
+    fn ssrc_by_tag_walks_the_shape_rtpengine_actually_returns() {
+        let reply = reply_from(
+            "d6:result2:ok4:tagsd8:hosttestd6:mediasld7:streamsld4:SSRCi2004318071eeeeee\
+13:QF4pc39U9Dj8Fd6:mediasld7:streamsld4:SSRCi1985452339eeeeeeee",
+        );
+        let mut found = reply.ssrc_by_tag();
+        found.sort();
+        assert_eq!(
+            found,
+            vec![
+                ("QF4pc39U9Dj8F".to_string(), 1985452339),
+                ("hosttest".to_string(), 2004318071),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_reply_without_tags_or_ssrcs_yields_nothing_rather_than_failing() {
+        assert!(reply_from("d6:result2:oke").ssrc_by_tag().is_empty());
+        let stream_without_ssrc =
+            reply_from("d4:tagsd1:ad6:mediasld7:streamsld4:porti30000eeeeeeee");
+        assert!(stream_without_ssrc.ssrc_by_tag().is_empty());
     }
 }
