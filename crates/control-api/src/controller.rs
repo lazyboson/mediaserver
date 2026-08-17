@@ -115,6 +115,27 @@ impl SessionController {
         MediaControlServer::new(controller)
     }
 
+    pub fn snapshot(&self) -> Vec<(SessionView, Vec<AttachmentView>)> {
+        let registry = self.lock();
+        registry
+            .session_ids()
+            .into_iter()
+            .filter_map(|id| {
+                let session = registry.session_view(id).ok()?;
+                let attachments = session
+                    .attachments
+                    .iter()
+                    .filter_map(|held| registry.attachment_view(*held).ok())
+                    .collect();
+                Some((session, attachments))
+            })
+            .collect()
+    }
+
+    pub fn holds_external_id(&self, external_id: &str) -> bool {
+        self.lock().resolve(external_id).is_ok()
+    }
+
     pub fn subscribe(&self) -> broadcast::Receiver<MediaEvent> {
         self.watchers.subscribe()
     }

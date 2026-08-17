@@ -13,7 +13,7 @@ Status as of **2026-08-17**.
 | **M1 — scaffold** | workspace, sans-IO cores (RTP, G.711, DTMF, jitter), NG bencode, consumer dialects, two-world daemon skeleton, watchdog | ✅ done (2026-08-13) |
 | **M2 — Phase-0 spike** | real NG subscribe against lab rtpengine, both legs jitter-buffered to WAV, per-tap cost | ✅ **code done**; 3 org-side items open (below) |
 | **M3 — fan-out hub** | per-session pub/sub, N consumers, WS-Twilio adapter, pause/resume/send_text parity | ✅ done |
-| **M4 — control plane** | `MediaControl` gRPC, session state machine, Kafka events, Redis registry, tenant-flag pilot | 🔶 **~65%** — see next-up list |
+| **M4 — control plane** | `MediaControl` gRPC, session state machine, Kafka events, Redis registry, tenant-flag pilot | 🔶 **~85%** — metrics, MediaStream gRPC and auth remain |
 | M5+ | Phases 2–4 (recording, interactive media, full media plane) | ⬜ not started |
 
 ### What landed, concretely
@@ -105,7 +105,19 @@ created the session.
 `StartStream` call produces the same session/attachment shape as the
 equivalent native calls.
 
-### 3. Redis session registry + re-subscribe on pod loss
+### 3. Redis session registry + re-subscribe on pod loss — ✅ DONE (2026-08-17)
+`session_store.rs` (namespaced keys, TTL'd leases, atomic `SET NX` claim) plus
+`registry_keeper.rs` (persist, renew, adopt, release). Adoption rebuilds through
+the controller's own API so every invariant applies to a rebuilt session, and
+`TapPlane` re-establishes the subscription. Verified against real Redis,
+including six pods racing for one orphan producing exactly one owner, and on a
+live lab call. Sessions with no call identity are released rather than
+half-restored; ended sessions are forgotten so no pod adopts a dead call.
+**Still to prove:** the exit criterion wants a real pod kill mid-call observed
+end to end (two daemons against one Redis), not just the unit and store-level
+proofs.
+
+### 3b. (original description, for reference)
 **Where:** `crates/mediaserverd` (new module) + `session-core` stays sans-IO.
 **What:** persist session/attachment state with CAS-safe writes and TTL'd
 ownership leases renewed by heartbeat; on lease expiry another pod
