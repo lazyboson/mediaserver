@@ -160,8 +160,10 @@ services:
       - start
       - --smp=1
       - --overprovisioned
-      - --kafka-addr=PLAINTEXT://0.0.0.0:9092
-      - --advertise-kafka-addr=PLAINTEXT://172.31.99.60:9092
+      - --kafka-addr=INTERNAL://0.0.0.0:9092,EXTERNAL://0.0.0.0:19092
+      - --advertise-kafka-addr=INTERNAL://172.31.99.60:9092,EXTERNAL://127.0.0.1:19092
+    ports:
+      - "19092:19092"
     networks:
       lab:
         ipv4_address: 172.31.99.60
