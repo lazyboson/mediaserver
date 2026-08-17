@@ -37,6 +37,9 @@ legs + injection (voice AI) → Phase 4 mixing/conferencing.
   scaling model, ecosystem map.
 - [docs/roadmap.md](docs/roadmap.md) — the phased plan from first tap to
   a FreeSWITCH with no media, with exit criteria and live status.
+- [docs/tasks.md](docs/tasks.md) — **what is done and what is next**:
+  milestone state, the ordered next-up list with a definition of done for
+  each item, open defects, and what is blocked on other people.
 - [CLAUDE.md](CLAUDE.md) — orientation for AI-assisted sessions and new
   engineers: stack context, binding rules, where work continues.
 
@@ -71,17 +74,3 @@ cargo run -p control-api --example mss_ctl -- http://127.0.0.1:50551 \
 ```
 
 Toolchain is pinned in `rust-toolchain.toml`.
-
-## Milestones
-
-- [x] **M1 — scaffold**: workspace, sans-IO cores (RTP, G.711, DTMF, jitter,
-  NG bencode, consumer dialects), two-world daemon skeleton, watchdog.
-- [ ] **M2 — Phase-0 spike**: NG client over real UDP against a lab
-  rtpengine; tap one call, jitter-buffer it, dump both legs to WAV;
-  `recvmmsg` ingest benchmark. *Exit: measured per-tap cost.*
-- [ ] **M3 — fan-out hub**: per-session pub/sub, consumer bridges
-  (WS Twilio dialect first), pause/resume/send_text parity with telservice.
-- [ ] **M4 — control plane**: `MediaControl` gRPC service and its sans-IO
-  state machine ✅ (`session-core` + `control-api`); still open — wiring into
-  `mediaserverd`, Redis session registry with ownership leases, Kafka
-  lifecycle events, pilot behind a tenant feature flag.
