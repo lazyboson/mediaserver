@@ -39,12 +39,16 @@ pub struct LegStats {
     pub underruns: u64,
     pub capture_full: bool,
     pub datagram_log_full: bool,
+    pub unknown_ssrc: Option<u32>,
+    pub ssrcs_seen: [Option<u32>; 4],
     pub pipeline: PipelineStats,
     pub jitter: jitter::Stats,
 }
 
 pub struct TapLeg {
     track: Track,
+    ssrc_tracks: Vec<(u32, Track)>,
+    track_resolved: bool,
     socket: UdpSocket,
     pipeline: StreamPipeline,
     samples: Vec<i16>,
@@ -72,6 +76,8 @@ impl TapLeg {
         let capacity_samples = capture_capacity_samples(format, max_capture);
         Ok(TapLeg {
             track,
+            ssrc_tracks: Vec::new(),
+            track_resolved: true,
             socket,
             pipeline,
             samples: Vec::with_capacity(capacity_samples),
@@ -88,6 +94,61 @@ impl TapLeg {
     pub fn with_datagram_log(mut self, capacity_bytes: usize) -> Self {
         self.datagram_log = Vec::with_capacity(capacity_bytes);
         self
+    }
+
+    pub fn with_ssrc_tracks(mut self, ssrc_tracks: Vec<(u32, Track)>) -> Self {
+        self.track_resolved = ssrc_tracks.is_empty();
+        self.ssrc_tracks = ssrc_tracks;
+        self
+    }
+
+    fn resolve_track(&mut self) {
+        let Some(ssrc) = self.pipeline.last_audio_ssrc() else {
+            return;
+        };
+        self.remember_ssrc(ssrc);
+        if self.track_resolved {
+            return;
+        }
+        self.track_resolved = true;
+        match self.ssrc_tracks.iter().find(|(known, _)| *known == ssrc) {
+            Some((_, track)) => self.track = *track,
+            None => self.stats.unknown_ssrc = Some(ssrc),
+        }
+    }
+
+    pub fn resolved_track(&self) -> Option<Track> {
+        if self.track_resolved && self.stats.unknown_ssrc.is_none() {
+            Some(self.track)
+        } else {
+            None
+        }
+    }
+
+    pub fn take_remaining_track(&mut self, taken: Track) {
+        if self.track_resolved && self.stats.unknown_ssrc.is_none() {
+            return;
+        }
+        let remaining = match taken {
+            Track::Customer => Track::Agent,
+            Track::Agent => Track::Customer,
+            Track::Mixed => return,
+        };
+        self.track = remaining;
+        self.track_resolved = true;
+    }
+
+    fn remember_ssrc(&mut self, ssrc: u32) {
+        for slot in self.stats.ssrcs_seen.iter_mut() {
+            match slot {
+                Some(known) if *known == ssrc => return,
+                None => {
+                    *slot = Some(ssrc);
+                    return;
+                }
+                _ => {}
+            }
+        }
     }
 
     pub fn datagram_log(&self) -> &[u8] {
@@ -119,7 +180,9 @@ impl TapLeg {
             match self.socket.recv_from(buf) {
                 Ok((len, _from)) => {
                     self.log_datagram(&buf[..len]);
-                    if let IngestOutcome::Dtmf(digit) = self.pipeline.ingest(&buf[..len]) {
+                    let outcome = self.pipeline.ingest(&buf[..len]);
+                    self.resolve_track();
+                    if let IngestOutcome::Dtmf(digit) = outcome {
                         if self.digits_recorded < MAX_RECORDED_DIGITS {
                             self.digits[self.digits_recorded] = digit;
                             self.digits_recorded += 1;
@@ -226,6 +289,18 @@ pub struct CaptureSummary {
     pub elapsed: Duration,
 }
 
+fn settle_by_elimination(legs: &mut [TapLeg]) {
+    if legs.len() != 2 {
+        return;
+    }
+    let resolved: Vec<Option<Track>> = legs.iter().map(TapLeg::resolved_track).collect();
+    match (resolved[0], resolved[1]) {
+        (Some(taken), None) => legs[1].take_remaining_track(taken),
+        (None, Some(taken)) => legs[0].take_remaining_track(taken),
+        _ => {}
+    }
+}
+
 pub fn capture(
     legs: &mut [TapLeg],
     mut hub: Option<&mut Hub>,
@@ -248,6 +323,7 @@ pub fn capture(
         for leg in legs.iter_mut() {
             leg.drain(&mut buf, hub.as_deref_mut());
         }
+        settle_by_elimination(legs);
 
         let now = Instant::now();
         if now >= next_release {
@@ -658,5 +734,144 @@ mod tests {
             Err(SpikeError::DuplicateTrack(Track::Customer)) => {}
             other => panic!("expected duplicate track rejection, got {other:?}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod ssrc_track_tests {
+    use super::*;
+    use media_core::replay::G711StreamGenerator;
+    use std::net::UdpSocket;
+    use std::time::Duration;
+
+    fn leg_with_map(map: Vec<(u32, Track)>) -> (TapLeg, UdpSocket) {
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let sender = UdpSocket::bind("127.0.0.1:0").unwrap();
+        sender.connect(socket.local_addr().unwrap()).unwrap();
+        let leg = TapLeg::new(
+            Track::Customer,
+            socket,
+            AudioFormat::pcmu_8k_20ms(),
+            1,
+            Some(101),
+            Duration::from_secs(1),
+        )
+        .unwrap()
+        .with_ssrc_tracks(map);
+        (leg, sender)
+    }
+
+    fn feed(leg: &mut TapLeg, sender: &UdpSocket, ssrc: u32, frames: u16) {
+        let mut stream = G711StreamGenerator::new(AudioFormat::pcmu_8k_20ms(), ssrc, 100).unwrap();
+        let mut buf = [0u8; 2048];
+        for _ in 0..frames {
+            sender.send(&stream.next_datagram()).unwrap();
+            std::thread::sleep(Duration::from_millis(2));
+            leg.drain(&mut buf, None);
+        }
+    }
+
+    #[test]
+    fn the_first_audio_packet_names_the_leg_after_its_speaker() {
+        let (mut leg, sender) = leg_with_map(vec![
+            (0xAAAA_0001, Track::Agent),
+            (0xBBBB_0002, Track::Customer),
+        ]);
+        assert_eq!(leg.track(), Track::Customer);
+
+        feed(&mut leg, &sender, 0xAAAA_0001, 3);
+
+        assert_eq!(leg.track(), Track::Agent);
+        assert_eq!(leg.stats().unknown_ssrc, None);
+    }
+
+    #[test]
+    fn an_ssrc_the_map_never_promised_keeps_the_default_and_reports_itself() {
+        let (mut leg, sender) = leg_with_map(vec![(0xAAAA_0001, Track::Agent)]);
+
+        feed(&mut leg, &sender, 0xDEAD_BEEF, 3);
+
+        assert_eq!(leg.track(), Track::Customer);
+        assert_eq!(leg.stats().unknown_ssrc, Some(0xDEAD_BEEF));
+    }
+
+    #[test]
+    fn an_empty_map_means_positional_naming_with_no_resolution_pass() {
+        let (mut leg, sender) = leg_with_map(Vec::new());
+
+        feed(&mut leg, &sender, 0xCCCC_0003, 2);
+
+        assert_eq!(leg.track(), Track::Customer);
+        assert_eq!(leg.stats().unknown_ssrc, None);
+    }
+}
+
+#[cfg(test)]
+mod elimination_tests {
+    use super::*;
+    use media_core::replay::G711StreamGenerator;
+    use std::net::UdpSocket;
+    use std::time::Duration;
+
+    fn leg(map: Vec<(u32, Track)>) -> (TapLeg, UdpSocket) {
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let sender = UdpSocket::bind("127.0.0.1:0").unwrap();
+        sender.connect(socket.local_addr().unwrap()).unwrap();
+        let leg = TapLeg::new(
+            Track::Customer,
+            socket,
+            AudioFormat::pcmu_8k_20ms(),
+            1,
+            Some(101),
+            Duration::from_secs(1),
+        )
+        .unwrap()
+        .with_ssrc_tracks(map);
+        (leg, sender)
+    }
+
+    fn feed(leg: &mut TapLeg, sender: &UdpSocket, ssrc: u32) {
+        let mut stream = G711StreamGenerator::new(AudioFormat::pcmu_8k_20ms(), ssrc, 50).unwrap();
+        let mut buf = [0u8; 2048];
+        for _ in 0..3 {
+            sender.send(&stream.next_datagram()).unwrap();
+            std::thread::sleep(Duration::from_millis(2));
+            leg.drain(&mut buf, None);
+        }
+    }
+
+    #[test]
+    fn one_recognized_leg_names_the_other_by_elimination() {
+        let map = vec![(0xCA11_0001, Track::Customer)];
+        let (mut known, known_sender) = leg(map.clone());
+        let (mut mystery, mystery_sender) = leg(map);
+
+        feed(&mut known, &known_sender, 0xCA11_0001);
+        feed(&mut mystery, &mystery_sender, 0x0DD_BA11);
+        assert_eq!(known.resolved_track(), Some(Track::Customer));
+        assert_eq!(mystery.resolved_track(), None);
+        assert_eq!(mystery.stats().unknown_ssrc, Some(0x0DD_BA11));
+
+        let mut legs = vec![known, mystery];
+        settle_by_elimination(&mut legs);
+
+        assert_eq!(legs[0].track(), Track::Customer);
+        assert_eq!(legs[1].track(), Track::Agent);
+    }
+
+    #[test]
+    fn two_unrecognized_legs_stay_as_named_rather_than_guessing() {
+        let map = vec![(0xCA11_0001, Track::Customer)];
+        let (mut first, first_sender) = leg(map.clone());
+        let (mut second, second_sender) = leg(map);
+
+        feed(&mut first, &first_sender, 0x1111_1111);
+        feed(&mut second, &second_sender, 0x2222_2222);
+
+        let mut legs = vec![first, second];
+        settle_by_elimination(&mut legs);
+        assert_eq!(legs[0].track(), Track::Customer);
+        assert_eq!(legs[1].track(), Track::Customer);
+        assert!(legs.iter().all(|leg| leg.stats().unknown_ssrc.is_some()));
     }
 }

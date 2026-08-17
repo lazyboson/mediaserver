@@ -66,6 +66,7 @@ pub struct StreamPipeline {
     dtmf: DtmfDetector,
     pcm: [i16; MAX_PAYLOAD],
     stats: PipelineStats,
+    last_audio_ssrc: Option<u32>,
 }
 
 impl StreamPipeline {
@@ -103,6 +104,7 @@ impl StreamPipeline {
             dtmf: DtmfDetector::new(),
             pcm: [0; MAX_PAYLOAD],
             stats: PipelineStats::default(),
+            last_audio_ssrc: None,
         })
     }
 
@@ -153,6 +155,7 @@ impl StreamPipeline {
             self.stats.unknown_payload_type += 1;
             return IngestOutcome::UnknownPayloadType(packet.payload_type);
         };
+        self.last_audio_ssrc = Some(packet.ssrc);
         match self.jitter.push(packet.sequence, payload) {
             PushOutcome::Buffered => IngestOutcome::Buffered,
             PushOutcome::Duplicate => IngestOutcome::Duplicate,
@@ -160,6 +163,10 @@ impl StreamPipeline {
             PushOutcome::TooBig => IngestOutcome::Oversized,
             PushOutcome::Reset => IngestOutcome::Resynchronized,
         }
+    }
+
+    pub fn last_audio_ssrc(&self) -> Option<u32> {
+        self.last_audio_ssrc
     }
 
     pub fn release(&mut self) -> Playout<'_> {
@@ -477,5 +484,35 @@ mod tests {
         assert_eq!(pipeline.stats().unparsable, 2);
         assert_eq!(pipeline.jitter_stats().received, 0);
         assert_eq!(pipeline.release(), Playout::Waiting);
+    }
+}
+
+#[cfg(test)]
+mod ssrc_identity_tests {
+    use super::*;
+    use crate::replay::G711StreamGenerator;
+
+    #[test]
+    fn only_accepted_audio_names_the_stream_ssrc() {
+        let mut pipeline = StreamPipeline::new(AudioFormat::pcmu_8k_20ms(), 2, Some(101)).unwrap();
+        assert_eq!(pipeline.last_audio_ssrc(), None);
+
+        pipeline.ingest(b"garbage");
+        assert_eq!(pipeline.last_audio_ssrc(), None);
+
+        let mut wrong_pt = G711StreamGenerator::new(AudioFormat::pcmu_8k_20ms(), 0xAAAA_0001, 1)
+            .unwrap()
+            .next_datagram();
+        wrong_pt[1] = 96;
+        assert_eq!(
+            pipeline.ingest(&wrong_pt),
+            IngestOutcome::UnknownPayloadType(96)
+        );
+        assert_eq!(pipeline.last_audio_ssrc(), None);
+
+        let mut speech =
+            G711StreamGenerator::new(AudioFormat::pcmu_8k_20ms(), 0xBBBB_0002, 2).unwrap();
+        pipeline.ingest(&speech.next_datagram());
+        assert_eq!(pipeline.last_audio_ssrc(), Some(0xBBBB_0002));
     }
 }

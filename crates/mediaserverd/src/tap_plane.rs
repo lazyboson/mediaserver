@@ -204,6 +204,8 @@ impl MediaPlane for TapPlane {
             .await
             .map_err(|error| MediaPlaneError(format!("subscribe answer: {error}")))?;
 
+        let ssrc_tracks = speaker_ssrcs(&transport, &view).await;
+
         let mut legs = Vec::with_capacity(sockets.len());
         for (index, socket) in sockets.into_iter().enumerate() {
             let telephone_event = offer
@@ -213,14 +215,15 @@ impl MediaPlane for TapPlane {
                 .map(|event| event.payload_type);
             legs.push(
                 TapLeg::new(
-                    track_for_stream(index),
+                    speaker_track(index),
                     socket,
                     format,
                     TARGET_DEPTH_PACKETS,
                     telephone_event,
                     RETAIN_NO_LOCAL_AUDIO,
                 )
-                .map_err(|error| MediaPlaneError(format!("tap leg: {error}")))?,
+                .map_err(|error| MediaPlaneError(format!("tap leg: {error}")))?
+                .with_ssrc_tracks(ssrc_tracks.clone()),
             );
         }
 
@@ -256,6 +259,8 @@ impl MediaPlane for TapPlane {
                         jitter_late_drops = stats.jitter.late_drops,
                         jitter_resets = stats.jitter.resets,
                         recv_errors = stats.recv_errors,
+                        unknown_ssrc = stats.unknown_ssrc,
+                        ssrcs_seen = ?stats.ssrcs_seen,
                         "tap leg finished"
                     );
                 }
@@ -522,7 +527,44 @@ fn tracks_of(selector: TrackSelector) -> Vec<String> {
     }
 }
 
-fn track_for_stream(index: usize) -> Track {
+async fn speaker_ssrcs(transport: &NgTransport, view: &SessionView) -> Vec<(u32, Track)> {
+    let reply = match transport.query(&view.call_id).await {
+        Ok(reply) => reply,
+        Err(error) => {
+            warn!(
+                call_id = %view.call_id,
+                %error,
+                "query failed; leg identity falls back to stream order"
+            );
+            return Vec::new();
+        }
+    };
+    let mut ssrc_tracks = Vec::new();
+    for (tag, ssrc) in reply.ssrc_by_tag() {
+        let Some(position) = view.from_tags.iter().position(|held| *held == tag) else {
+            continue;
+        };
+        let speaker = speaker_track(position);
+        info!(
+            call_id = %view.call_id,
+            %tag,
+            ssrc,
+            ?speaker,
+            "the leg carrying this ssrc is this participant's own voice"
+        );
+        ssrc_tracks.push((ssrc, speaker));
+    }
+    if ssrc_tracks.is_empty() {
+        warn!(
+            call_id = %view.call_id,
+            "rtpengine reported no ssrcs for the requested tags; \
+             leg identity falls back to stream order"
+        );
+    }
+    ssrc_tracks
+}
+
+fn speaker_track(index: usize) -> Track {
     if index == 0 {
         Track::Customer
     } else {
@@ -697,5 +739,16 @@ mod tests {
             tracks_of(TrackSelector::Only(Track::Customer)),
             vec!["inbound"]
         );
+    }
+}
+
+#[cfg(test)]
+mod leg_naming_tests {
+    use super::*;
+
+    #[test]
+    fn a_leg_carries_its_own_participants_voice_first_tag_is_the_customer() {
+        assert_eq!(speaker_track(0), Track::Customer);
+        assert_eq!(speaker_track(1), Track::Agent);
     }
 }
