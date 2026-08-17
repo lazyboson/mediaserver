@@ -1,5 +1,5 @@
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let protos = ["mediacontrol.proto", "mediastream.proto"];
+    let protos = ["mediacontrol.proto", "mediastream.proto", "telcompat.proto"];
     let include = "../../proto";
 
     let descriptors = protox::compile(protos, [include])?;

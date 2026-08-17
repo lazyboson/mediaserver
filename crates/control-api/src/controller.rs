@@ -111,6 +111,10 @@ impl SessionController {
         MediaControlServer::new(self)
     }
 
+    pub fn service_for(controller: Arc<SessionController>) -> MediaControlServer<Arc<Self>> {
+        MediaControlServer::new(controller)
+    }
+
     pub fn subscribe(&self) -> broadcast::Receiver<MediaEvent> {
         self.watchers.subscribe()
     }
@@ -202,6 +206,81 @@ fn optional(text: String) -> Option<String> {
         None
     } else {
         Some(text)
+    }
+}
+
+#[tonic::async_trait]
+impl MediaControl for Arc<SessionController> {
+    type WatchEventsStream = <SessionController as MediaControl>::WatchEventsStream;
+
+    async fn create_session(
+        &self,
+        request: Request<proto::CreateSessionRequest>,
+    ) -> Result<Response<proto::Session>, Status> {
+        self.as_ref().create_session(request).await
+    }
+
+    async fn destroy_session(
+        &self,
+        request: Request<proto::SessionRef>,
+    ) -> Result<Response<proto::Ack>, Status> {
+        self.as_ref().destroy_session(request).await
+    }
+
+    async fn describe_session(
+        &self,
+        request: Request<proto::SessionRef>,
+    ) -> Result<Response<proto::Session>, Status> {
+        self.as_ref().describe_session(request).await
+    }
+
+    async fn attach(
+        &self,
+        request: Request<proto::AttachRequest>,
+    ) -> Result<Response<proto::Attachment>, Status> {
+        self.as_ref().attach(request).await
+    }
+
+    async fn detach(
+        &self,
+        request: Request<proto::AttachmentRef>,
+    ) -> Result<Response<proto::Ack>, Status> {
+        self.as_ref().detach(request).await
+    }
+
+    async fn update_attachment(
+        &self,
+        request: Request<proto::UpdateAttachmentRequest>,
+    ) -> Result<Response<proto::Attachment>, Status> {
+        self.as_ref().update_attachment(request).await
+    }
+
+    async fn send_to_attachment(
+        &self,
+        request: Request<proto::SendToAttachmentRequest>,
+    ) -> Result<Response<proto::Ack>, Status> {
+        self.as_ref().send_to_attachment(request).await
+    }
+
+    async fn start_playback(
+        &self,
+        request: Request<proto::StartPlaybackRequest>,
+    ) -> Result<Response<proto::Playback>, Status> {
+        self.as_ref().start_playback(request).await
+    }
+
+    async fn stop_playback(
+        &self,
+        request: Request<proto::PlaybackRef>,
+    ) -> Result<Response<proto::Ack>, Status> {
+        self.as_ref().stop_playback(request).await
+    }
+
+    async fn watch_events(
+        &self,
+        request: Request<proto::WatchRequest>,
+    ) -> Result<Response<Self::WatchEventsStream>, Status> {
+        self.as_ref().watch_events(request).await
     }
 }
 
