@@ -659,3 +659,53 @@ async fn the_media_plane_is_told_to_open_and_close_what_the_api_creates() {
         std::slice::from_ref(&attachment.attachment_id)
     );
 }
+
+#[tokio::test]
+async fn every_committed_event_reaches_the_sink_in_sequence_order() {
+    #[derive(Default)]
+    struct RecordingSink {
+        seen: Mutex<Vec<(String, u64, String)>>,
+    }
+    impl control_api::EventSink for RecordingSink {
+        fn accept(&self, event: session_core::MediaEvent) {
+            self.seen.lock().unwrap().push((
+                event.external_id.clone(),
+                event.seq,
+                format!("{:?}", event.kind),
+            ));
+        }
+    }
+
+    let sink = Arc::new(RecordingSink::default());
+    let controller = SessionController::new("sink-pod").with_event_sink(sink.clone());
+    let session = session_with(&controller, "req-sink").await;
+    let attachment = controller
+        .attach(Request::new(attach(
+            &session,
+            proto::Transport::GrpcStream,
+            &[proto::Capability::Sink],
+        )))
+        .await
+        .unwrap()
+        .into_inner();
+    controller
+        .detach(Request::new(proto::AttachmentRef {
+            attachment_id: attachment.attachment_id,
+        }))
+        .await
+        .unwrap();
+    controller
+        .destroy_session(Request::new(proto::SessionRef {
+            id: Some(proto::session_ref::Id::SessionId(session)),
+        }))
+        .await
+        .unwrap();
+
+    let seen = sink.seen.lock().unwrap().clone();
+    let seqs: Vec<u64> = seen.iter().map(|(_, seq, _)| *seq).collect();
+    assert_eq!(seqs, vec![0, 1, 2]);
+    assert!(seen.iter().all(|(id, _, _)| id == "req-sink"));
+    assert!(seen[0].2.starts_with("AttachmentUp"));
+    assert!(seen[1].2.starts_with("AttachmentDown"));
+    assert!(seen[2].2.starts_with("SessionEnded"));
+}

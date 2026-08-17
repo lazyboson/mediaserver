@@ -77,12 +77,15 @@ Work:
   real socket and tested through a generated client — and **`mediaserverd`
   now serves it** (`MSS_CONTROL_LISTEN`), with `tap_plane::TapPlane` turning
   `CreateSession`/`Attach` into a real rtpengine subscription and a real
-  consumer websocket. Still to come: the Redis session registry with
-  ownership leases + re-subscribe on pod loss, and **events published to
-  Kafka**
-  (`mss.events`, typed `MediaEvent`) rather than streamed back over gRPC —
-  a translator in the legacy controller renders them onto the existing `eventTopic` in the
-  positional format `the application server` already consumes (§5.4).
+  consumer websocket. **Events now publish to Kafka** (`mss.events`, typed
+  `MediaEvent`, keyed by `external_id`, gapless per-session seq,
+  `legacy_eligible` marking the authoritative attachment — verified off the
+  wire against Redpanda in the lab, `crates/mediaserverd/src/event_pump.rs`)
+  rather than streamed back over gRPC. Still to come: the translator in
+  the legacy controller that renders `mss.events` onto the existing `eventTopic` in the
+  positional format `the application server` already consumes (§5.4 — it lives in the legacy controller,
+  not here), and the Redis session registry with ownership leases +
+  re-subscribe on pod loss.
 - `TelCompat` façade: `the legacy verb API.proto` message shapes verbatim, so a
   per-tenant flag routes `StartStream`/`StartRecording`/
   `StartCallTranscription` to `the legacy gRPC server` or `MSS` with no client

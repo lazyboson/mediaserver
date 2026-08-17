@@ -35,7 +35,7 @@ services:
 
   opensips:
     image: opensips/opensips:3.4
-    depends_on: [rtpengine]
+    depends_on: [rtpengine, redpanda]
     entrypoint: ["/bin/sh", "-c"]
     command:
       - sed "s/__ADVERTISED_IP__/${ADVERTISED_IP:-127.0.0.1}/" /etc/opensips/opensips.cfg.tmpl > /tmp/opensips.cfg && exec /usr/sbin/opensips -F -f /tmp/opensips.cfg
@@ -153,6 +153,19 @@ services:
       lab:
         ipv4_address: 172.31.99.30
 
+  redpanda:
+    image: redpandadata/redpanda:v24.2.4
+    command:
+      - redpanda
+      - start
+      - --smp=1
+      - --overprovisioned
+      - --kafka-addr=PLAINTEXT://0.0.0.0:9092
+      - --advertise-kafka-addr=PLAINTEXT://172.31.99.60:9092
+    networks:
+      lab:
+        ipv4_address: 172.31.99.60
+
   mss-control:
     image: rust:1.95-slim-bookworm
     working_dir: /build
@@ -171,6 +184,7 @@ services:
       MSS_POD_NAME: lab-control
       MSS_RTPENGINE_NODE: 172.31.99.10:22222
       MSS_TAP_LOCAL_IP: 172.31.99.31
+      MSS_KAFKA_BROKERS: 172.31.99.60:9092
     ports:
       - "50551:50551"
     networks:
