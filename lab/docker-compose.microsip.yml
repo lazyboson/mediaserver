@@ -106,7 +106,7 @@ services:
     environment:
       RECORDER_PORT: "8090"
       OUT_DIR: /out
-      RIGHT_TRACK: mixed
+      RIGHT_TRACK: outbound
     networks:
       lab:
         ipv4_address: 172.31.99.110

@@ -52,6 +52,8 @@ SAME_SESSION_ID = os.environ.get("SAME_SESSION_ID", "0") == "1"
 SKIP_UNSUBSCRIBE = os.environ.get("SKIP_UNSUBSCRIBE", "0") == "1"
 SKIP_PLAY = os.environ.get("SKIP_PLAY", "0") == "1"
 ONLY_TAG_INDEX = os.environ.get("ONLY_TAG_INDEX", "")
+MULTI = os.environ.get("MULTI", "0") == "1"
+DUMP_QUERY = os.environ.get("DUMP_QUERY", "0") == "1"
 TONE_SECONDS = float(os.environ.get("TONE_SECONDS", "3"))
 
 
@@ -200,6 +202,71 @@ def goertzel(samples, hz, rate=8000):
     return power / len(samples)
 
 
+def multi_answer_sdp(local_ip, ports, session_id):
+    head = (
+        "v=0\r\n"
+        f"o=- {session_id} {session_id} IN IP4 {local_ip}\r\n"
+        "s=mss-subscribe-probe\r\n"
+        f"c=IN IP4 {local_ip}\r\n"
+        "t=0 0\r\n"
+    )
+    body = ""
+    for port in ports:
+        body += (
+            f"m=audio {port} RTP/AVP 0 8 101\r\n"
+            "a=rtpmap:0 PCMU/8000\r\n"
+            "a=rtpmap:8 PCMA/8000\r\n"
+            "a=rtpmap:101 telephone-event/8000\r\n"
+            "a=ptime:20\r\n"
+            "a=recvonly\r\n"
+        )
+    return head + body
+
+
+def multi_trial(ng, local_ip, tags):
+    log("\n--- one subscription carrying every tag (the safe model) ---")
+    reply = ng.call({
+        "command": "subscribe request",
+        "call-id": CALL_ID,
+        "from-tags": tags,
+        "codec": {"transcode": ["PCMU"]},
+    })
+    if reply.get("result") != "ok":
+        log(f"  REFUSED: {reply.get('error-reason')}")
+        return
+    to_tag = reply.get("to-tag")
+    offered = reply.get("sdp", "")
+    stream_ports = re.findall(r"m=audio (\d+) ", offered)
+    labels = re.findall(r"a=label:(\S+)", offered)
+    log(f"  offered {len(stream_ports)} streams, source ports {stream_ports}, "
+        f"labels {labels or 'none'}")
+
+    listeners = [Subscription(f"stream{i}") for i in range(len(stream_ports))]
+    answer = ng.call({
+        "command": "subscribe answer",
+        "call-id": CALL_ID,
+        "to-tag": to_tag,
+        "sdp": multi_answer_sdp(local_ip, [held.port for held in listeners], 4242),
+    })
+    log(f"  answer: {answer.get('result')} {answer.get('error-reason') or ''}")
+
+    deadline = time.time() + LISTEN_SECONDS
+    while time.time() < deadline:
+        for held in listeners:
+            held.drain()
+
+    for index, held in enumerate(listeners):
+        loud = 0.0
+        if held.samples:
+            loud = math.sqrt(sum(x * x for x in held.samples) / len(held.samples))
+        log(f"  stream {index} (source_port {stream_ports[index]}): "
+            f"datagrams={held.datagrams} rms={loud:.0f} ssrcs={sorted(held.ssrcs)}")
+    log(f"  call alive after listening: {alive(ng)}")
+    ng.call({"command": "unsubscribe", "call-id": CALL_ID, "to-tag": to_tag})
+    for held in listeners:
+        held.close()
+
+
 class Subscription:
     def __init__(self, tag):
         self.tag = tag
@@ -211,6 +278,7 @@ class Subscription:
         self.datagrams = 0
         self.samples = []
         self.payload_types = {}
+        self.ssrcs = set()
 
     def drain(self):
         while True:
@@ -223,6 +291,7 @@ class Subscription:
             if len(packet) < 12:
                 continue
             self.datagrams += 1
+            self.ssrcs.add(f"{int.from_bytes(packet[8:12], 'big')}")
             payload_type = packet[1] & 0x7F
             self.payload_types[payload_type] = self.payload_types.get(payload_type, 0) + 1
             body = packet[12:]
@@ -329,6 +398,9 @@ def main():
     local_ip = ng.local_address()
 
     queried = ng.call({"command": "query", "call-id": CALL_ID})
+    if DUMP_QUERY:
+        import json as _json
+        log(_json.dumps(queried, indent=1, default=str)[:6000])
     if queried.get("result") != "ok":
         log(f"rtpengine does not know call {CALL_ID}: {queried.get('error-reason')}")
         return 1
@@ -355,6 +427,10 @@ def main():
         log(f"subscribing to {chosen} ALONE, to see whether one subscription "
             f"behaves differently from two")
         tags = [chosen]
+
+    if MULTI:
+        multi_trial(ng, local_ip, tags)
+        return 0
 
     everything = []
     for index in range(TRIALS):
