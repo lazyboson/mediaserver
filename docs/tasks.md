@@ -80,7 +80,18 @@ tenant can be flipped, so it gates everything else in Phase 1.
 `mod_audio_fork` uninvolved, and the event-name mapping table in
 `proto/mediacontrol.proto` matches the shim one-for-one.
 
-### 2. `TelCompat` façade
+### 2. `TelCompat` façade — ✅ DONE (2026-08-17)
+Landed in `crates/control-api/src/telcompat.rs` with
+`proto/telcompat.proto` declaring `protos.TelService` so the method paths match
+cigol's byte for byte. Serves stream/recording/playback verbs onto the nouns,
+one test per mapping row, both surfaces on one port, proven over a real socket
+with a generated cigol client. `StartCallTranscription` returns `UNIMPLEMENTED`
+by design (the ASR endpoint is not in its request message).
+**Blocked before a tenant can be flipped:** a TelCompat session has only the
+channel uuid, so it needs the OpenSIPS→Redis discovery map (M2 item 3) to
+resolve call-id and tags before it can tap.
+
+### 2b. (original description, for reference) `TelCompat` façade
 **Where:** `crates/control-api`.
 **What:** a second gRPC service reusing `telsvc.proto` message shapes
 verbatim — `StartStream`, `StopStream`, `StreamPause`, `StreamResume`,

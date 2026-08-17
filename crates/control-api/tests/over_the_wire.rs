@@ -224,3 +224,44 @@ async fn a_watch_on_one_session_ends_when_that_session_does() {
         .expect("the server should drain once its watchers are done")
         .unwrap();
 }
+
+#[tokio::test]
+async fn one_port_serves_both_the_new_api_and_cigols_existing_verbs() {
+    use control_api::telcompat_proto::tel_service_client::TelServiceClient;
+    use control_api::telcompat_proto::StreamRequest;
+
+    let (endpoint, stop, serving) = listening().await;
+    let call = "8f14e45f-ea34-4b2c-9a3f-1d2e3f4a5b6c";
+
+    let mut legacy = TelServiceClient::connect(endpoint.clone()).await.unwrap();
+    legacy
+        .start_stream(StreamRequest {
+            request_uuid: call.to_string(),
+            acc_id: "acct-1".to_string(),
+            stream_sid: "MZ-1".to_string(),
+            ws_url: "wss-endpoint".to_string(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+    let mut native = MediaControlClient::connect(endpoint).await.unwrap();
+    let session = native
+        .describe_session(proto::SessionRef {
+            id: Some(proto::session_ref::Id::ExternalId(call.to_string())),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+
+    assert_eq!(session.external_id, call);
+    assert_eq!(session.attachments.len(), 1);
+    assert_eq!(session.attachments[0].label, "stream");
+    assert!(session.attachments[0].authoritative);
+
+    let _ = stop.send(());
+    tokio::time::timeout(std::time::Duration::from_secs(5), serving)
+        .await
+        .expect("drain")
+        .unwrap();
+}

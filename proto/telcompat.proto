@@ -1,0 +1,90 @@
+// TelCompat — cigol's telsvc verbs, served by MSS (architecture.md §5.6).
+//
+// The package and service name are `protos.TelService` deliberately: gRPC
+// routes on the fully-qualified method path, so `/protos.TelService/StartStream`
+// must be byte-identical to what cigol already calls. That is what lets a
+// per-tenant flag point a client at mssServer instead of telServer with **no
+// client change**, and roll back by pointing it back.
+//
+// SOURCE OF TRUTH: cigol pkg/telservice/proto/telsvc.proto. Message shapes and
+// field numbers are copied verbatim; only the subset MSS can serve is declared.
+// Everything else — originate, answer, hangup, bridge, conferences, IVR
+// prompting — stays on FreeSWITCH, and a client that calls one of those on this
+// server correctly gets UNIMPLEMENTED rather than a silent success.
+//
+// This file is a compatibility surface, not the design. New work targets
+// mediacontrol.proto; this exists to be deleted when cigol speaks nouns.
+
+syntax = "proto3";
+
+package protos;
+
+service TelService {
+  rpc StartStream(StreamRequest) returns (CallResponse) {}
+  rpc StopStream(StreamRequest) returns (CallResponse) {}
+  rpc StreamPause(StreamRequest) returns (CallResponse) {}
+  rpc StreamResume(StreamRequest) returns (CallResponse) {}
+  rpc StreamSendText(StreamRequest) returns (CallResponse) {}
+  rpc StreamPlayFile(StreamRequest) returns (CallResponse) {}
+
+  rpc StartCallTranscription(PlayAndGatherRequest) returns (CallResponse) {}
+  rpc StopCallTranscription(PlayAndGatherRequest) returns (CallResponse) {}
+  rpc StopPlayback(PlayAndGatherRequest) returns (CallResponse) {}
+
+  rpc StartRecording(RecordRequest) returns (CallResponse) {}
+  rpc StopRecording(RecordRequest) returns (CallResponse) {}
+}
+
+message CallResponse {
+  string message = 1;
+  string error = 2;
+}
+
+message StreamRequest {
+  string request_uuid = 1;
+  string app_uuid = 2;
+  string acc_id = 3;
+  string stream_sid = 4;
+  string call_sid = 5;
+  string ws_url = 6;
+  string mix_type = 7;
+  string sampling_rate = 8;
+  string track = 9;
+  string data = 10;
+  string play_file = 11;
+  // google.protobuf.Struct in telsvc; MSS only needs it as attachment
+  // metadata, and a string map is what the attachment stores.
+  map<string, string> metadata = 12;
+}
+
+message RecordRequest {
+  string request_uuid = 1;
+  string app_uuid = 2;
+  string acc_id = 3;
+  string record_id = 4;
+  string recording_len = 5;
+  string file_format = 6;
+  string recording_channels = 7;
+  string finis_on_key = 8;
+  string limit = 9;
+  uint32 timeout = 10;
+  bool play_beep = 11;
+}
+
+message PlayAndGatherRequest {
+  string request_uuid = 1;
+  string app_uuid = 2;
+  string play_file = 3;
+  uint32 min_digit_len = 4;
+  uint32 max_digit_len = 5;
+  uint32 retry = 6;
+  uint32 input_timeout = 7;
+  uint32 inter_digit_timeout = 8;
+  string error_file = 9;
+  string term_char = 10;
+  string regex = 11;
+  string output_var = 12;
+  string lang_code = 13;
+  string finis_on_key = 14;
+  map<string, string> channel_vars_map = 15;
+}

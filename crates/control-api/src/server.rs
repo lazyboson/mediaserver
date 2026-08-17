@@ -1,4 +1,6 @@
 use crate::controller::SessionController;
+use crate::telcompat::TelCompat;
+use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::transport::Server;
@@ -7,10 +9,7 @@ pub async fn serve_on(
     controller: SessionController,
     listener: TcpListener,
 ) -> Result<(), tonic::transport::Error> {
-    Server::builder()
-        .add_service(controller.into_service())
-        .serve_with_incoming(TcpListenerStream::new(listener))
-        .await
+    serve_on_until(controller, listener, std::future::pending()).await
 }
 
 pub async fn serve_on_until(
@@ -19,8 +18,12 @@ pub async fn serve_on_until(
     shutdown: impl std::future::Future<Output = ()>,
 ) -> Result<(), tonic::transport::Error> {
     let draining = controller.drain_handle();
+    let controller = Arc::new(controller);
+    let telcompat = TelCompat::new(Arc::clone(&controller)).into_service();
+
     Server::builder()
-        .add_service(controller.into_service())
+        .add_service(SessionController::service_for(controller))
+        .add_service(telcompat)
         .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async move {
             shutdown.await;
             let _ = draining.send(true);
