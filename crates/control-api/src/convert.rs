@@ -187,6 +187,16 @@ pub fn format_wire(format: AudioFormat) -> proto::AudioFormat {
     }
 }
 
+pub fn event_bytes(event: MediaEvent) -> Vec<u8> {
+    use prost::Message;
+    event_wire(event).encode_to_vec()
+}
+
+pub fn event_from_bytes(bytes: &[u8]) -> Result<proto::MediaEvent, String> {
+    use prost::Message;
+    proto::MediaEvent::decode(bytes).map_err(|error| error.to_string())
+}
+
 pub fn event_wire(event: MediaEvent) -> proto::MediaEvent {
     let legacy_eligible = event.legacy_eligible;
     proto::MediaEvent {

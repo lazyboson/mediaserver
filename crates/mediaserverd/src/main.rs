@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 mod consumer_ws;
+mod event_pump;
 mod hub;
 mod media_rt;
 mod ng_transport;
@@ -21,6 +22,9 @@ use tracing::{error, info, warn};
 
 const RTPENGINE_NODE_ENV: &str = "MSS_RTPENGINE_NODE";
 const CONTROL_LISTEN_ENV: &str = "MSS_CONTROL_LISTEN";
+const KAFKA_BROKERS_ENV: &str = "MSS_KAFKA_BROKERS";
+const EVENTS_TOPIC_ENV: &str = "MSS_EVENTS_TOPIC";
+const EVENTS_PARTITIONS_ENV: &str = "MSS_EVENTS_PARTITIONS";
 const POD_NAME_ENV: &str = "MSS_POD_NAME";
 const LOCAL_MEDIA_IP_ENV: &str = "MSS_TAP_LOCAL_IP";
 const DEFAULT_POD_NAME: &str = "mediaserverd";
@@ -181,7 +185,25 @@ async fn serve_control_plane(listen: SocketAddr) {
     }));
     let owner = std::env::var(POD_NAME_ENV).unwrap_or_else(|_| DEFAULT_POD_NAME.to_string());
     let draining = Arc::clone(&plane);
-    let controller = SessionController::new(owner.clone()).with_media_plane(plane);
+    let mut controller = SessionController::new(owner.clone()).with_media_plane(plane);
+
+    let mut pump_worker = None;
+    match event_sink_from_env().await {
+        Ok(Some((sink, worker, counters))) => {
+            controller = controller.with_event_sink(sink);
+            pump_worker = Some((worker, counters));
+        }
+        Ok(None) => {
+            info!(
+                env = KAFKA_BROKERS_ENV,
+                "no event bus configured; events stay in-process"
+            );
+        }
+        Err(error) => {
+            error!(%error, "the configured event bus is unreachable; refusing to start");
+            return;
+        }
+    }
 
     let listener = match tokio::net::TcpListener::bind(listen).await {
         Ok(listener) => listener,
@@ -205,4 +227,48 @@ async fn serve_control_plane(listen: SocketAddr) {
     if let Err(error) = served {
         warn!(%error, "the control plane stopped with an error");
     }
+    if let Some((worker, counters)) = pump_worker {
+        worker.abort();
+        info!(
+            published = counters
+                .published
+                .load(std::sync::atomic::Ordering::Relaxed),
+            failed = counters.failed.load(std::sync::atomic::Ordering::Relaxed),
+            dropped = counters.dropped.load(std::sync::atomic::Ordering::Relaxed),
+            "event bus totals at shutdown"
+        );
+    }
+}
+
+async fn event_sink_from_env() -> Result<
+    Option<(
+        Arc<event_pump::KafkaEventPump>,
+        tokio::task::JoinHandle<()>,
+        Arc<event_pump::PumpCounters>,
+    )>,
+    String,
+> {
+    let Ok(configured) = std::env::var(KAFKA_BROKERS_ENV) else {
+        return Ok(None);
+    };
+    let brokers: Vec<String> = configured
+        .split(',')
+        .map(str::trim)
+        .filter(|broker| !broker.is_empty())
+        .map(str::to_string)
+        .collect();
+    if brokers.is_empty() {
+        return Err(format!("{KAFKA_BROKERS_ENV} is set but names no brokers"));
+    }
+    let topic =
+        std::env::var(EVENTS_TOPIC_ENV).unwrap_or_else(|_| event_pump::DEFAULT_TOPIC.to_string());
+    let partitions = std::env::var(EVENTS_PARTITIONS_ENV)
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(event_pump::DEFAULT_PARTITIONS);
+
+    let transport = event_pump::RskafkaTransport::connect(brokers, &topic, partitions).await?;
+    let (pump, worker) = event_pump::KafkaEventPump::start(Arc::new(transport));
+    let counters = pump.counters();
+    Ok(Some((Arc::new(pump), worker, counters)))
 }

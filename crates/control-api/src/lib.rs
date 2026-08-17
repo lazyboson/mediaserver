@@ -8,6 +8,6 @@ pub mod controller;
 pub mod convert;
 pub mod server;
 
-pub use controller::{MediaPlane, MediaPlaneError, PlaybackSource, SessionController};
+pub use controller::{EventSink, MediaPlane, MediaPlaneError, PlaybackSource, SessionController};
 pub use server::{serve_on, serve_on_until};
 pub use tonic::async_trait;

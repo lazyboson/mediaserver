@@ -25,3 +25,5 @@ tokio-tungstenite = { version = "0.30.0", default-features = false, features = [
 futures-util = { version = "0.3.34", default-features = false, features = ["sink", "std"] }
 serde_json = { workspace = true }
 crossbeam-queue = "0.3.13"
+rskafka = { version = "0.6.0", default-features = false }
+chrono = { version = "0.4", default-features = false, features = ["clock"] }

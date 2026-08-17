@@ -362,6 +362,46 @@ the controller; broadcast lag is logged with the missed count.
 
 ## crates/mediaserverd
 
+### event_pump.rs — events onto Kafka `mss.events` (M4)
+
+The other half of architecture.md §5.4: commands arrive over gRPC, events
+leave on the bus. `SessionController` gained an `EventSink` seam
+(`with_event_sink`), fed **inside the registry lock** right after
+`drain_events()` so per-session order survives concurrent RPCs; `accept` is
+contractually non-blocking (`try_send` into a bounded queue). The pump
+worker encodes each `session_core::MediaEvent` to the typed protobuf
+`mss.v1.MediaEvent` (`convert::event_bytes` / `event_from_bytes`, pure and
+round-trip-tested) and produces it keyed by `external_id`.
+
+- **Partitioning**: FNV-1a over `external_id` modulo the topic's partition
+  count — deterministic across restarts, so a session's events stay on one
+  partition and per-call ordering holds. Verified off the wire: a full
+  lifecycle (2×AttachmentUp, PlaybackStarted, 2×AttachmentDown,
+  SessionEnded) landed on one partition with gapless seq 0-5 and
+  `legacy_eligible` true only for the authoritative attachment's events.
+- **Bounds and honesty**: queue of 1024, counted drops with a warning;
+  broker failures are counted per event and logged, never fatal
+  (at-most-once for now — durable retry is future work and the gapless seq
+  makes gaps detectable downstream). Totals logged at shutdown.
+- **Topic bootstrap**: `RskafkaTransport::connect` lists topics and creates
+  `mss.events` (default 4 partitions, RF 1) when absent, then holds one
+  `PartitionClient` per partition. Config: `MSS_KAFKA_BROKERS` (comma
+  list; unset = events stay in-process, logged), `MSS_EVENTS_TOPIC`,
+  `MSS_EVENTS_PARTITIONS`. A configured-but-unreachable broker **refuses to
+  start** rather than silently running eventless.
+- **Crate map deviation, measured not preferred**: the architecture listed
+  `rdkafka`, but its vendored librdkafka 2.12 build hard-requires libcurl
+  headers plus cmake/g++, which would have to be added to CI, the
+  Dockerfile and the lab image (probe: `rdkafka_conf.c:60 fatal error:
+  curl/curl.h`). `rskafka` (InfluxData, MIT/Apache) is pure Rust and
+  builds hermetically — the same trade already made with protox over
+  protoc. Producer-only use fits it; revisit only if consumer groups or
+  transactions are ever needed on the MSS side.
+- `examples/mss_events_tail.rs` consumes and decodes the topic — the lab
+  verification tool and the reference for cigol's translator.
+- Fixed in passing: the Dockerfile never copied `proto/`, so the image
+  build had been broken since control-api landed.
+
 ### tap_plane.rs — the control plane's hands in the media world
 
 `TapPlane` implements `control_api::MediaPlane` over the machinery the

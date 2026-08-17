@@ -17,6 +17,10 @@ use tonic::{Request, Response, Status};
 
 pub const WATCH_CAPACITY: usize = 256;
 
+pub trait EventSink: Send + Sync + 'static {
+    fn accept(&self, event: MediaEvent);
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum PlaybackSource {
     Blob(Vec<u8>),
@@ -69,6 +73,7 @@ pub struct SessionController {
     watchers: broadcast::Sender<MediaEvent>,
     draining: Arc<watch::Sender<bool>>,
     media: Option<Arc<dyn MediaPlane>>,
+    events: Option<Arc<dyn EventSink>>,
     owner: String,
 }
 
@@ -79,8 +84,14 @@ impl SessionController {
             watchers: broadcast::Sender::new(WATCH_CAPACITY),
             draining: Arc::new(watch::Sender::new(false)),
             media: None,
+            events: None,
             owner: owner.into(),
         }
+    }
+
+    pub fn with_event_sink(mut self, sink: Arc<dyn EventSink>) -> Self {
+        self.events = Some(sink);
+        self
     }
 
     pub fn drain_handle(&self) -> Arc<watch::Sender<bool>> {
@@ -118,6 +129,11 @@ impl SessionController {
             let mut registry = self.lock();
             let outcome = action(&mut registry);
             let events = registry.drain_events();
+            if let Some(sink) = &self.events {
+                for event in &events {
+                    sink.accept(event.clone());
+                }
+            }
             (outcome, events)
         };
         for event in events {
