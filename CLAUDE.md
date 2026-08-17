@@ -49,6 +49,9 @@ injection) and finally conference mixing.
    ecosystem map (Appendix A).
 4. [docs/roadmap.md](docs/roadmap.md) — the phased execution plan with
    exit criteria and current status. **Update it when a milestone lands.**
+   [docs/tasks.md](docs/tasks.md) is the ordered next-up list, open defects
+   and what is blocked on other people — **read it first to know what to
+   pick up, and update it in the same PR that changes an item's state.**
 5. [docs/implementation-notes.md](docs/implementation-notes.md) — per-module
    scaffold status, known limitations, and pending work. Since source files
    carry no comments, this file is where that context lives — **update it
@@ -103,8 +106,15 @@ pipeline triggers on `v*` tags.
 
 ## Where work continues
 
-Check [docs/roadmap.md](docs/roadmap.md) for the current milestone. As of
-scaffold time, the next step is **M2: the Phase-0 spike** — a real NG
-subscribe against a lab rtpengine, both legs jitter-buffered and dumped to
-WAV, with a measured per-tap cost. Do not start the fan-out hub before
-that number exists (Constitution, Article VIII).
+Read [docs/tasks.md](docs/tasks.md) — it holds the milestone state and the
+ordered next-up list with a definition of done for each item.
+
+Short version as of 2026-08-17: M1–M3 are done and **M4 (control plane) is
+about two thirds there** — `MediaControl` is served over gRPC and wired into
+the daemon, taps and consumers are driven by the API, events publish to Kafka
+`mss.events`, and leg identity is solved by SSRC correlation. Next up: the
+event translator in cigol (which gates flipping any tenant), the `TelCompat`
+façade, the Redis registry with re-subscribe on pod loss, and exported
+metrics. Three Phase-0 items remain blocked on other people: the production
+rtpengine version check, the rtpengine-side per-tap cost, and the
+OpenSIPS→Redis call→node discovery design.
