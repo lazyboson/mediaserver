@@ -23,6 +23,7 @@ pub const MAX_PLAYBACK_BLOB_BYTES: usize = 60_000;
 
 const TARGET_DEPTH_PACKETS: u16 = 3;
 const MAX_TAPPED_STREAMS: usize = 2;
+const MAX_TAPPED_LEGS: usize = 2;
 const CONSUMER_QUEUE_FRAMES: usize = 200;
 const TEXT_QUEUE_DEPTH: usize = 32;
 const RETAIN_NO_LOCAL_AUDIO: Duration = Duration::ZERO;
@@ -89,6 +90,55 @@ impl TapPlane {
         })
     }
 
+    async fn complete_from_tags(
+        &self,
+        transport: &NgTransport,
+        mut view: SessionView,
+    ) -> Result<SessionView, MediaPlaneError> {
+        if view.from_tags.len() >= MAX_TAPPED_LEGS {
+            return Ok(view);
+        }
+        let reply = transport
+            .query(&view.call_id)
+            .await
+            .map_err(|error| MediaPlaneError(format!("query for {}: {error}", view.call_id)))?;
+        let known = reply.tags();
+        if known.is_empty() {
+            return Err(MediaPlaneError(format!(
+                "rtpengine knows no participants for call {}; \
+                 it is not anchoring that call",
+                view.call_id
+            )));
+        }
+        let caller_known = !view.from_tags.is_empty();
+        for tag in known {
+            if view.from_tags.len() >= MAX_TAPPED_LEGS {
+                break;
+            }
+            if !view.from_tags.contains(&tag) {
+                view.from_tags.push(tag);
+            }
+        }
+        if caller_known {
+            info!(
+                call_id = %view.call_id,
+                from_tags = ?view.from_tags,
+                "resolved this call's participants; the caller was named so the \
+                 customer leg is known"
+            );
+        } else {
+            warn!(
+                call_id = %view.call_id,
+                from_tags = ?view.from_tags,
+                caller_tag_key = telcompat_caller_tag_key(),
+                "resolved this call's participants but nobody named the caller, so \
+                 customer and agent are assigned by tag order and may be swapped; \
+                 pass the caller's sip from-tag to fix it"
+            );
+        }
+        Ok(view)
+    }
+
     fn session_handles(
         &self,
         session: SessionId,
@@ -134,6 +184,8 @@ impl MediaPlane for TapPlane {
             .await
             .map_err(|error| MediaPlaneError(format!("NG socket: {error}")))?,
         );
+
+        let view = self.complete_from_tags(&transport, view).await?;
 
         let reply = transport
             .subscribe_request(&SubscribeRequest {
@@ -501,6 +553,10 @@ impl MediaPlane for TapPlane {
             .map_err(|error| MediaPlaneError(format!("stop media: {error}")))?;
         Ok(())
     }
+}
+
+fn telcompat_caller_tag_key() -> &'static str {
+    control_api::telcompat::CALLER_TAG_KEY
 }
 
 fn target_of(target_tag: Option<String>) -> PlayTarget {

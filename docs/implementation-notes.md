@@ -465,6 +465,45 @@ round-trip-tested) and produces it keyed by `external_id`.
 - Fixed in passing: the Dockerfile never copied `proto/`, so the image
   build had been broken since control-api landed.
 
+### Resolving a call's participants without the discovery map (2026-08-17)
+
+The blocker on any cigol integration was that a TelCompat caller knows only
+the FreeSWITCH channel uuid, while a tap needs the SIP call-id and the
+participants' from-tags — filed for months as "waiting on OpenSIPS to write a
+discovery map to Redis".
+
+It turns out not to need one. cigol already has both facts on the channel:
+`Variable_sip_call_id`, and the caller's tag inside `Variable_sip_full_from`.
+And rtpengine will name a call's participants itself — `query` returns
+`tags`, which is what `lab/call_watcher.py` has been doing all along. So:
+
+- `TelCompat` reads `sipCallId` and `callerFromTag` out of `StreamRequest`'s
+  metadata map (no proto change, so clients stay wire-compatible) and puts
+  them on the session.
+- `TapPlane::complete_from_tags` asks rtpengine for the rest before
+  subscribing. One `query`, no new dependency, no OpenSIPS config change.
+
+**The caller hint is not optional in practice.** Measured on two live calls:
+
+| | resolved order | the caller's voice landed on |
+| --- | --- | --- |
+| no hint | `[freeswitch-tag, hosttest]` | `outbound` — **wrong** (rms 488) |
+| with hint | `[hosttest, freeswitch-tag]` | `inbound` — correct (rms 543) |
+
+rtpengine's reply is a bencode dict, so tags arrive in key order, not creation
+order; `created` is second-resolution and ties on a fast answer (the lab
+watcher hit the same wall and resorted to a topology heuristic — which leg
+faces FreeSWITCH — that MSS should not copy). Without the hint, customer and
+agent are a coin flip on tag sort, so an unnamed caller now logs a **warning**
+naming the metadata key that fixes it, rather than silently mislabelling a
+recording. SSRC correlation still pins *which stream is which speaker*; it
+cannot know which speaker is the customer, and that is what the hint supplies.
+
+Consequence for the roadmap: the OpenSIPS→Redis discovery map is no longer on
+the critical path for a pilot. It is still the better long-term answer — it
+avoids a `query` per tap and works when MSS never sees the channel — but it is
+now an optimisation rather than a blocker.
+
 ### telcompat.rs — cigol's verbs, served by MSS (§5.6)
 
 The migration switch. `proto/telcompat.proto` declares

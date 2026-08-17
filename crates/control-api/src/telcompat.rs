@@ -17,9 +17,34 @@ const RECORD_ID_KEY: &str = "recordingId";
 const FILE_FORMAT_KEY: &str = "fileFormat";
 const CHANNELS_KEY: &str = "recordingChannels";
 const TRACK_BOTH: &str = "both";
+pub const SIP_CALL_ID_KEY: &str = "sipCallId";
+pub const CALLER_TAG_KEY: &str = "callerFromTag";
+
+#[derive(Clone, Default)]
+struct CallIdentity {
+    sip_call_id: String,
+    caller_tag: Option<String>,
+}
+
+impl CallIdentity {
+    fn recorder_has_none() -> CallIdentity {
+        CallIdentity::default()
+    }
+
+    fn from_metadata(metadata: &HashMap<String, String>) -> CallIdentity {
+        CallIdentity {
+            sip_call_id: metadata.get(SIP_CALL_ID_KEY).cloned().unwrap_or_default(),
+            caller_tag: metadata
+                .get(CALLER_TAG_KEY)
+                .filter(|tag| !tag.is_empty())
+                .cloned(),
+        }
+    }
+}
 
 struct SinkSpec {
     label: &'static str,
+    identity: CallIdentity,
     transport: proto::Transport,
     endpoint: String,
     selector: Option<proto::TrackSelector>,
@@ -70,7 +95,11 @@ impl TelCompat {
             .ok_or_else(|| Status::not_found(format!("{external_id} has no {label} attachment")))
     }
 
-    async fn ensure_session(&self, external_id: &str) -> Result<proto::Session, Status> {
+    async fn ensure_session(
+        &self,
+        external_id: &str,
+        identity: CallIdentity,
+    ) -> Result<proto::Session, Status> {
         match self.session_for(external_id).await {
             Ok(session) => Ok(session),
             Err(status) if status.code() == tonic::Code::NotFound => self
@@ -78,8 +107,8 @@ impl TelCompat {
                 .create_session(Request::new(proto::CreateSessionRequest {
                     external_id: external_id.to_string(),
                     kind: proto::SessionKind::Tap as i32,
-                    call_id: String::new(),
-                    from_tags: Vec::new(),
+                    call_id: identity.sip_call_id,
+                    from_tags: identity.caller_tag.into_iter().collect(),
                     rtpengine_node: String::new(),
                     mix: false,
                     idempotency_key: format!("telcompat-session-{external_id}"),
@@ -95,7 +124,8 @@ impl TelCompat {
         external_id: &str,
         spec: SinkSpec,
     ) -> Result<proto::Attachment, Status> {
-        self.ensure_session(external_id).await?;
+        self.ensure_session(external_id, spec.identity.clone())
+            .await?;
         let label = spec.label;
         self.controller
             .attach(Request::new(proto::AttachRequest {
@@ -205,6 +235,7 @@ impl TelService for TelCompat {
             &message.request_uuid,
             SinkSpec {
                 label: STREAM_LABEL,
+                identity: CallIdentity::from_metadata(&metadata),
                 transport: proto::Transport::WsTwilio,
                 endpoint: message.ws_url.clone(),
                 selector: track_selector(&message.track),
@@ -352,6 +383,7 @@ impl TelService for TelCompat {
             &message.request_uuid,
             SinkSpec {
                 label: RECORDER_LABEL,
+                identity: CallIdentity::recorder_has_none(),
                 transport: proto::Transport::FileS3,
                 endpoint,
                 selector: None,
