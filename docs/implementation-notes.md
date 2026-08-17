@@ -402,6 +402,57 @@ round-trip-tested) and produces it keyed by `external_id`.
 - Fixed in passing: the Dockerfile never copied `proto/`, so the image
   build had been broken since control-api landed.
 
+### telcompat.rs — cigol's verbs, served by MSS (§5.6)
+
+The migration switch. `proto/telcompat.proto` declares
+**`package protos; service TelService`** deliberately: gRPC routes on the
+fully-qualified method path, so `/protos.TelService/StartStream` is
+byte-identical to what cigol already calls, and a per-tenant flag can point a
+client at `mssServer` instead of `telServer` with **no client change** and roll
+back by pointing it back. Message shapes and field numbers are copied verbatim
+from cigol's `telsvc.proto`.
+
+Only the media subset is declared — stream, transcription, recording, playback
+stop. Originate, answer, hangup, bridge, conferences and IVR prompting stay on
+FreeSWITCH, and a client calling one of those here gets `UNIMPLEMENTED`, which
+is the honest answer rather than a silent success.
+
+The mapping (one test per row in `tests/telcompat.rs`):
+
+| telsvc verb | MSS nouns |
+| --- | --- |
+| `StartStream` | `CreateSession{TAP}` if absent + `Attach{WS_TWILIO, SINK+EVENTS+INJECT, authoritative}` |
+| `StopStream` | `Detach`, and `DestroySession` when it was the last attachment |
+| `StreamPause` / `StreamResume` | `UpdateAttachment{paused}` |
+| `StreamSendText` | `SendToAttachment` |
+| `StreamPlayFile` | `StartPlayback{file, requested_by: the fork}` |
+| `StartRecording` | `Attach{FILE_S3, SINK}`, endpoint `${accountID}/${recordingID}.${format}` |
+| `StopRecording` | `Detach` (+ `DestroySession` if last) |
+| `StopPlayback` | `StopPlayback` — the barge-in primitive |
+| `StartCallTranscription` | **`UNIMPLEMENTED`**, deliberately: since the Deepgram move transcription *is* the fork, and the tenant's ASR endpoint is not in `PlayAndGatherRequest`. Callers use `StartStream` with `ws_url` until that config is plumbed. Inventing an endpoint here would fail at connect time instead of at the call. |
+
+Two things the tests caught, both worth keeping:
+
+- **Authoritative follows the session's purpose, not arrival order.** The first
+  version claimed `authoritative: true` for every attachment, so a recorder
+  joining a streamed call was refused with `AuthoritativeAlreadyBound`. The
+  fork produces the speech events streamfsm runs on; a recorder is a `SINK`
+  with no back-channel and must never claim them.
+- **One session serves both.** `StartStream` + `StartRecording` on the same
+  channel produce one tap with two attachments, which is the whole point:
+  today those are two FreeSWITCH mechanisms.
+
+Both surfaces share one controller and one port (`server.rs`): the packages
+differ (`mss.v1` vs `protos`) so the method paths cannot collide, and
+`over_the_wire.rs` proves an unmodified cigol client and the native API drive
+the same session over one socket. `SessionController` implements `MediaControl`
+for `Arc<Self>` so both services can hold it.
+
+Gap: session creation passes an empty `call_id`/`from_tags`, because telsvc
+callers only know the channel uuid — the OpenSIPS→Redis discovery map (M2, open)
+is what resolves those, and until it exists a TelCompat-created session cannot
+actually tap.
+
 ### tap_plane.rs — the control plane's hands in the media world
 
 `TapPlane` implements `control_api::MediaPlane` over the machinery the
