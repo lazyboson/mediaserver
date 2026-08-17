@@ -1,6 +1,6 @@
 # mediaserver
 
-The **Media Streaming Service (MSS)** — the upstream platform's centralized media plane.
+The **Media Streaming Service (MSS)** —  centralized media plane.
 
 Pulls per-call audio taps from RTPEngine (NG `subscribe`), fans them out to
 RTT (gRPC), ASR/transcription (WebSocket, Twilio-Media-Streams-compatible),
