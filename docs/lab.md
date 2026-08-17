@@ -386,3 +386,40 @@ synthetic lab:
    block egress. Whether an AI utterance and live caller audio should mix
    or the peer should be suppressed is a product question, and the
    `block egress` flag is the knob for it — untested.
+
+
+## ng_subscribe_probe.py — what a subscription actually carries (2026-08-17)
+
+Written because three questions could not be answered one call at a time
+from the daemon: whether a subscription carries what a participant sends or
+hears, whether `play media`'s `from-tag` names the speaker or the listener,
+and why tap delivery was intermittent.
+
+The method avoids inference. Each participant gets a pure tone at its own
+frequency, injected with `play media` aimed at that participant, and every
+subscription socket is scored with a Goertzel filter for both frequencies —
+a tone is a fact, so whichever frequency turns up names the participant
+without needing anyone to speak. Trials repeat so intermittency reads as a
+rate. `SKIP_PLAY`, `ONLY_TAG_INDEX`, `SAME_SESSION_ID` and
+`SKIP_UNSUBSCRIBE` isolate one variable at a time.
+
+```sh
+docker run --rm --network mss-microsip_lab -v "$PWD:/lab" -w /lab \
+    -e CALL_ID=<from /shared/call.env> -e TRIALS=3 \
+    python:3-slim python ng_subscribe_probe.py
+```
+
+Findings against rtpengine 14.1.1.8:
+
+| Question | Answer |
+| --- | --- |
+| Are subscription streams labelled? | **No** — `a=label` is absent, and stream order does not follow the requested tag order |
+| Two subscriptions on one call? | **Destroys the call** within seconds; every later command returns *Unknown call-ID* |
+| One subscription per tag? | Sometimes survives its trial, sometimes not |
+| Packet rate on a per-tag subscription | **890-2176/sec against a 50 pps call** (20-40x), carrying real audio |
+| Packet rate on one multi-tag subscription | ~21-44/sec per leg, stable for minutes — the safe model |
+| `play media {from-tag: X}` | The tone appears on the subscription made with the **other** participant's tag |
+
+The last row cannot be reconciled with architecture.md §6, which says
+`from-tag` selects who *hears* injected audio. One of the two readings is
+wrong; neither should be trusted until re-probed.
