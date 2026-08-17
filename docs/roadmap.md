@@ -12,11 +12,14 @@ is boringly stable in production).
 | Phase | Name | Retires from FreeSWITCH | Status |
 | --- | --- | --- | --- |
 | — | M1 scaffold | — | ✅ done (2026-08-13) |
-| 0 | Groundwork spike | — (de-risking only) | 🔶 in progress |
-| 1 | Passive fan-out | `uuid_audio_fork`, `uuid_google_transcribe2` media bugs | 🔶 hub core landed |
+| 0 | Groundwork spike (M2) | — (de-risking only) | ✅ code done; 3 org-side items open |
+| 1 | Passive fan-out (M3–M4) | `uuid_audio_fork`, `uuid_google_transcribe2` media bugs | 🔶 M3 done, M4 ~65% |
 | 2 | Recording | `record_session` bugs, shared-FS recording pipeline | ⬜ |
 | 3 | Interactive media | dummy leg + conference-per-AI-interaction; the legacy media gateway service | ⬜ |
 | 4 | Full media plane | conference mixing, monitor/whisper (`relate nospeak`), MOH | ⬜ |
+
+The ordered next-up list, with a definition of done per item, open defects
+and what is blocked on other people, lives in [tasks.md](tasks.md).
 
 End state: FreeSWITCH performs IVR prompting and call control only
 (originate/answer/hangup/park/transfer/bridge/DTMF) — or is retired
@@ -29,8 +32,8 @@ code depends on it.
 
 Work:
 - Confirm deployed rtpengine version supports `subscribe request/answer`
-  / `unsubscribe`; establish upgrade path if not. **Open** — 14.1.1.8
-  proven in the lab; the production version is unverified.
+  / `unsubscribe`; establish upgrade path if not. **Open (org-side)** —
+  14.1.1.8 proven in the lab; the production version is unverified.
 - ✅ Async NG transport in `mediaserverd` wrapping the sans-IO
   `rtpengine-ng` crate (UDP, cookie correlation, timeout/retry).
 - ✅ Lab test: subscribe to a live call, receive both legs, run them
@@ -39,7 +42,7 @@ Work:
   through OpenSIPS + FreeSWITCH (2026-08-15), with the codec, silence
   and injection lessons recorded in [lab.md](lab.md).
 - Ingest benchmark: `recvmmsg` batching, packets/sec/core, per-tap CPU on
-  the rtpengine host at 100/500/1000 concurrent taps. **Partial** — the
+  the rtpengine host at 100/500/1000 concurrent taps. **Partial (org-side)** — the
   WSL2 rough shape is recorded in [testing.md](testing.md) (pipeline
   244 ns/packet, ~41k taps/core pipeline-only); the socket path and the
   rtpengine-side delta still need the namespace rig.
@@ -57,10 +60,15 @@ OpenSIPS config owners.
 Objective: every listen-only consumer stops touching FreeSWITCH.
 
 Work:
-- Fan-out hub: per-session pub/sub, N consumers, attach/detach mid-call,
-  per-consumer bounded queues with drop-oldest + metrics. **Core landed**
-  (`crates/mediaserverd/src/hub.rs`) with the WS consumer ported onto it;
-  metrics are counters surfaced in logs, not yet exported.
+- ✅ Fan-out hub: per-session pub/sub, N consumers, attach/detach mid-call,
+  per-consumer bounded queues with drop-oldest + counted drops
+  (`crates/mediaserverd/src/hub.rs`), with the WS consumer ported onto it.
+  Metrics are counters surfaced in logs; **exporting them is open**
+  (tasks.md item 4).
+- ✅ Speaker attribution: each tap leg is named from the participant's own
+  SSRC (rtpengine `query`) with elimination for transcode-restamped legs, so
+  stereo recording and RTT speaker labels are trustworthy. Open soft spot:
+  a mid-call SSRC change does not re-resolve (tasks.md D1).
 - Codec pipeline: G.711 → L16 → resample (8k/16k) → per-consumer encode;
   Opus via `audiopus` when a consumer needs it.
 - Consumer adapters: WebSocket Twilio dialect first (wire-compatible with
