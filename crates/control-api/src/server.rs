@@ -17,8 +17,15 @@ pub async fn serve_on_until(
     listener: TcpListener,
     shutdown: impl std::future::Future<Output = ()>,
 ) -> Result<(), tonic::transport::Error> {
+    serve_shared_until(Arc::new(controller), listener, shutdown).await
+}
+
+pub async fn serve_shared_until(
+    controller: Arc<SessionController>,
+    listener: TcpListener,
+    shutdown: impl std::future::Future<Output = ()>,
+) -> Result<(), tonic::transport::Error> {
     let draining = controller.drain_handle();
-    let controller = Arc::new(controller);
     let telcompat = TelCompat::new(Arc::clone(&controller)).into_service();
 
     Server::builder()

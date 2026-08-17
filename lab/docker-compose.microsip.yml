@@ -35,7 +35,7 @@ services:
 
   opensips:
     image: opensips/opensips:3.4
-    depends_on: [rtpengine, redpanda]
+    depends_on: [rtpengine, redpanda, redis]
     entrypoint: ["/bin/sh", "-c"]
     command:
       - sed "s/__ADVERTISED_IP__/${ADVERTISED_IP:-127.0.0.1}/" /etc/opensips/opensips.cfg.tmpl > /tmp/opensips.cfg && exec /usr/sbin/opensips -F -f /tmp/opensips.cfg
@@ -168,6 +168,15 @@ services:
       lab:
         ipv4_address: 172.31.99.60
 
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    ports:
+      - "16379:6379"
+    networks:
+      lab:
+        ipv4_address: 172.31.99.61
+
   mss-control:
     image: rust:1.95-slim-bookworm
     working_dir: /build
@@ -187,6 +196,7 @@ services:
       MSS_RTPENGINE_NODE: 172.31.99.10:22222
       MSS_TAP_LOCAL_IP: 172.31.99.31
       MSS_KAFKA_BROKERS: 172.31.99.60:9092
+      MSS_REDIS_URL: redis://172.31.99.61:6379
     ports:
       - "50551:50551"
     networks:
