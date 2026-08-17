@@ -50,7 +50,23 @@ Status as of **2026-08-17**.
 
 ## Next up — ordered
 
-### 1. cigol event translator — `mss.events` → legacy `eventTopic`
+### 1. cigol event translator — ✅ WRITTEN, awaiting review and merge
+**State (2026-08-17):** implemented on the cigol branch
+`feature/mss-event-translator` as `pkg/telservice/msstranslator`, **local and
+uncommitted by instruction**. Pure `Render` plus a Kafka consumer on its own
+group (`mssEventTranslator`), wired into `cmd/telServer` behind
+`MSS_EVENTS_TOPIC` so an unconfigured deployment is unchanged. 15 unit cases
+plus a broker-backed test (`-tags=integration`, `MSS_TEST_BROKERS`) that
+publishes a MediaEvent and reads the legacy event back off the target topic:
+verified end to end against the lab Redpanda, rendering
+`mod_audio_fork::first_transcript` with the exact `gsrResult` body
+`handleTranscribe` unmarshals, and dropping a non-authoritative attachment's
+transcript in the same run. Confirmed against cigol's code that
+`request_uuid` is the FreeSWITCH channel UUID (it is passed straight to
+`uuid_audio_fork <uuid> start`), so `external_id` keys and shards correctly.
+Remaining: review, commit, merge, and a pilot tenant.
+
+### 1b. (original description, for reference) cigol event translator
 **Where:** the `cigol` repo, not here (architecture §5.4 — the positional
 format *is* `constants.MapKeyIndex`, a Go constant table; encoding it in Rust
 would couple MSS to a file that changes without our knowing).
