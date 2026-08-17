@@ -2,7 +2,8 @@ use control_api::proto;
 use control_api::proto::media_control_client::MediaControlClient;
 
 const USAGE: &str = "\
-mss_ctl <endpoint> create <external-id> <call-id> <from-tag> [rtpengine-node]
+mss_ctl <endpoint> create <external-id> <call-id> <from-tag|-> [rtpengine-node]
+   a from-tag of - lets MSS resolve the call's participants from rtpengine
 mss_ctl <endpoint> describe <external-id>
 mss_ctl <endpoint> attach <external-id> <ws-url> [label] [authoritative]
 mss_ctl <endpoint> play <external-id> <wav-path> [target-tag]
@@ -34,7 +35,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     external_id: args[2].clone(),
                     kind: proto::SessionKind::Tap as i32,
                     call_id: args[3].clone(),
-                    from_tags: args[4].split(',').map(str::to_string).collect(),
+                    from_tags: if args[4] == "-" {
+                        Vec::new()
+                    } else {
+                        args[4].split(',').map(str::to_string).collect()
+                    },
                     rtpengine_node: args.get(5).cloned().unwrap_or_default(),
                     mix: false,
                     idempotency_key: String::new(),

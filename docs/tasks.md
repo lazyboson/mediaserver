@@ -199,10 +199,13 @@ These are not code and have blocked since Phase 0:
 2. **rtpengine-side per-tap cost** — MSS-side cost is measured; the userspace
    copy cost on the rtpengine host at 100/500/1000 taps is not, and it sets
    the rtpengine capacity plan.
-3. **OpenSIPS → Redis call→node discovery** — MSS needs call-id → rtpengine
-   node + tags. A polling stand-in (`lab/call_watcher.py`) works in the lab;
-   the production design needs agreement with the OpenSIPS config owners.
-   Everything in Phase 1 depends on it at pilot time.
+3. **OpenSIPS → Redis call→node discovery** — **no longer a blocker
+   (2026-08-17).** MSS now resolves a call's participants itself: the legacy controller passes
+   the SIP call-id and the caller's from-tag (both already on the channel as
+   `Variable_sip_call_id` and `Variable_sip_full_from`) and `TapPlane` asks
+   rtpengine's `query` for the rest. The map remains the better long-term
+   answer — it avoids a `query` per tap and works when MSS never sees the
+   channel — but it is now an optimisation, not a prerequisite for a pilot.
 
 ## Later phases
 

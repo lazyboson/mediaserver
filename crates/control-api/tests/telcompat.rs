@@ -371,3 +371,61 @@ async fn transcription_says_what_it_needs_rather_than_guessing_an_endpoint() {
     assert_eq!(status.code(), Code::Unimplemented);
     assert!(status.message().contains("ASR endpoint"), "{status:?}");
 }
+
+#[tokio::test]
+async fn start_stream_carries_the_sip_call_identity_so_the_tap_can_resolve_itself() {
+    let (compat, controller, _) = wired();
+    let mut request = stream(CALL);
+    request.metadata.insert(
+        "sipCallId".to_string(),
+        "1b2c3d4e@softphone.example".to_string(),
+    );
+    request
+        .metadata
+        .insert("callerFromTag".to_string(), "caller-tag-9".to_string());
+
+    compat.start_stream(Request::new(request)).await.unwrap();
+
+    let session = describe(&controller, CALL).await.expect("session");
+    assert_eq!(
+        session.call_id, "1b2c3d4e@softphone.example",
+        "without the sip call-id rtpengine cannot be asked about this call"
+    );
+    assert_eq!(
+        session.from_tags,
+        vec!["caller-tag-9".to_string()],
+        "the caller's tag must lead so the customer leg is named, not guessed"
+    );
+}
+
+#[tokio::test]
+async fn a_stream_without_the_sip_call_id_still_attaches_but_cannot_identify_the_call() {
+    let (compat, controller, _) = wired();
+
+    compat
+        .start_stream(Request::new(stream(CALL)))
+        .await
+        .unwrap();
+
+    let session = describe(&controller, CALL).await.expect("session");
+    assert!(
+        session.call_id.is_empty() && session.from_tags.is_empty(),
+        "an absent identity must stay absent rather than be invented"
+    );
+}
+
+#[tokio::test]
+async fn a_recording_only_session_has_no_call_identity_to_offer() {
+    let (compat, controller, _) = wired();
+
+    compat
+        .start_recording(Request::new(record(CALL)))
+        .await
+        .unwrap();
+
+    let session = describe(&controller, CALL).await.expect("session");
+    assert!(
+        session.call_id.is_empty(),
+        "RecordRequest carries no metadata map, so it cannot name the sip call"
+    );
+}

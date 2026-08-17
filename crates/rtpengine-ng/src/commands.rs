@@ -60,6 +60,17 @@ impl NgReply {
         self.body.get("to-tag").and_then(Value::as_str)
     }
 
+    pub fn tags(&self) -> Vec<String> {
+        let Some(Value::Dict(tags)) = self.body.get("tags") else {
+            return Vec::new();
+        };
+        tags.keys()
+            .filter_map(|tag| std::str::from_utf8(tag).ok())
+            .filter(|tag| !tag.is_empty())
+            .map(str::to_string)
+            .collect()
+    }
+
     pub fn ssrc_by_tag(&self) -> Vec<(String, u32)> {
         let mut found = Vec::new();
         let Some(Value::Dict(tags)) = self.body.get("tags") else {
@@ -456,5 +467,34 @@ mod query_tests {
         let stream_without_ssrc =
             reply_from("d4:tagsd1:ad6:mediasld7:streamsld4:porti30000eeeeeeee");
         assert!(stream_without_ssrc.ssrc_by_tag().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod tag_tests {
+    use super::*;
+
+    fn reply(body: &str) -> NgReply {
+        NgReply {
+            cookie: b"c".to_vec(),
+            body: Value::decode(body.as_bytes()).unwrap(),
+        }
+    }
+
+    #[test]
+    fn tags_lists_every_participant_rtpengine_knows() {
+        let held =
+            reply("d6:result2:ok4:tagsd13:QF4pc39U9Dj8Fd6:mediaslee8:hosttestd6:mediasleeee");
+        let mut found = held.tags();
+        found.sort();
+        assert_eq!(
+            found,
+            vec!["QF4pc39U9Dj8F".to_string(), "hosttest".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_reply_with_no_tags_yields_nothing_rather_than_failing() {
+        assert!(reply("d6:result2:oke").tags().is_empty());
     }
 }
