@@ -523,7 +523,7 @@ The audit of `mediagateway` produced a concrete list of what the purpose-built s
 | File decode (prompts) / encode (recording) | `symphonia`, `hound`, `ogg` | pure Rust |
 | VAD / denoise (later) | Silero via `ort`, `nnnoiseless` | better than anything FS ships |
 | RTPEngine NG | in-tree (`rtpengine-ng`) | bencode + subscribe lifecycle, sans-IO |
-| Kafka / Redis | `rdkafka`, `redis-rs` | reuse existing topics/schemas |
+| Kafka / Redis | `rskafka` (pure Rust; `rdkafka`'s vendored librdkafka needs libcurl+cmake — measured, see implementation-notes), `redis-rs` | reuse existing topics/schemas |
 | Consumer dialects | in-tree (`protocol`) | Twilio Media Streams + audio_fork send_text, wire-compatible |
 | Phase-4 mixer fallback | `gstreamer-rs` | held in reserve; see §9/Appendix A |
 

@@ -1,6 +1,7 @@
 FROM rust:1.95-slim-bookworm AS builder
 WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
+COPY proto ./proto
 COPY crates ./crates
 RUN cargo build --release --locked -p mediaserverd
 
