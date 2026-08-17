@@ -5,6 +5,8 @@ mod event_pump;
 mod hub;
 mod media_rt;
 mod ng_transport;
+mod registry_keeper;
+mod session_store;
 #[allow(dead_code)]
 mod supervisor;
 mod tap_plane;
@@ -25,6 +27,7 @@ const CONTROL_LISTEN_ENV: &str = "MSS_CONTROL_LISTEN";
 const KAFKA_BROKERS_ENV: &str = "MSS_KAFKA_BROKERS";
 const EVENTS_TOPIC_ENV: &str = "MSS_EVENTS_TOPIC";
 const EVENTS_PARTITIONS_ENV: &str = "MSS_EVENTS_PARTITIONS";
+const REDIS_URL_ENV: &str = "MSS_REDIS_URL";
 const POD_NAME_ENV: &str = "MSS_POD_NAME";
 const LOCAL_MEDIA_IP_ENV: &str = "MSS_TAP_LOCAL_IP";
 const DEFAULT_POD_NAME: &str = "mediaserverd";
@@ -214,7 +217,26 @@ async fn serve_control_plane(listen: SocketAddr) {
     };
     info!(%listen, owner = %owner, "MediaControl is serving");
 
-    let served = control_api::serve_on_until(controller, listener, async {
+    let controller = Arc::new(controller);
+    let mut keeper_counters = None;
+    match session_store_from_env().await {
+        Ok(Some(store)) => {
+            let keeper =
+                registry_keeper::RegistryKeeper::new(Arc::clone(&controller), store, owner.clone());
+            keeper_counters = Some(keeper.counters());
+            tokio::spawn(keeper.run());
+        }
+        Ok(None) => info!(
+            env = REDIS_URL_ENV,
+            "no session registry configured; sessions live and die with this pod"
+        ),
+        Err(error) => {
+            error!(%error, "the configured session registry is unreachable; refusing to start");
+            return;
+        }
+    }
+
+    let served = control_api::serve_shared_until(controller, listener, async {
         tokio::signal::ctrl_c()
             .await
             .expect("failed to listen for shutdown signal");
@@ -226,6 +248,18 @@ async fn serve_control_plane(listen: SocketAddr) {
     .await;
     if let Err(error) = served {
         warn!(%error, "the control plane stopped with an error");
+    }
+    if let Some(counters) = keeper_counters {
+        info!(
+            persisted = counters
+                .persisted
+                .load(std::sync::atomic::Ordering::Relaxed),
+            adopted = counters.adopted.load(std::sync::atomic::Ordering::Relaxed),
+            released = counters.released.load(std::sync::atomic::Ordering::Relaxed),
+            lost = counters.lost.load(std::sync::atomic::Ordering::Relaxed),
+            failed = counters.failed.load(std::sync::atomic::Ordering::Relaxed),
+            "session registry totals at shutdown"
+        );
     }
     if let Some((worker, counters)) = pump_worker {
         worker.abort();
@@ -271,4 +305,14 @@ async fn event_sink_from_env() -> Result<
     let (pump, worker) = event_pump::KafkaEventPump::start(Arc::new(transport));
     let counters = pump.counters();
     Ok(Some((Arc::new(pump), worker, counters)))
+}
+
+async fn session_store_from_env(
+) -> Result<Option<Arc<dyn session_store::SessionStore>>, session_store::StoreError> {
+    let Ok(url) = std::env::var(REDIS_URL_ENV) else {
+        return Ok(None);
+    };
+    let store = session_store::RedisSessionStore::connect(&url).await?;
+    info!(url, "session registry connected");
+    Ok(Some(Arc::new(store)))
 }

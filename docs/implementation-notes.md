@@ -362,6 +362,69 @@ the controller; broadcast lag is logged with the missed count.
 
 ## crates/mediaserverd
 
+### session_store.rs + registry_keeper.rs — surviving a pod (M4)
+
+Until now a tap lived and died with its pod. The registry makes a session
+recoverable, which is the Phase-1 exit criterion about re-subscribe recovery.
+
+**What is stored** (`mss:` namespace, configurable — a shared Redis serves
+several environments):
+
+- `mss:session:{external_id}` — the whole `PersistedSession`: kind, call-id,
+  from-tags, rtpengine node, owner, and every attachment with its **endpoint,
+  capabilities, selector, authoritative flag, paused state and metadata**.
+  The test that matters asserts the endpoint survives: without it a rebuilt
+  consumer has nowhere to reconnect, and the first draft dropped it because
+  the proto `Attachment` response does not carry endpoint or metadata. The
+  keeper now reads `SessionController::snapshot()` — the lossless view — not
+  the wire types.
+- `mss:lease:{external_id}` — the owner pod, **with a TTL** (15 s, renewed
+  every 5 s). The lease is the whole HA mechanism: a pod that dies stops
+  renewing, the key expires, and the session becomes adoptable.
+- `mss:sessions` — a set, so a sweep never needs `KEYS`.
+
+**How adoption works.** Every 10 s a pod runs `claim_unleased`, which for each
+indexed session attempts `SET lease NX EX 15`. `NX` is what makes the claim
+atomic: **exactly one** pod wins, verified against real Redis with six
+concurrent contenders racing for one orphan. The winner rebuilds through the
+controller's own API — `CreateSession` then `Attach` per attachment, replaying
+`paused` — so every invariant (capability checks, one authoritative
+attachment, idempotency) applies to a rebuilt session exactly as to a new one,
+and `TapPlane` re-establishes the rtpengine subscription as a side effect.
+`MAX_ADOPTIONS_PER_SWEEP` (8) stops one pod inhaling every orphan at once.
+
+**Two failure modes it refuses to paper over:**
+
+- A session with no call-id or from-tags **cannot be re-tapped**, so it is
+  released rather than half-restored and counted as `unrebuildable`. This is
+  exactly the shape a TelCompat-created session has today, which is another
+  reason the discovery map matters.
+- An **ended** session must stop being persisted, or another pod adopts a call
+  that is already over and taps a dead call forever. The keeper tracks what it
+  persisted and calls `forget` for anything that has vanished from the
+  controller; `released` counts it. The first draft missed this and the test
+  for it was the one that caught it.
+
+Counters (`persisted`, `renewed`, `lost`, `adopted`, `unrebuildable`,
+`released`, `failed`) are logged at shutdown and are the natural next metrics.
+A rising `lost` means two pods believe they own one session — the split-brain
+signal worth alerting on.
+
+Config: `MSS_REDIS_URL`; unset means sessions live and die with the pod
+(logged), and a configured-but-unreachable Redis **refuses to start** rather
+than running with no recovery. Verified in the lab on a live call: the session
+appeared in Redis with its call-id, tags and consumer endpoint, the lease
+counted down from 15, and the index was empty again after `DestroySession`.
+
+`redis` 1.6 is pure Rust, so this added no system dependency — but it pulls
+`xxhash-rust` under **BSL-1.0** (Boost), now allowed in `deny.toml`:
+permissive, OSI-approved, no attribution burden in binaries.
+
+Gaps: leases are renewed per session per tick with one round trip each (fine
+at hundreds, revisit at thousands); the discovery map (call-id → node + tags)
+is a separate, still-unbuilt concern; and `SessionStore` is a `mediaserverd`
+module rather than a crate, so the integration test re-includes it by path.
+
 ### event_pump.rs — events onto Kafka `mss.events` (M4)
 
 The other half of architecture.md §5.4: commands arrive over gRPC, events

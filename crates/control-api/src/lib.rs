@@ -14,6 +14,7 @@ pub mod server;
 pub mod telcompat;
 
 pub use controller::{EventSink, MediaPlane, MediaPlaneError, PlaybackSource, SessionController};
-pub use server::{serve_on, serve_on_until};
+pub use server::{serve_on, serve_on_until, serve_shared_until};
 pub use telcompat::TelCompat;
+pub use tonic;
 pub use tonic::async_trait;

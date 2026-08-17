@@ -664,6 +664,10 @@ impl SessionRegistry {
         self.events_dropped
     }
 
+    pub fn session_ids(&self) -> Vec<SessionId> {
+        self.sessions.keys().copied().collect()
+    }
+
     pub fn session_count(&self) -> usize {
         self.sessions.len()
     }
