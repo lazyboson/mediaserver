@@ -392,41 +392,45 @@ into something that actually taps calls.
   `MAX_PLAYBACK_BLOB_BYTES` because one NG datagram cannot carry it (the
   lab's `EMSGSIZE` finding), and streaming playback names itself as
   Phase-3 work.
-- **Leg identity: one subscription per participant (2026-08-16/17).** The
-  first version asked for both `from-tags` in a single `subscribe request`
-  and named the resulting streams by position. Against 14.1.1.8 that is not
-  sound: rtpengine returns **no `a=label`** on the streams and the order does
-  not follow the order of the tags requested. `subscribe_one_leg` now makes
-  one subscription per tag, so the tag we asked for is the only thing on the
-  socket and identity is never inferred from ordering. If a later leg fails,
-  the earlier ones are unsubscribed before the error returns.
-- **Two lab findings came out of that, both measured, one of them ours:**
-  1. *Every answer needs its own SDP session id.* The per-leg answers
-     initially reused `sdp_session_id`, and rtpengine then delivered roughly
-     twice the datagrams to one leg and silence to the other — consistent
-     with it treating identical `o=` lines as one session. Each leg now
-     answers with `sdp_session_id + index`, and the two legs immediately
-     came back with matched counts (2609 vs 2664).
-  2. *A subscription carries what that participant **hears**, not what it
-     says.* With the counts even, the subscription made with the caller's
-     tag was silent while the one made with FreeSWITCH's tag carried the
-     caller's voice, across three runs. FreeSWITCH was genuinely silent
-     (the caller's own ear recording has zero voiced samples), so both sides
-     agree. `voice_the_participant_hears` encodes this: the leg subscribed
-     with participant *i*'s tag is named for the **other** party's voice.
-     This contradicts the older architecture.md §6 note that `play media`'s
-     `from-tag` picks who *hears* the audio — an injection aimed at the
-     caller showed up on the FreeSWITCH-tag subscription — so one of the two
-     readings is wrong and §6 should not be trusted until re-probed.
-- **Not yet proven end to end, and it must be before Phase 2 trusts stereo.**
-  Media delivery on per-tag subscriptions is **intermittent**: the same code
-  and the same call shape produced 2664 datagrams of speech on the second
-  leg in one run and 0 in the next, and a single-tag session delivered
-  nothing at all. Until that is understood, the naming above rests on the
-  runs where media flowed. The next step is a dedicated probe in the
-  `lab/ng_*_probe.py` style — subscribe per tag repeatedly against one call,
-  with both parties producing distinguishable audio — rather than more
-  guessing from the daemon.
+- **Leg identity is still positional, and still unsound — the per-tag fix
+  was tried, measured, and reverted (2026-08-17).** `track_for_stream` names
+  stream 0 Customer and stream 1 Agent. Against 14.1.1.8 rtpengine returns
+  **no `a=label`** on subscription streams and does not return them in the
+  order the `from-tags` were requested, so the naming is a guess and the
+  caller's voice can land on the agent channel. Do not trust stereo or RTT
+  speaker attribution until this is solved.
+- **Why per-tag subscriptions are not the answer.** One `subscribe request`
+  per from-tag makes identity unambiguous in principle, and it is what the
+  code did briefly. `lab/ng_subscribe_probe.py` measured what it actually
+  does to a live call:
+  - **Two concurrent subscriptions destroy the call.** rtpengine answers
+    both, media flows for a few seconds, and then the call is gone —
+    `query` returns *Unknown call-ID* and every later command fails. A
+    single subscription sometimes survives its trial and sometimes does
+    not.
+  - **Subscriptions arrive at 20-40x the real packet rate** (890-2176
+    datagrams/sec against a 50 pps call), carrying real audio. The
+    original single multi-tag subscription does not do this: measured
+    ~21-44 pps per leg, over taps lasting minutes, with the call ending
+    only when the caller hung up.
+  The flood and the teardown are the same shape of problem and are almost
+  certainly related. Until they are understood, **one subscription carrying
+  every from-tag is the only model known to be safe**, which is what the
+  code does again.
+- **What the probe did settle.** Injecting a tone with `play media
+  {from-tag: X}` puts that tone on the subscription made with the *other*
+  participant's tag — consistently, and matching where the caller's own
+  speech appears. So `subscribe` and `play media` disagree about what a
+  from-tag selects, and architecture.md §6's note that `from-tag` picks who
+  *hears* injected audio cannot be reconciled with the subscribe behaviour;
+  one of the two needs re-probing before either is trusted.
+- **The most promising route to leg identity** is correlation by SSRC
+  rather than by position: `query` returns the call's SSRC list, so if the
+  tapped RTP carries the original sender's SSRC, the mapping stops being a
+  guess without changing the subscription model at all. The probe prints
+  the SSRC list already; extracting SSRC per participant needs deeper
+  walking of the `tags[].medias[].streams[]` structure, and then a run that
+  compares those against the SSRCs actually seen on each socket.
 - **Known gaps:** no Redis registry, so a tap lives and dies with its pod;
   `stop_playback` stops everything on the call rather than one playback,
   because rtpengine's `stop media` targets a participant, not a playback id;
