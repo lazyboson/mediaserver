@@ -22,7 +22,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("{USAGE}");
         std::process::exit(2);
     }
-    let mut client = MediaControlClient::connect(args[0].clone()).await?;
+    let channel = control_api::tonic::transport::Endpoint::from_shared(args[0].clone())?
+        .connect()
+        .await?;
+    let token = std::env::var("MSS_AUTH_TOKEN").ok();
+    let mut client = MediaControlClient::with_interceptor(
+        channel,
+        move |mut request: control_api::tonic::Request<()>| {
+            if let Some(token) = &token {
+                let value = format!("Bearer {token}").parse().map_err(|_| {
+                    control_api::tonic::Status::invalid_argument(
+                        "MSS_AUTH_TOKEN is not a legal header value",
+                    )
+                })?;
+                request.metadata_mut().insert("authorization", value);
+            }
+            Ok(request)
+        },
+    );
 
     let outcome = match args[1].as_str() {
         "create" => {

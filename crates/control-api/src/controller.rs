@@ -32,6 +32,22 @@ pub enum PlaybackSource {
 #[error("{0}")]
 pub struct MediaPlaneError(pub String);
 
+#[derive(Debug, Clone, PartialEq)]
+pub enum StreamFrame {
+    Media {
+        track: &'static str,
+        pts_ms: u64,
+        payload: Vec<u8>,
+    },
+    Dtmf {
+        track: &'static str,
+        digit: char,
+    },
+    Text {
+        json: String,
+    },
+}
+
 #[tonic::async_trait]
 pub trait MediaPlane: Send + Sync + 'static {
     async fn open_session(&self, session: SessionView) -> Result<(), MediaPlaneError>;
@@ -66,6 +82,17 @@ pub trait MediaPlane: Send + Sync + 'static {
         session: SessionId,
         playback: PlaybackId,
     ) -> Result<(), MediaPlaneError>;
+
+    async fn open_stream(
+        &self,
+        session: SessionId,
+        attachment: AttachmentId,
+    ) -> Result<mpsc::Receiver<StreamFrame>, MediaPlaneError> {
+        let _ = (session, attachment);
+        Err(MediaPlaneError(
+            "this media plane serves no grpc data plane".to_string(),
+        ))
+    }
 }
 
 pub struct SessionController {
@@ -138,6 +165,43 @@ impl SessionController {
 
     pub fn subscribe(&self) -> broadcast::Receiver<MediaEvent> {
         self.watchers.subscribe()
+    }
+
+    pub fn attachment(&self, attachment: AttachmentId) -> Result<AttachmentView, Status> {
+        self.lock().attachment_view(attachment).map_err(status_of)
+    }
+
+    pub fn session(&self, session: SessionId) -> Result<SessionView, Status> {
+        self.lock().session_view(session).map_err(status_of)
+    }
+
+    pub fn authorize_inject(&self, attachment: AttachmentId) -> Result<(), Status> {
+        self.lock().authorize_inject(attachment).map_err(status_of)
+    }
+
+    pub fn counts(&self) -> (usize, usize) {
+        let registry = self.lock();
+        (registry.session_count(), registry.attachment_count())
+    }
+
+    pub fn events_dropped(&self) -> u64 {
+        self.lock().events_dropped()
+    }
+
+    pub fn drain_watch(&self) -> watch::Receiver<bool> {
+        self.draining.subscribe()
+    }
+
+    pub(crate) async fn open_stream(
+        &self,
+        session: SessionId,
+        attachment: AttachmentId,
+    ) -> Result<mpsc::Receiver<StreamFrame>, Status> {
+        let media = self.media_plane()?.clone();
+        media
+            .open_stream(session, attachment)
+            .await
+            .map_err(|error| Status::unavailable(error.to_string()))
     }
 
     fn lock(&self) -> MutexGuard<'_, SessionRegistry> {
