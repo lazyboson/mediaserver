@@ -16,6 +16,7 @@ tokio = { workspace = true }
 tokio-stream = { version = "0.1.18", default-features = false, features = ["sync", "net"] }
 tracing = { workspace = true }
 thiserror = { workspace = true }
+hound = "3.5.1"
 
 [build-dependencies]
 tonic-prost-build = "0.14.6"

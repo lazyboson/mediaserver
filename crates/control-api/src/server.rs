@@ -1,4 +1,7 @@
+use crate::auth::AuthPolicy;
 use crate::controller::SessionController;
+use crate::proto::media_control_server::MediaControlServer;
+use crate::stream::MediaStreamService;
 use crate::telcompat::TelCompat;
 use std::sync::Arc;
 use tokio::net::TcpListener;
@@ -25,11 +28,23 @@ pub async fn serve_shared_until(
     listener: TcpListener,
     shutdown: impl std::future::Future<Output = ()>,
 ) -> Result<(), tonic::transport::Error> {
+    serve_authenticated_until(controller, AuthPolicy::open(), listener, shutdown).await
+}
+
+pub async fn serve_authenticated_until(
+    controller: Arc<SessionController>,
+    auth: AuthPolicy,
+    listener: TcpListener,
+    shutdown: impl std::future::Future<Output = ()>,
+) -> Result<(), tonic::transport::Error> {
     let draining = controller.drain_handle();
-    let telcompat = TelCompat::new(Arc::clone(&controller)).into_service();
+    let control = MediaControlServer::with_interceptor(Arc::clone(&controller), auth.clone());
+    let stream = MediaStreamService::new(Arc::clone(&controller), auth).into_service();
+    let telcompat = TelCompat::new(controller).into_service();
 
     Server::builder()
-        .add_service(SessionController::service_for(controller))
+        .add_service(control)
+        .add_service(stream)
         .add_service(telcompat)
         .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async move {
             shutdown.await;
