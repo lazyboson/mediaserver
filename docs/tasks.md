@@ -4,7 +4,7 @@ Living work list. [roadmap.md](roadmap.md) holds the *why* and the phase exit
 criteria; this file holds the *what next*, ordered, with a definition of done
 for each item. Update it in the same PR that changes the state of an item.
 
-Status as of **2026-08-17**.
+Status as of **2026-08-20**.
 
 ## Milestones
 
@@ -13,7 +13,7 @@ Status as of **2026-08-17**.
 | **M1 — scaffold** | workspace, sans-IO cores (RTP, G.711, DTMF, jitter), NG bencode, consumer dialects, two-world daemon skeleton, watchdog | ✅ done (2026-08-13) |
 | **M2 — Phase-0 spike** | real NG subscribe against lab rtpengine, both legs jitter-buffered to WAV, per-tap cost | ✅ **code done**; 3 org-side items open (below) |
 | **M3 — fan-out hub** | per-session pub/sub, N consumers, WS-Twilio adapter, pause/resume/send_text parity | ✅ done |
-| **M4 — control plane** | `MediaControl` gRPC, session state machine, Kafka events, Redis registry, tenant-flag pilot | 🔶 **~85%** — metrics, MediaStream gRPC and auth remain |
+| **M4 — control plane** | `MediaControl` gRPC, session state machine, Kafka events, Redis registry, tenant-flag pilot | 🔶 **~95%** — code complete; the cigol translator merge and the barge-in measurement remain |
 | M5+ | Phases 2–4 (recording, interactive media, full media plane) | ⬜ not started |
 
 ### What landed, concretely
@@ -128,7 +128,19 @@ criterion ("re-subscribe recovery observed working").
 **Done when:** killing the owning pod mid-call moves the tap to another pod
 with a bounded audio gap, and no rtpengine subscription is left behind.
 
-### 4. Exported metrics
+### 4. Exported metrics — ✅ DONE (2026-08-20)
+`crates/mediaserverd/src/metrics.rs`: a dependency-free Prometheus text
+endpoint on `MSS_METRICS_LISTEN`, serving ingest/jitter/consumer/event-pump/
+registry counters plus live gauges, with the capture thread publishing
+per-leg stats into shared atomics each release tick and `TapPlane` folding
+finished legs into retired totals so every counter stays monotonic across
+session churn. The audio-flow watchdog (`supervisor.rs`) is finally wired:
+per-leg stall state and stall transitions are exported (`mss_legs_stalled`,
+`mss_ingest_stalls_total`). Alert rules for every drop counter live in
+`deploy/prometheus-alerts.yaml`. Verified by unit tests including a real
+HTTP GET; not yet scraped by a real Prometheus in the lab.
+
+### 4b. (original description, for reference) Exported metrics
 **Where:** `crates/mediaserverd`.
 **What:** Prometheus endpoint over the counters that already exist —
 per-leg ingest (datagrams, loss, concealed, suppressed, companded,
@@ -150,21 +162,41 @@ slow the fallback (a gRPC stream for speech events only) is a design change,
 not a tuning knob — better known early.
 **Done when:** a number exists, compared against the barge-in budget.
 
-### 6. gRPC `MediaStream` data plane
-**Where:** `crates/control-api`.
-**What:** implement the generated `MediaStream::Subscribe` — binary frames,
-`ConsumerHello` auth, `inject` honored only with `INJECT` capability, marks
-and `clear`.
-**Why now:** the native, allocation-cheap consumer transport; WS-Twilio stays
-the compatibility surface. Lower priority than 1–5 because every consumer
-today speaks WS.
-**Done when:** a consumer receives a live tap over gRPC and an unprivileged
-attachment's `inject` is refused.
+### 6. gRPC `MediaStream` data plane — ✅ DONE (2026-08-20)
+`crates/control-api/src/stream.rs` implements `MediaStream::Subscribe` over a
+new `MediaPlane::open_stream` seam that `TapPlane` serves from the hub. A
+consumer attaches via `MediaControl` (transport `GRPC_STREAM`), then dials in
+with `ConsumerHello{attachment_id, token}`; it gets `StreamStart`, raw binary
+frames (no base64), DTMF, `send_text` passthrough as `TextFrame`, and a
+`StreamStop` on detach, session end or drain. `inject` is capability-checked
+at the first frame — an unprivileged attachment gets `PERMISSION_DENIED` and
+the stream ends (a protocol violation, not a no-op); an authorized utterance
+flushes on `Mark` through the registry-tracked `StartPlayback` path (so it is
+evented, capability-attributed and idempotent) and `Clear` discards + stops
+the last playback (the barge shape). Wire-verified through a generated client
+against a real socket, including the drain regression. Limits, deliberate:
+one connected consumer per attachment (reconnect allowed after it drops),
+attachment format must equal the tap format until re-encode (item 8) exists,
+and an utterance is capped at one playback datagram — chunked/paced playback
+stays with the WS bridge. **Still to prove: a live tap over gRPC in the lab**
+— every consumer today speaks WS, so this ran only against the fake plane.
 
-### 7. Auth on attachments
-**Where:** `crates/control-api`.
-**What:** verify `ConsumerHello.token`; an interceptor on `MediaControl`.
-Nothing authenticates today (fine for the lab, not for a pilot).
+### 7. Auth on attachments — ✅ DONE (2026-08-20)
+`crates/control-api/src/auth.rs`: `AuthPolicy`, a shared bearer secret from
+`MSS_AUTH_TOKEN`. It is a tonic interceptor on `MediaControl` (missing or
+wrong `authorization: Bearer …` → `UNAUTHENTICATED`) and verifies
+`ConsumerHello.token` on `MediaStream` (constant-time comparison). Unset env
+= open lab mode, logged loudly at startup. **`TelCompat` is deliberately not
+intercepted**: its contract is byte-identical cigol clients with no client
+change, and cigol does not send metadata — the pilot fronts it with network
+policy instead. `mss_ctl` sends the bearer when `MSS_AUTH_TOKEN` is set.
+
+### 6b/7b. (original descriptions, for reference)
+**6:** implement the generated `MediaStream::Subscribe` — binary frames,
+`ConsumerHello` auth, `inject` honored only with `INJECT` capability, marks
+and `clear`. **Done when:** a consumer receives a live tap over gRPC and an
+unprivileged attachment's `inject` is refused.
+**7:** verify `ConsumerHello.token`; an interceptor on `MediaControl`.
 **Done when:** an unauthenticated consumer cannot attach, and MediaControl
 rejects unauthenticated callers.
 
@@ -183,7 +215,7 @@ asks for 16k L16 or a bandwidth-sensitive consumer asks for Opus.
 | D1 | A **mid-call SSRC change** (re-INVITE, transfer, codec renegotiation) does not re-resolve leg identity; `ssrcs_seen` makes it visible but nothing acts on it | `tap_spike.rs` | medium — affects transferred calls |
 | D2 | `stop_playback` stops **all** playback on the call: rtpengine's `stop media` targets a participant, not a playback id | `tap_plane.rs` | low until multiple concurrent playbacks exist |
 | D3 | `close_attachment` **aborts** the consumer task instead of closing the websocket politely (no `stop` frame) | `tap_plane.rs` | low, but consumers see a truncated stream |
-| D4 | Only `WS_TWILIO` attachments are served; other transports are refused by name | `tap_plane.rs` | expected — item 6 above |
+| D4 | `WS_TWILIO` and `GRPC_STREAM` attachments are served; `FILE_S3` (phase 2) and `RTP_INLINE` (phase 3) are refused by name | `tap_plane.rs` | expected — phase work |
 | D5 | Event delivery is **at-most-once**; a broker outage drops events (counted, and the gapless seq makes gaps detectable) | `event_pump.rs` | medium before pilot |
 | D6 | `play media` `from-tag` semantics are **unmeasured** — architecture §6's claim was retracted after the instrument turned out to be broken (see lab.md correction) | docs + lab | low, but §6 must not be trusted until re-probed |
 | D7 | Jitter buffer: fixed target depth, no adaptive sizing, no timestamp-aware gap handling, silence instead of real PLC | `jitter.rs`, `pipeline.rs` | medium for quality under real impairment |

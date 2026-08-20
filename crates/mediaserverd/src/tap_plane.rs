@@ -1,8 +1,8 @@
 use crate::consumer_ws::{self, ConsumerConfig};
-use crate::hub::{Hub, HubClient, TrackSelection};
+use crate::hub::{Hub, HubClient, Subscription, SubscriptionMetrics, TapEvent, TrackSelection};
 use crate::ng_transport::{NgTransport, NgTransportConfig};
-use crate::tap_spike::{capture, TapLeg};
-use control_api::{MediaPlane, MediaPlaneError, PlaybackSource};
+use crate::tap_spike::{capture, SharedLegStats, TapLeg};
+use control_api::{MediaPlane, MediaPlaneError, PlaybackSource, StreamFrame};
 use media_core::{AudioFormat, Track};
 use rtpengine_ng::{
     PlayMedia, PlaySource, PlayTarget, SubscribeRequest, SubscriptionAnswer, SubscriptionOffer,
@@ -14,18 +14,20 @@ use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
 pub const MAX_SESSION_DURATION: Duration = Duration::from_secs(8 * 3600);
 pub const MAX_PLAYBACK_BLOB_BYTES: usize = 60_000;
+pub const STALL_AFTER: Duration = Duration::from_secs(10);
 
 const TARGET_DEPTH_PACKETS: u16 = 3;
 const MAX_TAPPED_STREAMS: usize = 2;
 const MAX_TAPPED_LEGS: usize = 2;
 const CONSUMER_QUEUE_FRAMES: usize = 200;
 const TEXT_QUEUE_DEPTH: usize = 32;
+const GRPC_FRAME_QUEUE: usize = 64;
 const RETAIN_NO_LOCAL_AUDIO: Duration = Duration::ZERO;
 const ACCOUNT_METADATA_KEY: &str = "accountId";
 const STREAM_SID_METADATA_KEY: &str = "streamSid";
@@ -49,16 +51,163 @@ struct LiveSession {
     capture: Option<std::thread::JoinHandle<()>>,
 }
 
-struct LiveAttachment {
-    session: SessionId,
-    text: mpsc::Sender<String>,
-    task: tokio::task::JoinHandle<Result<consumer_ws::ConsumerStats, consumer_ws::ConsumerError>>,
+enum LiveAttachment {
+    Ws {
+        session: SessionId,
+        text: mpsc::Sender<String>,
+        task:
+            tokio::task::JoinHandle<Result<consumer_ws::ConsumerStats, consumer_ws::ConsumerError>>,
+    },
+    Grpc {
+        session: SessionId,
+        selection: TrackSelection,
+        live: Option<GrpcLive>,
+    },
+}
+
+struct GrpcLive {
+    frames: mpsc::Sender<StreamFrame>,
+    pump: tokio::task::JoinHandle<()>,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct LegTotals {
+    pub datagrams: u64,
+    pub recv_errors: u64,
+    pub underruns: u64,
+    pub frames_played: u64,
+    pub frames_concealed: u64,
+    pub frames_suppressed: u64,
+    pub companded: u64,
+    pub unknown_payload_type: u64,
+    pub unparsable: u64,
+    pub telephone_events: u64,
+    pub dtmf_digits: u64,
+    pub jitter_lost: u64,
+    pub jitter_duplicates: u64,
+    pub jitter_late_drops: u64,
+    pub jitter_resets: u64,
+    pub stalls: u64,
+}
+
+impl LegTotals {
+    fn add_shared(&mut self, shared: &SharedLegStats) {
+        let read = |value: &std::sync::atomic::AtomicU64| value.load(Ordering::Relaxed);
+        self.datagrams += read(&shared.datagrams);
+        self.recv_errors += read(&shared.recv_errors);
+        self.underruns += read(&shared.underruns);
+        self.frames_played += read(&shared.frames_played);
+        self.frames_concealed += read(&shared.frames_concealed);
+        self.frames_suppressed += read(&shared.frames_suppressed);
+        self.companded += read(&shared.companded);
+        self.unknown_payload_type += read(&shared.unknown_payload_type);
+        self.unparsable += read(&shared.unparsable);
+        self.telephone_events += read(&shared.telephone_events);
+        self.dtmf_digits += read(&shared.dtmf_digits);
+        self.jitter_lost += read(&shared.jitter_lost);
+        self.jitter_duplicates += read(&shared.jitter_duplicates);
+        self.jitter_late_drops += read(&shared.jitter_late_drops);
+        self.jitter_resets += read(&shared.jitter_resets);
+        self.stalls += read(&shared.stalls);
+    }
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct IngestSnapshot {
+    pub totals: LegTotals,
+    pub sessions_live: u64,
+    pub legs_live: u64,
+    pub legs_unknown_ssrc: u64,
+    pub legs_stalled: u64,
+    pub consumers_live: u64,
+    pub consumer_dropped_oldest: u64,
+    pub consumer_delivered: u64,
+    pub consumer_queue_depth: u64,
+    pub consumer_queue_depth_max: u64,
+}
+
+#[derive(Default)]
+struct MetricsInner {
+    retired: LegTotals,
+    retired_consumer_dropped: u64,
+    retired_consumer_delivered: u64,
+    legs: HashMap<SessionId, Vec<Arc<SharedLegStats>>>,
+    consumers: HashMap<AttachmentId, SubscriptionMetrics>,
+}
+
+#[derive(Clone, Default)]
+pub struct TapPlaneMetrics(Arc<Mutex<MetricsInner>>);
+
+impl TapPlaneMetrics {
+    fn lock(&self) -> std::sync::MutexGuard<'_, MetricsInner> {
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn register_session(&self, session: SessionId, legs: Vec<Arc<SharedLegStats>>) {
+        self.lock().legs.insert(session, legs);
+    }
+
+    fn retire_session(&self, session: SessionId) {
+        let mut inner = self.lock();
+        if let Some(legs) = inner.legs.remove(&session) {
+            for leg in legs {
+                inner.retired.add_shared(&leg);
+            }
+        }
+    }
+
+    fn register_consumer(&self, attachment: AttachmentId, metrics: SubscriptionMetrics) {
+        let mut inner = self.lock();
+        if let Some(replaced) = inner.consumers.insert(attachment, metrics) {
+            inner.retired_consumer_dropped += replaced.dropped_oldest();
+            inner.retired_consumer_delivered += replaced.delivered();
+        }
+    }
+
+    fn retire_consumer(&self, attachment: AttachmentId) {
+        let mut inner = self.lock();
+        if let Some(removed) = inner.consumers.remove(&attachment) {
+            inner.retired_consumer_dropped += removed.dropped_oldest();
+            inner.retired_consumer_delivered += removed.delivered();
+        }
+    }
+
+    pub fn snapshot(&self) -> IngestSnapshot {
+        let inner = self.lock();
+        let mut snapshot = IngestSnapshot {
+            totals: inner.retired,
+            sessions_live: inner.legs.len() as u64,
+            consumers_live: inner.consumers.len() as u64,
+            consumer_dropped_oldest: inner.retired_consumer_dropped,
+            consumer_delivered: inner.retired_consumer_delivered,
+            ..IngestSnapshot::default()
+        };
+        for legs in inner.legs.values() {
+            for leg in legs {
+                snapshot.totals.add_shared(leg);
+                snapshot.legs_live += 1;
+                snapshot.legs_unknown_ssrc += leg.unknown_ssrc.load(Ordering::Relaxed);
+                snapshot.legs_stalled += leg.stalled.load(Ordering::Relaxed);
+            }
+        }
+        for consumer in inner.consumers.values() {
+            snapshot.consumer_dropped_oldest += consumer.dropped_oldest();
+            snapshot.consumer_delivered += consumer.delivered();
+            let depth = consumer.queue_depth() as u64;
+            snapshot.consumer_queue_depth += depth;
+            snapshot.consumer_queue_depth_max = snapshot.consumer_queue_depth_max.max(depth);
+        }
+        snapshot
+    }
 }
 
 pub struct TapPlane {
     config: TapPlaneConfig,
     sessions: Mutex<HashMap<SessionId, LiveSession>>,
     attachments: Mutex<HashMap<AttachmentId, LiveAttachment>>,
+    metrics: TapPlaneMetrics,
 }
 
 impl TapPlane {
@@ -67,11 +216,16 @@ impl TapPlane {
             config,
             sessions: Mutex::new(HashMap::new()),
             attachments: Mutex::new(HashMap::new()),
+            metrics: TapPlaneMetrics::default(),
         }
     }
 
     pub fn live_sessions(&self) -> usize {
         self.sessions.lock().map(|held| held.len()).unwrap_or(0)
+    }
+
+    pub fn metrics(&self) -> TapPlaneMetrics {
+        self.metrics.clone()
     }
 
     fn node_for(&self, view: &SessionView) -> Result<SocketAddr, MediaPlaneError> {
@@ -137,6 +291,106 @@ impl TapPlane {
             );
         }
         Ok(view)
+    }
+
+    fn open_ws_attachment(&self, view: AttachmentView) -> Result<(), MediaPlaneError> {
+        if view.endpoint.is_empty() {
+            return Err(MediaPlaneError(
+                "a ws-twilio attachment needs its endpoint url".to_string(),
+            ));
+        }
+
+        let (_, call_id, hub, external_id, _) = self.session_handles(view.session)?;
+        let subscription = hub
+            .attach(CONSUMER_QUEUE_FRAMES, selection_of(view.selector))
+            .ok_or_else(|| {
+                MediaPlaneError("the hub would not take another consumer".to_string())
+            })?;
+        let subscription_metrics = subscription.metrics();
+
+        let stream_sid = view
+            .metadata
+            .get(STREAM_SID_METADATA_KEY)
+            .cloned()
+            .unwrap_or_else(|| view.id.to_string());
+        let config = ConsumerConfig {
+            url: view.endpoint.clone(),
+            account_id: view
+                .metadata
+                .get(ACCOUNT_METADATA_KEY)
+                .cloned()
+                .unwrap_or_else(|| DEFAULT_ACCOUNT_ID.to_string()),
+            call_sid: if call_id.is_empty() {
+                external_id
+            } else {
+                call_id
+            },
+            stream_sid,
+            format: view.format,
+            tracks: tracks_of(view.selector),
+            custom_parameters: view
+                .metadata
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
+        };
+
+        let (text, inbound) = mpsc::channel(TEXT_QUEUE_DEPTH);
+        info!(
+            attachment = %view.id,
+            session = %view.session,
+            label = %view.label,
+            url = %view.endpoint,
+            "connecting a consumer for the control plane"
+        );
+        let task = tokio::spawn(consumer_ws::run(config, subscription, None, Some(inbound)));
+
+        let mut held = self
+            .attachments
+            .lock()
+            .map_err(|_| MediaPlaneError("the attachment table is poisoned".to_string()))?;
+        held.insert(
+            view.id,
+            LiveAttachment::Ws {
+                session: view.session,
+                text,
+                task,
+            },
+        );
+        drop(held);
+        self.metrics
+            .register_consumer(view.id, subscription_metrics);
+        Ok(())
+    }
+
+    fn open_grpc_attachment(&self, view: AttachmentView) -> Result<(), MediaPlaneError> {
+        if view.format != self.config.format {
+            return Err(MediaPlaneError(format!(
+                "a grpc-stream attachment must use the tap format {:?}; \
+                 per-consumer re-encode is not built yet",
+                self.config.format
+            )));
+        }
+        self.session_handles(view.session)?;
+        let mut held = self
+            .attachments
+            .lock()
+            .map_err(|_| MediaPlaneError("the attachment table is poisoned".to_string()))?;
+        held.insert(
+            view.id,
+            LiveAttachment::Grpc {
+                session: view.session,
+                selection: selection_of(view.selector),
+                live: None,
+            },
+        );
+        info!(
+            attachment = %view.id,
+            session = %view.session,
+            label = %view.label,
+            "a grpc-stream attachment is waiting for its consumer to subscribe"
+        );
+        Ok(())
     }
 
     fn session_handles(
@@ -259,12 +513,15 @@ impl MediaPlane for TapPlane {
         let ssrc_tracks = speaker_ssrcs(&transport, &view).await;
 
         let mut legs = Vec::with_capacity(sockets.len());
+        let mut shared_stats = Vec::with_capacity(sockets.len());
         for (index, socket) in sockets.into_iter().enumerate() {
             let telephone_event = offer
                 .streams
                 .get(index)
                 .and_then(|stream| stream.telephone_event())
                 .map(|event| event.payload_type);
+            let shared = Arc::new(SharedLegStats::default());
+            shared_stats.push(Arc::clone(&shared));
             legs.push(
                 TapLeg::new(
                     speaker_track(index),
@@ -275,7 +532,8 @@ impl MediaPlane for TapPlane {
                     RETAIN_NO_LOCAL_AUDIO,
                 )
                 .map_err(|error| MediaPlaneError(format!("tap leg: {error}")))?
-                .with_ssrc_tracks(ssrc_tracks.clone()),
+                .with_ssrc_tracks(ssrc_tracks.clone())
+                .with_shared_stats(shared, STALL_AFTER, Instant::now()),
             );
         }
 
@@ -352,6 +610,8 @@ impl MediaPlane for TapPlane {
                 capture: Some(capture_thread),
             },
         );
+        drop(held);
+        self.metrics.register_session(view.id, shared_stats);
         Ok(())
     }
 
@@ -386,80 +646,19 @@ impl MediaPlane for TapPlane {
                 warn!(%session, "the capture thread did not join cleanly");
             }
         }
+        self.metrics.retire_session(session);
         info!(%session, call_id = %live.call_id, "tap closed");
         Ok(())
     }
 
     async fn open_attachment(&self, view: AttachmentView) -> Result<(), MediaPlaneError> {
-        if view.transport != Transport::WsTwilio {
-            return Err(MediaPlaneError(format!(
-                "{} attachments are not served yet; only ws-twilio is",
-                view.transport
-            )));
+        match view.transport {
+            Transport::WsTwilio => self.open_ws_attachment(view),
+            Transport::GrpcStream => self.open_grpc_attachment(view),
+            other => Err(MediaPlaneError(format!(
+                "{other} attachments are not served yet; ws-twilio and grpc-stream are"
+            ))),
         }
-        if view.endpoint.is_empty() {
-            return Err(MediaPlaneError(
-                "a ws-twilio attachment needs its endpoint url".to_string(),
-            ));
-        }
-
-        let (_, call_id, hub, external_id, _) = self.session_handles(view.session)?;
-        let subscription = hub
-            .attach(CONSUMER_QUEUE_FRAMES, selection_of(view.selector))
-            .ok_or_else(|| {
-                MediaPlaneError("the hub would not take another consumer".to_string())
-            })?;
-
-        let stream_sid = view
-            .metadata
-            .get(STREAM_SID_METADATA_KEY)
-            .cloned()
-            .unwrap_or_else(|| view.id.to_string());
-        let config = ConsumerConfig {
-            url: view.endpoint.clone(),
-            account_id: view
-                .metadata
-                .get(ACCOUNT_METADATA_KEY)
-                .cloned()
-                .unwrap_or_else(|| DEFAULT_ACCOUNT_ID.to_string()),
-            call_sid: if call_id.is_empty() {
-                external_id
-            } else {
-                call_id
-            },
-            stream_sid,
-            format: view.format,
-            tracks: tracks_of(view.selector),
-            custom_parameters: view
-                .metadata
-                .iter()
-                .map(|(k, v)| (k.clone(), v.clone()))
-                .collect(),
-        };
-
-        let (text, inbound) = mpsc::channel(TEXT_QUEUE_DEPTH);
-        info!(
-            attachment = %view.id,
-            session = %view.session,
-            label = %view.label,
-            url = %view.endpoint,
-            "connecting a consumer for the control plane"
-        );
-        let task = tokio::spawn(consumer_ws::run(config, subscription, None, Some(inbound)));
-
-        let mut held = self
-            .attachments
-            .lock()
-            .map_err(|_| MediaPlaneError("the attachment table is poisoned".to_string()))?;
-        held.insert(
-            view.id,
-            LiveAttachment {
-                session: view.session,
-                text,
-                task,
-            },
-        );
-        Ok(())
     }
 
     async fn close_attachment(
@@ -474,10 +673,20 @@ impl MediaPlane for TapPlane {
                 .map_err(|_| MediaPlaneError("the attachment table is poisoned".to_string()))?;
             held.remove(&attachment)
         };
-        if let Some(live) = live {
-            live.task.abort();
-            info!(%attachment, session = %live.session, "consumer detached");
+        match live {
+            Some(LiveAttachment::Ws { session, task, .. }) => {
+                task.abort();
+                info!(%attachment, %session, "consumer detached");
+            }
+            Some(LiveAttachment::Grpc { session, live, .. }) => {
+                if let Some(live) = live {
+                    live.pump.abort();
+                }
+                info!(%attachment, %session, "grpc consumer detached");
+            }
+            None => {}
         }
+        self.metrics.retire_consumer(attachment);
         Ok(())
     }
 
@@ -486,19 +695,114 @@ impl MediaPlane for TapPlane {
         attachment: AttachmentId,
         json: String,
     ) -> Result<(), MediaPlaneError> {
+        enum Outbound {
+            Ws(mpsc::Sender<String>),
+            Grpc(mpsc::Sender<StreamFrame>),
+        }
         let sender = {
             let held = self
                 .attachments
                 .lock()
                 .map_err(|_| MediaPlaneError("the attachment table is poisoned".to_string()))?;
-            held.get(&attachment)
-                .map(|live| live.text.clone())
-                .ok_or_else(|| MediaPlaneError(format!("{attachment} is not connected here")))?
+            match held.get(&attachment) {
+                Some(LiveAttachment::Ws { text, .. }) => Outbound::Ws(text.clone()),
+                Some(LiveAttachment::Grpc {
+                    live: Some(live), ..
+                }) => Outbound::Grpc(live.frames.clone()),
+                Some(LiveAttachment::Grpc { live: None, .. }) => {
+                    return Err(MediaPlaneError(format!(
+                        "{attachment} has no connected grpc consumer to send to"
+                    )))
+                }
+                None => {
+                    return Err(MediaPlaneError(format!(
+                        "{attachment} is not connected here"
+                    )))
+                }
+            }
         };
-        sender
-            .send(json)
-            .await
-            .map_err(|_| MediaPlaneError(format!("{attachment} has stopped reading")))
+        let delivered = match sender {
+            Outbound::Ws(text) => text.send(json).await.is_ok(),
+            Outbound::Grpc(frames) => frames.send(StreamFrame::Text { json }).await.is_ok(),
+        };
+        if delivered {
+            Ok(())
+        } else {
+            Err(MediaPlaneError(format!("{attachment} has stopped reading")))
+        }
+    }
+
+    async fn open_stream(
+        &self,
+        session: SessionId,
+        attachment: AttachmentId,
+    ) -> Result<mpsc::Receiver<StreamFrame>, MediaPlaneError> {
+        let selection = {
+            let held = self
+                .attachments
+                .lock()
+                .map_err(|_| MediaPlaneError("the attachment table is poisoned".to_string()))?;
+            match held.get(&attachment) {
+                Some(LiveAttachment::Grpc {
+                    session: held_session,
+                    selection,
+                    live,
+                }) => {
+                    if *held_session != session {
+                        return Err(MediaPlaneError(format!(
+                            "{attachment} belongs to another session"
+                        )));
+                    }
+                    if live.as_ref().is_some_and(|live| !live.pump.is_finished()) {
+                        return Err(MediaPlaneError(format!(
+                            "{attachment} already has a connected consumer"
+                        )));
+                    }
+                    *selection
+                }
+                Some(LiveAttachment::Ws { .. }) => {
+                    return Err(MediaPlaneError(format!(
+                        "{attachment} is a websocket attachment; it has no grpc stream"
+                    )))
+                }
+                None => {
+                    return Err(MediaPlaneError(format!(
+                        "{attachment} is not attached here"
+                    )))
+                }
+            }
+        };
+
+        let (_, _, hub, _, _) = self.session_handles(session)?;
+        let subscription = hub
+            .attach(CONSUMER_QUEUE_FRAMES, selection)
+            .ok_or_else(|| {
+                MediaPlaneError("the hub would not take another consumer".to_string())
+            })?;
+        let subscription_metrics = subscription.metrics();
+        let (frames, receiver) = mpsc::channel(GRPC_FRAME_QUEUE);
+        let pump = tokio::spawn(pump_frames(subscription, frames.clone()));
+
+        let mut held = self
+            .attachments
+            .lock()
+            .map_err(|_| MediaPlaneError("the attachment table is poisoned".to_string()))?;
+        match held.get_mut(&attachment) {
+            Some(LiveAttachment::Grpc { live, .. }) => {
+                *live = Some(GrpcLive { frames, pump });
+            }
+            _ => {
+                pump.abort();
+                return Err(MediaPlaneError(format!(
+                    "{attachment} was detached while its consumer connected"
+                )));
+            }
+        }
+        drop(held);
+        self.metrics
+            .register_consumer(attachment, subscription_metrics);
+        info!(%attachment, %session, "grpc consumer connected to its tap");
+        Ok(receiver)
     }
 
     async fn start_playback(
@@ -552,6 +856,30 @@ impl MediaPlane for TapPlane {
             .await
             .map_err(|error| MediaPlaneError(format!("stop media: {error}")))?;
         Ok(())
+    }
+}
+
+async fn pump_frames(mut subscription: Subscription, frames: mpsc::Sender<StreamFrame>) {
+    while let Some(event) = subscription.next().await {
+        let frame = match event {
+            TapEvent::Media {
+                track,
+                timestamp_ms,
+                len,
+                bytes,
+            } => StreamFrame::Media {
+                track: control_api::convert::track_name(track),
+                pts_ms: timestamp_ms,
+                payload: bytes[..len].to_vec(),
+            },
+            TapEvent::Dtmf { track, digit } => StreamFrame::Dtmf {
+                track: control_api::convert::track_name(track),
+                digit,
+            },
+        };
+        if frames.send(frame).await.is_err() {
+            return;
+        }
     }
 }
 
@@ -706,13 +1034,43 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn only_the_websocket_transport_is_served_today() {
+    async fn transports_without_a_bridge_are_refused_by_name() {
         let plane = plane();
         let error = plane
-            .open_attachment(attachment(Transport::GrpcStream, "grpc-target"))
+            .open_attachment(attachment(Transport::FileS3, "acct/rec.wav"))
             .await
             .unwrap_err();
         assert!(error.to_string().contains("not served yet"));
+        assert!(error.to_string().contains("file-s3"));
+    }
+
+    #[tokio::test]
+    async fn a_grpc_attachment_needs_a_session_this_pod_taps() {
+        let plane = plane();
+        let error = plane
+            .open_attachment(attachment(Transport::GrpcStream, ""))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("not tapped here"));
+    }
+
+    #[tokio::test]
+    async fn a_grpc_attachment_must_use_the_tap_format_until_reencode_exists() {
+        let plane = plane();
+        let mut wrong = attachment(Transport::GrpcStream, "");
+        wrong.format = AudioFormat::l16_16k_20ms();
+        let error = plane.open_attachment(wrong).await.unwrap_err();
+        assert!(error.to_string().contains("re-encode"));
+    }
+
+    #[tokio::test]
+    async fn a_stream_can_only_open_against_a_grpc_attachment_this_pod_holds() {
+        let plane = plane();
+        let error = plane
+            .open_stream(SessionId::from_raw(1), AttachmentId::from_raw(2))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("not attached here"));
     }
 
     #[tokio::test]

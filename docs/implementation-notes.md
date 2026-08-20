@@ -316,8 +316,10 @@ full of doc comments lifted from the `.proto` files).
   source is `INVALID_ARGUMENT` rather than a no-op.
 - `MediaPlane` is the seam to the media world, and it covers the whole
   lifecycle: `open_session` / `close_session`, `open_attachment` /
-  `close_attachment`, `send_text`, `start_playback` / `stop_playback`. It is
-  async because opening a tap means an NG round trip to rtpengine.
+  `close_attachment`, `send_text`, `start_playback` / `stop_playback`, and
+  `open_stream` (a bounded channel of `StreamFrame`s for a grpc-stream
+  attachment; defaulted to a refusal so registry-only planes need not care).
+  It is async because opening a tap means an NG round trip to rtpengine.
   **Every open is rolled back if the media world refuses it** — a session
   rtpengine will not tap is destroyed again before the RPC returns, and an
   attachment whose consumer cannot be reached is detached, so a failed call
@@ -348,21 +350,121 @@ Watchers are served by a spawned task feeding a bounded `mpsc`, so a
 subscriber that stops reading applies backpressure to itself rather than to
 the controller; broadcast lag is logged with the missed count.
 
+### stream.rs — the `MediaStream` data plane (M4, landed 2026-08-20)
+
+`MediaStreamService` implements the generated `MediaStream::Subscribe`. The
+shape inverts the WS adapter: MSS does not dial the consumer, the consumer
+dials MSS after `Attach{GRPC_STREAM}`, presenting
+`ConsumerHello{attachment_id, token}`. The service validates hello (token,
+attachment exists, transport is grpc-stream, requested format equals the
+attachment's — re-encode is tasks item 8 and a mismatch is `UNIMPLEMENTED`,
+never silent), then asks the media plane for frames through the new
+`MediaPlane::open_stream` seam and serves them as binary `AudioFrame`s
+(raw payload, no base64), `DtmfFrame`s, and `TextFrame`s for
+`SendToAttachment` passthrough.
+
+- **Frame vocabulary is native** (`customer`/`agent`/`mixed`), not the
+  Twilio `inbound`/`outbound` — this is the native surface, the WS adapter
+  is the compatibility one.
+- **Inject is authorized at the first frame**, not at flush:
+  `authorize_inject` maps `CapabilityDenied` to `PERMISSION_DENIED` and the
+  stream ends — the proto calls unprivileged inject a protocol violation,
+  not a no-op. An authorized utterance accumulates decoded PCM, `Mark`
+  flushes it as a WAV blob through the controller's own `StartPlayback`
+  (requested_by = the attachment, block_egress = true), so the playback is
+  registry-tracked, evented onto `mss.events` and attributed; `Clear`
+  discards the buffer and stops the last playback — the barge shape, with
+  `NOT_FOUND` on the stop tolerated because the playback may have ended.
+- **Utterances are capped at one playback datagram** (~3.7 s at 8 kHz,
+  `MAX_UTTERANCE_SAMPLES`); over the cap is `RESOURCE_EXHAUSTED` naming
+  chunked playback as unimplemented. The WS bridge keeps the piece-paced
+  path for long utterances.
+- **The drain lesson applies here too**: every subscribe task watches the
+  controller's drain signal and ends with a `StreamStop{draining}`, pinned
+  by `a_subscribe_stream_ends_when_the_pod_drains` — the same class of bug
+  the first `WatchEvents` had.
+- Stream end semantics: media-plane channel closing (detach, session end)
+  sends `StreamStop{"the tap ended"}`; the consumer hanging up just ends the
+  task, which drops the frame receiver and detaches from the hub. The
+  attachment survives its consumer, so a reconnect is a fresh `Subscribe` —
+  `TapPlane` refuses a second concurrent consumer per attachment.
+
+### auth.rs — the shared-secret policy (M4, landed 2026-08-20)
+
+`AuthPolicy` carries an optional shared secret (`MSS_AUTH_TOKEN` in the
+daemon). As a tonic interceptor it guards `MediaControl` (`authorization:
+Bearer …`, constant-time comparison, `UNAUTHENTICATED` otherwise); the same
+policy checks `ConsumerHello.token` on the data plane. Unset means open —
+the lab mode — and the daemon logs that loudly at startup.
+
+**`TelCompat` is deliberately not intercepted.** Its whole contract is that
+an unmodified cigol client works byte-for-byte; cigol sends no auth
+metadata, so intercepting it would break the no-client-change property.
+The pilot fronts that surface with network policy; if cigol ever grows an
+outbound interceptor, wiring the same `AuthPolicy` there is one line.
+A shared static secret is the v1: per-attachment minted tokens (so a
+data-plane consumer never holds the control-plane credential) are the
+natural next step and would ride the provisional `Attachment` proto.
+
 ### Known gaps (M4)
 
-- `WatchEvents` is the debug path only. The production event path is Kafka
-  `mss.events` (§5.4) and has not been built yet — `SessionController`
-  currently publishes events only to its in-process broadcast.
+- `WatchEvents` is the debug path only; the production event path is Kafka
+  `mss.events` via the daemon's event pump.
 - `owner_pod` is whatever string the controller was constructed with; real
-  placement and Redis ownership leases are still ahead.
-- No auth interceptor yet. `ConsumerHello.token` exists in the data-plane
-  proto and nothing verifies it.
-- The `MediaStream` data-plane service is generated but not implemented;
-  only `MediaControl` is served.
+  placement is still ahead (the Redis lease keeper supplies recovery, not
+  placement).
+- Auth is a single shared secret per deployment; per-attachment tokens are
+  future work (see auth.rs above).
 
 ## crates/mediaserverd
 
-### session_store.rs + registry_keeper.rs — surviving a pod (M4)
+### metrics.rs — the Prometheus endpoint (M4, landed 2026-08-20)
+
+`MSS_METRICS_LISTEN=ip:port` serves the Prometheus text format. There is
+deliberately **no metrics crate and no HTTP framework**: the exposition
+format is plain text and the handler answers any complete HTTP/1.1 request
+with the one page, `Connection: close`. Fewer dependencies to audit, and
+the format is asserted by tests (every series declares HELP/TYPE; every
+drop counter the alert rules reference is present).
+
+How the numbers get out of the media world without locks or allocation:
+
+- Each `TapLeg` gets an `Arc<SharedLegStats>` (a struct of `AtomicU64`s).
+  The capture thread `store`s its counters into it once per release tick
+  (~17 relaxed stores per leg at 50 Hz — noise), plus once at capture end.
+- `TapPlaneMetrics` holds the live map plus **retired totals**: when a
+  session closes, its final leg values are folded into the retired
+  accumulator *after* the capture thread joins (so the values are final),
+  and a scrape sums retired + live under one lock. That keeps every
+  counter monotonic across session churn, which `rate()` requires.
+- Consumers are the same shape: `hub::SubscriptionMetrics` exposes queue
+  depth, `dropped_oldest` and `delivered` from the hub's own atomics;
+  closing or replacing a consumer folds its totals into retired.
+- Per-call label cardinality is deliberately avoided: totals are per pod,
+  gauges cover live state (`mss_sessions_live`, `mss_legs_stalled`,
+  queue depth sum/max). The per-call detail already exists in the
+  `tap leg finished` log line; a label per call is a cardinality bomb at
+  the intended scale.
+- Event pump, registry keeper and controller outbox counters are read
+  directly from their existing `Arc`s; absent sources (no Kafka, no Redis)
+  leave their series out entirely rather than reporting zeros that look
+  like health.
+
+`deploy/prometheus-alerts.yaml` carries the alert rules: every drop counter
+(consumer frames, event queue, publish failures, outbox), watchdog stalls,
+jitter loss ratio, and the split-brain signal `mss_registry_lost_total`.
+
+### supervisor.rs — the audio-flow watchdog, now wired (2026-08-20)
+
+`AudioFlowWatchdog` finally has a caller: each `TapLeg` with shared stats
+owns one. The capture loop touches it when datagrams arrive and checks it
+each release tick; the stall flag and transition count are exported
+(`mss_legs_stalled`, `mss_ingest_stalls_total`). `STALL_AFTER` is 10 s —
+generous on purpose, because a silence-suppressing caller (MicroSIP
+between utterances) legitimately stops sending RTP; the alert adds its own
+`for:` window on top. Stall-triggered re-subscribe remains future,
+incident-driven work — the metric comes first so we learn real stall
+shapes before automating a reaction.
 
 Until now a tap lived and died with its pod. The registry makes a session
 recoverable, which is the Phase-1 exit criterion about re-subscribe recovery.
@@ -575,11 +677,21 @@ into something that actually taps calls.
 - The capture loop is bounded by `MAX_SESSION_DURATION` (8 h) as well as by
   its stop flag, so a session whose `DestroySession` never arrives cannot
   pin a thread forever.
-- `open_attachment` serves `WS_TWILIO` only; every other transport is
-  refused **by name** rather than silently accepted and ignored. Metadata
-  carries `accountId`/`streamSid` through to the Twilio `start` frame, and
-  the `TrackSelector` becomes both the hub's `TrackSelection` and the
-  `tracks` list the consumer is told about.
+- `open_attachment` serves `WS_TWILIO` and (since 2026-08-20) `GRPC_STREAM`;
+  `FILE_S3` and `RTP_INLINE` are refused **by name** rather than silently
+  accepted and ignored. Metadata carries `accountId`/`streamSid` through to
+  the Twilio `start` frame, and the `TrackSelector` becomes both the hub's
+  `TrackSelection` and the `tracks` list the consumer is told about.
+- **A grpc-stream attachment is two-phase**: `Attach` records it (validating
+  the session is tapped here and the format matches the tap — re-encode is
+  tasks item 8), and the hub subscription only happens when the consumer's
+  `ConsumerHello` arrives and `open_stream` runs. A pump task converts
+  `TapEvent`s into `StreamFrame`s over a bounded channel; either side going
+  away ends the pump, which drops the hub subscription. One connected
+  consumer per attachment at a time — a second `Subscribe` while one is live
+  is refused, and a reconnect after it drops is allowed, which is what makes
+  a consumer restart survivable without re-attaching. `send_text` reaches a
+  connected grpc consumer as a `TextFrame`.
 - `send_text` reaches the far end through a bounded channel added to
   `consumer_ws::run`; blob playback is refused above
   `MAX_PLAYBACK_BLOB_BYTES` because one NG datagram cannot carry it (the
@@ -676,9 +788,11 @@ never takes a lock and never waits on the control world.
 - `MSS_LISTENERS=name=url,name=url` attaches N listen-only Twilio-dialect
   consumers per tap; the lab wires an RTT service and a recorder this way
   alongside the interactive bridge.
-- Still to come in M3: per-consumer codec/resample pipelines (G.711 →
-  L16 → 8k/16k), the gRPC `MediaStream` adapter, and hub metrics exported
-  rather than logged.
+- Still to come: per-consumer codec/resample pipelines (G.711 → L16 →
+  8k/16k, tasks item 8). The gRPC `MediaStream` adapter and exported hub
+  metrics landed 2026-08-20 — `SubscriptionMetrics` is the cloneable
+  handle over a subscription's queue depth and drop/delivery counters
+  that the metrics endpoint reads.
 - **The hub is what architecture.md §5 calls an Attachment set**, and the
   spike already prefigures two of its rules: capability is structural (the
   voice-AI consumer is constructed with a command channel, listeners with
@@ -845,16 +959,19 @@ The worker loop currently only ticks and counts. Per-iteration plan:
 Deadline anchoring already implemented: late wakeups shorten the next
 sleep; a badly-behind loop re-anchors instead of bursting.
 
-### supervisor.rs — watchdog logic done, unwired
-`AudioFlowWatchdog` (touch/check, sticky stall origin) has tests but no
-caller. **M3:** wire into the worker loop per session; stall events feed
-metrics + tap re-subscribe.
+### supervisor.rs — watchdog logic, wired 2026-08-20
+`AudioFlowWatchdog` (touch/check, sticky stall origin) is driven per tap
+leg from the capture loop and exported through the metrics endpoint (see
+the metrics.rs section above). Stall-triggered re-subscribe remains
+future work.
 
-### main.rs — boots both worlds; control plane is M4
-**M4:** tonic `MediaControl` (proto/mediastream.proto), NG client task,
-Redis session registry with ownership leases, Kafka producers (reuse
-`MEDIAGATEWAY_BILLING_TOPIC` / `KAFKA_VOICE_AI_AGENT_TOPIC` schemas),
-health endpoint, graceful drain.
+### main.rs — boots both worlds
+The control-plane pieces are all wired: `MediaControl` + `TelCompat` +
+`MediaStream` on `MSS_CONTROL_LISTEN` (auth via `MSS_AUTH_TOKEN`), the
+Kafka event pump on `MSS_KAFKA_BROKERS`, the Redis registry keeper on
+`MSS_REDIS_URL`, the metrics endpoint on `MSS_METRICS_LISTEN`, graceful
+drain on ctrl-c. Still open: billing-topic producers for phase 3
+(`MEDIAGATEWAY_BILLING_TOPIC` / `KAFKA_VOICE_AI_AGENT_TOPIC` schemas).
 
 ## Phase-0 measurements so far (Article VIII)
 

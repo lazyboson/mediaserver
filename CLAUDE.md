@@ -109,12 +109,15 @@ pipeline triggers on `v*` tags.
 Read [docs/tasks.md](docs/tasks.md) — it holds the milestone state and the
 ordered next-up list with a definition of done for each item.
 
-Short version as of 2026-08-17: M1–M3 are done and **M4 (control plane) is
-about two thirds there** — `MediaControl` is served over gRPC and wired into
-the daemon, taps and consumers are driven by the API, events publish to Kafka
-`mss.events`, and leg identity is solved by SSRC correlation. Next up: the
-event translator in cigol (which gates flipping any tenant), the `TelCompat`
-façade, the Redis registry with re-subscribe on pod loss, and exported
-metrics. Three Phase-0 items remain blocked on other people: the production
-rtpengine version check, the rtpengine-side per-tap cost, and the
-OpenSIPS→Redis call→node discovery design.
+Short version as of 2026-08-20: M1–M3 are done and **M4 (control plane) is
+code complete (~95%)** — `MediaControl`, `TelCompat` and the gRPC
+`MediaStream` data plane are served on one port (bearer auth via
+`MSS_AUTH_TOKEN`), taps and consumers are driven by the API, events publish
+to Kafka `mss.events`, the Redis registry re-subscribes on pod loss, leg
+identity is solved by SSRC correlation, and Prometheus metrics are exported
+on `MSS_METRICS_LISTEN` with alert rules in `deploy/`. What still gates the
+tenant pilot: reviewing and merging the cigol event translator (written, on
+cigol branch `feature/mss-event-translator`), the barge-in cut-through
+measurement, and a live pod-kill re-subscribe observation. Two Phase-0 items
+remain blocked on other people: the production rtpengine version check and
+the rtpengine-side per-tap cost.
