@@ -13,7 +13,7 @@ is boringly stable in production).
 | --- | --- | --- | --- |
 | — | M1 scaffold | — | ✅ done (2026-08-13) |
 | 0 | Groundwork spike (M2) | — (de-risking only) | ✅ code done; 3 org-side items open |
-| 1 | Passive fan-out (M3–M4) | `uuid_audio_fork`, `uuid_google_transcribe2` media bugs | 🔶 M3 done, M4 ~65% |
+| 1 | Passive fan-out (M3–M4) | `uuid_audio_fork`, `uuid_google_transcribe2` media bugs | 🔶 M3 done, M4 ~95% (code complete; translator merge + barge-in measurement remain) |
 | 2 | Recording | `record_session` bugs, shared-FS recording pipeline | ⬜ |
 | 3 | Interactive media | dummy leg + conference-per-AI-interaction; mediagateway service | ⬜ |
 | 4 | Full media plane | conference mixing, monitor/whisper (`relate nospeak`), MOH | ⬜ |
@@ -63,17 +63,21 @@ Work:
 - ✅ Fan-out hub: per-session pub/sub, N consumers, attach/detach mid-call,
   per-consumer bounded queues with drop-oldest + counted drops
   (`crates/mediaserverd/src/hub.rs`), with the WS consumer ported onto it.
-  Metrics are counters surfaced in logs; **exporting them is open**
-  (tasks.md item 4).
+  ✅ Metrics are exported (2026-08-20): a Prometheus endpoint on
+  `MSS_METRICS_LISTEN` serves the ingest, jitter, consumer, event and
+  registry counters, the audio-flow watchdog is wired per leg, and
+  `deploy/prometheus-alerts.yaml` alerts on every drop counter.
 - ✅ Speaker attribution: each tap leg is named from the participant's own
   SSRC (rtpengine `query`) with elimination for transcode-restamped legs, so
   stereo recording and RTT speaker labels are trustworthy. Open soft spot:
   a mid-call SSRC change does not re-resolve (tasks.md D1).
 - Codec pipeline: G.711 → L16 → resample (8k/16k) → per-consumer encode;
   Opus via `audiopus` when a consumer needs it.
-- Consumer adapters: WebSocket Twilio dialect first (wire-compatible with
+- ✅ Consumer adapters: WebSocket Twilio dialect first (wire-compatible with
   mediagateway — existing endpoints must not change), then gRPC
-  `MediaStream` (proto/mediastream.proto). Each attaches with a declared
+  `MediaStream` (proto/mediastream.proto, landed 2026-08-20 — binary frames,
+  `ConsumerHello` token auth, capability-checked inject, mark/clear; a live
+  lab consumer over gRPC is still owed). Each attaches with a declared
   capability (`SINK` / `+EVENTS` / `+INJECT`) — architecture.md §5.2 — and
   exactly one per session is `authoritative` (§5.3).
 - Control plane: tonic `MediaControl` over the Session/Attachment/Playback
@@ -89,11 +93,16 @@ Work:
   `MediaEvent`, keyed by `external_id`, gapless per-session seq,
   `legacy_eligible` marking the authoritative attachment — verified off the
   wire against Redpanda in the lab, `crates/mediaserverd/src/event_pump.rs`)
-  rather than streamed back over gRPC. Still to come: the translator in
-  cigol that renders `mss.events` onto the existing `eventTopic` in the
-  positional format `appServer` already consumes (§5.4 — it lives in cigol,
-  not here), and the Redis session registry with ownership leases +
-  re-subscribe on pod loss.
+  rather than streamed back over gRPC. **The Redis session registry landed
+  2026-08-17** (ownership leases, adoption through the controller's own API,
+  re-subscribe via `TapPlane`), and **auth landed 2026-08-20**
+  (`MSS_AUTH_TOKEN` bearer interceptor on `MediaControl`, `ConsumerHello`
+  token on the data plane; TelCompat deliberately open for client
+  compatibility). Still to come: the translator in cigol that renders
+  `mss.events` onto the existing `eventTopic` in the positional format
+  `appServer` already consumes (§5.4 — written on cigol branch
+  `feature/mss-event-translator`, awaiting review and merge), and a real
+  pod-kill-mid-call observation of re-subscribe recovery.
 - `TelCompat` façade: `telsvc.proto` message shapes verbatim, so a
   per-tenant flag routes `StartStream`/`StartRecording`/
   `StartCallTranscription` to `telServer` or `mssServer` with no client

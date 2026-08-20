@@ -1,0 +1,375 @@
+use crate::auth::AuthPolicy;
+use crate::controller::{SessionController, StreamFrame};
+use crate::convert::{attachment_id, format, format_wire, track_name};
+use crate::proto;
+use crate::proto::media_control_server::MediaControl;
+use crate::proto::media_stream_server::{MediaStream, MediaStreamServer};
+use media_core::{g711, Encoding, Track};
+use session_core::{AttachmentView, SessionView, TrackSelector, Transport};
+use std::sync::Arc;
+use tokio::sync::mpsc;
+use tokio_stream::wrappers::ReceiverStream;
+use tonic::{Request, Response, Status, Streaming};
+use tracing::info;
+
+pub const STREAM_QUEUE_DEPTH: usize = 64;
+pub const MAX_UTTERANCE_SAMPLES: usize = 29_900;
+const STREAM_SID_METADATA_KEY: &str = "streamSid";
+
+pub struct MediaStreamService {
+    controller: Arc<SessionController>,
+    auth: AuthPolicy,
+}
+
+impl MediaStreamService {
+    pub fn new(controller: Arc<SessionController>, auth: AuthPolicy) -> Self {
+        MediaStreamService { controller, auth }
+    }
+
+    pub fn into_service(self) -> MediaStreamServer<Self> {
+        MediaStreamServer::new(self)
+    }
+}
+
+#[tonic::async_trait]
+impl MediaStream for MediaStreamService {
+    type SubscribeStream = ReceiverStream<Result<proto::ServerToConsumer, Status>>;
+
+    async fn subscribe(
+        &self,
+        request: Request<Streaming<proto::ConsumerToServer>>,
+    ) -> Result<Response<Self::SubscribeStream>, Status> {
+        let draining = self.controller.drain_watch();
+        if *draining.borrow() {
+            return Err(Status::unavailable("this pod is draining"));
+        }
+        let mut inbound = request.into_inner();
+
+        let hello = match inbound.message().await? {
+            Some(proto::ConsumerToServer {
+                msg: Some(proto::consumer_to_server::Msg::Hello(hello)),
+            }) => hello,
+            Some(_) => {
+                return Err(Status::invalid_argument(
+                    "the first message on a subscribe stream must be a consumer hello",
+                ))
+            }
+            None => {
+                return Err(Status::invalid_argument(
+                    "the stream ended before a consumer hello arrived",
+                ))
+            }
+        };
+        self.auth.check_hello_token(&hello.token)?;
+
+        let attachment = attachment_id(&hello.attachment_id)?;
+        let view = self.controller.attachment(attachment)?;
+        if view.transport != Transport::GrpcStream {
+            return Err(Status::failed_precondition(format!(
+                "attachment {attachment} is {}; only grpc-stream attachments subscribe here",
+                view.transport
+            )));
+        }
+        if let Some(requested) = hello.requested_format.as_ref() {
+            let requested = format(Some(requested))?;
+            if requested != view.format {
+                return Err(Status::unimplemented(
+                    "per-consumer re-encode is not built yet; \
+                     request the format the attachment declared or omit it",
+                ));
+            }
+        }
+        let session = self.controller.session(view.session)?;
+        let frames = self.controller.open_stream(view.session, view.id).await?;
+        info!(
+            %attachment,
+            session = %view.session,
+            external_id = %session.external_id,
+            "a grpc consumer subscribed to its attachment"
+        );
+
+        let (sender, receiver) = mpsc::channel(STREAM_QUEUE_DEPTH);
+        let controller = Arc::clone(&self.controller);
+        tokio::spawn(async move {
+            serve_stream(controller, session, view, inbound, frames, sender, draining).await;
+        });
+        Ok(Response::new(ReceiverStream::new(receiver)))
+    }
+}
+
+type OutboundSender = mpsc::Sender<Result<proto::ServerToConsumer, Status>>;
+
+async fn serve_stream(
+    controller: Arc<SessionController>,
+    session: SessionView,
+    view: AttachmentView,
+    mut inbound: Streaming<proto::ConsumerToServer>,
+    mut frames: mpsc::Receiver<StreamFrame>,
+    sender: OutboundSender,
+    mut draining: tokio::sync::watch::Receiver<bool>,
+) {
+    if send_message(&sender, start_message(&session, &view))
+        .await
+        .is_err()
+    {
+        return;
+    }
+
+    let mut seq: u64 = 0;
+    let mut inject = InjectState::new(view.format.encoding, view.format.sample_rate_hz);
+
+    loop {
+        tokio::select! {
+            changed = draining.changed() => {
+                if changed.is_err() || *draining.borrow() {
+                    let _ = send_stop(&sender, "this pod is draining").await;
+                    return;
+                }
+            }
+            frame = frames.recv() => match frame {
+                Some(frame) => {
+                    seq += 1;
+                    if send_message(&sender, frame_message(frame, seq)).await.is_err() {
+                        return;
+                    }
+                }
+                None => {
+                    let _ = send_stop(&sender, "the tap ended").await;
+                    return;
+                }
+            },
+            message = inbound.message() => match message {
+                Ok(Some(message)) => {
+                    if let Err(status) =
+                        handle_consumer(&controller, &view, &mut inject, message).await
+                    {
+                        let _ = sender.send(Err(status)).await;
+                        return;
+                    }
+                }
+                Ok(None) | Err(_) => return,
+            },
+        }
+    }
+}
+
+struct InjectState {
+    encoding: Encoding,
+    sample_rate_hz: u32,
+    utterance: Vec<i16>,
+    authorized: bool,
+    last_playback: Option<String>,
+}
+
+impl InjectState {
+    fn new(encoding: Encoding, sample_rate_hz: u32) -> InjectState {
+        InjectState {
+            encoding,
+            sample_rate_hz,
+            utterance: Vec::new(),
+            authorized: false,
+            last_playback: None,
+        }
+    }
+}
+
+async fn handle_consumer(
+    controller: &Arc<SessionController>,
+    view: &AttachmentView,
+    inject: &mut InjectState,
+    message: proto::ConsumerToServer,
+) -> Result<(), Status> {
+    match message.msg {
+        Some(proto::consumer_to_server::Msg::Hello(_)) => Err(Status::invalid_argument(
+            "a consumer hello arrives exactly once, first",
+        )),
+        Some(proto::consumer_to_server::Msg::Inject(frame)) => {
+            if !inject.authorized {
+                controller.authorize_inject(view.id)?;
+                inject.authorized = true;
+            }
+            if inject.utterance.len() + frame.payload.len() > MAX_UTTERANCE_SAMPLES {
+                return Err(Status::resource_exhausted(format!(
+                    "an injected utterance is capped at {MAX_UTTERANCE_SAMPLES} samples \
+                     because one playback datagram carries no more; \
+                     chunked playback is not implemented"
+                )));
+            }
+            decode_inject(inject.encoding, &frame.payload, &mut inject.utterance)
+        }
+        Some(proto::consumer_to_server::Msg::Mark(_)) => {
+            if inject.utterance.is_empty() {
+                return Ok(());
+            }
+            let blob = wav_blob(inject.sample_rate_hz, &inject.utterance)?;
+            inject.utterance.clear();
+            let request = proto::StartPlaybackRequest {
+                session: Some(proto::SessionRef {
+                    id: Some(proto::session_ref::Id::SessionId(view.session.to_string())),
+                }),
+                source: Some(proto::start_playback_request::Source::Blob(blob)),
+                target_tag: String::new(),
+                repeat_times: 0,
+                block_egress: true,
+                requested_by: view.id.to_string(),
+                idempotency_key: String::new(),
+            };
+            let playback = controller
+                .as_ref()
+                .start_playback(Request::new(request))
+                .await?;
+            inject.last_playback = Some(playback.into_inner().playback_id);
+            Ok(())
+        }
+        Some(proto::consumer_to_server::Msg::Clear(_)) => {
+            inject.utterance.clear();
+            let Some(playback_id) = inject.last_playback.take() else {
+                return Ok(());
+            };
+            let stopped = controller
+                .as_ref()
+                .stop_playback(Request::new(proto::PlaybackRef { playback_id }))
+                .await;
+            match stopped {
+                Ok(_) => Ok(()),
+                Err(status) if status.code() == tonic::Code::NotFound => Ok(()),
+                Err(status) => Err(status),
+            }
+        }
+        None => Err(Status::invalid_argument(
+            "a consumer message carried no payload",
+        )),
+    }
+}
+
+fn decode_inject(encoding: Encoding, payload: &[u8], out: &mut Vec<i16>) -> Result<(), Status> {
+    match encoding {
+        Encoding::Pcmu => out.extend(payload.iter().map(|byte| g711::ulaw_to_linear(*byte))),
+        Encoding::Pcma => out.extend(payload.iter().map(|byte| g711::alaw_to_linear(*byte))),
+        Encoding::L16 | Encoding::Opus => {
+            return Err(Status::unimplemented(
+                "inject accepts g711 attachments only until the codec pipeline broadens",
+            ))
+        }
+    }
+    Ok(())
+}
+
+fn wav_blob(sample_rate_hz: u32, pcm: &[i16]) -> Result<Vec<u8>, Status> {
+    let spec = hound::WavSpec {
+        channels: 1,
+        sample_rate: sample_rate_hz,
+        bits_per_sample: 16,
+        sample_format: hound::SampleFormat::Int,
+    };
+    let mut cursor = std::io::Cursor::new(Vec::new());
+    let mut writer = hound::WavWriter::new(&mut cursor, spec)
+        .map_err(|error| Status::internal(format!("wav header: {error}")))?;
+    for sample in pcm {
+        writer
+            .write_sample(*sample)
+            .map_err(|error| Status::internal(format!("wav body: {error}")))?;
+    }
+    writer
+        .finalize()
+        .map_err(|error| Status::internal(format!("wav finalize: {error}")))?;
+    Ok(cursor.into_inner())
+}
+
+fn start_message(session: &SessionView, view: &AttachmentView) -> proto::ServerToConsumer {
+    let tracks = match view.selector {
+        TrackSelector::All => vec![
+            track_name(Track::Customer).to_string(),
+            track_name(Track::Agent).to_string(),
+        ],
+        TrackSelector::Only(track) => vec![track_name(track).to_string()],
+    };
+    proto::ServerToConsumer {
+        msg: Some(proto::server_to_consumer::Msg::Start(proto::StreamStart {
+            session_id: session.id.to_string(),
+            external_id: session.external_id.clone(),
+            attachment_id: view.id.to_string(),
+            stream_sid: view
+                .metadata
+                .get(STREAM_SID_METADATA_KEY)
+                .cloned()
+                .unwrap_or_else(|| view.id.to_string()),
+            tracks,
+            format: Some(format_wire(view.format)),
+            custom_parameters: view
+                .metadata
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect(),
+        })),
+    }
+}
+
+fn frame_message(frame: StreamFrame, seq: u64) -> proto::ServerToConsumer {
+    let msg = match frame {
+        StreamFrame::Media {
+            track,
+            pts_ms,
+            payload,
+        } => proto::server_to_consumer::Msg::Frame(proto::AudioFrame {
+            track: track.to_string(),
+            seq,
+            pts_ms,
+            payload,
+        }),
+        StreamFrame::Dtmf { track, digit } => {
+            proto::server_to_consumer::Msg::Dtmf(proto::DtmfFrame {
+                track: track.to_string(),
+                digit: digit.to_string(),
+            })
+        }
+        StreamFrame::Text { json } => {
+            proto::server_to_consumer::Msg::Text(proto::TextFrame { json })
+        }
+    };
+    proto::ServerToConsumer { msg: Some(msg) }
+}
+
+async fn send_message(sender: &OutboundSender, message: proto::ServerToConsumer) -> Result<(), ()> {
+    sender.send(Ok(message)).await.map_err(|_| ())
+}
+
+async fn send_stop(sender: &OutboundSender, reason: &str) -> Result<(), ()> {
+    send_message(
+        sender,
+        proto::ServerToConsumer {
+            msg: Some(proto::server_to_consumer::Msg::Stop(proto::StreamStop {
+                reason: reason.to_string(),
+            })),
+        },
+    )
+    .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_injected_utterance_becomes_a_mono_wav_of_the_attachment_rate() {
+        let blob = wav_blob(8_000, &[0i16, 100, -100]).unwrap();
+        assert_eq!(&blob[..4], b"RIFF");
+        assert_eq!(&blob[8..12], b"WAVE");
+        let mut reader = hound::WavReader::new(std::io::Cursor::new(blob)).unwrap();
+        assert_eq!(reader.spec().channels, 1);
+        assert_eq!(reader.spec().sample_rate, 8_000);
+        let samples: Vec<i16> = reader.samples::<i16>().map(|s| s.unwrap()).collect();
+        assert_eq!(samples, vec![0, 100, -100]);
+    }
+
+    #[test]
+    fn inject_decodes_both_g711_variants_and_refuses_the_rest() {
+        let mut out = Vec::new();
+        decode_inject(Encoding::Pcmu, &[0xFF, 0x7F], &mut out).unwrap();
+        assert_eq!(out.len(), 2);
+        decode_inject(Encoding::Pcma, &[0xD5], &mut out).unwrap();
+        assert_eq!(out.len(), 3);
+        let refused = decode_inject(Encoding::L16, &[0, 0], &mut out).unwrap_err();
+        assert_eq!(refused.code(), tonic::Code::Unimplemented);
+    }
+}
