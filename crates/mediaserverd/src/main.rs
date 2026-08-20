@@ -4,16 +4,16 @@ mod consumer_ws;
 mod event_pump;
 mod hub;
 mod media_rt;
+mod metrics;
 mod ng_transport;
 mod registry_keeper;
 mod session_store;
-#[allow(dead_code)]
 mod supervisor;
 mod tap_plane;
 mod tap_session;
 mod tap_spike;
 
-use control_api::SessionController;
+use control_api::{AuthPolicy, SessionController};
 use media_core::AudioFormat;
 use ng_transport::{NgTransport, NgTransportConfig};
 use std::net::{IpAddr, SocketAddr};
@@ -30,6 +30,8 @@ const EVENTS_PARTITIONS_ENV: &str = "MSS_EVENTS_PARTITIONS";
 const REDIS_URL_ENV: &str = "MSS_REDIS_URL";
 const POD_NAME_ENV: &str = "MSS_POD_NAME";
 const LOCAL_MEDIA_IP_ENV: &str = "MSS_TAP_LOCAL_IP";
+const METRICS_LISTEN_ENV: &str = "MSS_METRICS_LISTEN";
+const AUTH_TOKEN_ENV: &str = "MSS_AUTH_TOKEN";
 const DEFAULT_POD_NAME: &str = "mediaserverd";
 
 fn main() {
@@ -169,6 +171,27 @@ fn control_listen_address() -> Option<Result<SocketAddr, String>> {
     Some(configured.parse().map_err(|_| configured))
 }
 
+fn metrics_listen_address() -> Option<Result<SocketAddr, String>> {
+    let configured = std::env::var(METRICS_LISTEN_ENV).ok()?;
+    Some(configured.parse().map_err(|_| configured))
+}
+
+fn auth_policy_from_env() -> AuthPolicy {
+    match std::env::var(AUTH_TOKEN_ENV) {
+        Ok(token) if !token.is_empty() => {
+            info!("control plane authentication is on");
+            AuthPolicy::shared_secret(token)
+        }
+        _ => {
+            warn!(
+                env = AUTH_TOKEN_ENV,
+                "no auth token configured; the control plane accepts unauthenticated callers"
+            );
+            AuthPolicy::open()
+        }
+    }
+}
+
 fn local_media_address() -> IpAddr {
     std::env::var(LOCAL_MEDIA_IP_ENV)
         .ok()
@@ -188,6 +211,7 @@ async fn serve_control_plane(listen: SocketAddr) {
     }));
     let owner = std::env::var(POD_NAME_ENV).unwrap_or_else(|_| DEFAULT_POD_NAME.to_string());
     let draining = Arc::clone(&plane);
+    let tap_metrics = plane.metrics();
     let mut controller = SessionController::new(owner.clone()).with_media_plane(plane);
 
     let mut pump_worker = None;
@@ -236,7 +260,40 @@ async fn serve_control_plane(listen: SocketAddr) {
         }
     }
 
-    let served = control_api::serve_shared_until(controller, listener, async {
+    match metrics_listen_address() {
+        Some(Ok(metrics_listen)) => match tokio::net::TcpListener::bind(metrics_listen).await {
+            Ok(metrics_listener) => {
+                let sources = metrics::MetricsSources {
+                    tap: tap_metrics,
+                    controller: Arc::clone(&controller),
+                    pump: pump_worker
+                        .as_ref()
+                        .map(|(_, counters)| Arc::clone(counters)),
+                    keeper: keeper_counters.clone(),
+                };
+                tokio::spawn(metrics::serve(metrics_listener, sources));
+            }
+            Err(error) => {
+                error!(%metrics_listen, %error, "could not bind the metrics listener; refusing to start");
+                return;
+            }
+        },
+        Some(Err(configured)) => {
+            error!(
+                configured,
+                env = METRICS_LISTEN_ENV,
+                "the metrics listen address must be ip:port; refusing to start"
+            );
+            return;
+        }
+        None => info!(
+            env = METRICS_LISTEN_ENV,
+            "no metrics listen address configured; counters stay in logs"
+        ),
+    }
+
+    let auth = auth_policy_from_env();
+    let served = control_api::serve_authenticated_until(controller, auth, listener, async {
         tokio::signal::ctrl_c()
             .await
             .expect("failed to listen for shutdown signal");

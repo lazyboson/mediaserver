@@ -257,6 +257,31 @@ impl Subscription {
     pub fn delivered(&self) -> u64 {
         self.shared.delivered.load(Ordering::Relaxed)
     }
+
+    pub fn metrics(&self) -> SubscriptionMetrics {
+        SubscriptionMetrics {
+            shared: Arc::clone(&self.shared),
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct SubscriptionMetrics {
+    shared: Arc<Shared>,
+}
+
+impl SubscriptionMetrics {
+    pub fn queue_depth(&self) -> usize {
+        self.shared.frames.len()
+    }
+
+    pub fn dropped_oldest(&self) -> u64 {
+        self.shared.dropped_oldest.load(Ordering::Relaxed)
+    }
+
+    pub fn delivered(&self) -> u64 {
+        self.shared.delivered.load(Ordering::Relaxed)
+    }
 }
 
 impl Drop for Subscription {
@@ -395,6 +420,25 @@ mod tests {
         assert_eq!(stamps, vec![0, 20, 40, 60, 80]);
         assert_eq!(speech, vec![false, true, true, true, false]);
         assert_eq!(std::iter::from_fn(|| listener.try_next()).count(), 5);
+    }
+
+    #[test]
+    fn a_metrics_handle_reports_depth_drops_and_delivery_while_the_consumer_runs() {
+        let (mut hub, client) = Hub::new();
+        let mut slow = client.attach(4, TrackSelection::All).unwrap();
+        let metrics = slow.metrics();
+        hub.poll_commands();
+
+        for at in 0..6 {
+            hub.publish(frame(Track::Customer, at * 20));
+        }
+
+        assert_eq!(metrics.queue_depth(), 4);
+        assert_eq!(metrics.dropped_oldest(), 2);
+        assert_eq!(metrics.delivered(), 4);
+
+        slow.try_next();
+        assert_eq!(metrics.queue_depth(), 3);
     }
 
     #[tokio::test]

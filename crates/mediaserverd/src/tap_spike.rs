@@ -1,11 +1,13 @@
 use crate::hub::{Hub, TapEvent};
+use crate::supervisor::{AudioFlowWatchdog, SessionHealth};
 use media_core::jitter;
 use media_core::pipeline::{IngestOutcome, PipelineError, PipelineStats, Playout, StreamPipeline};
 use media_core::{AudioFormat, Track};
 use std::io::ErrorKind;
 use std::net::UdpSocket;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use thiserror::Error;
 
@@ -45,6 +47,63 @@ pub struct LegStats {
     pub jitter: jitter::Stats,
 }
 
+#[derive(Default)]
+pub struct SharedLegStats {
+    pub datagrams: AtomicU64,
+    pub recv_errors: AtomicU64,
+    pub underruns: AtomicU64,
+    pub frames_played: AtomicU64,
+    pub frames_concealed: AtomicU64,
+    pub frames_suppressed: AtomicU64,
+    pub companded: AtomicU64,
+    pub unknown_payload_type: AtomicU64,
+    pub unparsable: AtomicU64,
+    pub telephone_events: AtomicU64,
+    pub dtmf_digits: AtomicU64,
+    pub jitter_lost: AtomicU64,
+    pub jitter_duplicates: AtomicU64,
+    pub jitter_late_drops: AtomicU64,
+    pub jitter_resets: AtomicU64,
+    pub unknown_ssrc: AtomicU64,
+    pub stalled: AtomicU64,
+    pub stalls: AtomicU64,
+}
+
+impl SharedLegStats {
+    fn store(&self, stats: &LegStats, stalled: bool, stalls: u64) {
+        self.datagrams.store(stats.datagrams, Ordering::Relaxed);
+        self.recv_errors.store(stats.recv_errors, Ordering::Relaxed);
+        self.underruns.store(stats.underruns, Ordering::Relaxed);
+        self.frames_played
+            .store(stats.pipeline.frames_played, Ordering::Relaxed);
+        self.frames_concealed
+            .store(stats.pipeline.frames_concealed, Ordering::Relaxed);
+        self.frames_suppressed
+            .store(stats.pipeline.frames_suppressed, Ordering::Relaxed);
+        self.companded
+            .store(stats.pipeline.companded, Ordering::Relaxed);
+        self.unknown_payload_type
+            .store(stats.pipeline.unknown_payload_type, Ordering::Relaxed);
+        self.unparsable
+            .store(stats.pipeline.unparsable, Ordering::Relaxed);
+        self.telephone_events
+            .store(stats.pipeline.telephone_events, Ordering::Relaxed);
+        self.dtmf_digits
+            .store(stats.pipeline.dtmf_digits, Ordering::Relaxed);
+        self.jitter_lost.store(stats.jitter.lost, Ordering::Relaxed);
+        self.jitter_duplicates
+            .store(stats.jitter.duplicates, Ordering::Relaxed);
+        self.jitter_late_drops
+            .store(stats.jitter.late_drops, Ordering::Relaxed);
+        self.jitter_resets
+            .store(stats.jitter.resets, Ordering::Relaxed);
+        self.unknown_ssrc
+            .store(u64::from(stats.unknown_ssrc.is_some()), Ordering::Relaxed);
+        self.stalled.store(u64::from(stalled), Ordering::Relaxed);
+        self.stalls.store(stalls, Ordering::Relaxed);
+    }
+}
+
 pub struct TapLeg {
     track: Track,
     ssrc_tracks: Vec<(u32, Track)>,
@@ -59,6 +118,11 @@ pub struct TapLeg {
     ptime_ms: u64,
     frames_released: u64,
     datagram_log: Vec<u8>,
+    shared: Option<Arc<SharedLegStats>>,
+    watchdog: Option<AudioFlowWatchdog>,
+    watched_datagrams: u64,
+    stalled: bool,
+    stalls: u64,
 }
 
 impl TapLeg {
@@ -88,12 +152,49 @@ impl TapLeg {
             ptime_ms: format.ptime_ms.max(1) as u64,
             frames_released: 0,
             datagram_log: Vec::new(),
+            shared: None,
+            watchdog: None,
+            watched_datagrams: 0,
+            stalled: false,
+            stalls: 0,
         })
     }
 
     pub fn with_datagram_log(mut self, capacity_bytes: usize) -> Self {
         self.datagram_log = Vec::with_capacity(capacity_bytes);
         self
+    }
+
+    pub fn with_shared_stats(
+        mut self,
+        shared: Arc<SharedLegStats>,
+        stall_after: Duration,
+        now: Instant,
+    ) -> Self {
+        self.shared = Some(shared);
+        self.watchdog = Some(AudioFlowWatchdog::new(stall_after, now));
+        self
+    }
+
+    pub fn publish_shared(&mut self, now: Instant) {
+        if self.shared.is_none() {
+            return;
+        }
+        if let Some(watchdog) = self.watchdog.as_mut() {
+            if self.stats.datagrams > self.watched_datagrams {
+                self.watched_datagrams = self.stats.datagrams;
+                watchdog.touch(now);
+            }
+            let stalled_now = matches!(watchdog.check(now), SessionHealth::Stalled { .. });
+            if stalled_now && !self.stalled {
+                self.stalls += 1;
+            }
+            self.stalled = stalled_now;
+        }
+        let stats = self.stats();
+        if let Some(shared) = &self.shared {
+            shared.store(&stats, self.stalled, self.stalls);
+        }
     }
 
     pub fn with_ssrc_tracks(mut self, ssrc_tracks: Vec<(u32, Track)>) -> Self {
@@ -329,6 +430,7 @@ pub fn capture(
         if now >= next_release {
             for leg in legs.iter_mut() {
                 leg.release_frame(hub.as_deref_mut());
+                leg.publish_shared(now);
             }
             if let Some(hub) = hub.as_deref_mut() {
                 if let Some(samples) = format.samples_per_packet() {
@@ -349,6 +451,11 @@ pub fn capture(
         if sleep_until > now {
             std::thread::sleep(sleep_until - now);
         }
+    }
+
+    let ended = Instant::now();
+    for leg in legs.iter_mut() {
+        leg.publish_shared(ended);
     }
 
     CaptureSummary {
@@ -646,6 +753,40 @@ mod tests {
             offered += 1;
         }
         assert_eq!(offered as u64, summary.releases);
+    }
+
+    #[test]
+    fn shared_stats_follow_the_leg_and_the_watchdog_reports_a_stall() {
+        let max_capture = Duration::from_millis(400);
+        let (socket, addr) = loopback_pair();
+        let shared = Arc::new(SharedLegStats::default());
+        let mut legs = vec![leg(Track::Customer, socket, max_capture).with_shared_stats(
+            Arc::clone(&shared),
+            Duration::from_millis(120),
+            Instant::now(),
+        )];
+
+        let sender = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let mut stream = G711StreamGenerator::new(AudioFormat::pcmu_8k_20ms(), 4, 0).unwrap();
+        for _ in 0..5 {
+            sender.send_to(&stream.next_datagram(), addr).unwrap();
+        }
+
+        let stop = AtomicBool::new(false);
+        capture(
+            &mut legs,
+            None,
+            AudioFormat::pcmu_8k_20ms(),
+            max_capture,
+            &stop,
+        );
+
+        assert_eq!(shared.datagrams.load(Ordering::Relaxed), 5);
+        assert_eq!(shared.frames_played.load(Ordering::Relaxed), 5);
+        assert_eq!(shared.unknown_ssrc.load(Ordering::Relaxed), 0);
+        assert_eq!(shared.stalled.load(Ordering::Relaxed), 1);
+        assert_eq!(shared.stalls.load(Ordering::Relaxed), 1);
+        assert!(shared.underruns.load(Ordering::Relaxed) > 0);
     }
 
     #[test]
