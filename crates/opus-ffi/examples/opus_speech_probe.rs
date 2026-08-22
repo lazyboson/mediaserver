@@ -1,6 +1,4 @@
-use media_core::opus::{OpusStreamDecoder, MAX_OPUS_PACKET_BYTES};
-use media_core::{AudioFormat, Encoding};
-use opus_rs::{Application, OpusEncoder};
+use opus_ffi::{OpusDecoder, OpusEncoder, MAX_PACKET_BYTES};
 
 const USAGE: &str = "\
 opus_speech_probe <input.wav> <output.wav> [sample-rate-hz]
@@ -30,17 +28,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let pcm: Vec<i16> = reader.samples::<i16>().collect::<Result<_, _>>()?;
     println!("probe: {} samples in at {rate} Hz", pcm.len());
 
-    let format = AudioFormat {
-        encoding: Encoding::Opus,
-        sample_rate_hz: rate,
-        channels: 1,
-        ptime_ms: 20,
-    };
-    let mut encoder =
-        OpusEncoder::new(rate as i32, 1, Application::Voip).map_err(|e| format!("encoder: {e}"))?;
-    encoder.bitrate_bps = 24000;
-    encoder.use_cbr = true;
-    let mut decoder = OpusStreamDecoder::new(format)?;
+    let mut encoder = OpusEncoder::new(rate, 1)?;
+    let mut decoder = OpusDecoder::new(rate, 1)?;
 
     let mut writer = hound::WavWriter::create(
         &args[1],
@@ -52,17 +41,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
     )?;
 
-    let mut packet = vec![0u8; MAX_OPUS_PACKET_BYTES];
+    let mut packet = vec![0u8; MAX_PACKET_BYTES];
     let mut decoded = vec![0i16; decoder.max_frame_samples()];
     let mut frames = 0u64;
     let mut packet_bytes = 0u64;
     let mut samples_out = 0u64;
 
     for chunk in pcm.chunks(frame) {
-        let mut input: Vec<f32> = chunk.iter().map(|s| f32::from(*s) / 32768.0).collect();
-        input.resize(frame, 0.0);
+        let mut input = chunk.to_vec();
+        input.resize(frame, 0);
         let bytes = encoder
-            .encode(&input, frame, &mut packet)
+            .encode(&input, &mut packet)
             .map_err(|e| format!("encode: {e}"))?;
         packet_bytes += bytes as u64;
         let produced = decoder.decode(&packet[..bytes], &mut decoded)?;

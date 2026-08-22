@@ -1,0 +1,7 @@
+# The lab pods run `cargo run` straight out of a mounted source tree, so they
+# need whatever the build needs. libopus is vendored and built by opusic-sys
+# via cmake, which the plain rust:slim image does not carry.
+FROM rust:1.95-slim-bookworm
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends cmake make g++ \
+ && rm -rf /var/lib/apt/lists/*

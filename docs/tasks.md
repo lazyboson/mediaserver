@@ -602,31 +602,47 @@ the kernel path (item 20). So Opus in MSS is a cost and kernel-path
 requirement, not a capability gap: **WebRTC calls are tapped successfully
 today.**
 
-#### 16a. Opus decoder — ✅ DONE (2026-08-22)
-`media-core/src/opus.rs`: `OpusStreamDecoder`, one Opus packet to mono `i16`
-PCM at a caller-chosen rate (8/12/16/24/48 kHz), scratch sized once for the
-longest legal 60 ms frame, malformed input an error and never a panic.
-**The build trade is settled by probe, not preference:** `opus-rs` 0.1.31
-builds in `rust:1.95-slim-bookworm` with **only `cc`** — no cmake, no
-pkg-config, 4.5 s, **zero dependencies** — so the hermetic build, CI, the
-Dockerfile and the lab image are all untouched, and BSD-3-Clause was already
-allowlisted so `cargo deny` needed **no new allowance**. It is a port of
-reference libopus 1.6 rather than an independent implementation, and it is
-`no_std`/heap-free with the big SILK and CELT state boxed once at
-construction, which is precisely Article V's shape. `audiopus` was rejected on
-evidence: the real libopus, but the binding has been unmaintained since
-April 2021, is still a release candidate, and needs cmake in three places.
-**Verified:** a tone round-trips at all five rates with exact sample counts;
-silence stays quiet; and real lab speech through this module at 8 kHz/24 kbps
-was transcribed **verbatim by Deepgram** ("Hello.", "This is the media server
-speaking through your bridge.") through `ear_intelligibility_probe.py` —
-`examples/opus_speech_probe.rs` is the throwaway that produced it.
-**Risk on the record:** v0.1.x, released the day before adoption, docs.rs
-coverage 1.49%, and its changelog records a recently fixed table bug that made
->160 kbps stereo decode to garbage against libopus. WebRTC speech is far below
-that, and `MSS_TAP_TRANSCODE=on` is a working per-deployment escape hatch, so
-this is not a one-way door. **Owed: an independent cross-check against libopus
-output**, the same debt `g711.rs` carries against the ITU vectors.
+#### 16a. Opus decoder — ✅ DONE (2026-08-22), on libopus
+New crate **`crates/opus-ffi`**: a safe wrapper over **libopus**, and the only
+crate in the workspace that contains `unsafe` (every logic crate keeps
+`#![forbid(unsafe_code)]`). `media-core/src/opus.rs` is a thin `AudioFormat`
+adapter over it.
+**The codec is libopus because Article XI says so** — vetted bindings to proven
+C libraries, the same code FreeSWITCH wraps. libopus has shipped in every
+browser, WhatsApp, Zoom, Signal, FreeSWITCH and Asterisk since 2012.
+**A pure-Rust port (`opus-rs`) was tried first and rejected on evidence:** six
+months old, **30 releases** in that window, **zero external dependents**, docs
+coverage 1.49%, and a changelog entry for a table bug that made >160 kbps
+stereo decode to garbage against libopus, fixed days earlier. It built with no
+cmake, which was the whole attraction — but trading codec correctness on real
+customer audio for a build convenience inverts the Constitution's own ordering.
+**The binding is `opusic-sys` 0.7.5, not the more popular `opus` crate**, for a
+measured reason: `opus` 0.3.1 pulls `audiopus_sys` 0.2.2 (unmaintained since
+2021) which vendors libopus 1.3, whose CMakeLists declares
+`cmake_minimum_required` below 3.5 — **CMake 4.x removed that compatibility, so
+it does not build at all.** `opusic-sys` is current, builds in ~14 s under the
+pinned toolchain, and its BSD-3-Clause was already allowlisted so `cargo deny`
+needed **no new allowance**.
+**Build cost, paid and verified:** `cmake`, `make`, `g++` at build time only —
+libopus links statically, so nothing is needed at run time. One cached layer in
+the Dockerfile builder (the shipped distroless image builds, the binary starts,
+36.6 MB); the lab pods now build from `lab/Dockerfile.rust`; **CI unchanged**
+because `ubuntu-latest` carries all three. The `make` requirement was found by
+building the image, not assumed — cmake alone fails with
+`CMAKE_MAKE_PROGRAM is not set`.
+**What the wrapper adds over raw FFI:** mono and the five legal rates enforced
+by name; `frame_samples` reads the packet TOC so an undersized buffer is a named
+error *before* the decode; libopus error codes rendered through
+`opus_strerror`; and **`conceal()` passes a NULL packet so Opus's own PLC
+handles Opus loss** rather than the G.711 Appendix I concealer. An empty packet
+is a distinct error from concealment, so the two cannot be confused at a call
+site.
+**Verified:** tone round-trip at all five rates with exact frame counts,
+silence quiet, libopus concealing a lost frame, malformed packets erroring
+rather than crashing, a decoder moving between threads, and — the bar for a
+speech codec — real lab speech round-tripped through libopus at 8 kHz
+transcribed **verbatim by Deepgram** at 9.8 kbps
+(`examples/opus_speech_probe.rs` + `ear_intelligibility_probe.py`).
 
 #### 16b. Negotiate Opus on the tap leg — ⬜ NEXT, and it is the blocker
 Nothing can tap an Opus leg until this lands, because the subscription answer

@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/opus-ffi",
     "crates/media-core",
     "crates/rtpengine-ng",
     "crates/protocol",
