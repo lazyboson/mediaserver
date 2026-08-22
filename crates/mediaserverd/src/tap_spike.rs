@@ -339,7 +339,7 @@ impl TapLeg {
         match pipeline.release() {
             Playout::Pcm(pcm) | Playout::Concealed(pcm) | Playout::Suppressed(pcm) => {
                 if let Some(hub) = hub {
-                    hub.publish(TapEvent::media(*track, timestamp_ms, pcm, true));
+                    hub.publish(TapEvent::media(*track, timestamp_ms, pcm));
                 }
                 append_within_capacity(samples, *capacity_samples, pcm, stats)
             }
@@ -347,12 +347,7 @@ impl TapLeg {
                 stats.underruns += 1;
                 if let Some(hub) = hub {
                     let quiet = frame_samples.min(SILENCE.len());
-                    hub.publish(TapEvent::media(
-                        *track,
-                        timestamp_ms,
-                        &SILENCE[..quiet],
-                        true,
-                    ));
+                    hub.publish(TapEvent::media(*track, timestamp_ms, &SILENCE[..quiet]));
                 }
                 if samples.len() + frame_samples > *capacity_samples {
                     stats.capture_full = true;
