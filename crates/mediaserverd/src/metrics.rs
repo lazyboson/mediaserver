@@ -436,6 +436,7 @@ mod tests {
             cookie_prefix: 1,
             sdp_session_id: 1,
             recording: crate::recorder::RecordingSupport::default(),
+            capabilities: Arc::new(crate::rtpengine_capability::NodeCapabilityLog::new(true)),
         });
         MetricsSources {
             tap: plane.metrics(),
