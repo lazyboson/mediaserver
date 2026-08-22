@@ -34,12 +34,48 @@ groups:
         expr: rate(mss_events_failed_total[5m]) > 0
         for: 2m
         labels:
-          severity: critical
+          severity: warning
         annotations:
           summary: "The Kafka broker is refusing MediaEvents"
           description: >-
-            Delivery is at-most-once, so every failure here is a lost event.
-            Check broker health before anything else.
+            Failed publish attempts are retried from the pump backlog, so a
+            short blip costs nothing but latency. Sustained failure fills the
+            backlog and then loses the oldest events; check broker health
+            before mss_events_dropped_oldest_total starts moving.
+
+      - alert: MssEventBacklogDroppingOldest
+        expr: rate(mss_events_dropped_oldest_total[5m]) > 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "The event retry backlog is full and losing its oldest events"
+          description: >-
+            The broker has been unreachable long enough to fill the pump
+            backlog on {{ $labels.instance }}. Events are now lost, oldest
+            first; downstream sees holes in the per-session seq.
+
+      - alert: MssEventBacklogDeep
+        expr: mss_events_retry_depth > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "MediaEvents have been waiting to publish for five minutes"
+          description: >-
+            The pump is retrying and not draining. Events are still safe in
+            memory, but they are late — and a pod restart would lose them.
+
+      - alert: MssEventsAbandoned
+        expr: increase(mss_events_abandoned_total[10m]) > 0
+        labels:
+          severity: critical
+        annotations:
+          summary: "A pump shut down with unsent MediaEvents"
+          description: >-
+            mediaserverd stopped while the bus was still refusing events, so
+            the backlog was discarded. Expect seq holes for the sessions that
+            were live at shutdown.
 
       - alert: MssRegistryOutboxDropping
         expr: rate(mss_events_outbox_dropped_total[5m]) > 0

@@ -163,6 +163,13 @@ pub fn render(sources: &MetricsSources) -> String {
         "Deepest single consumer queue",
         snapshot.consumer_queue_depth_max,
     );
+    if let Some(pump) = &sources.pump {
+        gauge(
+            "mss_events_retry_depth",
+            "Events waiting in the pump backlog for a retry",
+            pump.retry_depth.load(Ordering::Relaxed),
+        );
+    }
     gauge(
         "mss_registry_sessions",
         "Sessions the control-plane registry holds",
@@ -198,13 +205,28 @@ pub fn render(sources: &MetricsSources) -> String {
         );
         counter(
             "mss_events_failed_total",
-            "Events the broker refused",
+            "Publish attempts the broker refused; each one is retried",
             pump.failed.load(Ordering::Relaxed),
         );
         counter(
+            "mss_events_retried_total",
+            "Republish attempts made after a refusal",
+            pump.retried.load(Ordering::Relaxed),
+        );
+        counter(
             "mss_events_dropped_total",
-            "Events dropped because the pump queue was full",
+            "Events dropped because the pump handoff queue was full",
             pump.dropped.load(Ordering::Relaxed),
+        );
+        counter(
+            "mss_events_dropped_oldest_total",
+            "Unsent events evicted because the retry backlog hit its cap",
+            pump.dropped_oldest.load(Ordering::Relaxed),
+        );
+        counter(
+            "mss_events_abandoned_total",
+            "Unsent events discarded when the pump stopped with the bus still refusing",
+            pump.abandoned.load(Ordering::Relaxed),
         );
     }
     if let Some(keeper) = &sources.keeper {
@@ -348,6 +370,10 @@ mod tests {
         for name in [
             "mss_consumer_dropped_oldest_total",
             "mss_events_dropped_total 3",
+            "mss_events_dropped_oldest_total",
+            "mss_events_abandoned_total",
+            "mss_events_retried_total",
+            "mss_events_retry_depth",
             "mss_events_failed_total",
             "mss_events_outbox_dropped_total",
             "mss_registry_lost_total",
@@ -381,6 +407,7 @@ mod tests {
         sources.keeper = None;
         let text = render(&sources);
         assert!(!text.contains("mss_events_published_total"));
+        assert!(!text.contains("mss_events_retry_depth"));
         assert!(!text.contains("mss_registry_persisted_total"));
         assert!(text.contains("mss_sessions_live"));
     }

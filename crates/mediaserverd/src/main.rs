@@ -33,6 +33,7 @@ const LOCAL_MEDIA_IP_ENV: &str = "MSS_TAP_LOCAL_IP";
 const METRICS_LISTEN_ENV: &str = "MSS_METRICS_LISTEN";
 const AUTH_TOKEN_ENV: &str = "MSS_AUTH_TOKEN";
 const DEFAULT_POD_NAME: &str = "mediaserverd";
+const EVENT_FLUSH_WINDOW: std::time::Duration = std::time::Duration::from_secs(10);
 
 fn main() {
     tracing_subscriber::fmt()
@@ -319,13 +320,25 @@ async fn serve_control_plane(listen: SocketAddr) {
         );
     }
     if let Some((worker, counters)) = pump_worker {
+        let unsent = event_pump::await_empty_backlog(&counters, EVENT_FLUSH_WINDOW).await;
+        if unsent > 0 {
+            warn!(
+                unsent,
+                "the event backlog did not drain within the shutdown window"
+            );
+        }
         worker.abort();
         info!(
             published = counters
                 .published
                 .load(std::sync::atomic::Ordering::Relaxed),
             failed = counters.failed.load(std::sync::atomic::Ordering::Relaxed),
+            retried = counters.retried.load(std::sync::atomic::Ordering::Relaxed),
             dropped = counters.dropped.load(std::sync::atomic::Ordering::Relaxed),
+            dropped_oldest = counters
+                .dropped_oldest
+                .load(std::sync::atomic::Ordering::Relaxed),
+            unsent,
             "event bus totals at shutdown"
         );
     }
