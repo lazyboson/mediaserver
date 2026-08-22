@@ -98,15 +98,17 @@ pub async fn run(
                 let Some(event) = event else { break };
                 sequence += 1;
                 let message = match event {
-                    TapEvent::Media { track, timestamp_ms, len, bytes } => {
+                    TapEvent::Media { track, timestamp_ms, len, samples } => {
                         stats.media_sent += 1;
+                        let mut ulaw = [0u8; crate::hub::MAX_FRAME_SAMPLES];
+                        let encoded = g711::encode_into(true, &samples[..len], &mut ulaw);
                         encode(&Outbound::Media {
                             sequence_number: sequence.to_string(),
                             stream_sid: config.stream_sid.clone(),
                             media: MediaPayload {
                                 track: track_name(track).to_string(),
                                 timestamp: timestamp_ms.to_string(),
-                                payload: BASE64.encode(&bytes[..len]),
+                                payload: BASE64.encode(&ulaw[..encoded]),
                             },
                         }, "media")?
                     }
@@ -260,18 +262,18 @@ mod tests {
     }
 
     #[test]
-    fn media_events_carry_ulaw_encoded_frames() {
-        match TapEvent::media(Track::Customer, 40, &pcm_frame(0), true) {
+    fn media_events_carry_the_pcm_the_pipeline_released() {
+        match TapEvent::media(Track::Customer, 40, &pcm_frame(0)) {
             TapEvent::Media {
                 track,
                 timestamp_ms,
                 len,
-                bytes,
+                samples,
             } => {
                 assert_eq!(track, Track::Customer);
                 assert_eq!(timestamp_ms, 40);
                 assert_eq!(len, 160);
-                assert_eq!(bytes[0], g711::linear_to_ulaw(0));
+                assert_eq!(samples[..len], pcm_frame(0));
             }
             _ => panic!("expected media"),
         }
@@ -310,7 +312,7 @@ mod tests {
         };
         let consumer = tokio::spawn(run(config, subscription, None, None));
 
-        hub.publish(TapEvent::media(Track::Agent, 20, &pcm_frame(0), true));
+        hub.publish(TapEvent::media(Track::Agent, 20, &pcm_frame(0)));
         tokio::time::sleep(Duration::from_millis(50)).await;
         drop(hub);
 
