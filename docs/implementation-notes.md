@@ -22,10 +22,59 @@ map to the milestones in [roadmap.md](roadmap.md) and README.
   decode tables in-tree. µ-law has two zero codes (0xFF canonical, 0x7F);
   our encoder canonicalizes to 0xFF.
 
-### jitter.rs — scaffold; the M2/M3 hardening list
-Current: fixed target depth, sequence-only ordering, 64-slot ring,
-G.711-sized slots (480 B), duplicate/late/loss/reset accounting,
+### jitter.rs — hardened 2026-08-22 (tasks item 17, defect D7)
+Current: adaptive target depth from observed inter-arrival jitter,
+timestamp-aware gap classification, explicit stream restart, 64-slot ring,
+G.711-sized slots (480 B), duplicate/late/loss/reset/silence accounting,
 wraparound-safe.
+
+Two constructors, deliberately:
+- `JitterBuffer::new(target)` is the **fixed-depth, timing-agnostic** form
+  (`timestamp_increment: 0`, ceiling == floor). Adaptation and gap
+  classification are inert, which is why every playout-semantics test below
+  still reads exactly as it did before the hardening.
+- `JitterBuffer::with_config(JitterConfig)` is what `StreamPipeline` builds:
+  floor = the caller's `target_depth_packets`, ceiling = 4× that (hard-capped
+  at `CAPACITY / 2` so the reorder grace can never deadlock playout), and
+  `timestamp_increment` = samples per packet.
+
+Timing is a **parameter, never a clock** (Article II): `push_timed` takes
+`Timing { timestamp, arrival_ticks, marker }`, where `arrival_ticks` is a
+monotonic count in the stream's own sample-clock units. `StreamPipeline`
+converts the caller's arrival micros; `pipeline.ingest` without an arrival
+passes `arrival_ticks = timestamp`, which is exactly the statement "this
+replay models a perfectly paced network" — one code path, zero jitter
+measured, gap classification still live.
+
+- **Adaptive depth.** RFC 3550's interarrival estimate
+  (`J += (|D| - J)/16`, `D` = arrival delta minus timestamp delta) is kept
+  in `Stats.jitter_ticks`. The target is
+  `floor + ceil(3·J / timestamp_increment)`, clamped to the ceiling. It
+  **rises immediately and shrinks one packet at a time** after 250
+  consecutive packets that wanted less (`the_target_depth_shrinks_only_after_a_long_quiet_spell`);
+  raising the target never re-primes, so growing the cushion costs an
+  underrun, not a re-priming gap. Only packets that advance `max_seq` feed
+  the estimate: reordered arrivals would inflate it, and telephone-event
+  packets freeze the RTP timestamp during a press, which would blow it up.
+- **Timestamp-aware gaps.** When a sequence gap opens, the buffer asks
+  whether more time elapsed than the missing packets could carry:
+  `unexplained = (ts - last_ts) - span·increment`. If `unexplained` is a
+  whole packet or more (or the marker bit says talkspurt-start and any time
+  is unexplained), the skipped sequence numbers are filled as silence,
+  counted in `Stats.silence_gaps`, and `push_timed` returns
+  `BufferedAfterSenderSilence`; loss is untouched. Otherwise the gap is
+  loss, exactly as before. Pinned by
+  `a_gap_the_timestamps_explain_is_silence_not_loss` and
+  `a_gap_the_timestamps_do_not_explain_is_still_loss`.
+- **`restart()`** is the explicit stream discontinuity, used by the pipeline
+  on an SSRC change. It re-anchors on the next packet, so a new sender at a
+  *nearby* sequence number no longer produces a run of `TooLate` drops (the
+  defect item 14 handed over); it counts a `reset`, so
+  `mss_jitter_resets_total` and `mss_legs_ssrc_changes_total` keep moving
+  together. The cost is the same as the old sequence-jump reset: audio
+  already buffered for the old sender is dropped
+  (`a_new_ssrc_at_a_nearby_sequence_restarts_instead_of_dropping_late`
+  pins the count).
 
 Playout semantics as decided (each pinned by a test named after it):
 - `depth()` is occupancy of the `play_seq..=max_seq` span and returns **0**
@@ -52,12 +101,14 @@ Playout semantics as decided (each pinned by a test named after it):
   `Accounted` for it, and `lost` counts only real gaps. This closed the
   IVR-inflates-loss finding from the lab; the DTMF-on-a-clean-link
   acceptance test lives in pipeline.rs.
-- **M2:** adaptive target depth driven by observed inter-arrival jitter.
-- **M2:** timestamp-aware gap handling so silence-suppression gaps
-  (marker bit, big TS jump, small seq jump) are not misread as loss.
-- **M3:** PLC hook on `PopOutcome::Lost` (G.711 Appendix I style repeat/
-  attenuate; Opus PLC comes free with the decoder later).
+- ~~**M2:** adaptive target depth~~ — landed 2026-08-22.
+- ~~**M2:** timestamp-aware gap handling~~ — landed 2026-08-22.
+- ~~**M3:** PLC hook on `PopOutcome::Lost`~~ — landed 2026-08-22 (plc.rs).
 - **M3:** slot sizing revisit when Opus lands (payloads up to ~1275 B).
+- **Still open:** the adaptive ceiling is a multiple of the configured floor
+  rather than a millisecond budget, and nothing yet *reports* the chosen
+  depth per leg beyond `Stats.target_depth` (exported only in the
+  `tap leg finished` line, not as a gauge).
 
 ### pipeline.rs — one tapped stream, end to end, sans-IO
 `StreamPipeline` is the whole per-stream ingest path as a state machine:
@@ -74,10 +125,32 @@ the DTMF detector and the G.711 decode, and allocates nothing per packet
   `telephone_events_never_reach_the_audio_path` is the guard.
 - An unexpected payload type is counted and dropped, never decoded:
   mediagateway's codec mismatch silently passed garbage bytes through.
-- Loss is `Playout::Concealed` filled with silence, counted separately
-  from `Playout::Pcm`, so a caller writing a recording keeps timing while
-  the metric still says "this was a gap, not audio". **M3:** replace the
-  silence fill with real PLC — the variant is the seam for it.
+- Loss is `Playout::Concealed`, counted separately from `Playout::Pcm`, so a
+  caller writing a recording keeps timing while the metric still says "this
+  was a gap, not audio". Since 2026-08-22 the fill is **real PLC** (plc.rs),
+  not silence — `conceals_a_dropped_packet_with_plc_audio_and_counts_it`.
+- **Comfort noise (payload type 13, RFC 3389/3551 static) is accounted, not
+  decoded**: the sequence number is occupied and played out as
+  `Playout::Suppressed` silence, so a caller that suppresses audio during a
+  silence period neither inflates `jitter_lost` nor collapses the recording's
+  wall-clock timing. Counted as `PipelineStats.comfort_noise`. This is the
+  same trick that closed the DTMF-inflates-loss finding, applied to the other
+  in-band non-audio payload we actually see.
+- **Arrival time comes from the caller.** `ingest_at(datagram, micros)` is
+  the production entry point (the tap leg passes monotonic micros since the
+  leg's epoch, read once per datagram); `ingest(datagram)` is the replay
+  entry point and means "arrived perfectly paced". The pipeline converts
+  micros to the stream's sample-clock ticks — media-core still owns no clock.
+- **An SSRC change restarts the buffer and forgets the PLC history.**
+  `last_audio_ssrc` is still assigned **before** the push (item 14's
+  invariant: leg identity survives a restart), and the first packet of the
+  new sender reports `IngestOutcome::Resynchronized` whatever its sequence
+  number. Two interleaved SSRCs on one leg will therefore restart per packet
+  — that pathology already produced garbage before this change (see the
+  dual-SSRC note in lab.md); it is not made worse, and the leg-renaming
+  hysteresis lives in `tap_spike.rs`, not here.
+- A talkspurt that resumes after sender silence also forgets the PLC
+  history, so concealment can never resurrect audio from before a pause.
 - Known limitation, pinned by
   `reorder_before_playout_starts_strands_the_earlier_packet`: playout
   anchors on the first packet that arrives, so if the first two packets of
@@ -86,6 +159,43 @@ the DTMF detector and the G.711 decode, and allocates nothing per packet
   make start-of-stream reorder recoverable. Deferred because it changes
   jitter admission on the sacred path and wants its own benchmark.
 
+### plc.rs — packet loss concealment, G.711 Appendix I shape (landed 2026-08-22)
+
+`PacketLossConcealer` is the concealment G.711 Appendix I describes, adopted
+as an algorithm rather than invented: keep a history of recent output, find
+its pitch period, repeat that period for as long as the gap lasts, hold the
+first 10 ms unattenuated, fade linearly to silence by 60 ms, and cross-fade
+back into the first real frame. Article XI says adopt DSP rather than
+reimplement it; this is arithmetic (AMDF search, integer gain ramp, linear
+cross-fade) with no codec table in it, so it is implemented in-tree from the
+published algorithm's shape — the same shape spandsp's `plc.c` carries.
+
+- **Fixed buffers, no allocation on the packet path**: 100 ms history ring
+  (800 samples), a 320-sample linear search window, a 160-sample period
+  buffer. Pitch search runs **only on the first frame of a gap**: AMDF over
+  a 20 ms span against lags of 40–160 samples (200 Hz–50 Hz). The window is
+  copied out of the ring first so the inner loop indexes linearly instead of
+  paying a modulo per sample.
+- Pitch bounds and the fade points are derived from the format's sample rate
+  and clamped into the fixed arrays, so an odd rate degrades rather than
+  panicking (`unusual_sample_rates_stay_inside_the_fixed_buffers`). G.711 is
+  8 kHz by definition; the constants are chosen for it.
+- Concealed output is fed back into the history (spandsp does the same), so a
+  long burst keeps a coherent signal to repeat and the fade is monotone.
+- `forget()` is how the pipeline says "the signal before this point is not
+  continuous with what comes next": comfort noise, a DTMF suppression frame,
+  a talkspurt resuming after silence, a reset, an SSRC change.
+- Tests pin each clause of the algorithm:
+  `conceals_by_repeating_the_detected_pitch_period` (unattenuated head is a
+  sample-exact repeat), `a_burst_fades_to_silence_by_sixty_milliseconds`,
+  `the_first_frame_after_a_gap_is_crossfaded_not_spliced`,
+  `with_no_history_concealment_is_silence`.
+- **Not done:** no listening test yet, and no comparison against a reference
+  Appendix I implementation's output. What is measured is the algorithm's
+  structure, not its perceptual quality; the ASR-as-judge probe
+  (`lab/ear_intelligibility_probe.py`) under `tc netem` burst loss is the
+  cheap next step.
+
 ### replay.rs — the packet-replay harness (Article III)
 - `G711StreamGenerator` emits deterministic G.711 streams whose payload
   bytes are a counter, so decoded output is exactly assertable; it can
@@ -93,6 +203,20 @@ the DTMF detector and the G.711 decode, and allocates nothing per packet
   sequence gap.
 - `disturb(datagrams, script)` applies `Deliver / Drop / DeliverTwice /
   DelayOne` to model loss, duplication and reorder in one reusable place.
+- Added for the jitter hardening (item 17): `suppress_silence(packets)`
+  advances the RTP timestamp without the sequence number and sets the marker
+  bit on the next packet — a sender going quiet and starting a new talkspurt;
+  `next_comfort_noise_datagram(level)` emits a payload-type-13 packet.
+  `disturb` deliberately still models *order and multiplicity only* — arrival
+  time is a per-packet argument to `ingest_at`, so a test that needs modelled
+  jitter supplies its own arrival schedule (see
+  `arrival_jitter_without_loss_grows_the_cushion_and_plays_everything`).
+- `pipeline.rs`'s `impairment_matrix` test module drives these against a
+  **lag-based pacer**: playout trails the arrival clock by the target depth,
+  which is what a wall-clock pacer does. A one-release-per-datagram loop is
+  *not* equivalent — it gives a duplicate its own release slot and drains the
+  cushion, which made duplication look like late arrival. If a new impairment
+  test reports impossible counters, check the pacer model first.
 - `DatagramLog` reads a length-prefixed (`u32` big-endian) log of raw
   datagrams from a byte slice, with malformed logs surfaced as
   `ReplayError`, not panics. It takes a slice rather than a path because
@@ -480,6 +604,13 @@ How the numbers get out of the media world without locks or allocation:
 `deploy/prometheus-alerts.yaml` carries the alert rules: every drop counter
 (consumer frames, event queue, publish failures, outbox), watchdog stalls,
 jitter loss ratio, and the split-brain signal `mss_registry_lost_total`.
+
+Since the jitter hardening (item 17) there is also
+`mss_jitter_silence_gaps_total` — sequence numbers a sender's silence
+explains. It has no alert rule on purpose: it is normal traffic on any leg
+whose endpoint does silence suppression. Its value is that
+`MssJitterLossHigh` got *quieter and more honest* — those gaps used to land
+in `mss_jitter_lost_total`.
 
 The SSRC re-resolution series (2026-08-22) are meant to be read as one
 sequence: `mss_legs_ssrc_changes_total` (a leg's sender changed),
@@ -1142,7 +1273,31 @@ not the production Linux/x86 target, so treat these as order-of-magnitude:
 | `ingest_only_per_packet` (parse + jitter push) | 10.89 µs | **10.9 ns** |
 | `parse_jitter_decode_per_packet` (+ pop + G.711 decode) | 164.9 µs | **165 ns** |
 
-Reading: decode dominates the sans-IO path (~154 of the 165 ns). One
+Re-measured 2026-08-22 for the jitter hardening (tasks item 17) on the
+development machine — **WSL2 on Windows, 11th-gen Intel i7-1165G7, 8 cores
+allotted, x86_64, rustc 1.95.0 (the pinned toolchain)**. Both columns come
+from the same machine and the same criterion invocation, minutes apart, so
+the delta is meaningful even though neither number is comparable to the M2
+row above:
+
+| Benchmark (per packet) | Before item 17 | After item 17 | Delta |
+| --- | --- | --- | --- |
+| `ingest_only_per_packet` | 16.3 ns | **25.6 ns** | +52% |
+| `parse_jitter_decode_per_packet` | 240.9 ns | **269.8 ns** | +10% |
+
+The Article-VIII bar is 2× per packet; the full path moved 10%. The ingest
+half costs ~9 ns more because every admitted packet now updates the RFC 3550
+estimate and recomputes the target depth (that recompute carries an integer
+division). It was left per-packet rather than batched: at 50 packets/s per
+leg, 9 ns is 0.45 µs of CPU per second per 1000 legs, and a per-packet target
+is easier to reason about than a periodically-refreshed one. The decode path
+grew ~29 ns, mostly the PLC history memcpy (320 bytes per frame) — the pitch
+search does not run on a clean stream. Neither benchmark exercises loss, so
+concealment cost is unpriced; the AMDF search is ~19k integer ops once per
+gap, which is tens of microseconds against a 20 ms pacing deadline.
+
+Reading of the original M2 run: decode dominates the sans-IO path (~154 of
+the 165 ns). One
 G.711/20 ms leg is 50 packets/s, so a leg costs ~8.3 µs of CPU per second
 and a two-leg passive session ~16.5 µs/s — about 0.002% of one core.
 
