@@ -221,6 +221,7 @@ services:
       CARGO_TARGET_DIR: /target
       RUST_LOG: info
       MSS_CONTROL_LISTEN: 0.0.0.0:50551
+      MSS_METRICS_LISTEN: 0.0.0.0:9464
       MSS_POD_NAME: lab-control
       MSS_RTPENGINE_NODE: 172.31.99.10:22222
       MSS_TAP_LOCAL_IP: 172.31.99.31
@@ -234,6 +235,7 @@ services:
       MSS_RECORDING_SPILL_DIR: /out/recordings
     ports:
       - "50551:50551"
+      - "9464:9464"
     networks:
       lab:
         ipv4_address: 172.31.99.31
