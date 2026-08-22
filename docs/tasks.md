@@ -13,7 +13,7 @@ Status as of **2026-08-22**.
 | **M1 — scaffold** | workspace, sans-IO cores (RTP, G.711, DTMF, jitter), NG bencode, consumer dialects, two-world daemon skeleton, watchdog | ✅ done (2026-08-13) |
 | **M2 — Phase-0 spike** | real NG subscribe against lab rtpengine, both legs jitter-buffered to WAV, per-tap cost | ✅ **code done**; 3 org-side items open (below) |
 | **M3 — fan-out hub** | per-session pub/sub, N consumers, WS-Twilio adapter, pause/resume/send_text parity | ✅ done |
-| **M4 — control plane** | `MediaControl` gRPC, session state machine, Kafka events, Redis registry, tenant-flag pilot | 🔶 **code complete** — pilot gates: translator merge (external), barge-in number (item 5), live pod-kill drill (item 11). The gRPC lab proof (item 10) is **done 2026-08-22** |
+| **M4 — control plane** | `MediaControl` gRPC, session state machine, Kafka events, Redis registry, tenant-flag pilot | 🔶 **code complete** — pilot gates: translator merge (external), barge-in number (item 5). The gRPC lab proof (item 10) and the **live pod-kill drill (item 11, gap 14.41 s)** are both **done 2026-08-22**; the drill left D14 open (orphan subscription after a pod death) |
 | **M5 — recording (Phase 2)** | per-leg taps → stereo segmenter → S3, identity + callback contract, dual-recording | 🔶 **code complete (2026-08-22)** — a live tapped call recorded end to end to a real MinIO, callbacks read off `mss.events` (2026-08-22, item 10's drill); owed: FS byte-parity sign-off (harness exists) |
 | M6+ | Phases 3–4 (interactive media, full media plane) | ⬜ not started |
 
@@ -53,7 +53,9 @@ Status as of **2026-08-22**.
   control-plane CLI, `mss_events_tail` bus consumer, `mss_stream_probe` gRPC
   consumer and `grpc_stream_drill.sh` (item 10) which taps a live call over
   the gRPC data plane, records it to S3 and scrapes the metrics in one
-  command.
+  command. Since item 11 the stack also runs **three MSS pods** on one Redis,
+  and `pod_kill_drill.sh` kills the owning one mid-call and measures the
+  consumer's audio gap (`gap_consumer.py`, `ng_call_tags.py`).
 
 ## Next up — ordered
 
@@ -116,7 +118,7 @@ created the session.
 `StartStream` call produces the same session/attachment shape as the
 equivalent native calls.
 
-### 3. Redis session registry + re-subscribe on pod loss — ✅ DONE (2026-08-17)
+### 3. Redis session registry + re-subscribe on pod loss — ✅ DONE (2026-08-17), live pod-kill observed 2026-08-22
 `session_store.rs` (namespaced keys, TTL'd leases, atomic `SET NX` claim) plus
 `registry_keeper.rs` (persist, renew, adopt, release). Adoption rebuilds through
 the controller's own API so every invariant applies to a rebuilt session, and
@@ -124,9 +126,10 @@ the controller's own API so every invariant applies to a rebuilt session, and
 including six pods racing for one orphan producing exactly one owner, and on a
 live lab call. Sessions with no call identity are released rather than
 half-restored; ended sessions are forgotten so no pod adopts a dead call.
-**Still to prove:** the exit criterion wants a real pod kill mid-call observed
-end to end (two daemons against one Redis), not just the unit and store-level
-proofs.
+**Proved on 2026-08-22 (item 11):** three pods on one Redis, `kill -9` on the
+owner mid-call, one survivor adopted 14.6 s later and the consumer's audio
+resumed after a **14.41 s** gap. What the same run showed missing is D14: the
+dead pod's rtpengine subscription is never cancelled.
 
 ### 3b. (original description, for reference)
 **Where:** `crates/mediaserverd` (new module) + `session-core` stays sans-IO.
@@ -324,32 +327,52 @@ stays 0. Remember `MSS_AUTH_TOKEN` unset = open lab mode.
 **Done when:** a live tapped call is intelligible from a gRPC/L16-16k
 consumer's WAV, and the run's metrics scrape is pasted into the PR.
 
-### 11. Pod-kill re-subscribe drill (Phase-1 exit criterion)
-**Where:** `lab/`, no product code expected.
-**What:** the Redis registry (item 3) was proven at store level; the exit
-criterion wants a real kill observed end to end.
-**Direction:** two `mediaserverd` processes against one Redis (distinct
-`MSS_POD_NAME`, distinct control ports, same `MSS_REDIS_URL`); live call
-tapped by pod A with a WS consumer attached; `kill -9` pod A mid-call;
-pod B's keeper adopts within the lease TTL (15 s) and re-subscribes.
-Measure the audio gap in the consumer's artifact (silence run length),
-assert exactly one adopter (`mss_registry_adopted_total`), zero
-`mss_registry_lost_total`, and no orphan subscription left in rtpengine
-(NG `query` before/after).
-**Done when:** the drill script lives in `lab/`, the measured gap is
-recorded here, and [lab.md](lab.md) documents the procedure.
-**What item 10's session leaves you** (read its lab.md section first):
-`lab/grpc_stream_drill.sh` already does call discovery → `mss_ctl create` →
-attach → metrics scrape → destroy, so the kill drill is that script plus a
-second daemon and a `kill -9`; `mss_stream_probe` is a better consumer than
-the WS mock for measuring a gap, because it prints per-track sample counts
-and its wav is a silence-run measurement away from the answer. Two traps
-that cost that session real runs: a re-subscribe lands **inside**
-rtpengine's duplicate-cookie window, which was D12 and is fixed — if you see
-a leg with `datagrams: 0` and healthy `underruns`, suspect a stale cached NG
-answer again before anything else; and the compose `mediaserverd` service
-(the Phase-0 spike) must stay **down**, or it taps the same call from its own
-process.
+### 11. Pod-kill re-subscribe drill (Phase-1 exit criterion) — ✅ DONE (2026-08-22)
+**What shipped:** `lab/pod_kill_drill.sh`, plus two instruments it needed —
+`lab/gap_consumer.py` (a WS_TWILIO consumer built to measure an outage: it
+stamps every frame's arrival, survives the reconnect, and writes one wav per
+track on an arrival timeline so the outage is a run of samples no frame ever
+covered) and `lab/ng_call_tags.py` (asks rtpengine `query` how many taps a
+call carries). `docker-compose.microsip.yml` gained `mss-control-b` and
+`mss-control-c`: three pods on one Redis, differing only in pod name,
+published ports and tap address. **Two** survivors on purpose — with one
+candidate, "exactly one adopter" is a tautology.
+**The measured gap: 14.41 s** (longest arrival gap 14407 ms, longest
+uncovered run 14380 ms, identical on all three tracks; the WS connection was
+dead 14.35 s). Adoption landed 14.6 s after `kill -9`, by pod C. Two earlier
+runs of the same drill: 19.55 s / 19.7 s and 17.97 s / 18.6 s. All three sit
+inside the arithmetic the design implies — lease 15 s renewed every 5 s, adopt
+sweep every 10 s, so **worst case 25 s**.
+**The three assertions, as measured:** exactly one adopter
+(`mss_registry_adopted_total` 1 → 2 on pod C, unchanged on pod B); zero
+`mss_registry_lost_total` on both survivors (and zero `unrebuildable`, zero
+`failed`); **the orphan assertion failed** — see D14 below. The rebuilt tap
+was healthy, not merely present: Customer 5551 / Agent 5640 datagrams,
+`jitter_lost: 0`, `frames_concealed: 0`, `recv_errors: 0`,
+`dropped_oldest: 0`, both legs named. Procedure, tables and the rtpengine
+teardown evidence are in [lab.md](lab.md).
+**It found a defect (D14, filed not fixed).** The adopter creates a new
+subscription and nothing cancels the dead pod's: the tap's `to-tag` is not
+persisted, so no survivor can. rtpengine's teardown block priced it —
+**14,743 packets / 2.5 MB copied to a pod that had been dead for 110 s**,
+four ports held until the call ended. The fix needs a new seam (persist the
+to-tag; `unsubscribe` it on adopt) plus a decision about a
+partitioned-but-alive owner, which is more than this lab item should land.
+**Two instrument findings worth reusing** (both in lab.md): rtpengine
+`query` does **not** show a *lone* subscription — both taps appeared only
+once a second `subscribe` touched the call, so a 0 from `ng_call_tags.py`
+means "0 or 1" — and a query reply's `stats_out`/`last packet` are stale,
+while the teardown "Final packet stats" block has the real totals. Under
+Docker Desktop on WSL2 the pods reach a host-run consumer at
+`host.docker.internal`, not at the lab bridge gateway (refused) and not at
+`ADVERTISED_IP` (times out).
+**Also filed:** D15 — an adopted attachment loses its negotiated format
+(`PersistedAttachment` has no format field). Found by reading the adoption
+path, not observed, since this drill's consumer was WS/PCMU.
+**Not covered:** the D9 half of a pod death — a recording buffered in the
+dead pod's memory is still lost, and the adopter starts a new segment; this
+drill attached no recorder. And the gap is a lab number on an idle box; the
+soak suite (item 19) should re-measure it under load.
 
 ### 12. Barge-in cut-through measurement
 Item 5 above, unchanged — still gated on the cigol translator merge
@@ -653,6 +676,16 @@ Article VIII requires it after any pipeline change (items 14/17 are that).
 **Done when:** one green soak run is recorded in testing.md with its
 numbers, and the script fails loudly on any assertion so CI or a cron can
 own it later.
+**What item 11 leaves you:** the compose stack now has three pods
+(`mss-control`, `-b`, `-c`) on one Redis and one Redpanda, so a soak can hold
+sessions on several pods at once; `pod_kill_drill.sh` is a reusable shape for
+"do a thing to a live call and assert on `/metrics` afterwards" (preflight
+that the Phase-0 spike is down, call discovery from `call_watcher`, metric
+deltas rather than absolutes, artifacts stamped into `lab/out/`); and
+`gap_consumer.py` is the cheap way to assert continuity — its per-track
+longest-arrival-gap is exactly the number a soak wants to stay near 20 ms.
+Re-measure the pod-kill gap under load while you are there: 14.41 s was
+measured on an idle box.
 
 ## Open defects and soft spots
 
@@ -670,6 +703,8 @@ own it later.
 | ~~D7~~ | ~~Jitter buffer: fixed target depth, no adaptive sizing, no timestamp-aware gap handling, silence instead of real PLC~~ — **fixed 2026-08-22 (item 17)**: adaptive depth from the RFC 3550 estimate, timestamp-aware silence gaps, comfort noise accounted, G.711 Appendix I-shaped PLC, restart on SSRC change. Replay-verified across the impairment matrix; **not** yet verified against `tc netem` or judged perceptually | `jitter.rs`, `pipeline.rs`, `plc.rs` | closed |
 | D8 | `owner_pod` is a config string; real placement and load-aware scheduling do not exist | `main.rs` | low until multi-pod |
 | ~~D12~~ | ~~**NG cookies repeat across sessions on one pod**: `CookieSequence` restarted its serial at 0 and `TapPlane` binds a new `NgTransport` per session, so every session's first command was `<prefix>-0`. Two sessions inside rtpengine's duplicate-cookie reply-cache window get the *same cached subscribe answer*, and the second tap receives **no media at all** while looking healthy~~ — **fixed 2026-08-22 (item 10)**: the serial is process-wide, unit-pinned and lab-proved before/after | `ng_transport.rs` | closed — was **high**, it silently broke every second tap within a minute |
+| D15 | An adopted attachment loses its **negotiated format**: `PersistedAttachment` has no format field and `rebuild` passes `format: None`, so a consumer that attached as L16/16k comes back at the session default (g711 at the tap rate). Found by reading the adoption path during item 11, **not** observed — that drill's consumer was WS/PCMU, where the default is the only legal answer. A gRPC consumer would notice | `session_store.rs`, `registry_keeper.rs` | low today, medium once ASR consumers ask for L16/16k |
+| D14 | **A dead pod's rtpengine subscription is never torn down.** The adopter re-subscribes but nothing cancels the old tap: `PersistedSession` does not carry the subscription's `to-tag`, and only the pod that created it holds one. Measured in the item-11 drill from rtpengine's teardown block: **14,743 packets / 2.5 MB copied to a pod that had been dead for 110 s**, four ports held for the rest of the call — i.e. a pod death permanently doubles that call's cost on the rtpengine host, which is exactly the capacity number still open with the platform team. Fix shape: persist the to-tag, have the adopter `unsubscribe` it before subscribing, and decide what an adopter should do when the previous owner is partitioned rather than dead (`mss_registry_lost_total` is the signal) | `session_store.rs`, `registry_keeper.rs`, `tap_plane.rs` | medium — every pod restart during a call leaks one tap |
 | D13 | `StreamStart` (and the Twilio `start` frame's `tracks`) advertises `["customer","agent"]` for `TrackSelector::All`, but a silent `mixed` track is delivered too, at the full frame rate: a consumer must tolerate an unannounced track and pays 50% extra bandwidth for silence. Fixing it means either naming `mixed` in the start frame or not carrying it under `All` — the latter touches the frozen Twilio surface | `stream.rs`, `tap_plane.rs`, `hub.rs` | low for correctness, medium for cost |
 
 ## Waiting on other people (M2 close-out)
