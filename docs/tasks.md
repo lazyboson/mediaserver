@@ -66,6 +66,10 @@ transcript in the same run. Confirmed against cigol's code that
 `request_uuid` is the FreeSWITCH channel UUID (it is passed straight to
 `uuid_audio_fork <uuid> start`), so `external_id` keys and shards correctly.
 Remaining: review, commit, merge, and a pilot tenant.
+**Review note added 2026-08-22 (item 13):** MSS event delivery is now
+**at-least-once**, so `handle` should dedupe on `(external_id, seq)` — it
+forwards every record today, and its `MarkMessage`/auto-commit loop can
+already replay one on a rebalance.
 
 ### 1b. (original description, for reference) cigol event translator
 **Where:** the `cigol` repo, not here (architecture §5.4 — the positional
@@ -290,20 +294,46 @@ Item 5 above, unchanged — still gated on the cigol translator merge
 budget, the fallback (a gRPC stream for speech events only) is a design
 change better known early.
 
-### 13. Event delivery durability (defect D5)
+### 13. Event delivery durability (defect D5) — ✅ DONE (2026-08-22)
 **Where:** `crates/mediaserverd/src/event_pump.rs`.
-**What:** delivery is at-most-once; a broker outage silently (but
-countedly) drops events. Before a pilot, add bounded retry with backoff:
-keep a failed event and retry it before taking the next (per-session order
-must hold — never reorder within a session), cap the buffered backlog,
-count and drop-oldest beyond it, and surface retry depth as a metric.
-**Direction:** the translator dedupes nothing today — it relies on the
-gapless seq. At-least-once is safe only if the downstream treats
-(external_id, seq) as idempotent; confirm with the translator's tests
-before switching semantics, and say which semantics shipped here.
-**Done when:** stopping Redpanda for 30 s mid-call in the lab loses zero
-events after recovery (verify with `mss_events_tail`: gapless seq), and
-the pump's totals reconcile.
+**What shipped:** a FIFO retry backlog inside the pump worker. The head is
+retried (100 ms doubling to a 5 s cap) before any newer event is attempted,
+so nothing is reordered; the worker keeps draining the handoff queue while
+it waits, so `accept` stays non-blocking; the backlog caps at 8192 and
+evicts the **oldest** unsent event beyond that, counted. Each attempt has a
+5 s timeout, and shutdown is bounded (10 s flush in `main`, then 3 attempts
+before the remainder is counted `abandoned`). New series:
+`mss_events_retried_total`, `mss_events_dropped_oldest_total`,
+`mss_events_abandoned_total`, gauge `mss_events_retry_depth`, all alerted in
+`deploy/prometheus-alerts.yaml`. `mss_events_failed_total` now counts failed
+**attempts**, not lost events.
+**Semantics shipped: at-least-once.** A retry after an ambiguous failure can
+duplicate a record, so **the cigol translator must treat `(external_id,
+seq)` as idempotent**. Checked in the translator's source on cigol branch
+`feature/mss-event-translator` (`pkg/telservice/msstranslator/consumer.go`,
+read not run): it dedupes nothing — `handle` renders and forwards every
+record — but it is *already* an at-least-once consumer, because it
+`MarkMessage`s after handling and sarama auto-commits, so a rebalance or
+crash already replays records. Our change therefore adds no new class of
+duplicate; it does make the case for a `(external_id, seq)` seen-set in
+`handle` concrete. **Flag it in the item-1 review.** No duplicate was
+observed in the drill (0 of 60), but the guarantee is at-least-once.
+**Verified against a real broker** (`lab/event_outage_drill.sh`, Redpanda
+`docker stop` for 30 s mid-run, 60 events at 1/s through the production
+`RskafkaTransport`): `accepted=60 published=60 failed=6 retried=6 dropped=0
+dropped_oldest=0 unsent=0`, seq 0-59 gapless on one partition at contiguous
+offsets, confirmed independently with `mss_events_tail`. The 6 failed
+attempts are what the old at-most-once path would have lost. The drill is
+the env-gated integration test `crates/mediaserverd/tests/kafka_outage.rs`
+(`MSS_TEST_KAFKA_BROKERS`).
+**Verified against fakes only** (unit tests, `PumpTuning` shortens the
+backoff): drop-oldest past the cap keeping the newest survivors in order, a
+transient refusal retried without a duplicate landing, a send that never
+answers, and the shutdown give-up path. **Not exercised:** a live tapped
+call during the outage — the drill drives the pump directly rather than
+through rtpengine, so it proves the pump and the transport, not the whole
+call path. Also still open by design: a pod that dies holding a backlog
+loses it (memory only, no disk spool).
 
 ### 14. Mid-call SSRC re-resolution (defect D1)
 **Where:** `crates/mediaserverd/src/tap_spike.rs` + `tap_plane.rs`.
@@ -434,7 +464,7 @@ own it later.
 | D2 | `stop_playback` stops **all** playback on the call: rtpengine's `stop media` targets a participant, not a playback id | `tap_plane.rs` | low until multiple concurrent playbacks exist |
 | D3 | `close_attachment` **aborts** the consumer task instead of closing the websocket politely (no `stop` frame) | `tap_plane.rs` | low, but consumers see a truncated stream |
 | D4 | `WS_TWILIO` and `GRPC_STREAM` attachments are served; `FILE_S3` (phase 2) and `RTP_INLINE` (phase 3) are refused by name | `tap_plane.rs` | expected — phase work |
-| D5 | Event delivery is **at-most-once**; a broker outage drops events (counted, and the gapless seq makes gaps detectable) | `event_pump.rs` | medium before pilot; **item 13** |
+| ~~D5~~ | ~~Event delivery is **at-most-once**; a broker outage drops events~~ — **fixed 2026-08-22 (item 13)**: bounded retry backlog, order preserved, drop-oldest counted. Now **at-least-once**, so the translator must dedupe by `(external_id, seq)`; a backlog past its 8192 cap or a pod death still loses events | `event_pump.rs` | closed |
 | D6 | `play media` `from-tag` semantics are **unmeasured** — architecture §6's claim was retracted after the instrument turned out to be broken (see lab.md correction) | docs + lab | low, but §6 must not be trusted until re-probed |
 | D7 | Jitter buffer: fixed target depth, no adaptive sizing, no timestamp-aware gap handling, silence instead of real PLC | `jitter.rs`, `pipeline.rs` | medium for quality under real impairment; **item 17** |
 | D8 | `owner_pod` is a config string; real placement and load-aware scheduling do not exist | `main.rs` | low until multi-pod |
