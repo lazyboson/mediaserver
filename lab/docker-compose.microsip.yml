@@ -168,6 +168,35 @@ services:
       lab:
         ipv4_address: 172.31.99.60
 
+  # Recording storage for phase 2. S3-compatible, so mediaserverd talks to it
+  # with the same object_store client it uses against real S3 -- only the
+  # endpoint and the credentials differ. The console is on 9001 if you want to
+  # click through the bucket; `mc` lives inside the container for scripting.
+  minio:
+    image: quay.io/minio/minio:latest
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    networks:
+      lab:
+        ipv4_address: 172.31.99.62
+
+  # object_store does not create buckets, and MSS deliberately does not either:
+  # a recorder that can create buckets can also create typos.
+  minio-init:
+    image: quay.io/minio/minio:latest
+    depends_on: [minio]
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - until mc alias set lab http://172.31.99.62:9000 ${MINIO_ROOT_USER:-minioadmin} ${MINIO_ROOT_PASSWORD:-minioadmin}; do sleep 1; done && mc mb --ignore-existing lab/${MSS_RECORDING_BUCKET:-lab-recordings} && mc ls lab
+    networks:
+      lab:
+        ipv4_address: 172.31.99.63
+
   redis:
     image: redis:7-alpine
     command: ["redis-server", "--save", "", "--appendonly", "no"]
@@ -181,7 +210,7 @@ services:
     image: rust:1.95-slim-bookworm
     working_dir: /build
     command: ["cargo", "run", "--quiet", "-p", "mediaserverd"]
-    depends_on: [rtpengine]
+    depends_on: [rtpengine, minio-init]
     volumes:
       - ..:/build:ro
       - lab-target:/target
@@ -197,6 +226,12 @@ services:
       MSS_TAP_LOCAL_IP: 172.31.99.31
       MSS_KAFKA_BROKERS: 172.31.99.60:9092
       MSS_REDIS_URL: redis://172.31.99.61:6379
+      MSS_RECORDING_BUCKET: ${MSS_RECORDING_BUCKET:-lab-recordings}
+      MSS_RECORDING_S3_ENDPOINT: http://172.31.99.62:9000
+      MSS_RECORDING_S3_REGION: us-east-1
+      MSS_RECORDING_S3_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-minioadmin}
+      MSS_RECORDING_S3_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin}
+      MSS_RECORDING_SPILL_DIR: /out/recordings
     ports:
       - "50551:50551"
     networks:
