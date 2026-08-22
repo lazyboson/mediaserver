@@ -11,3 +11,11 @@ updates:
     directory: /
     schedule:
       interval: weekly
+    ignore:
+      # For dtolnay/rust-toolchain the tag IS the Rust version, so a bump
+      # is a toolchain upgrade, not an action update. Toolchain bumps are
+      # deliberate: rust-toolchain.toml and the workflow refs move together
+      # in one PR (docs/implementation-notes.md, cross-cutting decisions).
+      # Dependabot once proposed 1.100.0 before that Rust version existed,
+      # which broke every toolchain job at setup (PR #14).
+      - dependency-name: dtolnay/rust-toolchain
