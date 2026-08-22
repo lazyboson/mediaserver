@@ -446,7 +446,32 @@ That is what makes `offered_format` in `rtpengine-ng` a safe question to ask.
   (`the_answer_to_an_alaw_only_offer_adds_no_codec_the_offer_did_not_carry`).
   `to_sdp` itself needed **no change**: it already puts `self.format` first and
   echoes the rest, so handing it the offered format is the whole fix.
-- **M3:** dynamic rtpmap so L16/Opus can be signalled on the tap leg.
+- ~~**M3:** dynamic rtpmap~~ — **landed 2026-08-22.** `NegotiatedCodec
+  {payload_type, encoding, clock_rate_hz}` is now what an answer is built from,
+  and it comes from one of two places, never a silent default:
+  - `OfferedStream::negotiate()` — what the offer carries. Static payload types
+    resolve through `media-core`'s table; a **dynamic** type is matched by its
+    `a=rtpmap` encoding name, which is the only way Opus can be recognised
+    because RFC 7587 says its payload type "is to be assigned dynamically".
+  - `NegotiatedCodec::from_static_format(format)` — our own configured codec,
+    which is the *transcode* shape: it puts a payload type into the answer that
+    the offer may not have carried, and that addition is what asks rtpengine to
+    convert.
+  `SubscriptionAnswer.answer_with` is **required**, not optional. An earlier
+  draft defaulted it to "negotiate from the offer", which silently broke the
+  transcode path — the caller knows which mode it is in, so it says.
+- **Three RFC 7587 rules the answer obeys, verified against the RFC rather than
+  assumed**, because §4's history is a list of answers rtpengine rejected:
+  the rtpmap clock rate **must** be 48000 and the channel count **must be 2**
+  *even for a mono stream* (mono is signalled in-band, not in the rtpmap); the
+  RTP timestamp clock is 48000 Hz "for all modes of Opus and all sampling
+  rates", which is why `NegotiatedCodec::samples_per_packet` is computed from
+  the **clock rate** and not from the audio rate we decode to; and the payload
+  type is dynamic, so the answer echoes the offer's rather than choosing one.
+  An offer advertising opus at any other clock rate is `OpusClockRate`.
+- A dynamic payload type whose rtpmap names a codec we do not decode (EVS,
+  G.722) is **skipped, not guessed**, and if nothing is left the error names
+  every offered type.
 
 ## crates/protocol — frozen wire contracts
 - `twilio.rs` and `fork_events.rs` serialization tests are the contract
