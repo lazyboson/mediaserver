@@ -23,6 +23,8 @@ pub enum SdpError {
     UnsupportedChannelCount(u8),
     #[error("format has no usable ptime/sample rate")]
     UnusableFormat,
+    #[error("offer carries no statically-typed g711 payload type: offered {0:?}")]
+    NoStaticCodecOffered(Vec<u8>),
 }
 
 pub const TELEPHONE_EVENT: &str = "telephone-event";
@@ -49,6 +51,32 @@ impl OfferedStream {
         self.rtpmaps
             .iter()
             .find(|map| map.encoding_name.eq_ignore_ascii_case(TELEPHONE_EVENT))
+    }
+
+    pub fn offered_format(&self, ptime_fallback_ms: u32) -> Result<AudioFormat, SdpError> {
+        for payload_type in &self.payload_types {
+            let Some(encoding) = Encoding::from_static_payload_type(*payload_type) else {
+                continue;
+            };
+            let sample_rate_hz = self
+                .rtpmaps
+                .iter()
+                .find(|map| map.payload_type == *payload_type)
+                .map(|map| map.clock_rate_hz)
+                .or_else(|| encoding.static_clock_rate_hz())
+                .unwrap_or_default();
+            let format = AudioFormat {
+                encoding,
+                sample_rate_hz,
+                channels: 1,
+                ptime_ms: self.ptime_ms.unwrap_or(ptime_fallback_ms),
+            };
+            if format.samples_per_packet().is_none() {
+                return Err(SdpError::UnusableFormat);
+            }
+            return Ok(format);
+        }
+        Err(SdpError::NoStaticCodecOffered(self.payload_types.clone()))
     }
 }
 
@@ -283,6 +311,115 @@ a=rtpmap:101 telephone-event/8000\r\n\
 a=sendonly\r\n\
 a=rtcp:29115\r\n\
 a=ptime:20\r\n";
+
+    const ALAW_ONLY_OFFER: &str = "v=0\r\n\
+o=- 9 9 IN IP4 10.0.0.5\r\n\
+s=rtpengine\r\n\
+c=IN IP4 10.0.0.5\r\n\
+t=0 0\r\n\
+m=audio 30004 RTP/AVP 8 101\r\n\
+a=rtpmap:8 PCMA/8000\r\n\
+a=rtpmap:101 telephone-event/8000\r\n\
+a=ptime:20\r\n\
+a=sendonly\r\n";
+
+    const OPUS_ONLY_OFFER: &str = "v=0\r\n\
+o=- 9 9 IN IP4 10.0.0.5\r\n\
+s=rtpengine\r\n\
+c=IN IP4 10.0.0.5\r\n\
+t=0 0\r\n\
+m=audio 30006 RTP/AVP 111 101\r\n\
+a=rtpmap:111 opus/48000\r\n\
+a=rtpmap:101 telephone-event/8000\r\n\
+a=ptime:20\r\n\
+a=sendonly\r\n";
+
+    #[test]
+    fn an_offer_names_the_format_the_tap_should_accept_when_nothing_is_transcoded() {
+        let offer = SubscriptionOffer::parse(TWO_LEG_OFFER).unwrap();
+
+        let customer = offer.streams[0].offered_format(20).unwrap();
+        assert_eq!(customer.encoding, Encoding::Pcmu);
+        assert_eq!(customer.sample_rate_hz, 8000);
+        assert_eq!(customer.channels, 1);
+        assert_eq!(customer.ptime_ms, 20);
+
+        let agent = offer.streams[1].offered_format(20).unwrap();
+        assert_eq!(agent.encoding, Encoding::Pcma);
+        assert_eq!(agent.ptime_ms, 20);
+    }
+
+    #[test]
+    fn the_answer_to_an_alaw_only_offer_adds_no_codec_the_offer_did_not_carry() {
+        let offer = SubscriptionOffer::parse(ALAW_ONLY_OFFER).unwrap();
+        let format = offer.streams[0].offered_format(20).unwrap();
+        assert_eq!(format.encoding, Encoding::Pcma);
+
+        let ports = [41000u16];
+        let sdp = SubscriptionAnswer {
+            session_id: 3,
+            local_address: "10.0.0.30",
+            receive_ports: &ports,
+            format,
+        }
+        .to_sdp(&offer)
+        .unwrap();
+
+        assert!(sdp.contains("m=audio 41000 RTP/AVP 8 101\r\n"), "{sdp}");
+        assert!(sdp.contains("a=rtpmap:8 PCMA/8000\r\n"), "{sdp}");
+        assert!(
+            sdp.contains("a=rtpmap:101 telephone-event/8000\r\n"),
+            "{sdp}"
+        );
+        assert!(!sdp.contains("a=rtpmap:0 "), "{sdp}");
+    }
+
+    #[test]
+    fn our_configured_codec_would_have_added_an_unoffered_payload_type() {
+        let offer = SubscriptionOffer::parse(ALAW_ONLY_OFFER).unwrap();
+        let ports = [41000u16];
+        let sdp = SubscriptionAnswer {
+            session_id: 3,
+            local_address: "10.0.0.30",
+            receive_ports: &ports,
+            format: AudioFormat::pcmu_8k_20ms(),
+        }
+        .to_sdp(&offer)
+        .unwrap();
+
+        assert!(sdp.contains("m=audio 41000 RTP/AVP 0 8 101\r\n"), "{sdp}");
+    }
+
+    #[test]
+    fn the_first_offered_g711_payload_type_wins_over_any_preference_of_ours() {
+        let both = ALAW_ONLY_OFFER.replace("RTP/AVP 8 101", "RTP/AVP 8 0 101");
+        let offer = SubscriptionOffer::parse(&both).unwrap();
+        assert_eq!(offer.streams[0].payload_types, vec![8, 0, 101]);
+        assert_eq!(
+            offer.streams[0].offered_format(20).unwrap().encoding,
+            Encoding::Pcma
+        );
+    }
+
+    #[test]
+    fn an_offer_of_codecs_this_tap_cannot_decode_is_refused_by_name() {
+        let offer = SubscriptionOffer::parse(OPUS_ONLY_OFFER).unwrap();
+        assert_eq!(
+            offer.streams[0].offered_format(20),
+            Err(SdpError::NoStaticCodecOffered(vec![111, 101]))
+        );
+    }
+
+    #[test]
+    fn a_stream_without_a_ptime_takes_the_callers_fallback() {
+        let offer = SubscriptionOffer::parse(TWO_LEG_OFFER).unwrap();
+        assert_eq!(offer.streams[1].ptime_ms, None);
+        assert_eq!(offer.streams[1].offered_format(40).unwrap().ptime_ms, 40);
+        assert_eq!(
+            offer.streams[1].offered_format(0),
+            Err(SdpError::UnusableFormat)
+        );
+    }
 
     #[test]
     fn parses_a_real_rtpengine_14_subscribe_offer() {
