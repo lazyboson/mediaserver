@@ -571,10 +571,9 @@ round-trip-tested) and produces it keyed by `external_id`.
   lifecycle (2×AttachmentUp, PlaybackStarted, 2×AttachmentDown,
   SessionEnded) landed on one partition with gapless seq 0-5 and
   `legacy_eligible` true only for the authoritative attachment's events.
-- **Bounds and honesty**: queue of 1024, counted drops with a warning;
-  broker failures are counted per event and logged, never fatal
-  (at-most-once for now — durable retry is future work and the gapless seq
-  makes gaps detectable downstream). Totals logged at shutdown.
+- **Bounds and honesty**: handoff queue of 1024, counted drops with a
+  warning; broker failures are counted and logged, never fatal. Totals
+  logged at shutdown. Delivery durability is described below.
 - **Topic bootstrap**: `RskafkaTransport::connect` lists topics and creates
   `mss.events` (default 4 partitions, RF 1) when absent, then holds one
   `PartitionClient` per partition. Config: `MSS_KAFKA_BROKERS` (comma
@@ -593,6 +592,74 @@ round-trip-tested) and produces it keyed by `external_id`.
   verification tool and the reference for the legacy controller's translator.
 - Fixed in passing: the Dockerfile never copied `proto/`, so the image
   build had been broken since control-api landed.
+
+#### Delivery durability — defect D5 closed, semantics now at-least-once (2026-08-22)
+
+The pump used to publish each event once and count the failure; a broker
+blip was a permanent, silent-except-for-a-counter hole in a session's event
+stream. It now keeps a **single FIFO backlog** in the worker and retries the
+head until it lands:
+
+- **Order first.** The head is retried before any newer event is attempted,
+  so nothing is ever reordered — globally, therefore per session too. The
+  cost is head-of-line blocking across sessions during an outage, accepted
+  deliberately: the alternative (per-session queues) buys throughput that
+  low-rate lifecycle events do not need.
+- **Backoff** doubles from 100 ms to a 5 s cap. While waiting, the worker
+  keeps draining the handoff queue in the same `select!`, so `accept` stays
+  non-blocking and the drop decision belongs to the backlog, not the
+  channel.
+- **Bounded, counted, oldest-first.** The backlog caps at 8192 events;
+  beyond that the **oldest unsent** event is evicted and counted
+  (`dropped_oldest`). Evicting the head resets the attempt counter. Loss is
+  still possible under a long enough outage — but it is bounded, counted,
+  alerted, and visible downstream as a seq gap.
+- **A send that never answers** is a failure: each attempt is wrapped in a
+  5 s timeout, because rskafka's produce can otherwise park the worker for
+  as long as the broker's TCP stack allows.
+- **Shutdown** is bounded too: `main` waits up to 10 s
+  (`await_empty_backlog`) for the backlog to drain before aborting the
+  worker, and the worker itself gives up after `shutdown_attempts` (3)
+  failures once the inbox has closed, counting the remainder as
+  `abandoned`. Without that bound a permanently dead broker would keep the
+  worker alive forever.
+- **Tuning** lives in `PumpTuning` (`start_tuned`) so tests can use
+  millisecond backoffs and a 4-event cap; production uses `Default`.
+
+**Semantics shipped: at-least-once.** A retry after an ambiguous failure
+(timeout, connection reset after the broker committed) can duplicate a
+record. **The downstream translator must treat `(external_id, seq)` as
+idempotent** — it does not dedupe today; it relies on the gapless seq, which
+is exactly the key it needs. Duplicates were not observed in the lab drill
+(0 of 60), but the guarantee is at-least-once, not exactly-once, and a
+consumer that acts twice on one `PlaybackFinished` would be acting on our
+guarantee, not on chance.
+
+New counters, all exported by `metrics.rs` and alerted in
+`deploy/prometheus-alerts.yaml`: `mss_events_retried_total`,
+`mss_events_dropped_oldest_total`, `mss_events_abandoned_total`, and the
+gauge `mss_events_retry_depth`. `mss_events_failed_total` changed meaning:
+it now counts failed **attempts** (each retried), not lost events.
+
+Verified against a real broker: `lab/event_outage_drill.sh` sends 60 events
+at 1/s through the production `RskafkaTransport` while Redpanda is
+`docker stop`ped for 30 s in the middle. Result (2026-08-22):
+`accepted=60 published=60 failed=6 retried=6 dropped=0 dropped_oldest=0
+unsent=0`, and 60 distinct seqs 0-59 on one partition at contiguous offsets
+— confirmed independently with `mss_events_tail`. Those 6 failed attempts
+are exactly what the old code would have lost. The drill is
+`crates/mediaserverd/tests/kafka_outage.rs`, skipped unless
+`MSS_TEST_KAFKA_BROKERS` is set (same pattern as the Redis integration
+test). Unit tests cover what the lab cannot schedule: an outage that
+outlasts the cap (drop-oldest keeps the newest survivors in order), a
+transient refusal retried without a duplicate landing, a send that never
+answers, and the shutdown give-up path.
+
+What is still not durable: events dropped by the controller's outbox or by
+the handoff queue never reach the backlog, and the backlog is in memory
+only — a pod that dies with a backlog loses it. Disk-backed spooling was
+not built; the pilot's bar is surviving a broker restart, not a pod loss
+with the broker down.
 
 ### Resolving a call's participants without the discovery map (2026-08-17)
 
