@@ -5,6 +5,7 @@ use crate::recorder::{
     self, Layout, RecorderCounters, RecorderHandle, RecorderSpec, RecordingFormat,
     RecordingIdentity, RecordingSupport, RecordingTarget,
 };
+use crate::rtpengine_capability::NodeCapabilityLog;
 use crate::tap_spike::{
     capture, SharedLegStats, SsrcTrackPublisher, SsrcTracks, TapLeg, MAX_SSRC_TRACKS,
 };
@@ -53,6 +54,7 @@ pub struct TapPlaneConfig {
     pub cookie_prefix: u64,
     pub sdp_session_id: u64,
     pub recording: RecordingSupport,
+    pub capabilities: Arc<NodeCapabilityLog>,
 }
 
 struct LiveSession {
@@ -838,6 +840,11 @@ impl MediaPlane for TapPlane {
             .await
             .map_err(|error| MediaPlaneError(format!("NG socket: {error}")))?,
         );
+
+        self.config
+            .capabilities
+            .report_first_contact(node, &transport)
+            .await;
 
         let view = self.complete_from_tags(&transport, view).await?;
 
@@ -1790,6 +1797,7 @@ mod tests {
             cookie_prefix: 1,
             sdp_session_id: 1,
             recording,
+            capabilities: Arc::new(NodeCapabilityLog::new(true)),
         })
     }
 

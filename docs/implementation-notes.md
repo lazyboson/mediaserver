@@ -426,6 +426,46 @@ That is what makes `offered_format` in `rtpengine-ng` a safe question to ask.
   pauses the peer for the playback and resumes after, measured in
   `lab/host_test_caller.py` runs as complementary packet counts.
 
+### stats.rs — `version`, `statistics`, and the kernel-forwarding verdict (2026-08-23, item 23)
+- `NgClient::statistics` and `NgClient::version` are one-key requests;
+  `RtpengineStatistics::from_reply` shapes the reply, and
+  `KernelForwarding::from_statistics` turns it into a verdict. All sans-IO, all
+  unit-tested against bencode captured from the live lab node.
+- **There is no NG `version` command.** rtpengine 14.1.1.8-jambonz11 answers
+  `Unrecognized command`, and the upstream protocol documentation's command list
+  does not contain one either — brute-forcing 37 candidate names against the
+  live node found only `ping`, `list`, `statistics`, `transform` and the
+  call-scoped verbs. The builder ships anyway as a *probe*: it costs one
+  datagram at startup, a future build that grows the command is picked up for
+  free, and `mediaserverd`'s `VersionReport::NoVersionCommandOnThisNode` makes
+  the universal outcome a first-class state instead of an error. The version
+  itself has to come from the process, the package or `--listen-cli`.
+- The shape was probed before it was typed, and the probe changed the types.
+  Measured facts now pinned by tests: `totalstatistics.uptime` is a bencode
+  **string** (`"23129"`), not an integer, and so are the duration fields — hence
+  `number()` accepts `Value::Int` and numeric `Value::Bytes` and truncates at
+  the decimal point. `currentstatistics` carries `packetrate_kernel` /
+  `packetrate_user` / `media_kernel` / `media_userspace` / `media_mixed` /
+  `transcodedmedia`; `totalstatistics` carries `relayedpackets` and
+  `relayedbytes` each split `_kernel` / `_user`; `transcoders` is a list of
+  `{chain, packets, bytes, samples, num}` where `chain` reads
+  `"PCMU/8000 -> opus/48000/2"`.
+- The verdict ladder, in order: no kernel/userspace split in the reply at all →
+  `Undetermined(StatisticsWithoutKernelCounters)`; live kernel packet rate or
+  kernel/mixed media now → `ForwardingInKernelNow`; a non-zero kernel lifetime
+  total → `ForwardedInKernelEarlier`; nothing relayed at all →
+  `Undetermined(NoMediaRelayedYet)`; otherwise → `RelayingEntirelyInUserspace`.
+  `media_mixed` counts as kernel because part of it is. `module_in_play()`
+  returns `Option<bool>` so "cannot tell" cannot be mistaken for "no".
+- Deliberately **not** modelled: the `controlstatistics.proxies` array (one
+  entry per NG peer with per-command counts and durations) and the per-interface
+  ingress/egress/ports/voip_metrics blocks. They are large and nothing needs
+  them yet; `lab/kernel_probe.sh` reads whatever it likes straight off the wire.
+- Known limit: a `statistics` reply grows with the number of NG peers and
+  interfaces. It arrives as one UDP datagram and the transport's buffer is
+  65535 bytes, so a node with hundreds of proxies could in principle truncate.
+  Not observed — the lab's reply with six proxies is a few KB.
+
 ### sdp.rs — subscription-leg offer/answer
 - Parses rtpengine's subscribe offer: per-stream ports, payload-type
   lists, `a=ptime`, `a=label`, and session- vs media-level `c=` lines
@@ -1376,6 +1416,11 @@ cookie, per-request `oneshot`, timeout, retry, and node health counters.
   cookie unique per process by construction; the prefix still separates pods
   and restarts. Pinned by `two_transports_on_one_pod_never_share_a_cookie`
   and measured both ways in the lab (see lab.md, the gRPC drill).
+- `version()` and `statistics()` landed 2026-08-23 (item 23). `statistics()`
+  returns the parsed `RtpengineStatistics` rather than the raw reply, so a reply
+  without a `statistics` dict is a `MissingField` error instead of a report of
+  all zeroes; `version()` returns the raw reply because the interesting outcome
+  is the *error* (`Unrecognized command`) and the caller must see it.
 - A `PendingGuard` removes the waiter on every exit path, so a timed-out
   request cannot leak an entry into the correlation map
   (`pending_waiters_are_released_when_a_request_ends`).
@@ -1393,6 +1438,38 @@ cookie, per-request `oneshot`, timeout, retry, and node health counters.
 - **M2 remaining:** real lab validation against rtpengine.
   **M4:** node registry keyed by call→node discovery, re-subscribe on pod
   loss.
+
+### rtpengine_capability.rs — the first-contact capability log (2026-08-23, item 23)
+Answers, in the daemon's own log, "what is this rtpengine and can my taps use
+its kernel module?" — once per node, on the first NG contact with it.
+- Two pure decisions, both unit-tested, no I/O: `VersionReport::from_outcome`
+  maps a `version` round-trip onto `Reported` / `NoVersionCommandOnThisNode` /
+  `Unavailable(reason)` — and only the exact remote reason
+  `"Unrecognized command"` becomes "this protocol has no version command", so a
+  timeout never gets misreported as a missing feature.
+  `TapKernelVerdict::decide(kernel, transcode_at_tap)` is the eligibility rule:
+  **transcoding wins over everything** (a transcoded tap is a userspace tap
+  whatever the node is doing), otherwise the node's `KernelForwarding` decides.
+- `report_first_contact` claims the node in a `HashSet` **before** awaiting, so
+  concurrent `open_session` calls on a cold node cost one probe, not N.
+- Two call sites: `main`'s startup NG probe (so a daemon with
+  `MSS_RTPENGINE_NODE` reports before serving) and `TapPlane::open_session`
+  (so a node first seen through a session's own `rtpengine_node` is reported
+  too). One shared `Arc<NodeCapabilityLog>` carries the set across both, which
+  is also why `transcode_at_tap()` is now read once in `main` and handed to
+  `TapPlaneConfig` — it used to be read twice and logged twice.
+- The transcoding verdict is logged at **WARN**, everything else at INFO,
+  because "your taps cannot use the kernel module" is an operational finding
+  rather than a status line.
+- Verified live against the lab (2026-08-23) in both modes. With
+  `MSS_TAP_TRANSCODE=on`: `version="unknown: this rtpengine's NG protocol has
+  no version command"`, `relayed_packets_in_kernel=0`,
+  `relayed_packets_in_userspace=130865`, plus the transcoder chain
+  `["PCMU/8000 -> opus/48000/2"]` and the WARN verdict. With `off`: the same
+  facts and the "no kernel path for a tap to ride" verdict.
+- Not done: no metric is exported for the verdict (it is log-only), and the
+  probe never repeats — an rtpengine restarted under a running daemon keeps its
+  first-contact report. Both are cheap to add when something needs them.
 
 ### tap_spike.rs — the Phase-0 capture (media world)
 Owns the sockets and the pacing for one tap: drain both legs, release one
@@ -1491,7 +1568,10 @@ behavior, transcoding at the tap) and the rtpengine-host CPU measurement.
 and log the result, which is how the Phase-0 "does our deployed rtpengine
 answer NG at all" question gets answered without any other wiring. Unset
 skips the probe; an unparseable value logs an error and the daemon still
-starts (a diagnostic must not be able to stop the service).
+starts (a diagnostic must not be able to stop the service). Since 2026-08-23 a
+successful ping is followed by the first-contact capability report
+(`rtpengine_capability.rs`), which is why the probe now takes the shared
+`NodeCapabilityLog`; a node that fails the ping is not probed further.
 
 ### media_rt.rs — thread/tick skeleton real; session work is M2/M3
 The worker loop currently only ticks and counts. Per-iteration plan:
