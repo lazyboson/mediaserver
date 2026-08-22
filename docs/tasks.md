@@ -644,22 +644,59 @@ speech codec — real lab speech round-tripped through libopus at 8 kHz
 transcribed **verbatim by Deepgram** at 9.8 kbps
 (`examples/opus_speech_probe.rs` + `ear_intelligibility_probe.py`).
 
-#### 16b. Negotiate Opus on the tap leg — ⬜ NEXT, and it is the blocker
-Nothing can tap an Opus leg until this lands, because the subscription answer
-cannot express Opus at all.
-- **`SubscriptionAnswer::to_sdp` needs dynamic rtpmap.** It calls
-  `Encoding::static_payload_type` and refuses anything without one
-  (`NoStaticPayloadType`), so it can only ever answer PCMU/PCMA. Opus is always
-  a dynamically negotiated payload type (typically 111) with
-  `a=rtpmap:111 opus/48000/2`. This is the long-standing "M3: dynamic rtpmap"
-  item, now on the critical path.
-- **`offered_format` must learn Opus** from the offer's rtpmap rather than the
-  static table, and `Encoding::from_static_payload_type` must stay
-  static-only — the dynamic case is a different lookup.
-- **`StreamPipeline` needs the payload type passed in** rather than derived,
-  which is why 16a stopped at the decoder.
-**Done when:** MSS answers an Opus subscription offer, receives Opus, and the
-decoded audio is ASR-verified on a live WebRTC-shaped lab call.
+#### 16b-1. Negotiate Opus on the tap leg — ✅ DONE (2026-08-22)
+The named blocker is gone: **MSS can now ask rtpengine for Opus and answer an
+Opus offer.** `NegotiatedCodec {payload_type, encoding, clock_rate_hz}` in
+`rtpengine-ng/sdp.rs` is what an answer is built from; `OfferedStream::negotiate`
+resolves static payload types through `media-core`'s table and **dynamic** ones
+by their `a=rtpmap` encoding name, which is the only way Opus can be recognised.
+`SubscriptionAnswer.answer_with` is **required** rather than optional — an
+earlier draft defaulted it to "negotiate from the offer" and silently broke the
+transcode path, so the caller now states which mode it is in
+(`from_static_format(configured)` for transcode-on, `negotiate()` for off).
+**Three RFC 7587 rules obeyed, read from the RFC rather than assumed** (§4's
+history is a list of answers rtpengine rejected): rtpmap clock **must** be 48000
+and channels **must be 2 even for mono** (mono is in-band); the RTP timestamp
+clock is 48000 Hz for every Opus mode and sample rate, so
+`samples_per_packet` derives from the **clock rate**, not the rate we decode to;
+and the payload type is dynamic, so the answer **echoes the offer's**. A wrong
+opus clock rate is refused (`OpusClockRate`), and an unknown dynamic codec
+(EVS, G.722) is skipped rather than guessed.
+Also fixed here: `negotiated_tap_codec` requires every offered stream to agree
+on one codec, mirroring the format rule from item 20.
+**Verified by unit tests only** (46 in `rtpengine-ng`): negotiation at the
+dynamic PT, the exact `a=rtpmap:111 opus/48000/2` line, g711 keeping its
+two-field rtpmap, the clock-rate refusal, static-wins-when-offered-first, and
+an explicit answer codec overriding the offer. **No live call yet** — because
+Opus still cannot flow, see 16b-2.
+
+#### 16b-2. Make Opus actually flow — ⬜ NEXT, three things
+Negotiation is not decoding. **An Opus tap would still fail today**, and these
+are the reasons, each verified in the code:
+1. **`StreamPipeline` refuses Opus** —
+   `other => return Err(UnsupportedEncoding(other))`. Wiring it needs the
+   decoder from 16a **plus** separating two numbers the pipeline currently
+   conflates: `timestamp_increment` is set from `samples_per_packet`, which is
+   right only while the RTP clock equals the audio rate. For Opus the clock is
+   always 48 kHz while the decoded frame is whatever rate we pick, so at 16 kHz
+   the increment is **960** and the frame is **320**.
+2. **`jitter::MAX_PAYLOAD` is 480 bytes**, and an Opus packet is up to
+   **1276** (RFC 6716). The ring must widen; note the same constant also sizes
+   the pipeline's PCM scratch, so widening is safe but the conflation should be
+   split while touching it.
+3. **`ConsumerEncoder` refuses g711 output at any rate but the tap's**, so a
+   16 kHz Opus tap could not feed the frozen PCMU-8k WebSocket bridge. The fix
+   is small and half-built: resample before the g711 encode, the same `rubato`
+   path L16 already uses.
+**The rate decision:** decode Opus to **16 kHz** — it preserves the wideband
+information ASR consumers want, and 320 samples fits `hub::MAX_FRAME_SAMPLES`
+(480) where 48 kHz's 960 would not.
+**The lab proof to use:** rather than building an Opus caller, ask rtpengine to
+transcode *to* opus on the tap leg (`transcode: [opus]`). rtpengine reports
+`opus: fully supported`, so it will offer Opus on the subscription and the whole
+path — dynamic answer, libopus decode, 48 kHz clock against a 16 kHz frame,
+widened buffers — is exercised against real rtpengine-generated Opus with no
+WebRTC endpoint needed.
 
 #### 16c. Buffer sizing for Opus payloads — ⬜
 `jitter::MAX_PAYLOAD` is **480** bytes, sized for G.711. An Opus packet is up

@@ -7,4 +7,4 @@ pub mod sdp;
 pub use commands::{
     NgClient, NgError, NgReply, PlayMedia, PlaySource, PlayTarget, SubscribeRequest,
 };
-pub use sdp::{OfferedStream, SdpError, SubscriptionAnswer, SubscriptionOffer};
+pub use sdp::{NegotiatedCodec, OfferedStream, SdpError, SubscriptionAnswer, SubscriptionOffer};
