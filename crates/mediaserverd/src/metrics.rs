@@ -107,6 +107,21 @@ pub fn render(sources: &MetricsSources) -> String {
         snapshot.totals.jitter_resets,
     );
     counter(
+        "mss_legs_ssrc_changes_total",
+        "Times a tap leg started carrying a different sender ssrc mid-call",
+        snapshot.totals.ssrc_changes,
+    );
+    counter(
+        "mss_legs_ssrc_reresolved_total",
+        "Times a refreshed rtpengine speaker map renamed a tap leg",
+        snapshot.totals.reresolutions,
+    );
+    counter(
+        "mss_ssrc_requeries_total",
+        "rtpengine queries made to re-resolve a leg whose ssrc changed",
+        snapshot.ssrc_requeries,
+    );
+    counter(
         "mss_ingest_stalls_total",
         "Times a tap leg stopped receiving datagrams for the watchdog window",
         snapshot.totals.stalls,
@@ -384,6 +399,19 @@ mod tests {
             assert!(text.contains(name), "missing {name} in:\n{text}");
         }
         assert!(text.contains("mss_build_info{version="));
+    }
+
+    #[test]
+    fn the_exposition_tells_the_whole_ssrc_reresolution_story() {
+        let text = render(&sources());
+        for name in [
+            "mss_legs_unknown_ssrc",
+            "mss_legs_ssrc_changes_total",
+            "mss_ssrc_requeries_total",
+            "mss_legs_ssrc_reresolved_total",
+        ] {
+            assert!(text.contains(name), "missing {name} in:\n{text}");
+        }
     }
 
     #[test]
