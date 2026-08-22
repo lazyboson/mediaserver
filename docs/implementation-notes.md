@@ -101,6 +101,32 @@ the DTMF detector and the G.711 decode, and allocates nothing per packet
   production captures; the format is deliberately trivial so the
   converter is throwaway.
 
+### encode.rs — per-consumer output formats (landed 2026-08-22)
+
+`ConsumerEncoder` turns the tap's PCM into what one consumer asked for:
+G.711 µ/A passthrough at the tap rate, L16 at the tap rate, or resampled
+L16 (verified at 16k and 48k). One encoder instance per consumer **per
+track** — a resampler is stateful, so interleaving two tracks through one
+instance would corrupt its filter history; the gRPC pump keys encoders by
+track.
+
+- **L16 is little-endian** ("linear16" as ASR vendors consume it), not the
+  network-order RTP L16. Pinned by
+  `l16_at_the_tap_rate_is_little_endian_identity` and noted in
+  mediastream.proto.
+- Resampling is `rubato` 5 (`Fft`, `FixedSync::Input`) — Article XI:
+  adopted, pure Rust, no new system dependency. Chunk size is the tap's
+  samples-per-packet, so every call emits exactly one output frame
+  (320 samples at 16k). The FFT resampler carries a small group delay
+  (`output_delay`), which is why the replay test asserts rms over the
+  steady-state half rather than sample-exact equality.
+- **Short frames are zero-padded to a full chunk** rather than producing a
+  short output — streams must stay continuous for downstream ASR
+  (session-playbook §8); the injected-utterance tail is the case that hits
+  this.
+- Refusals are named, never silent: Opus (tasks item 9), G.711 at a
+  non-tap rate, stereo, mismatched ptime.
+
 ### dtmf.rs — complete for RFC 4733 digit reporting
 - Reports once per press on end-bit, deduped by (digit, RTP timestamp);
   events ≥16 (flash-hook etc.) deliberately ignored.
@@ -197,8 +223,8 @@ the DTMF detector and the G.711 decode, and allocates nothing per packet
 - `customParameters` is omitted entirely when empty and emitted when
   present; byte-exact tests cover both. Multi-entry maps have no
   deterministic order, so byte-exact tests use at most one entry.
-- **M3:** the WS consumer bridge must also replicate the the upstream platform-forked
-  mod_audio_fork dialect. **Open item:** the fork's exact wire format is
+- **M3:** the WS consumer bridge must also replicate the reference
+  deployment's forked mod_audio_fork dialect. **Open item:** the fork's exact wire format is
   specified only in the fork's C source (not in this repo, not in the legacy controller);
   pull it and write the byte-exact tests before the first ASR consumer
   migrates (architecture.md risk #4).
@@ -357,7 +383,8 @@ shape inverts the WS adapter: MSS does not dial the consumer, the consumer
 dials MSS after `Attach{GRPC_STREAM}`, presenting
 `ConsumerHello{attachment_id, token}`. The service validates hello (token,
 attachment exists, transport is grpc-stream, requested format equals the
-attachment's — re-encode is tasks item 8 and a mismatch is `UNIMPLEMENTED`,
+attachment's — the format was chosen at Attach and per-hello renegotiation
+is deliberately not a thing, so a mismatch is `UNIMPLEMENTED`,
 never silent), then asks the media plane for frames through the new
 `MediaPlane::open_stream` seam and serves them as binary `AudioFrame`s
 (raw payload, no base64), `DtmfFrame`s, and `TextFrame`s for
@@ -683,8 +710,9 @@ into something that actually taps calls.
   the Twilio `start` frame, and the `TrackSelector` becomes both the hub's
   `TrackSelection` and the `tracks` list the consumer is told about.
 - **A grpc-stream attachment is two-phase**: `Attach` records it (validating
-  the session is tapped here and the format matches the tap — re-encode is
-  tasks item 8), and the hub subscription only happens when the consumer's
+  the session is tapped here and `ConsumerEncoder` serves the format —
+  g711 at the tap rate or L16 at 8k/16k/48k since 2026-08-22, Opus refused
+  by name), and the hub subscription only happens when the consumer's
   `ConsumerHello` arrives and `open_stream` runs. A pump task converts
   `TapEvent`s into `StreamFrame`s over a bounded channel; either side going
   away ends the pump, which drops the hub subscription. One connected
@@ -788,11 +816,17 @@ never takes a lock and never waits on the control world.
 - `MSS_LISTENERS=name=url,name=url` attaches N listen-only Twilio-dialect
   consumers per tap; the lab wires an RTT service and a recorder this way
   alongside the interactive bridge.
-- Still to come: per-consumer codec/resample pipelines (G.711 → L16 →
-  8k/16k, tasks item 8). The gRPC `MediaStream` adapter and exported hub
-  metrics landed 2026-08-20 — `SubscriptionMetrics` is the cloneable
-  handle over a subscription's queue depth and drop/delivery counters
-  that the metrics endpoint reads.
+- ✅ Per-consumer codec/resample pipelines landed 2026-08-22: `TapEvent`
+  now carries **PCM samples**, not µ-law bytes, which is what makes the
+  "L16 interchange, one decode per ingest, N encodes per consumer"
+  cross-cutting decision physically true instead of aspirational. The WS
+  bridge µ-law-encodes at its edge (the frozen dialect's byte-exact tests
+  did not move); the gRPC pump encodes per attachment format with a
+  `ConsumerEncoder` per track (media-core encode.rs). The gRPC
+  `MediaStream` adapter and exported hub metrics landed 2026-08-20 —
+  `SubscriptionMetrics` is the cloneable handle over a subscription's
+  queue depth and drop/delivery counters that the metrics endpoint reads.
+  Opus output remains open (tasks item 9).
 - **The hub is what architecture.md §5 calls an Attachment set**, and the
   spike already prefigures two of its rules: capability is structural (the
   voice-AI consumer is constructed with a command channel, listeners with
@@ -1000,7 +1034,8 @@ fan-out, which is where the next measurement should go.
 
 ## Cross-cutting decisions already made (do not relitigate casually)
 - Codec interchange is L16 internally; one decode per ingest stream,
-  N encodes shared per consumer format.
+  N encodes per consumer format. Realized 2026-08-22: the hub publishes
+  PCM and every consumer bridge encodes its own output (encode.rs).
 - Consumers get raw bytes on gRPC (no base64); base64/JSON only on the
   WS-compat adapter.
 - `rust-toolchain.toml` pins 1.95.0, and both workflows now request

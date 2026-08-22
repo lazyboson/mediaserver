@@ -176,7 +176,8 @@ evented, capability-attributed and idempotent) and `Clear` discards + stops
 the last playback (the barge shape). Wire-verified through a generated client
 against a real socket, including the drain regression. Limits, deliberate:
 one connected consumer per attachment (reconnect allowed after it drops),
-attachment format must equal the tap format until re-encode (item 8) exists,
+the attachment format must be one the encoder serves (since item 8: g711 at
+the tap rate, or L16 at 8k/16k/48k — Opus is item 9),
 and an utterance is capped at one playback datagram — chunked/paced playback
 stays with the WS bridge. **Still to prove: a live tap over gRPC in the lab**
 — every consumer today speaks WS, so this ran only against the fake plane.
@@ -200,13 +201,32 @@ unprivileged attachment's `inject` is refused.
 **Done when:** an unauthenticated consumer cannot attach, and MediaControl
 rejects unauthenticated callers.
 
-### 8. Codec pipeline breadth
-**Where:** `media-core`.
-**What:** resample 8k↔16k↔48k (`rubato`), L16 output for ASR that wants it,
-Opus via `audiopus` (Article XI: adopt the C library, do not reimplement).
-**Why now:** consumers are all G.711/8k today; needed before an ASR vendor
-asks for 16k L16 or a bandwidth-sensitive consumer asks for Opus.
-**Done when:** a consumer can request L16/16k and get it, verified by replay.
+### 8. Codec pipeline breadth — ✅ DONE for L16 + resampling (2026-08-22)
+`media-core/src/encode.rs`: `ConsumerEncoder`, one per consumer track —
+G.711 (µ/A) passthrough at the tap rate, L16 little-endian at 8k, and
+resampled L16 at 16k/48k via `rubato` 5 (`Fft`, fixed-input chunks matching
+the tap's 20ms frames; short frames zero-padded so streams stay continuous).
+The hub now carries PCM (`TapEvent` holds `i16` samples), which makes the
+"L16 interchange, one decode per ingest, N encodes per consumer" rule real:
+the WS bridge encodes its own µ-law (dialect unchanged, byte-exact tests
+untouched) and the gRPC pump encodes per attachment format. A grpc-stream
+attachment may declare L16/16k at Attach; the WS transport refuses anything
+but PCMU 8k by name (frozen dialect). gRPC inject also accepts L16.
+Done-when met: an L16/16k consumer is verified by replay
+(`l16_16k_doubles_the_sample_count_and_preserves_the_tone`, pump test).
+
+### 9. Opus output
+**Where:** `media-core` (+ a dedicated FFI wrapper crate).
+**What:** Opus encode via `audiopus` (Article XI: adopt libopus, never
+reimplement). **The build trade must be decided first:** `audiopus_sys`
+compiles libopus with cmake/gcc, which breaks the hermetic
+pure-Rust build the repo chose twice already (protox over protoc, rskafka
+over rdkafka). Options: accept the toolchain in CI + Dockerfile, or a
+prebuilt static lib, or a pure-Rust decoder-only stopgap.
+**Why later:** no consumer asks for Opus yet; L16/16k covers the ASR
+vendors we know about.
+**Done when:** a consumer can request Opus and get it, verified by replay,
+with the build documented in CI and the Dockerfile.
 
 ## Open defects and soft spots
 

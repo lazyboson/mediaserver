@@ -174,7 +174,7 @@ mod tests {
     }
 
     #[test]
-    fn start_matches_the legacy media gateway_bytes() {
+    fn start_matches_the_legacy_gateway_bytes() {
         assert_serializes_to(
             &start(HashMap::new()),
             r#"{"event":"start","sequenceNumber":"1","streamSid":"MZ-1","start":{"accountId":"acct-1","streamSid":"MZ-1","callSid":"call-1","tracks":["inbound","outbound"],"mediaFormat":{"encoding":"PCMU","sampleRate":8000,"channels":1}}}"#,
@@ -191,7 +191,7 @@ mod tests {
     }
 
     #[test]
-    fn media_timestamp_is_a_string_because_the legacy media gateway_sends_one() {
+    fn media_timestamp_is_a_string_because_the_legacy_gateway_sends_one() {
         assert_serializes_to(
             &media(),
             r#"{"event":"media","sequenceNumber":"5","streamSid":"MZ-1","media":{"track":"outbound","timestamp":"1200","payload":"AAAA"}}"#,
@@ -199,7 +199,7 @@ mod tests {
     }
 
     #[test]
-    fn dtmf_matches_the legacy media gateway_bytes() {
+    fn dtmf_matches_the_legacy_gateway_bytes() {
         assert_serializes_to(
             &dtmf(),
             r#"{"event":"dtmf","sequenceNumber":"7","streamSid":"MZ-1","dtmf":{"track":"inbound","digit":"5"}}"#,
@@ -207,7 +207,7 @@ mod tests {
     }
 
     #[test]
-    fn mark_matches_the legacy media gateway_bytes() {
+    fn mark_matches_the_legacy_gateway_bytes() {
         assert_serializes_to(
             &mark(),
             r#"{"event":"mark","streamSid":"MZ-1","mark":{"name":"prompt-done"}}"#,
@@ -215,7 +215,7 @@ mod tests {
     }
 
     #[test]
-    fn stop_matches_the legacy media gateway_bytes() {
+    fn stop_matches_the_legacy_gateway_bytes() {
         assert_serializes_to(
             &stop(),
             r#"{"event":"stop","sequenceNumber":"9","streamSid":"MZ-1"}"#,

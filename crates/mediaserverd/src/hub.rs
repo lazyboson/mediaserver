@@ -1,10 +1,10 @@
 use crossbeam_queue::ArrayQueue;
-use media_core::{g711, Track};
+use media_core::Track;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::Notify;
 
-pub const MAX_FRAME_BYTES: usize = 320;
+pub const MAX_FRAME_SAMPLES: usize = 480;
 const COMMAND_CAPACITY: usize = 64;
 const INJECTED_CAPACITY: usize = 16;
 const INJECT_SILENCE: [i16; 480] = [0; 480];
@@ -16,7 +16,7 @@ pub enum TapEvent {
         track: Track,
         timestamp_ms: u64,
         len: usize,
-        bytes: [u8; MAX_FRAME_BYTES],
+        samples: [i16; MAX_FRAME_SAMPLES],
     },
     Dtmf {
         track: Track,
@@ -25,14 +25,15 @@ pub enum TapEvent {
 }
 
 impl TapEvent {
-    pub fn media(track: Track, timestamp_ms: u64, pcm: &[i16], ulaw: bool) -> TapEvent {
-        let mut bytes = [0u8; MAX_FRAME_BYTES];
-        let len = g711::encode_into(ulaw, pcm, &mut bytes);
+    pub fn media(track: Track, timestamp_ms: u64, pcm: &[i16]) -> TapEvent {
+        let mut samples = [0i16; MAX_FRAME_SAMPLES];
+        let len = pcm.len().min(MAX_FRAME_SAMPLES);
+        samples[..len].copy_from_slice(&pcm[..len]);
         TapEvent::Media {
             track,
             timestamp_ms,
             len,
-            bytes,
+            samples,
         }
     }
 
@@ -158,14 +159,14 @@ impl Hub {
         let event = match self.injecting.as_mut() {
             Some((pcm, at)) => {
                 let end = (*at + frame).min(pcm.len());
-                let event = TapEvent::media(Track::Mixed, timestamp_ms, &pcm[*at..end], true);
+                let event = TapEvent::media(Track::Mixed, timestamp_ms, &pcm[*at..end]);
                 *at = end;
                 if *at >= pcm.len() {
                     self.injecting = None;
                 }
                 event
             }
-            None => TapEvent::media(Track::Mixed, timestamp_ms, &INJECT_SILENCE[..frame], true),
+            None => TapEvent::media(Track::Mixed, timestamp_ms, &INJECT_SILENCE[..frame]),
         };
         self.publish(event);
     }
@@ -295,7 +296,7 @@ mod tests {
     use super::*;
 
     fn frame(track: Track, timestamp_ms: u64) -> TapEvent {
-        TapEvent::media(track, timestamp_ms, &[0i16; 160], true)
+        TapEvent::media(track, timestamp_ms, &[0i16; 160])
     }
 
     fn timestamp(event: &TapEvent) -> u64 {
@@ -395,7 +396,7 @@ mod tests {
             hub.release_injected(160, 20);
         }
         hub.release_injected(160, 20);
-        let voiced = |bytes: &[u8], len: usize| bytes[..len].iter().any(|b| *b != 0xFF);
+        let voiced = |samples: &[i16], len: usize| samples[..len].iter().any(|s| *s != 0);
 
         let mut sizes = Vec::new();
         let mut stamps = Vec::new();
@@ -406,12 +407,12 @@ mod tests {
                     track,
                     timestamp_ms,
                     len,
-                    bytes,
+                    samples,
                 } => {
                     assert_eq!(track, Track::Mixed);
                     stamps.push(timestamp_ms);
                     sizes.push(len);
-                    speech.push(voiced(&bytes, len));
+                    speech.push(voiced(&samples, len));
                 }
                 TapEvent::Dtmf { .. } => panic!("expected media"),
             }

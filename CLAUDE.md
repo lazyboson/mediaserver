@@ -5,10 +5,11 @@ pick up this project without re-deriving its context.
 
 ## What this project is
 
-**mediaserver** is the upstream platform's centralized media plane (internally: MSS,
-Media Streaming Service). Its mission, in one sentence: **remove every
-media workload from FreeSWITCH, phase by phase, until FreeSWITCH does
-only IVR and call control — or nothing at all.**
+**mediaserver** (MSS, Media Streaming Service) is an open-source
+centralized media plane for SIP infrastructures built on rtpengine. Its
+mission, in one sentence: **remove every media workload from FreeSWITCH,
+phase by phase, until FreeSWITCH does only IVR and call control — or
+nothing at all.**
 
 It taps per-call audio directly from RTPEngine (NG protocol `subscribe
 request/answer` — the SIPREC mechanism) and fans it out to consumers:
@@ -16,25 +17,36 @@ real-time transcription (RTT) over gRPC, ASR over WebSocket, recording to
 S3, and voice-AI agents. Later phases add inline media (bot speech
 injection) and finally conference mixing.
 
-## The production stack this replaces parts of
+## The reference deployment it replaces parts of
+
+The project grew out of one production contact-center stack; that stack is
+the reference deployment, and its internal component names appear
+throughout the docs as concrete stand-ins for generic roles (full glossary
+in the [README](README.md#provenance-and-glossary)):
 
 - **Carrier → OpenSIPS → RTPEngine (kernel module) → FreeSWITCH** is the
   customer leg; agents connect via a registrar/OpenSIPS gateway + RTPEngine
   into the same FreeSWITCH.
-- **the legacy controller** (Go, `Telephony/the legacy controller` repo) drives FreeSWITCH over ESL: IVR,
-  the `<Stream>` verb state machine (`the legacy stream fsm`), conference-based
-  monitor/whisper, recording. Its `the legacy verb API` gRPC API is the control
-  surface our `MediaControl` API mirrors (StartStream→StartTap etc.).
-- **the legacy media gateway** (Go, separate repo) is the predecessor this service
-  supersedes: a per-call RTP↔WebSocket pump behind an OpenSIPS B2B dummy
-  leg + FreeSWITCH conference. Its audit produced our requirements delta
+- **the legacy controller** (Go) is the legacy telephony controller: it drives FreeSWITCH
+  over ESL — IVR, the `<Stream>` verb state machine (`the legacy stream fsm`),
+  conference-based monitor/whisper, recording. Its `the legacy verb API` gRPC API is
+  the control surface our `TelCompat` façade mirrors byte-for-byte
+  (StartStream→CreateSession/Attach etc.).
+- **the legacy media gateway** (Go) is the legacy gateway this service supersedes: a
+  per-call RTP↔WebSocket pump behind an OpenSIPS B2B dummy leg +
+  FreeSWITCH conference. Its audit produced our requirements delta
   (architecture doc §7.1) — every design rule here traces to a defect
   found there (no jitter buffer, hardcoded 20 ms pacing, blocking I/O on
   the pacer, silent queue drops, per-pod pinned state).
-- Today FreeSWITCH carries the fork load we are removing:
-  `uuid_audio_fork` (a the upstream platform-forked mod_audio_fork with extra positional
-  args), `uuid_google_transcribe2`, `record_session` media bugs, and one
-  dummy leg + one conference per voice-AI interaction.
+- Today that FreeSWITCH carries the fork load we are removing:
+  `uuid_audio_fork` (a fork of mod_audio_fork with extra positional args),
+  `uuid_google_transcribe2`, `record_session` media bugs, and one dummy
+  leg + one conference per voice-AI interaction.
+
+None of the core depends on that platform: any deployment whose media
+anchors in rtpengine can run MSS, and the compatibility surfaces
+(Twilio-Media-Streams WS dialect, mod_audio_fork event names, the the legacy verb API
+façade) are optional adapters.
 
 ## Binding documents (in order of authority)
 

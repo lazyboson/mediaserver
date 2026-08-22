@@ -840,7 +840,7 @@ mod tests {
     }
 
     #[test]
-    fn a_session_is_reachable_by_the_external_id_the legacy controller_knows_it_by() {
+    fn a_session_is_reachable_by_the_external_id_the_legacy_controller_knows_it_by() {
         let (registry, session) = started();
         assert_eq!(registry.resolve("req-1"), Ok(session));
         assert_eq!(
