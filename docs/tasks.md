@@ -4,7 +4,7 @@ Living work list. [roadmap.md](roadmap.md) holds the *why* and the phase exit
 criteria; this file holds the *what next*, ordered, with a definition of done
 for each item. Update it in the same PR that changes the state of an item.
 
-Status as of **2026-08-22**.
+Status as of **2026-08-23**.
 
 ## Milestones
 
@@ -62,7 +62,11 @@ Status as of **2026-08-22**.
   Since item 21 there is `group_recording_drill.sh` — two fabricated calls, two
   sessions, one recording group, one object per participant in MinIO — and
   `call_driver.py` takes a `COOKIE_PREFIX` so two drivers can fabricate two
-  calls at once without colliding in rtpengine's reply cache.
+  calls at once without colliding in rtpengine's reply cache. Since item 23
+  there is `kernel_probe.sh` (does this rtpengine forward in the kernel,
+  answered over NG alone, runnable on a metal box) and `opus_call_driver.py`
+  (a **native** Opus call, libopus in the endpoints, so rtpengine transcodes
+  nothing).
 
 ## Next up — ordered
 
@@ -734,6 +738,15 @@ sine should produce. The raw datagram log confirms the wire: RTP timestamp
 delta **960** on every packet, no sequence gaps, TOC `0x08` (SILK NB, 20 ms,
 one frame per packet). Recipe in [lab.md](lab.md).
 
+**That open question is now closed — see item 23 (2026-08-23).** A native Opus
+call (`lab/opus_call_driver.py`, libopus in the endpoints, rtpengine transcoding
+nothing) taps at **50.0 packets/s**, against **3.8/s** for the transcoded tap on
+the same rtpengine the same afternoon and **51.1/s** for the same call as PCMU.
+The under-production is rtpengine's G.711→Opus transcoder; the relay path and
+MSS are innocent, and the production shape — a call already carrying Opus,
+tapped with `MSS_TAP_TRANSCODE=off` — runs at full rate. The original write-up
+of the question follows.
+
 **One open question, and it is rtpengine's, not ours.** When rtpengine
 transcodes G.711→Opus it emits only ~10 packets/second where the same call
 tapped as PCMU gives ~51 — a ~15% duty cycle, so the tap is mostly silence.
@@ -885,16 +898,22 @@ exposes one; (C) eBPF, last resort.
   2. Probe whether a subscription is kernel-forwarded, and **whether
      dropping the transcode request is what decides it** — that is the
      hypothesis item 20 exists to make testable, since the kernel module
-     has no codec and therefore cannot transcode. On a host that can load
-     the module: `cat /proc/rtpengine/<table>/list` at baseline, after a
-     subscribe **with** transcode, and after one **without**, comparing
+     has no codec and therefore cannot transcode. **The instrument for this
+     now exists (item 23, 2026-08-23):** `lab/kernel_probe.sh <ng-host>
+     <ng-port>` gives the verdict from rtpengine's own `statistics` over NG
+     alone, runs unchanged on a metal box, and mediaserverd logs the same
+     judgement per node at startup. The full read-only checklist is in
+     architecture §8.1. On a host that can load the module also
+     `cat /proc/rtpengine/<table>/list` at baseline, after a subscribe
+     **with** transcode, and after one **without**, comparing
      `num_destinations` on the target entries. Run rtpengine with
      `--no-fallback` so it refuses to start rather than silently
      degrading to userspace. **This cannot be probed in this lab** —
      `--table=-1`, no `/proc/rtpengine`, and no kernel headers to build
-     the module against. On a production-shaped host that already runs
-     the module it needs **no config change and is read-only**, so bundle
-     it with open items 1 and 2 above in one visit.
+     the module against, and `kernel_probe.sh` was machine-verified here on
+     exactly that "no module" answer. On a production-shaped host that
+     already runs the module it needs **no config change and is read-only**,
+     so bundle it with open items 1 and 2 above in one visit.
      rtpengine's kernel module also has a packet-mirroring path used by
      `rtpengine-recording` — probe whether that reaches an arbitrary UDP
      destination; if yes, that is the same win with vendor support and no
@@ -1047,6 +1066,95 @@ persisted on the attachment, but `RegistryKeeper::rebuild` **refuses** to
 restore a grouped recording on an adopting pod (counted `grouped_not_adopted`)
 rather than split one recording across two pods. Placement — scheduling a
 group's sessions onto one pod — is the real fix and does not exist (D8).
+### 23. rtpengine kernel-module readiness — ✅ DONE (2026-08-23)
+**Why this exists:** item 18's decision gate cannot be opened without knowing
+whether a tap rides rtpengine's kernel path, and the production deployment runs
+the kernel module. **No MSS media-path change was needed or made** — MSS speaks
+NG over UDP and receives plain RTP, so a kernel-forwarded subscription and a
+userspace one are identical at our socket. What decides it is **transcoding**,
+which is why item 20's `MSS_TAP_TRANSCODE=off` is the kernel-eligible mode.
+
+**What shipped.**
+- **`rtpengine-ng/stats.rs`** — `NgClient::statistics` / `NgClient::version`,
+  `RtpengineStatistics` and `KernelForwarding`, sans-IO and unit-tested (74
+  tests in the crate now). The shape was **probed against the live node before
+  it was typed**, and the probe corrected two assumptions: `uptime` is a bencode
+  *string*, and the kernel/userspace split lives in two places
+  (`totalstatistics.relayedpackets_kernel/_user` for lifetime,
+  `currentstatistics.packetrate_kernel` + `media_kernel`/`media_mixed` for now).
+  `module_in_play()` returns `Option<bool>` so "cannot tell" can never read as
+  "no".
+- **`mediaserverd/rtpengine_capability.rs`** — a first-contact-per-node
+  capability log, called from both the startup NG probe and
+  `TapPlane::open_session`. It logs the version (or why it cannot be had), the
+  relay split, live sessions, the active transcoder chains, and a plain-English
+  kernel verdict; when transcoding is on it says at **WARN** that transcoded
+  taps are processed in rtpengine userspace and the kernel module cannot help
+  them. Both modes verified live.
+- **`lab/kernel_probe.sh <host> <port>`** — the same judgement from a shell,
+  over NG alone, so it runs unchanged on a metal box later. Exit 0 kernel in
+  play, 1 userspace only, 2 cannot tell (with the reason), 3 unreachable. On
+  the rtpengine host it adds the `/proc/rtpengine` and `lsmod` evidence NG
+  cannot expose; anywhere else it says that half is skipped rather than
+  guessing. **Machine-verified against the lab's "no module" path**: 150,462
+  packets relayed, every one in userspace, 207/s live, exit 1.
+- **`lab/opus_call_driver.py`** — a native Opus caller (libopus via ctypes,
+  CBR 24 kbit/s, VBR and DTX off, a phase-continuous 440 Hz tone at 20 ms) that
+  places an Opus↔Opus call through rtpengine so nothing is transcoded. It
+  refuses to pump if rtpengine renumbers the payload type, so a run that
+  reaches the tap really is native Opus.
+- **Docs:** architecture §8.1 "Running MSS against a kernel-module rtpengine" —
+  the eligibility checklist, the read-only on-metal probe list (including
+  `--no-fallback` so a degraded start cannot masquerade as a negative result),
+  and the WSL2 limitation. Lab recipes and numbers in [lab.md](lab.md).
+
+**There is no NG `version` command — anywhere.** 14.1.1.8-jambonz11 answers
+`Unrecognized command`, and neither does upstream's documented command list
+contain one; brute-forcing 37 candidate names against the live node found only
+`ping`, `list`, `statistics`, `transform` and the call-scoped verbs. **Decision:
+ship the builder anyway as a probe** — one datagram at startup, a future build
+that grows the command is picked up for free, and the universal outcome is a
+first-class state (`VersionReport::NoVersionCommandOnThisNode`) rather than an
+error. Every kernel judgement rests on `statistics`, which does exist and is
+rich. The version itself has to come from the process, the package or
+`--listen-cli`; that is now written into the Phase-0 blocker below.
+
+**16b-2's open question is settled: it was rtpengine's transcoder.** Same
+rtpengine, same afternoon, audio packets per second at the tap:
+
+| tap | rtpengine's codec work | packets/s |
+| --- | --- | --- |
+| PCMU, from a G.711 call | pass-through | **51.1** |
+| Opus, **rtpengine transcoded it** from the same G.711 call | G.711 → Opus | **3.8** |
+| Opus, **native** from the endpoints, `MSS_TAP_TRANSCODE=off` | none | **50.0** |
+
+Native Opus arrives at the sender's full rate (750 datagrams in 15 s against
+750 sent, both legs), with `unknown_payload_type=0 unparsable=0
+undecodable_frames=0 frame_size_mismatch=0 carry_overflow_samples=0
+jitter_lost=0 recv_errors=0`, a **440.0 Hz** dominant tone at rms 8465.9 on both
+channels, and a wire the datagram log confirms independently: pt 111, the
+endpoints' **own** SSRCs (rtpengine did not re-stamp them), sequence deltas all
+1, RTP timestamp deltas all 960, a constant 60-byte payload, and both the
+one-frame (`0x48`) and two-frame (`0x4B`) SILK TOC shapes decoded without a
+single `frame_size_mismatch`. The transcoded case measured **worse** than the
+~10/s recorded in 16b-2 — 3.8/s, and on one run its Customer leg produced
+**zero** Opus packets for 15 s. **This never affected the production shape**,
+which is a WebRTC call already carrying Opus, tapped with transcoding off — the
+50.0/s column. It does mean `transcode: [opus]` is only a smoke test, not a way
+to manufacture Opus.
+
+**What this does *not* answer, and why it cannot here.** Whether a subscription
+on a kernel-module rtpengine stays in the kernel. This box runs `--table=-1`,
+has no `/proc/rtpengine`, an empty `lsmod` and no
+`/lib/modules/$(uname -r)/build`, so the module cannot even be built without a
+custom-kernel detour. That half is now a read-only checklist for the platform
+team (architecture §8.1) rather than an unknown, and `kernel_probe.sh` is the
+instrument it hands them.
+
+**Left open:** the kernel verdict is log-only, not a metric; the capability
+probe never repeats, so an rtpengine restarted under a running daemon keeps its
+first-contact report; and `controlstatistics.proxies` and the per-interface
+blocks are read by the shell probe but not modelled in Rust.
 
 ## Open defects and soft spots
 
@@ -1075,10 +1183,18 @@ These are not code and have blocked since Phase 0:
 
 1. **Production rtpengine version check** — lab is 14.1.1.8 with `subscribe`
    working; the deployed version is unverified. If it lacks `subscribe`, the
-   whole ingest model needs an upgrade path first.
+   whole ingest model needs an upgrade path first. **It cannot be asked over
+   NG** (item 23, 2026-08-23): rtpengine has no NG `version` command, in this
+   build or upstream. Read it from the process, the package, or rtpengine's CLI
+   interface (`--listen-cli`); `lab/kernel_probe.sh` prints the same finding so
+   whoever visits the host is not left guessing.
 2. **rtpengine-side per-tap cost** — MSS-side cost is measured; the userspace
    copy cost on the rtpengine host at 100/500/1000 taps is not, and it sets
-   the rtpengine capacity plan.
+   the rtpengine capacity plan. Take `lab/kernel_probe.sh` (item 23) on that
+   visit: `relayedpackets_kernel` vs `_user` and `media_kernel` vs
+   `media_userspace` across baseline / taps-with-transcode /
+   taps-without-transcode is the measurement, and architecture §8.1 has the
+   full read-only checklist. **Fix D14 first** or orphaned taps pollute it.
 3. **OpenSIPS → Redis call→node discovery** — **no longer a blocker
    (2026-08-17).** MSS now resolves a call's participants itself: the legacy controller passes
    the SIP call-id and the caller's from-tag (both already on the channel as

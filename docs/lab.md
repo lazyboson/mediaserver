@@ -1239,6 +1239,9 @@ anomalies), and not MSS (the identical code path on the identical call gives
 **native** Opus source. It does not affect the production shape, where the call
 is already Opus and rtpengine transcodes nothing.
 
+**Settled 2026-08-23 by `opus_call_driver.py`: it is rtpengine's transcoder.**
+See the `kernel_probe.sh` and `opus_call_driver.py` sections below.
+
 ## group_recording_drill.sh — two calls, one recording (2026-08-23)
 
 Item 21's recording groups had to be proved where they matter: **two separate
@@ -1323,3 +1326,174 @@ is the driver's byte-ramp fixture rather than speech — it exercises the group,
 the participant keys, the per-member pause and the uploads against real
 rtpengine and real object storage, not a real conference. It also runs one pod
 by construction: a group lives in that pod's memory (D16).
+
+## kernel_probe.sh — is rtpengine's kernel module in play? (2026-08-23)
+
+`lab/kernel_probe.sh <host> <port>` answers "does this rtpengine forward media
+in the kernel?" over NG alone, so the same script runs against a container, a
+staging node or a production box. It exists because item 18's decision gate
+needs that answer on a host this box cannot be, and because the answer changes
+what a tap costs on the rtpengine side.
+
+The evidence is rtpengine's own accounting. `statistics` splits both the
+lifetime relay totals and the live rates between the kernel module and
+userspace, so no `/proc` access and no root are needed:
+
+| key | where | what it settles |
+| --- | --- | --- |
+| `relayedpackets_kernel` / `_user` | `totalstatistics` | has the module *ever* forwarded on this node |
+| `packetrate_kernel` / `_user` | `currentstatistics` | is it forwarding *now* |
+| `media_kernel` / `media_userspace` / `media_mixed` | `currentstatistics` | how many media streams sit on each path |
+| `transcoders[].chain` / `.packets` | top level | which codec conversions are running, i.e. which streams *cannot* be in the kernel |
+
+Verdicts and exit codes: `0` module in play (now, or earlier on this node),
+`1` userspace only, `2` cannot tell (with the reason — either the node has
+relayed nothing yet, or its statistics carry no kernel/userspace split),
+`3` unreachable. Run on the rtpengine host it also reports `/proc/rtpengine`
+and `lsmod`, which NG cannot expose; anywhere else it says that half is
+skipped rather than guessing.
+
+The NG port is not published to the WSL host, so reach it from inside the lab:
+
+```sh
+export DOCKER_API_VERSION=1.43
+docker run --rm --network mss-microsip_lab -v "$PWD/lab":/lab:ro \
+    python:3-slim sh /lab/kernel_probe.sh 172.31.99.10 22222
+```
+
+What the lab answered (2026-08-23, rtpengine 14.1.1.8-jambonz11, `--table=-1`):
+
+```
+kernel_probe: no /proc/rtpengine (module not loaded here, or not this host)
+kernel_probe: this rtpengine has no NG version command ('Unrecognized command')
+kernel_probe: uptime 24752s, sessions now 4, transcoding media now 0
+kernel_probe: relayed packets total=150462 kernel=0 userspace=150462
+kernel_probe: packets/s now kernel=0 userspace=207; media now kernel=0
+              userspace=4 mixed=0
+kernel_probe: transcoding 'PCMU/8000 -> opus/48000/2', 7378 packets
+              (a transcoded stream cannot be kernel-forwarded)
+kernel_probe: VERDICT the kernel module is NOT in play -- every packet this
+              node relayed went through userspace
+```
+
+Exit code 1. That is the expected answer for this lab and it machine-verifies
+the "no module" path: 150k packets relayed, every one of them in userspace,
+including 207/s live while calls were up.
+
+**Two things the probing itself taught us.**
+
+- **There is no NG `version` command — anywhere.** Not in 14.1.1.8-jambonz11
+  (`Unrecognized command`) and not in the upstream protocol documentation,
+  whose command list runs ping, offer, answer, delete, query, recording and
+  media verbs, `statistics`, publish/subscribe/unsubscribe, connect, create,
+  mesh — and no version. Brute-forcing 37 candidate names against the live node
+  found exactly six that exist: `ping`, `list`, `statistics`, `transform`, plus
+  the call-scoped verbs. The version has to come from the process, the package
+  or the CLI interface (`--listen-cli`), none of which is NG. MSS therefore
+  probes for it, reports "unknown: this rtpengine's NG protocol has no version
+  command", and bases every kernel judgement on `statistics` instead.
+- **rtpengine caches NG replies by cookie, and a probe script must not reuse
+  one.** The first cut of `kernel_probe.sh` used a fixed cookie for all three
+  commands and got the *ping* reply back for `statistics` and `version` —
+  `{'result': 'pong'}` — which read exactly like a node that answers nothing
+  useful. The same cache is what makes MSS's retransmit-the-same-cookie retry
+  idempotent (and what caused defect D12), so this is a trap for every future
+  probe: one cookie per command.
+
+## opus_call_driver.py — a native Opus call, and the verdict on rtpengine's Opus under-production (2026-08-23)
+
+`lab/opus_call_driver.py` is `call_driver.py` with libopus in place of the
+G.711 byte ramp: both legs offer and answer `opus/48000/2` at a dynamic payload
+type, encode a real 440 Hz tone with libopus through ctypes (CBR 24 kbit/s, VBR
+and DTX explicitly off), and pump 960-sample frames on a wall-clock-anchored
+20 ms pacer. rtpengine only relays. The tone is built as a whole number of
+periods across a whole number of frames (5 frames of 960 samples = 4 periods of
+1200) so replaying the frame list is phase-continuous forever.
+
+It exists to settle 16b-2's one open question: rtpengine emitted ~10 packets/s
+when *it* transcoded G.711 to Opus, where the same call tapped as PCMU gave
+~51. CPU, DTX, VAD, loss and MSS were already ruled out by measurement; the
+missing experiment was Opus that rtpengine did not generate.
+
+```sh
+export DOCKER_API_VERSION=1.43
+NET=mss-microsip_lab
+
+docker run -d --name opus-native-driver --network $NET --ip 172.31.99.130 \
+  -v "$PWD/lab/opus_call_driver.py:/opus_call_driver.py:ro" \
+  -e NG_NODE=172.31.99.10 -e SELF_IP=172.31.99.130 \
+  -e CALL_ID=opus-native-proof -e FROM_TAG=natA -e TO_TAG=natB \
+  -e PUMP_SECONDS=420 \
+  python:3-slim sh -c 'apt-get update -qq && apt-get install -y -qq libopus0 \
+                       && python3 /opus_call_driver.py'
+
+docker run --rm --network $NET --ip 172.31.99.131 \
+  -v "$PWD:/build:ro" -v ${NET}-target:/target \
+  -v ${NET}-registry:/usr/local/cargo/registry -v "$PWD/lab/out:/out" \
+  -w /build -e CARGO_TARGET_DIR=/target -e RUST_LOG=info \
+  -e MSS_RTPENGINE_NODE=172.31.99.10:22222 -e MSS_TAP_LOCAL_IP=172.31.99.131 \
+  -e MSS_TAP_CALL_ID=opus-native-proof -e MSS_TAP_FROM_TAGS=natA,natB \
+  -e MSS_TAP_FORMAT=opus -e MSS_OPUS_DECODE_RATE_HZ=16000 \
+  -e MSS_TAP_TRANSCODE=off -e MSS_TAP_SECONDS=15 \
+  -e MSS_TAP_OUTPUT=/out/opus_native_tap.wav \
+  -e MSS_TAP_DATAGRAM_LOG_DIR=/out \
+  mss-lab-rust:1.95 cargo run --quiet -p mediaserverd
+```
+
+The driver refuses to pump if rtpengine renumbered the Opus payload type, so a
+run that reaches the tap really is a native-Opus call. It did not: rtpengine
+answered pt **111**, the offered type, and the tap saw `payload_types [111,
+101]` — nothing transcoded.
+
+**The number, and the verdict.** Same rtpengine, same afternoon:
+
+| tap | rtpengine's codec work | audio packets in 15 s | packets/s |
+| --- | --- | --- | --- |
+| PCMU, same G.711 call | pass-through | 766 | **51.1** |
+| Opus, **rtpengine transcoded it** from that same G.711 call | G.711 → Opus | 85 − 28 telephone-events = 57 | **3.8** |
+| Opus, **native** from the endpoints, `MSS_TAP_TRANSCODE=off` | none | 750 | **50.0** |
+
+**rtpengine's G.711→Opus transcoder under-produces; the relay path and MSS are
+innocent.** Native Opus arrives at the sender's full rate — 750 datagrams in
+15 s against 750 sent, both legs — and rtpengine relays it 1:1 (the driver's
+own ears also read 50.00/s each way over a 100 s control run). The transcoded
+case was *worse* than the ~10/s recorded in 16b-2, at 3.8/s, and on one run its
+Customer leg produced **zero** Opus packets for 15 s while the same call gave
+51.1/s as PCMU. **This does not affect the production shape**, which is a
+WebRTC call that is already Opus tapped with transcoding off — exactly the
+column that measured 50.0/s. It does mean `transcode: [opus]` is not a usable
+way to *manufacture* Opus for anything but a smoke test.
+
+Leg health on the native run, `MSS_TAP_TRANSCODE=off`, 15 s:
+
+| track | datagrams | played | undecodable | frame_size_mismatch | carry_overflow | unknown_pt | lost | concealed | recv_err |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| Customer | 750 | 746 | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
+| Agent | 750 | 746 | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
+
+`answering the subscription with this codec payload_type=111
+clock_rate_hz=48000 encoding=Opus decode_rate_hz=16000`. The four unplayed
+frames per leg are the jitter buffer's target depth (5) still holding audio at
+teardown, not loss.
+
+**Read the audio, not just the counters.** The captured wav's dominant frequency
+is **440.0 Hz on both channels** at rms 8465.9, against the 8485 a
+12000-amplitude sine should give, with 238698 of 239680 samples non-zero. The
+datagram log confirms the wire independently: 750 packets per leg, payload type
+**111**, **the endpoints' own SSRCs** (`0x33333333`/`0x44444444` — rtpengine did
+not re-stamp them, the same "leg identity gets cleaner without transcoding"
+effect item 20 found), sequence deltas all **1**, RTP timestamp deltas all
+**960**, and a constant **60-byte** payload (CBR 24 kbit/s at 20 ms). The TOC
+bytes are `0x4B` (551 packets) and `0x48` (199) — SILK wideband, config 9,
+mono, one packet carrying two 10 ms frames and the other one 20 ms frame. MSS
+decoded both shapes with `frame_size_mismatch=0`, which is the multi-frame
+path 16b-2 built the `Carry` for.
+
+**One unexplained observation, recorded rather than claimed.** On the 420 s run
+the caller's own ear fell from 50/s to ~16/s average partway through while the
+callee's stayed at 50/s; the tap itself was unaffected. Two discriminating runs
+say it was not the tap: a 100 s call with **no** tap held 50.00/s in both ears,
+and a 110 s call **tapped and unsubscribed mid-call** also held 50.00/s in both
+ears. So an MSS subscribe/unsubscribe does not damage the tapped call. The long
+run overlapped other agents' lab traffic and it has not reproduced; if it ever
+does, the discriminating experiment is a long call with nothing else on the box.
