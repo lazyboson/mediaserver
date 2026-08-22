@@ -83,8 +83,9 @@ Work:
 - ✅ Consumer adapters: WebSocket Twilio dialect first (wire-compatible with
   the legacy media gateway — existing endpoints must not change), then gRPC
   `MediaStream` (proto/mediastream.proto, landed 2026-08-20 — binary frames,
-  `ConsumerHello` token auth, capability-checked inject, mark/clear; a live
-  lab consumer over gRPC is still owed). Each attaches with a declared
+  `ConsumerHello` token auth, capability-checked inject, mark/clear; **a live
+  tapped call was heard over it in the lab on 2026-08-22**, L16/16k and
+  ASR-verified intelligible — tasks.md item 10). Each attaches with a declared
   capability (`SINK` / `+EVENTS` / `+INJECT`) — architecture.md §5.2 — and
   exactly one per session is `authoritative` (§5.3).
 - Control plane: tonic `MediaControl` over the Session/Attachment/Playback
@@ -164,11 +165,15 @@ Exit criteria: byte-comparable recordings vs FS output across codec/hold/
 transfer scenarios; downstream consumers (playback UI, QA tooling) work
 unmodified; dual-recording disabled for all tenants.
 
+One live tapped call recorded end to end **landed 2026-08-22** with item 10's
+lab drill: a real SIP call to MinIO, duration matching the reported
+`duration_ms` to the sample, and the recording callbacks read off the real
+`mss.events` topic.
+
 Exit criteria still open: the byte comparison itself — `lab/recording_parity.py`
-is the harness and has never seen a FreeSWITCH recording — plus one live
-tapped call recorded end to end, and the transfer scenario, which still lands
-on speaker naming by elimination until a tag-replacing transfer triggers a
-re-subscribe.
+is the harness and has never seen a FreeSWITCH recording — and the transfer
+scenario, which still lands on speaker naming by elimination until a
+tag-replacing transfer triggers a re-subscribe.
 
 ## Phase 3 — Interactive media
 

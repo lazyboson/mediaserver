@@ -543,6 +543,19 @@ never silent), then asks the media plane for frames through the new
   task, which drops the frame receiver and detaches from the hub. The
   attachment survives its consumer, so a reconnect is a fresh `Subscribe` —
   `TapPlane` refuses a second concurrent consumer per attachment.
+- **Proved on a live call 2026-08-22** (tasks item 10), not only against the
+  fake plane: `crates/control-api/examples/mss_stream_probe.rs` is the
+  reference consumer — attach, `ConsumerHello`, decode, one wav per track —
+  and `lab/grpc_stream_drill.sh` runs it against a real tapped SIP call. The
+  customer track came out at rms 614.5 and Deepgram transcribed it verbatim.
+- **Known wart found by that run (D13):** `start_message` derives its
+  `tracks` list from the selector, so `TrackSelector::All` advertises
+  `["customer","agent"]` — but the hub also delivers `Track::Mixed` (the
+  injection feed, silence-filled every tick so it stays gap-free), so a
+  consumer receives a track it was never told about and 50% more bytes than
+  the start frame implies. The same `tracks_of` shape feeds the frozen Twilio
+  `start` frame, which is why it was left alone here rather than "fixed" in
+  passing.
 
 ### auth.rs — the shared-secret policy (M4, landed 2026-08-20)
 
@@ -1005,7 +1018,12 @@ toward an unreachable rtpengine returns
 attempts`, and the follow-up `DescribeSession` returns `NotFound` — the
 rollback works in the daemon, not only against the test fake.
 `crates/control-api/examples/mss_ctl.rs` is the small client used for that
-and is the quickest way to poke a running control plane by hand.
+and is the quickest way to poke a running control plane by hand; it covers
+`create`, `describe`, `attach` (ws), `record` (the `FILE_S3` identity),
+`pause`, `detach`, `play` and `destroy`.
+`crates/control-api/examples/mss_stream_probe.rs` is its data-plane sibling:
+it attaches a `GRPC_STREAM` consumer, subscribes, and writes what it hears
+as a wav per track with rms and peak — the tool the item-10 lab proof used.
 
 ### hub.rs — the fan-out core (M3), first increment
 The per-session pub/sub the roadmap calls the fan-out hub. Two-worlds
@@ -1123,6 +1141,18 @@ cookie, per-request `oneshot`, timeout, retry, and node health counters.
   caller (`main` derives it from the wall clock), so a restarted pod does
   not collide with its own pre-restart cookies in rtpengine's reply
   cache. `CookieSequence` itself takes no clock, keeping it testable.
+- **The serial is process-wide, not per-`CookieSequence` (2026-08-22, defect
+  D12).** It used to restart at 0 in every instance, and `TapPlane` binds a
+  **new transport per session** — so every session's first command carried
+  cookie `<prefix>-0`. The same reply cache that makes a retransmit
+  idempotent then made a *second session* idempotent with the first: two
+  sessions inside rtpengine's cache window received the same cached
+  `subscribe answer`, and the second tap listened to a subscription that no
+  longer existed — `datagrams: 0` on every leg, looking for all the world
+  like a network fault. A static `AtomicU64` shared by all instances makes a
+  cookie unique per process by construction; the prefix still separates pods
+  and restarts. Pinned by `two_transports_on_one_pod_never_share_a_cookie`
+  and measured both ways in the lab (see lab.md, the gRPC drill).
 - A `PendingGuard` removes the waiter on every exit path, so a timed-out
   request cannot leak an entry into the correlation map
   (`pending_waiters_are_released_when_a_request_ends`).
