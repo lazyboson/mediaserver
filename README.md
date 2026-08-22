@@ -47,7 +47,7 @@ until the softswitch does only call control, or nothing at all.
 ## Quick start
 
 ```sh
-cargo run -p mediaserverd            # needs only Rust; no protoc, no cmake
+cargo run -p mediaserverd            # needs Rust plus cmake/make/g++ (libopus is vendored)
 ```
 
 Environment (all optional except the listen address):
@@ -80,7 +80,8 @@ synthetic callers and mock consumers) lives in [`lab/`](docs/lab.md).
 
 | Crate | What it is |
 | --- | --- |
-| `crates/media-core` | **Sans-IO** media pipeline core: RTP parse/serialize, G.711, RFC 4733 DTMF, jitter buffer, frame/format types, packet-replay harness. No sockets, no clocks, no async. |
+| `crates/media-core` | **Sans-IO** media pipeline core: RTP parse/serialize, G.711, Opus decode, RFC 4733 DTMF, jitter buffer with G.711 Appendix I concealment, per-consumer encode/resample, packet-replay harness. No sockets, no clocks, no async. |
+| `crates/opus-ffi` | Safe wrapper over **libopus** (vendored, statically linked). The only crate here that contains FFI `unsafe`; every other crate forbids it. |
 | `crates/rtpengine-ng` | **Sans-IO** rtpengine NG protocol client: bencode, `subscribe request/answer`, `unsubscribe`, `play media`/`stop media`, `query`, subscription SDP. |
 | `crates/protocol` | Frozen consumer wire dialects: Twilio Media Streams JSON and `audio_fork` send_text control events. The serialization tests are the spec. |
 | `crates/session-core` | **Sans-IO** control-plane state machine: sessions, attachments, playbacks, events — capability authorization, one authoritative attachment per session, idempotent retries. |

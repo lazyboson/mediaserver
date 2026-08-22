@@ -130,7 +130,10 @@ services:
         ipv4_address: 172.31.99.90
 
   mediaserverd:
-    image: rust:1.95-slim-bookworm
+    image: mss-lab-rust:1.95
+    build:
+      context: .
+      dockerfile: Dockerfile.rust
     working_dir: /build
     command: ["/lab/tap_live_call.sh"]
     depends_on: [opensips, freeswitch, llm-bridge, call-watcher, rtt-service, recorder-service]
@@ -213,7 +216,10 @@ services:
         ipv4_address: 172.31.99.61
 
   mss-control:
-    image: rust:1.95-slim-bookworm
+    image: mss-lab-rust:1.95
+    build:
+      context: .
+      dockerfile: Dockerfile.rust
     working_dir: /build
     command: ["cargo", "run", "--quiet", "-p", "mediaserverd"]
     depends_on: [rtpengine, minio-init]
@@ -255,7 +261,10 @@ services:
   # what makes "exactly one adopter" a real assertion rather than a tautology.
   # They share the build cache volume, so they start without recompiling.
   mss-control-b:
-    image: rust:1.95-slim-bookworm
+    image: mss-lab-rust:1.95
+    build:
+      context: .
+      dockerfile: Dockerfile.rust
     working_dir: /build
     command: ["cargo", "run", "--quiet", "-p", "mediaserverd"]
     depends_on: [rtpengine, minio-init]
@@ -290,7 +299,10 @@ services:
         ipv4_address: 172.31.99.32
 
   mss-control-c:
-    image: rust:1.95-slim-bookworm
+    image: mss-lab-rust:1.95
+    build:
+      context: .
+      dockerfile: Dockerfile.rust
     working_dir: /build
     command: ["cargo", "run", "--quiet", "-p", "mediaserverd"]
     depends_on: [rtpengine, minio-init]
