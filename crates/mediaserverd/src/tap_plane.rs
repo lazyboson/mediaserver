@@ -1,7 +1,9 @@
 use crate::consumer_ws::{self, ConsumerConfig};
 use crate::hub::{Hub, HubClient, Subscription, SubscriptionMetrics, TapEvent, TrackSelection};
 use crate::ng_transport::{NgTransport, NgTransportConfig};
-use crate::tap_spike::{capture, SharedLegStats, TapLeg};
+use crate::tap_spike::{
+    capture, SharedLegStats, SsrcTrackPublisher, SsrcTracks, TapLeg, MAX_SSRC_TRACKS,
+};
 use control_api::{MediaPlane, MediaPlaneError, PlaybackSource, StreamFrame};
 use media_core::{AudioFormat, ConsumerEncoder, Track};
 use rtpengine_ng::{
@@ -29,6 +31,8 @@ const CONSUMER_QUEUE_FRAMES: usize = 200;
 const TEXT_QUEUE_DEPTH: usize = 32;
 const GRPC_FRAME_QUEUE: usize = 64;
 const RETAIN_NO_LOCAL_AUDIO: Duration = Duration::ZERO;
+const SSRC_WATCH_INTERVAL: Duration = Duration::from_millis(500);
+const MAX_REQUERIED_SSRCS: usize = 16;
 const ACCOUNT_METADATA_KEY: &str = "accountId";
 const STREAM_SID_METADATA_KEY: &str = "streamSid";
 const DEFAULT_ACCOUNT_ID: &str = "mss";
@@ -49,6 +53,7 @@ struct LiveSession {
     hub: HubClient,
     stop: Arc<AtomicBool>,
     capture: Option<std::thread::JoinHandle<()>>,
+    speakers: Option<tokio::task::JoinHandle<()>>,
 }
 
 enum LiveAttachment {
@@ -88,6 +93,8 @@ pub struct LegTotals {
     pub jitter_duplicates: u64,
     pub jitter_late_drops: u64,
     pub jitter_resets: u64,
+    pub ssrc_changes: u64,
+    pub reresolutions: u64,
     pub stalls: u64,
 }
 
@@ -109,6 +116,8 @@ impl LegTotals {
         self.jitter_duplicates += read(&shared.jitter_duplicates);
         self.jitter_late_drops += read(&shared.jitter_late_drops);
         self.jitter_resets += read(&shared.jitter_resets);
+        self.ssrc_changes += read(&shared.ssrc_changes);
+        self.reresolutions += read(&shared.reresolutions);
         self.stalls += read(&shared.stalls);
     }
 }
@@ -120,6 +129,7 @@ pub struct IngestSnapshot {
     pub legs_live: u64,
     pub legs_unknown_ssrc: u64,
     pub legs_stalled: u64,
+    pub ssrc_requeries: u64,
     pub consumers_live: u64,
     pub consumer_dropped_oldest: u64,
     pub consumer_delivered: u64,
@@ -132,6 +142,7 @@ struct MetricsInner {
     retired: LegTotals,
     retired_consumer_dropped: u64,
     retired_consumer_delivered: u64,
+    ssrc_requeries: u64,
     legs: HashMap<SessionId, Vec<Arc<SharedLegStats>>>,
     consumers: HashMap<AttachmentId, SubscriptionMetrics>,
 }
@@ -159,6 +170,10 @@ impl TapPlaneMetrics {
         }
     }
 
+    fn record_ssrc_requery(&self) {
+        self.lock().ssrc_requeries += 1;
+    }
+
     fn register_consumer(&self, attachment: AttachmentId, metrics: SubscriptionMetrics) {
         let mut inner = self.lock();
         if let Some(replaced) = inner.consumers.insert(attachment, metrics) {
@@ -183,6 +198,7 @@ impl TapPlaneMetrics {
             consumers_live: inner.consumers.len() as u64,
             consumer_dropped_oldest: inner.retired_consumer_dropped,
             consumer_delivered: inner.retired_consumer_delivered,
+            ssrc_requeries: inner.ssrc_requeries,
             ..IngestSnapshot::default()
         };
         for legs in inner.legs.values() {
@@ -519,10 +535,11 @@ impl MediaPlane for TapPlane {
             .await
             .map_err(|error| MediaPlaneError(format!("subscribe answer: {error}")))?;
 
-        let ssrc_tracks = speaker_ssrcs(&transport, &view).await;
+        let ssrc_tracks = speaker_ssrcs(&transport, &view.call_id, &view.from_tags).await;
 
         let mut legs = Vec::with_capacity(sockets.len());
         let mut shared_stats = Vec::with_capacity(sockets.len());
+        let mut ssrc_publishers = Vec::with_capacity(sockets.len());
         for (index, socket) in sockets.into_iter().enumerate() {
             let telephone_event = offer
                 .streams
@@ -531,19 +548,19 @@ impl MediaPlane for TapPlane {
                 .map(|event| event.payload_type);
             let shared = Arc::new(SharedLegStats::default());
             shared_stats.push(Arc::clone(&shared));
-            legs.push(
-                TapLeg::new(
-                    speaker_track(index),
-                    socket,
-                    format,
-                    TARGET_DEPTH_PACKETS,
-                    telephone_event,
-                    RETAIN_NO_LOCAL_AUDIO,
-                )
-                .map_err(|error| MediaPlaneError(format!("tap leg: {error}")))?
-                .with_ssrc_tracks(ssrc_tracks.clone())
-                .with_shared_stats(shared, STALL_AFTER, Instant::now()),
-            );
+            let leg = TapLeg::new(
+                speaker_track(index),
+                socket,
+                format,
+                TARGET_DEPTH_PACKETS,
+                telephone_event,
+                RETAIN_NO_LOCAL_AUDIO,
+            )
+            .map_err(|error| MediaPlaneError(format!("tap leg: {error}")))?
+            .with_ssrc_tracks(ssrc_tracks.clone())
+            .with_shared_stats(shared, STALL_AFTER, Instant::now());
+            ssrc_publishers.push(leg.ssrc_track_publisher());
+            legs.push(leg);
         }
 
         let (mut hub, hub_client) = Hub::new();
@@ -593,6 +610,20 @@ impl MediaPlane for TapPlane {
             })
             .map_err(|error| MediaPlaneError(format!("capture thread: {error}")))?;
 
+        let speakers = if ssrc_tracks.is_empty() {
+            None
+        } else {
+            Some(tokio::spawn(reresolve_speakers(
+                Arc::clone(&transport),
+                view.call_id.clone(),
+                view.from_tags.clone(),
+                shared_stats.clone(),
+                ssrc_publishers,
+                Arc::clone(&stop),
+                self.metrics.clone(),
+            )))
+        };
+
         info!(
             session = %view.id,
             external_id = %view.external_id,
@@ -617,6 +648,7 @@ impl MediaPlane for TapPlane {
                 hub: hub_client,
                 stop,
                 capture: Some(capture_thread),
+                speakers,
             },
         );
         drop(held);
@@ -638,6 +670,9 @@ impl MediaPlane for TapPlane {
         };
 
         live.stop.store(true, Ordering::Relaxed);
+        if let Some(speakers) = live.speakers.take() {
+            speakers.abort();
+        }
         if let Err(error) = live
             .transport
             .unsubscribe(&live.call_id, &live.to_tag)
@@ -952,12 +987,16 @@ fn tracks_of(selector: TrackSelector) -> Vec<String> {
     }
 }
 
-async fn speaker_ssrcs(transport: &NgTransport, view: &SessionView) -> Vec<(u32, Track)> {
-    let reply = match transport.query(&view.call_id).await {
+async fn speaker_ssrcs(
+    transport: &NgTransport,
+    call_id: &str,
+    from_tags: &[String],
+) -> Vec<(u32, Track)> {
+    let reply = match transport.query(call_id).await {
         Ok(reply) => reply,
         Err(error) => {
             warn!(
-                call_id = %view.call_id,
+                %call_id,
                 %error,
                 "query failed; leg identity falls back to stream order"
             );
@@ -966,12 +1005,12 @@ async fn speaker_ssrcs(transport: &NgTransport, view: &SessionView) -> Vec<(u32,
     };
     let mut ssrc_tracks = Vec::new();
     for (tag, ssrc) in reply.ssrc_by_tag() {
-        let Some(position) = view.from_tags.iter().position(|held| *held == tag) else {
+        let Some(position) = from_tags.iter().position(|held| *held == tag) else {
             continue;
         };
         let speaker = speaker_track(position);
         info!(
-            call_id = %view.call_id,
+            %call_id,
             %tag,
             ssrc,
             ?speaker,
@@ -981,12 +1020,89 @@ async fn speaker_ssrcs(transport: &NgTransport, view: &SessionView) -> Vec<(u32,
     }
     if ssrc_tracks.is_empty() {
         warn!(
-            call_id = %view.call_id,
+            %call_id,
             "rtpengine reported no ssrcs for the requested tags; \
              leg identity falls back to stream order"
         );
     }
+    if ssrc_tracks.len() > MAX_SSRC_TRACKS {
+        warn!(
+            %call_id,
+            reported = ssrc_tracks.len(),
+            kept = MAX_SSRC_TRACKS,
+            "rtpengine named more speaker ssrcs than a leg map holds; \
+             the extras are dropped"
+        );
+    }
     ssrc_tracks
+}
+
+#[derive(Default)]
+struct SsrcRequeries {
+    asked_about: Vec<u32>,
+}
+
+impl SsrcRequeries {
+    fn note(&mut self, unresolved: &[u32]) -> bool {
+        let mut worth_asking = false;
+        for ssrc in unresolved {
+            if self.asked_about.contains(ssrc) {
+                continue;
+            }
+            if self.asked_about.len() == MAX_REQUERIED_SSRCS {
+                self.asked_about.remove(0);
+            }
+            self.asked_about.push(*ssrc);
+            worth_asking = true;
+        }
+        worth_asking
+    }
+}
+
+async fn reresolve_speakers(
+    transport: Arc<NgTransport>,
+    call_id: String,
+    from_tags: Vec<String>,
+    legs: Vec<Arc<SharedLegStats>>,
+    publishers: Vec<SsrcTrackPublisher>,
+    stop: Arc<AtomicBool>,
+    metrics: TapPlaneMetrics,
+) {
+    let mut requeries = SsrcRequeries::default();
+    while !stop.load(Ordering::Relaxed) {
+        tokio::time::sleep(SSRC_WATCH_INTERVAL).await;
+        let unresolved: Vec<u32> = legs
+            .iter()
+            .filter_map(|leg| leg.unresolved_ssrc())
+            .collect();
+        if !requeries.note(&unresolved) {
+            continue;
+        }
+        metrics.record_ssrc_requery();
+        let pairs = speaker_ssrcs(&transport, &call_id, &from_tags).await;
+        if pairs.is_empty() {
+            warn!(
+                %call_id,
+                ?unresolved,
+                "a leg started carrying an ssrc nobody claims and rtpengine named none; \
+                 the leg keeps the name it has"
+            );
+            continue;
+        }
+        let tracks = SsrcTracks::from_pairs(&pairs);
+        let unread = publishers
+            .iter()
+            .filter(|publisher| !publisher.publish(tracks))
+            .count();
+        info!(
+            %call_id,
+            ?unresolved,
+            speakers = tracks.len(),
+            legs = publishers.len(),
+            superseded = unread,
+            "re-resolved the speaker map after a mid-call ssrc change"
+        );
+    }
 }
 
 fn speaker_track(index: usize) -> Track {
@@ -1273,5 +1389,27 @@ mod leg_naming_tests {
     fn a_leg_carries_its_own_participants_voice_first_tag_is_the_customer() {
         assert_eq!(speaker_track(0), Track::Customer);
         assert_eq!(speaker_track(1), Track::Agent);
+    }
+
+    #[test]
+    fn one_unknown_ssrc_costs_one_query_however_long_it_lingers() {
+        let mut requeries = SsrcRequeries::default();
+        assert!(!requeries.note(&[]));
+        assert!(requeries.note(&[7]));
+        assert!(!requeries.note(&[7]));
+        assert!(!requeries.note(&[]));
+        assert!(requeries.note(&[7, 9]));
+        assert!(!requeries.note(&[9, 7]));
+    }
+
+    #[test]
+    fn the_requery_memory_is_bounded_and_forgets_its_oldest_ssrc() {
+        let mut requeries = SsrcRequeries::default();
+        for ssrc in 0..MAX_REQUERIED_SSRCS as u32 {
+            assert!(requeries.note(&[ssrc]));
+        }
+        assert!(!requeries.note(&[0]));
+        assert!(requeries.note(&[u32::MAX]));
+        assert!(requeries.note(&[0]));
     }
 }
