@@ -251,6 +251,77 @@ track.
 - Refusals are named, never silent: Opus (tasks item 9), G.711 at a
   non-tap rate, stereo, mismatched ptime.
 
+### opus.rs — the Opus decoder (landed 2026-08-22, ingest half only)
+
+`OpusStreamDecoder` decodes one Opus packet to mono `i16` PCM at a rate the
+caller chooses. It exists because **WebRTC legs are real**, and until now the
+only way to tap one was to make rtpengine transcode it — which is both a real
+cost on the rtpengine host (Opus decode is far heavier than G.711 companding)
+and the thing that keeps a subscription out of the kernel path (tasks item 20).
+
+**The dependency decision, made by measurement rather than preference.** The
+crate is `opus-rs` 0.1.31, and the reasons are in this order:
+
+- It **builds in the real builder image with only `cc`** — no cmake, no
+  pkg-config, 4.5 s, and it locks exactly one package because it has **zero
+  dependencies**. Probed directly in `rust:1.95-slim-bookworm` before any code
+  was written. The hermetic build the repo has twice chosen to keep (protox
+  over protoc, rskafka over rdkafka) survives untouched, and so do CI, the
+  Dockerfile and the lab image.
+- It is a **port of the reference C implementation** (libopus 1.6), not an
+  independent reimplementation, which is what makes it defensible under
+  Article XI. Its licence is libopus's own BSD-3-Clause, already in the
+  `deny.toml` allowlist, so this cost **no new licence allowance**.
+- It is `no_std` and **heap-free**, with a `heap` feature (on by default) that
+  boxes the large SILK and CELT state. That is exactly the shape Article V
+  wants: one allocation at session setup, none per packet.
+- The alternative, `audiopus`/`audiopus_sys`, is the real libopus but the
+  binding has been **unmaintained since April 2021 and is still a release
+  candidate**, and it needs cmake in three places. The usual "prefer the
+  battle-tested C binding" calculus inverts here.
+
+**The maturity risk, stated plainly.** This is v0.1.x, released the day before
+adoption, with docs.rs coverage at 1.49%, and its own changelog records a
+recently fixed table-transcription bug that made stereo streams above
+~160 kbps decode to garbage against libopus. WebRTC speech sits far below that
+bitrate, and there is a working escape hatch — `MSS_TAP_TRANSCODE=on` puts
+rtpengine back in the loop per deployment — so this is not a one-way door.
+**What is still owed: an independent cross-check against libopus output**, the
+same debt `g711.rs` carries against the ITU vectors.
+
+Design notes:
+
+- **The rate is the caller's choice**, and deliberately not decided here. Opus
+  decodes to 8/12/16/24/48 kHz, so the tap can ask for the rate that suits its
+  consumers. That policy belongs with the negotiation work, not the decoder.
+- The scratch buffer is sized for the **longest legal Opus frame** (60 ms at
+  the chosen rate) and allocated once, so no packet ever resizes it. A frame
+  that does not fit the caller's output slice is `FrameTooLong` naming both
+  sizes rather than a truncation.
+- Malformed input is a value, not a crash (Article IV): an empty packet and
+  assorted junk are errors or benign decodes, never panics, pinned by
+  `a_malformed_packet_is_an_error_not_a_panic`.
+- `f32` to `i16` conversion rounds and clamps, matching `encode.rs` so the two
+  directions agree.
+- Opus carries its **own PLC** for lost frames, which we do not use yet. Our
+  G.711 Appendix I concealer operates on decoded PCM and is therefore
+  codec-agnostic, so an Opus stream is concealed adequately today; using
+  Opus's native concealment would be better and is future work.
+
+**Verified**: a tone round-trips at all five legal rates with the expected
+sample count and energy; silence decodes quiet; and — the evidence that
+matters for a speech codec — real lab speech encoded and decoded through this
+module at 8 kHz / 24 kbps was transcribed **verbatim by Deepgram** ("Hello.",
+"This is the media server speaking through your bridge.") via
+`lab/ear_intelligibility_probe.py`. `examples/opus_speech_probe.rs` is the
+throwaway that produced it.
+
+**Not wired into `StreamPipeline` yet, on purpose.** The pipeline derives its
+audio payload type from `Encoding::static_payload_type`, and Opus has no static
+type — it is always a dynamically negotiated one (typically 111). Plumbing that
+belongs with the SDP work below, so this stage stops at a validated decoder
+rather than half-wiring the sacred path.
+
 ### frame.rs — the codec table, now readable in both directions
 
 `Encoding::static_payload_type` had no inverse, so nothing could answer "what

@@ -1288,6 +1288,8 @@ name = "media-core"
 version = "0.1.0"
 dependencies = [
  "criterion",
+ "hound",
+ "opus-rs",
  "rubato",
  "thiserror 2.0.20",
 ]
@@ -1463,6 +1465,12 @@ name = "openssl-probe"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7c87def4c32ab89d880effc9e097653c8da5d6ef28e6b539d313baaacfbafcbe"
+
+[[package]]
+name = "opus-rs"
+version = "0.1.31"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7206a32855c6007342b16e37fc3e8a57cab5a02ffc2f764a56556ba97582bce1"
 
 [[package]]
 name = "page_size"
@@ -2065,7 +2073,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

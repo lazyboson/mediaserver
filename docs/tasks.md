@@ -592,8 +592,77 @@ even if FS parity sign-off is a later human step. Item 14 (mid-call SSRC
 re-resolution) has landed, so a re-INVITE no longer stales the speaker
 labels of a recording; a tag-replacing transfer still can.
 
-### 16. Opus output
-Item 9 above, unchanged: decide the `audiopus_sys` cmake trade first.
+### 16. Opus — promoted to required (WebRTC legs are real)
+**Why it moved:** WebRTC media on the customer side is Opus, and the only way
+to tap it today is to have rtpengine transcode it. That works — the lab
+rtpengine reports `opus: fully supported` — but it costs rtpengine an Opus
+decode plus a G.711 encode per tap, which is far heavier than G.711
+companding, and a transcoding subscription is exactly what keeps the tap out of
+the kernel path (item 20). So Opus in MSS is a cost and kernel-path
+requirement, not a capability gap: **WebRTC calls are tapped successfully
+today.**
+
+#### 16a. Opus decoder — ✅ DONE (2026-08-22)
+`media-core/src/opus.rs`: `OpusStreamDecoder`, one Opus packet to mono `i16`
+PCM at a caller-chosen rate (8/12/16/24/48 kHz), scratch sized once for the
+longest legal 60 ms frame, malformed input an error and never a panic.
+**The build trade is settled by probe, not preference:** `opus-rs` 0.1.31
+builds in `rust:1.95-slim-bookworm` with **only `cc`** — no cmake, no
+pkg-config, 4.5 s, **zero dependencies** — so the hermetic build, CI, the
+Dockerfile and the lab image are all untouched, and BSD-3-Clause was already
+allowlisted so `cargo deny` needed **no new allowance**. It is a port of
+reference libopus 1.6 rather than an independent implementation, and it is
+`no_std`/heap-free with the big SILK and CELT state boxed once at
+construction, which is precisely Article V's shape. `audiopus` was rejected on
+evidence: the real libopus, but the binding has been unmaintained since
+April 2021, is still a release candidate, and needs cmake in three places.
+**Verified:** a tone round-trips at all five rates with exact sample counts;
+silence stays quiet; and real lab speech through this module at 8 kHz/24 kbps
+was transcribed **verbatim by Deepgram** ("Hello.", "This is the media server
+speaking through your bridge.") through `ear_intelligibility_probe.py` —
+`examples/opus_speech_probe.rs` is the throwaway that produced it.
+**Risk on the record:** v0.1.x, released the day before adoption, docs.rs
+coverage 1.49%, and its changelog records a recently fixed table bug that made
+>160 kbps stereo decode to garbage against libopus. WebRTC speech is far below
+that, and `MSS_TAP_TRANSCODE=on` is a working per-deployment escape hatch, so
+this is not a one-way door. **Owed: an independent cross-check against libopus
+output**, the same debt `g711.rs` carries against the ITU vectors.
+
+#### 16b. Negotiate Opus on the tap leg — ⬜ NEXT, and it is the blocker
+Nothing can tap an Opus leg until this lands, because the subscription answer
+cannot express Opus at all.
+- **`SubscriptionAnswer::to_sdp` needs dynamic rtpmap.** It calls
+  `Encoding::static_payload_type` and refuses anything without one
+  (`NoStaticPayloadType`), so it can only ever answer PCMU/PCMA. Opus is always
+  a dynamically negotiated payload type (typically 111) with
+  `a=rtpmap:111 opus/48000/2`. This is the long-standing "M3: dynamic rtpmap"
+  item, now on the critical path.
+- **`offered_format` must learn Opus** from the offer's rtpmap rather than the
+  static table, and `Encoding::from_static_payload_type` must stay
+  static-only — the dynamic case is a different lookup.
+- **`StreamPipeline` needs the payload type passed in** rather than derived,
+  which is why 16a stopped at the decoder.
+**Done when:** MSS answers an Opus subscription offer, receives Opus, and the
+decoded audio is ASR-verified on a live WebRTC-shaped lab call.
+
+#### 16c. Buffer sizing for Opus payloads — ⬜
+`jitter::MAX_PAYLOAD` is **480** bytes, sized for G.711. An Opus packet is up
+to **1276** bytes (RFC 6716), so the jitter ring must widen before Opus
+packets flow through it. Note the same constant also sizes `StreamPipeline`'s
+PCM scratch, so widening it is safe but the conflation should be split.
+`hub::MAX_FRAME_SAMPLES` is 480 samples, which holds 20 ms at 16 kHz (320) but
+**not at 48 kHz (960)** — so either the tap decodes Opus at ≤24 kHz or the hub
+frame grows.
+**The rate decision this forces:** decoding to 16 kHz preserves the wideband
+information ASR consumers want and fits existing buffers, but
+`ConsumerEncoder` currently refuses G.711 output at any rate but the tap's, so
+a 16 kHz tap could not feed the frozen PCMU-8k WebSocket bridge. Fix is small
+and already half-built: let `ConsumerEncoder` resample before G.711 encoding,
+which is the same `rubato` path L16 already uses.
+
+#### 16d. Opus output to consumers — ⬜ still genuinely later
+The original item 9 framing. `opus-rs` ships an encoder too, so this is now
+mostly plumbing, but no consumer has asked and ingest is what WebRTC needs.
 
 ### ~~17. Jitter hardening (defect D7)~~ — done 2026-08-22
 **Where:** `crates/media-core` (`jitter.rs`, `pipeline.rs`, new `plc.rs`,
