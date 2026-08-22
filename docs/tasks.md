@@ -4,7 +4,7 @@ Living work list. [roadmap.md](roadmap.md) holds the *why* and the phase exit
 criteria; this file holds the *what next*, ordered, with a definition of done
 for each item. Update it in the same PR that changes the state of an item.
 
-Status as of **2026-08-20**.
+Status as of **2026-08-22**.
 
 ## Milestones
 
@@ -13,8 +13,9 @@ Status as of **2026-08-20**.
 | **M1 — scaffold** | workspace, sans-IO cores (RTP, G.711, DTMF, jitter), NG bencode, consumer dialects, two-world daemon skeleton, watchdog | ✅ done (2026-08-13) |
 | **M2 — Phase-0 spike** | real NG subscribe against lab rtpengine, both legs jitter-buffered to WAV, per-tap cost | ✅ **code done**; 3 org-side items open (below) |
 | **M3 — fan-out hub** | per-session pub/sub, N consumers, WS-Twilio adapter, pause/resume/send_text parity | ✅ done |
-| **M4 — control plane** | `MediaControl` gRPC, session state machine, Kafka events, Redis registry, tenant-flag pilot | 🔶 **~95%** — code complete; the cigol translator merge and the barge-in measurement remain |
-| M5+ | Phases 2–4 (recording, interactive media, full media plane) | ⬜ not started |
+| **M4 — control plane** | `MediaControl` gRPC, session state machine, Kafka events, Redis registry, tenant-flag pilot | 🔶 **code complete** — pilot gates: translator merge (external), barge-in number (item 5), live pod-kill drill (item 11), gRPC lab proof (item 10) |
+| **M5 — recording (Phase 2)** | per-leg taps → stereo segmenter → S3, identity + callback contract, dual-recording | ⬜ next — item 15 below is the plan |
+| M6+ | Phases 3–4 (interactive media, full media plane) | ⬜ not started |
 
 ### What landed, concretely
 
@@ -228,17 +229,214 @@ vendors we know about.
 **Done when:** a consumer can request Opus and get it, verified by replay,
 with the build documented in CI and the Dockerfile.
 
+## The road from here — ordered handoff
+
+Items 1–9 above are M4 history; this section is the executable plan for
+whoever picks the project up next (human or AI session — it assumes no
+memory of the sessions that built M1–M4). **Read
+[CLAUDE.md](../CLAUDE.md), then [session-playbook.md](session-playbook.md),
+then this list, in that order.** The standing rules that are not optional:
+
+- Work on a branch, open a PR — never commit to `main` directly.
+- The gate, run as separate commands, every one read before the next:
+  `cargo test --workspace` · `cargo fmt --all --check` ·
+  `cargo clippy --all-targets -- -D warnings` ·
+  `grep -rn '//' crates --include='*.rs'` (must print nothing) ·
+  `cargo deny check all`.
+- No comments in `.rs` files; module context goes to
+  [implementation-notes.md](implementation-notes.md) **in the same PR**;
+  item state changes update this file in the same PR; milestones update
+  [roadmap.md](roadmap.md).
+- Probe vendors before building on their behavior (`lab/ng_*_probe.py`
+  pattern); machine-verify (`lab/host_test_caller.py`,
+  `lab/ear_intelligibility_probe.py`) before asking a human to dial;
+  one change per verification cycle.
+- A checkbox claims only what was measured. If a thing ran only against a
+  fake, say so where you record it done.
+
+### 10. Lab proof of the gRPC data plane
+**Where:** `crates/control-api/examples/` + `lab/`.
+**What:** the `MediaStream` service (item 6) has only ever run against the
+fake plane. Write `mss_stream_probe.rs` — an example binary using the
+generated `MediaStreamClient` (copy `mss_ctl.rs`'s shape): attach a
+`GRPC_STREAM` consumer with `L16/16k` to a live lab call, subscribe with
+`ConsumerHello`, decode the little-endian frames, write a WAV.
+**Direction:** drive a call with `lab/host_test_caller.py`; create/attach
+via `mss_ctl`; validate the WAV with `lab/ear_intelligibility_probe.py`.
+Scrape `MSS_METRICS_LISTEN` during the run and check
+`mss_consumer_delivered_total` moves and `mss_consumer_dropped_oldest_total`
+stays 0. Remember `MSS_AUTH_TOKEN` unset = open lab mode.
+**Done when:** a live tapped call is intelligible from a gRPC/L16-16k
+consumer's WAV, and the run's metrics scrape is pasted into the PR.
+
+### 11. Pod-kill re-subscribe drill (Phase-1 exit criterion)
+**Where:** `lab/`, no product code expected.
+**What:** the Redis registry (item 3) was proven at store level; the exit
+criterion wants a real kill observed end to end.
+**Direction:** two `mediaserverd` processes against one Redis (distinct
+`MSS_POD_NAME`, distinct control ports, same `MSS_REDIS_URL`); live call
+tapped by pod A with a WS consumer attached; `kill -9` pod A mid-call;
+pod B's keeper adopts within the lease TTL (15 s) and re-subscribes.
+Measure the audio gap in the consumer's artifact (silence run length),
+assert exactly one adopter (`mss_registry_adopted_total`), zero
+`mss_registry_lost_total`, and no orphan subscription left in rtpengine
+(NG `query` before/after).
+**Done when:** the drill script lives in `lab/`, the measured gap is
+recorded here, and [lab.md](lab.md) documents the procedure.
+
+### 12. Barge-in cut-through measurement
+Item 5 above, unchanged — still gated on the cigol translator merge
+(external). It is a **Phase-1 exit criterion**; if the Kafka hop misses the
+budget, the fallback (a gRPC stream for speech events only) is a design
+change better known early.
+
+### 13. Event delivery durability (defect D5)
+**Where:** `crates/mediaserverd/src/event_pump.rs`.
+**What:** delivery is at-most-once; a broker outage silently (but
+countedly) drops events. Before a pilot, add bounded retry with backoff:
+keep a failed event and retry it before taking the next (per-session order
+must hold — never reorder within a session), cap the buffered backlog,
+count and drop-oldest beyond it, and surface retry depth as a metric.
+**Direction:** the translator dedupes nothing today — it relies on the
+gapless seq. At-least-once is safe only if the downstream treats
+(external_id, seq) as idempotent; confirm with the translator's tests
+before switching semantics, and say which semantics shipped here.
+**Done when:** stopping Redpanda for 30 s mid-call in the lab loses zero
+events after recovery (verify with `mss_events_tail`: gapless seq), and
+the pump's totals reconcile.
+
+### 14. Mid-call SSRC re-resolution (defect D1)
+**Where:** `crates/mediaserverd/src/tap_spike.rs` + `tap_plane.rs`.
+**What:** a re-INVITE/transfer changes a leg's SSRC; today `ssrcs_seen`
+records it and nothing acts, so speaker labels can go stale. Blocks
+correct Phase-2 recording of transferred calls.
+**Direction:** the media thread must not do NG round trips. Reuse the two
+seams that exist: the capture thread already publishes `ssrcs_seen` into
+`SharedLegStats`-adjacent state, and the hub already shows how to hand
+commands into the capture loop (bounded `ArrayQueue`, polled per tick).
+A control-world task notices an unknown SSRC, re-runs `query` +
+`speaker_ssrcs` (both exist in `tap_plane.rs`), and pushes an updated
+ssrc→track map into the legs through a new command queue.
+**Done when:** a replay/lab test that switches the sender's SSRC mid-call
+(the `G711StreamGenerator` takes an SSRC — send with a second generator)
+keeps customer/agent naming correct, and D1 is struck from the table.
+
+### 15. Phase 2 — recording to S3 (milestone M5)
+**Where:** new `crates/mediaserverd/src/recorder.rs`; `tap_plane.rs` for
+the `FILE_S3` transport; `session-core` already has the event variants.
+**What:** the roadmap's Phase 2, most parts already exist. The recorder is
+just another hub consumer: subscription (all tracks) → stereo interleave
+by `timestamp_ms` (Customer left, Agent right — `write_wav` in
+`tap_spike.rs` shows the exact convention) → segment WAVs → upload.
+**Direction, in landable slices:**
+  1. `FILE_S3` attachments in `TapPlane::open_attachment`: endpoint is the
+     frozen identity `${accountID}/${recordingID}.${format}` — parse it,
+     refuse anything else loudly. Emit `RecordingStarted` via
+     `SessionRegistry::observe` (the variant exists, unraised).
+  2. Segmenter: buffer PCM per track, cut a segment on pause/stop;
+     **pause = segment + defer + accumulate duration** (the frozen
+     callback semantics — see roadmap Phase 2). `UpdateAttachment{paused}`
+     is the pause signal; wire it through `MediaPlane` (pause reaches no
+     media code today — that gap is part of this item).
+  3. Upload: prefer the `object_store` crate (pure Rust, MIT/Apache —
+     keeps the hermetic build; the lab needs MinIO or localstack in
+     `lab/docker-compose`). Emit `RecordingStopped{duration_ms}` and
+     `UploadCompleted{uri}`. Uploads run in the control world;
+     never on the capture thread.
+  4. Dual-recording is per tenant and lives in cigol's flag, not here.
+**Done when:** a lab call produces a stereo file in MinIO under the frozen
+identity, callbacks appear on `mss.events` in order, a paused interval is
+absent from audio but the duration math matches, and — the roadmap's exit
+bar — a byte-comparison harness against FS `RECORD_STEREO` output exists
+even if FS parity sign-off is a later human step. Requires item 14 for
+transferred calls; note it if shipped without.
+
+### 16. Opus output
+Item 9 above, unchanged: decide the `audiopus_sys` cmake trade first.
+
+### 17. Jitter hardening (defect D7)
+**Where:** `crates/media-core` (`jitter.rs`, `pipeline.rs`).
+**What:** the M2/M3 hardening list in
+[implementation-notes.md](implementation-notes.md): adaptive target depth
+from observed inter-arrival jitter, timestamp-aware gap handling so
+silence-suppression gaps stop counting as loss, PLC on `PopOutcome::Lost`
+(G.711 Appendix I repeat/attenuate — adopt, don't invent).
+**Direction:** everything here is sans-IO — build it with `replay.rs`
+(`disturb` scripts model loss/reorder/dup) and never against the lab
+first. Re-run `cargo bench -p media-core` after; the pipeline budget is
+the Article-VIII regression bar (~165 ns/packet on the recorded M2 run).
+**Done when:** the impairment matrix in [testing.md](testing.md) passes at
+the profiles it names, and the benchmark delta is recorded.
+
+### 18. RESEARCH — eBPF tap ingest (decide, don't build)
+**The question:** can we mirror RTP to MSS with an eBPF program on the
+rtpengine host instead of NG `subscribe`?
+
+First, terms: eBPF is not a kernel module — it is verified programs
+attached to kernel hooks (TC `clsact` here); rtpengine separately has its
+own kernel module (`xt_RTPENGINE`) that forwards media in-kernel. The
+worry that makes eBPF attractive: a `subscribe` may pull the subscribed
+legs out of kernel forwarding into rtpengine's userspace, making the
+per-tap cost on the rtpengine host non-trivial — **and that cost is
+exactly the still-open measurement** (Waiting-on-people item 2).
+
+The shape, if it ever wins: a TC egress program on the rtpengine host
+with a BPF map of tracked flows (5-tuple → MSS address), maintained by a
+small privileged agent; `bpf_clone_redirect` duplicates matching packets,
+the program rewrites IP/UDP headers (and checksums) toward the MSS pod;
+MSS ingest is **unchanged** (same UDP socket, jitter buffer, SSRC
+naming). NG stays for control (`query` still supplies tags/SSRCs) — only
+the media-copy mechanism changes. What it buys: near-zero per-tap cost,
+no dependency on the production rtpengine's `subscribe` support (removes
+Phase-0 blocker #1), taps that cannot perturb the call. What it costs: a
+privileged agent on every rtpengine host, a kernel/CO-RE support matrix,
+flow tracking through re-INVITEs, no tap-leg transcode (fine for G.711 —
+MSS compands both variants — but Opus/EVS calls would need decoding in
+MSS), and a second copy path invisible to rtpengine's own accounting.
+
+**Decision gate, in order — do not write eBPF before all three:**
+  1. Get the rtpengine-side per-tap cost measured (the open org item).
+     If `subscribe` at the target tap count costs little, stop here;
+     eBPF is unjustified complexity.
+  2. Probe whether `subscribe` actually kicks legs off kernel forwarding:
+     `cat /proc/rtpengine/*/list` on the lab host before/after a
+     subscribe (`lab/ng_*_probe.py` pattern). rtpengine's kernel module
+     also has a packet-mirroring path used by `rtpengine-recording` —
+     probe whether that reaches an arbitrary UDP destination; if yes,
+     that is the same win with vendor support and no eBPF.
+  3. Only then: a one-day TC `bpf_clone_redirect` PoC against the lab
+     rtpengine container with a hardcoded flow map, measuring per-packet
+     overhead and packet integrity at the MSS socket.
+**Done when:** a decision record lands in
+[architecture.md](architecture.md) (build / vendor-mirror / stay-on-NG),
+with the three probes' numbers.
+
+### 19. Soak + impairment suite — the "full testing" bar
+**Where:** `lab/` + [testing.md](testing.md).
+**What:** the three test altitudes exist (replay, lab, benchmark); what is
+missing is the standing proof that hours-long operation is boring.
+**Direction:** a `lab/soak.py` that runs N concurrent synthetic calls
+(`host_test_caller.py` is the building block) for ≥1 hour under `tc netem`
+impairment profiles from testing.md (loss 1%/5%, reorder, jitter), scraping
+`/metrics` each minute and asserting: zero `mss_legs_stalled` at steady
+state, `dropped_oldest` bounded, `mss_events_failed_total` zero, process
+RSS flat (no leak). Add the M2 benchmark re-run as the closing step —
+Article VIII requires it after any pipeline change (items 14/17 are that).
+**Done when:** one green soak run is recorded in testing.md with its
+numbers, and the script fails loudly on any assertion so CI or a cron can
+own it later.
+
 ## Open defects and soft spots
 
 | # | Item | Where | Severity |
 | --- | --- | --- | --- |
-| D1 | A **mid-call SSRC change** (re-INVITE, transfer, codec renegotiation) does not re-resolve leg identity; `ssrcs_seen` makes it visible but nothing acts on it | `tap_spike.rs` | medium — affects transferred calls |
+| D1 | A **mid-call SSRC change** (re-INVITE, transfer, codec renegotiation) does not re-resolve leg identity; `ssrcs_seen` makes it visible but nothing acts on it | `tap_spike.rs` | medium — affects transferred calls; **item 14** |
 | D2 | `stop_playback` stops **all** playback on the call: rtpengine's `stop media` targets a participant, not a playback id | `tap_plane.rs` | low until multiple concurrent playbacks exist |
 | D3 | `close_attachment` **aborts** the consumer task instead of closing the websocket politely (no `stop` frame) | `tap_plane.rs` | low, but consumers see a truncated stream |
 | D4 | `WS_TWILIO` and `GRPC_STREAM` attachments are served; `FILE_S3` (phase 2) and `RTP_INLINE` (phase 3) are refused by name | `tap_plane.rs` | expected — phase work |
-| D5 | Event delivery is **at-most-once**; a broker outage drops events (counted, and the gapless seq makes gaps detectable) | `event_pump.rs` | medium before pilot |
+| D5 | Event delivery is **at-most-once**; a broker outage drops events (counted, and the gapless seq makes gaps detectable) | `event_pump.rs` | medium before pilot; **item 13** |
 | D6 | `play media` `from-tag` semantics are **unmeasured** — architecture §6's claim was retracted after the instrument turned out to be broken (see lab.md correction) | docs + lab | low, but §6 must not be trusted until re-probed |
-| D7 | Jitter buffer: fixed target depth, no adaptive sizing, no timestamp-aware gap handling, silence instead of real PLC | `jitter.rs`, `pipeline.rs` | medium for quality under real impairment |
+| D7 | Jitter buffer: fixed target depth, no adaptive sizing, no timestamp-aware gap handling, silence instead of real PLC | `jitter.rs`, `pipeline.rs` | medium for quality under real impairment; **item 17** |
 | D8 | `owner_pod` is a config string; real placement and load-aware scheduling do not exist | `main.rs` | low until multi-pod |
 
 ## Waiting on other people (M2 close-out)
@@ -261,12 +459,13 @@ These are not code and have blocked since Phase 0:
 
 ## Later phases
 
-**Phase 2 — Recording** is the closest and mostly assembled already: per-leg
-taps with correct speaker attribution (done), stereo segmenter → direct S3,
-the `${accountID}/${recordingID}.${format}` identity contract, and
+**Phase 2 — Recording** is the closest and mostly assembled already —
+**item 15 above is its executable plan.** Per-leg taps with correct speaker
+attribution are done; what remains is the stereo segmenter → direct S3, the
+`${accountID}/${recordingID}.${format}` identity contract, and the
 `recordStart/recordStop/recordPause/uploadCompleted` callback semantics
-including pause = segment + defer + accumulate. Needs D1 fixed if transferred
-calls must record correctly.
+including pause = segment + defer + accumulate. Needs D1 (item 14) fixed if
+transferred calls must record correctly.
 
 **Phase 3 — Interactive media** needs the inline RTP leg (`SessionKind::INLINE`
 is already accepted by the API), streaming TTS playback, and barge-in
