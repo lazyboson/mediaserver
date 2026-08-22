@@ -667,51 +667,89 @@ on one codec, mirroring the format rule from item 20.
 **Verified by unit tests only** (46 in `rtpengine-ng`): negotiation at the
 dynamic PT, the exact `a=rtpmap:111 opus/48000/2` line, g711 keeping its
 two-field rtpmap, the clock-rate refusal, static-wins-when-offered-first, and
-an explicit answer codec overriding the offer. **No live call yet** — because
-Opus still cannot flow, see 16b-2.
+an explicit answer codec overriding the offer. Proven on a live call in 16b-2.
 
-#### 16b-2. Make Opus actually flow — ⬜ NEXT, three things
-Negotiation is not decoding. **An Opus tap would still fail today**, and these
-are the reasons, each verified in the code:
-1. **`StreamPipeline` refuses Opus** —
-   `other => return Err(UnsupportedEncoding(other))`. Wiring it needs the
-   decoder from 16a **plus** separating two numbers the pipeline currently
-   conflates: `timestamp_increment` is set from `samples_per_packet`, which is
-   right only while the RTP clock equals the audio rate. For Opus the clock is
-   always 48 kHz while the decoded frame is whatever rate we pick, so at 16 kHz
-   the increment is **960** and the frame is **320**.
-2. **`jitter::MAX_PAYLOAD` is 480 bytes**, and an Opus packet is up to
-   **1276** (RFC 6716). The ring must widen; note the same constant also sizes
-   the pipeline's PCM scratch, so widening is safe but the conflation should be
-   split while touching it.
-3. **`ConsumerEncoder` refuses g711 output at any rate but the tap's**, so a
-   16 kHz Opus tap could not feed the frozen PCMU-8k WebSocket bridge. The fix
-   is small and half-built: resample before the g711 encode, the same `rubato`
-   path L16 already uses.
-**The rate decision:** decode Opus to **16 kHz** — it preserves the wideband
-information ASR consumers want, and 320 samples fits `hub::MAX_FRAME_SAMPLES`
-(480) where 48 kHz's 960 would not.
-**The lab proof to use:** rather than building an Opus caller, ask rtpengine to
-transcode *to* opus on the tap leg (`transcode: [opus]`). rtpengine reports
-`opus: fully supported`, so it will offer Opus on the subscription and the whole
-path — dynamic answer, libopus decode, 48 kHz clock against a 16 kHz frame,
-widened buffers — is exercised against real rtpengine-generated Opus with no
-WebRTC endpoint needed.
+#### 16b-2. Make Opus actually flow — ✅ DONE (2026-08-23)
+**Opus now flows end to end against real rtpengine-generated Opus.** All three
+named blockers are gone, and one more was found by running it.
 
-#### 16c. Buffer sizing for Opus payloads — ⬜
-`jitter::MAX_PAYLOAD` is **480** bytes, sized for G.711. An Opus packet is up
-to **1276** bytes (RFC 6716), so the jitter ring must widen before Opus
-packets flow through it. Note the same constant also sizes `StreamPipeline`'s
-PCM scratch, so widening it is safe but the conflation should be split.
-`hub::MAX_FRAME_SAMPLES` is 480 samples, which holds 20 ms at 16 kHz (320) but
-**not at 48 kHz (960)** — so either the tap decodes Opus at ≤24 kHz or the hub
-frame grows.
-**The rate decision this forces:** decoding to 16 kHz preserves the wideband
-information ASR consumers want and fits existing buffers, but
-`ConsumerEncoder` currently refuses G.711 output at any rate but the tap's, so
-a 16 kHz tap could not feed the frozen PCMU-8k WebSocket bridge. Fix is small
-and already half-built: let `ConsumerEncoder` resample before G.711 encoding,
-which is the same `rubato` path L16 already uses.
+1. **`StreamPipeline` decodes Opus.** The decoder is now an enum
+   (`Decoder::{G711, Opus}`) chosen by `PipelineConfig`, which is the new way to
+   build a pipeline when the wire codec is not the decode format.
+   `StreamPipeline::new` remains for the static-mapped G.711 case and simply
+   delegates. The two conflated numbers are now separate: `timestamp_increment`
+   comes from `PipelineConfig.clock_rate_hz` (48000 for Opus, per RFC 7587)
+   while `samples_per_packet` comes from the decode format — so a 16 kHz Opus
+   tap advances the jitter buffer by **960** per packet and emits **320**
+   samples. Loss is concealed by **libopus itself** for Opus and by the G.711
+   concealer for G.711; they are not interchangeable.
+2. **`jitter::MAX_PAYLOAD` is 1276** (RFC 6716's maximum Opus packet), and the
+   conflation flagged in 16c is split: `MAX_PAYLOAD` sizes the wire slot,
+   the new `MAX_FRAME_SAMPLES` (960) sizes the PCM scratch.
+3. **`ConsumerEncoder` resamples before the G.711 encode**, so a 16 kHz Opus
+   tap feeds the frozen PCMU-8k WebSocket bridge unchanged. The refusal is now
+   "g711 is defined at 8 kHz only" — the codec's own constraint — rather than
+   "only at the tap rate". Pinned by
+   `a_wideband_tap_still_feeds_the_frozen_pcmu_bridge`.
+4. **Found by running it, not by reading it: a long Opus frame was being
+   silently truncated.** A first cut normalised every decoded frame to
+   `samples_per_packet`, which is correct for 20 ms senders and throws away
+   two thirds of the audio from a **60 ms** sender — a legal, and for WebRTC on
+   a bad network common, choice. The pipeline now carries the surplus in a
+   fixed `Carry` (no allocation) and releases it over the following frames.
+   Pinned by `a_sixty_millisecond_opus_sender_keeps_every_sample_instead_of_being_truncated`,
+   which asserts the tone survives in **every** released frame, and by the new
+   `frame_size_mismatch` / `carry_overflow_samples` counters, which are logged
+   per leg so truncation can never again be silent.
+
+**Configuration.** `MSS_TAP_FORMAT` (`pcmu`|`pcma`|`opus`) picks what the tap
+decodes; `MSS_OPUS_DECODE_RATE_HZ` picks the Opus decode rate, default
+**16000** — libopus resamples internally for free, so decoding straight to the
+rate consumers want is cheaper than decoding at 48 kHz and resampling after.
+An illegal rate is refused by name rather than rounded.
+
+**Also fixed here: the transcode path could not name a dynamic codec.** It
+answered with `from_static_format(configured)`, which has no answer for Opus.
+`OfferedStream::negotiate_encoding(encoding)` now finds the payload type for the
+codec we actually asked rtpengine for, falling back to the static mapping when
+the offer omits it. This also fixes a latent G.711 bug: asking rtpengine to
+transcode to PCMU while the offer led with PCMA used to answer with the wrong
+codec (pinned by
+`a_transcoded_tap_picks_the_codec_it_asked_for_not_the_first_one_offered`).
+
+**Verified in the lab, not only in unit tests.** rtpengine 14.1.1.8 (which
+links libopus and libavcodec directly) was asked to `transcode: [opus]` on a
+live call; it offered **payload type 96**, MSS answered with it at clock 48000,
+and decoded at 16 kHz:
+`unknown_payload_type=0 unparsable=0 undecodable_frames=0
+frame_size_mismatch=0 carry_overflow_samples=0 jitter_lost=0
+jitter_silence_gaps=0` on both legs, with DTMF still detected. The decisive
+check is the audio, not the counters: the captured WAV's dominant frequency is
+**440 Hz** — the tone pumped in — at RMS 8504 against the 8485 a 12000-amplitude
+sine should produce. The raw datagram log confirms the wire: RTP timestamp
+delta **960** on every packet, no sequence gaps, TOC `0x08` (SILK NB, 20 ms,
+one frame per packet). Recipe in [lab.md](lab.md).
+
+**One open question, and it is rtpengine's, not ours.** When rtpengine
+transcodes G.711→Opus it emits only ~10 packets/second where the same call
+tapped as PCMU gives ~51 — a ~15% duty cycle, so the tap is mostly silence.
+Ruled out by measurement: not CPU (rtpengine sat at 1–2%), not DTX or VAD (a
+continuous 440 Hz tone behaves the same as the byte-ramp fixture), not loss
+(zero jitter anomalies, contiguous sequence numbers), and not MSS (every packet
+that arrived decoded, and the identical code path on the identical call gives
+1018/1018 datagrams for PCMU). Distinguishing an rtpengine transcoder pacing
+bug from a lab artefact needs a **native** Opus source rather than a transcoded
+one. **Not blocking:** production taps a WebRTC call that is *already* Opus with
+transcoding off, which asks rtpengine to transcode nothing at all — the case
+this item's vehicle deliberately avoided in order to test without a WebRTC
+endpoint.
+
+#### ~~16c. Buffer sizing for Opus payloads~~ — done in 16b-2
+`jitter::MAX_PAYLOAD` is 1276 and the wire-slot/PCM-scratch conflation is
+split. `hub::MAX_FRAME_SAMPLES` needed no change: the default decode rate is
+16 kHz (320 samples). Decoding at 48 kHz works in the pipeline and is exercised
+in the lab, but 960 samples exceeds the hub frame, so a 48 kHz tap cannot fan
+out to consumers yet — that is the remaining piece if anyone ever wants it.
 
 #### 16d. Opus output to consumers — ⬜ still genuinely later
 The original item 9 framing. `opus-rs` ships an encoder too, so this is now

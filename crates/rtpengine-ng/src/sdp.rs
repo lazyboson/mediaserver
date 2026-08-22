@@ -25,6 +25,8 @@ pub enum SdpError {
     UnusableFormat,
     #[error("offer carries no payload type this tap can decode: offered {0:?}")]
     NoDecodableCodecOffered(Vec<u8>),
+    #[error("the offer carries no payload type for {0:?}")]
+    CodecNotOffered(Encoding),
     #[error("opus must be signalled at 48000 Hz per RFC 7587; the offer said {0}")]
     OpusClockRate(u32),
 }
@@ -101,41 +103,61 @@ impl OfferedStream {
             .find(|map| map.encoding_name.eq_ignore_ascii_case(TELEPHONE_EVENT))
     }
 
+    fn codec_at(&self, payload_type: u8) -> Result<Option<NegotiatedCodec>, SdpError> {
+        let rtpmap = self
+            .rtpmaps
+            .iter()
+            .find(|map| map.payload_type == payload_type);
+        if let Some(encoding) = Encoding::from_static_payload_type(payload_type) {
+            let clock_rate_hz = rtpmap
+                .map(|map| map.clock_rate_hz)
+                .or_else(|| encoding.static_clock_rate_hz())
+                .unwrap_or_default();
+            if clock_rate_hz == 0 {
+                return Err(SdpError::UnusableFormat);
+            }
+            return Ok(Some(NegotiatedCodec {
+                payload_type,
+                encoding,
+                clock_rate_hz,
+            }));
+        }
+        let Some(rtpmap) = rtpmap else {
+            return Ok(None);
+        };
+        if rtpmap.encoding_name.eq_ignore_ascii_case(OPUS) {
+            if rtpmap.clock_rate_hz != OPUS_CLOCK_RATE_HZ {
+                return Err(SdpError::OpusClockRate(rtpmap.clock_rate_hz));
+            }
+            return Ok(Some(NegotiatedCodec {
+                payload_type,
+                encoding: Encoding::Opus,
+                clock_rate_hz: OPUS_CLOCK_RATE_HZ,
+            }));
+        }
+        Ok(None)
+    }
+
     pub fn negotiate(&self) -> Result<NegotiatedCodec, SdpError> {
         for payload_type in &self.payload_types {
-            let rtpmap = self
-                .rtpmaps
-                .iter()
-                .find(|map| map.payload_type == *payload_type);
-            if let Some(encoding) = Encoding::from_static_payload_type(*payload_type) {
-                let clock_rate_hz = rtpmap
-                    .map(|map| map.clock_rate_hz)
-                    .or_else(|| encoding.static_clock_rate_hz())
-                    .unwrap_or_default();
-                if clock_rate_hz == 0 {
-                    return Err(SdpError::UnusableFormat);
-                }
-                return Ok(NegotiatedCodec {
-                    payload_type: *payload_type,
-                    encoding,
-                    clock_rate_hz,
-                });
-            }
-            let Some(rtpmap) = rtpmap else { continue };
-            if rtpmap.encoding_name.eq_ignore_ascii_case(OPUS) {
-                if rtpmap.clock_rate_hz != OPUS_CLOCK_RATE_HZ {
-                    return Err(SdpError::OpusClockRate(rtpmap.clock_rate_hz));
-                }
-                return Ok(NegotiatedCodec {
-                    payload_type: *payload_type,
-                    encoding: Encoding::Opus,
-                    clock_rate_hz: OPUS_CLOCK_RATE_HZ,
-                });
+            if let Some(codec) = self.codec_at(*payload_type)? {
+                return Ok(codec);
             }
         }
         Err(SdpError::NoDecodableCodecOffered(
             self.payload_types.clone(),
         ))
+    }
+
+    pub fn negotiate_encoding(&self, encoding: Encoding) -> Result<NegotiatedCodec, SdpError> {
+        for payload_type in &self.payload_types {
+            if let Some(codec) = self.codec_at(*payload_type)? {
+                if codec.encoding == encoding {
+                    return Ok(codec);
+                }
+            }
+        }
+        Err(SdpError::CodecNotOffered(encoding))
     }
 
     pub fn offered_format(&self, ptime_fallback_ms: u32) -> Result<AudioFormat, SdpError> {
