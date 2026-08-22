@@ -2,6 +2,7 @@ use crate::consumer_ws::{self, BridgeCommand, ConsumerConfig};
 use crate::hub::{Hub, HubClient, TrackSelection};
 use crate::ng_transport::{NgTransport, NgTransportConfig, TransportError};
 use crate::tap_spike::{capture, wav_blob, write_wav, SpikeError, TapLeg};
+use media_core::pipeline::PipelineConfig;
 use media_core::{AudioFormat, Track};
 use rtpengine_ng::{
     NegotiatedCodec, PlayMedia, PlaySource, PlayTarget, SdpError, SubscribeRequest,
@@ -31,6 +32,9 @@ const INJECT_TARGET_ENV: &str = "MSS_INJECT_TARGET";
 const CONSUMER_TRACKS_ENV: &str = "MSS_CONSUMER_TRACKS";
 const DATAGRAM_LOG_DIR_ENV: &str = "MSS_TAP_DATAGRAM_LOG_DIR";
 const LISTENERS_ENV: &str = "MSS_LISTENERS";
+const TAP_FORMAT_ENV: &str = "MSS_TAP_FORMAT";
+const OPUS_DECODE_RATE_ENV: &str = "MSS_OPUS_DECODE_RATE_HZ";
+const OPUS_DECODE_RATE_DEFAULT_HZ: u32 = 16000;
 
 const DEFAULT_OUTPUT: &str = "tap.wav";
 const DEFAULT_SECONDS: u64 = 30;
@@ -124,8 +128,61 @@ pub fn request_from_env(sdp_session_id: u64) -> Result<Option<TapSpikeRequest>, 
         output: PathBuf::from(output),
         duration: Duration::from_secs(seconds),
         sdp_session_id,
-        format: AudioFormat::pcmu_8k_20ms(),
+        format: spike_format()?,
     }))
+}
+
+fn answer_codec(
+    offer: &SubscriptionOffer,
+    format: AudioFormat,
+) -> Result<NegotiatedCodec, TapSessionError> {
+    let stream = offer
+        .streams
+        .first()
+        .ok_or(TapSessionError::ReplyMissing("an offered stream"))?;
+    match stream.negotiate_encoding(format.encoding) {
+        Ok(codec) => Ok(codec),
+        Err(SdpError::CodecNotOffered(_)) => Ok(NegotiatedCodec::from_static_format(format)?),
+        Err(error) => Err(TapSessionError::Sdp(error)),
+    }
+}
+
+fn spike_format() -> Result<AudioFormat, TapSessionError> {
+    let Ok(configured) = std::env::var(TAP_FORMAT_ENV) else {
+        return Ok(AudioFormat::pcmu_8k_20ms());
+    };
+    match configured.trim().to_ascii_lowercase().as_str() {
+        "pcmu" | "ulaw" => Ok(AudioFormat::pcmu_8k_20ms()),
+        "pcma" | "alaw" => Ok(AudioFormat {
+            encoding: media_core::Encoding::Pcma,
+            ..AudioFormat::pcmu_8k_20ms()
+        }),
+        "opus" => Ok(AudioFormat {
+            encoding: media_core::Encoding::Opus,
+            sample_rate_hz: opus_decode_rate_hz()?,
+            channels: 1,
+            ptime_ms: 20,
+        }),
+        _ => Err(TapSessionError::BadEnv {
+            env: TAP_FORMAT_ENV,
+            value: configured,
+            reason: "a tap decodes pcmu, pcma or opus",
+        }),
+    }
+}
+
+fn opus_decode_rate_hz() -> Result<u32, TapSessionError> {
+    let Ok(configured) = std::env::var(OPUS_DECODE_RATE_ENV) else {
+        return Ok(OPUS_DECODE_RATE_DEFAULT_HZ);
+    };
+    match configured.trim().parse::<u32>() {
+        Ok(rate) if media_core::opus::is_decodable_rate(rate) => Ok(rate),
+        _ => Err(TapSessionError::BadEnv {
+            env: OPUS_DECODE_RATE_ENV,
+            value: configured,
+            reason: "libopus decodes 8000, 12000, 16000, 24000 or 48000 only",
+        }),
+    }
 }
 
 fn required_env(env: &'static str) -> Result<String, TapSessionError> {
@@ -189,13 +246,21 @@ pub async fn run(request: TapSpikeRequest, cookie_prefix: u64) -> Result<(), Tap
         sockets.push(socket);
     }
 
+    let wire_codec = answer_codec(&offer, request.format)?;
+    info!(
+        payload_type = wire_codec.payload_type,
+        clock_rate_hz = wire_codec.clock_rate_hz,
+        encoding = ?wire_codec.encoding,
+        decode_rate_hz = request.format.sample_rate_hz,
+        "answering the subscription with this codec"
+    );
     let local_address = request.local_media_address.to_string();
     let answer_sdp = SubscriptionAnswer {
         session_id: request.sdp_session_id,
         local_address: &local_address,
         receive_ports: &receive_ports,
         format: request.format,
-        answer_with: NegotiatedCodec::from_static_format(request.format)?,
+        answer_with: wire_codec,
     }
     .to_sdp(&offer)?;
     info!(?receive_ports, to_tag = %to_tag, "answering the subscription");
@@ -213,12 +278,16 @@ pub async fn run(request: TapSpikeRequest, cookie_prefix: u64) -> Result<(), Tap
             .get(index)
             .and_then(|stream| stream.telephone_event())
             .map(|event| event.payload_type);
-        let mut leg = TapLeg::new(
+        let mut leg = TapLeg::with_pipeline_config(
             track_for_stream(index),
             socket,
-            request.format,
-            TARGET_DEPTH_PACKETS,
-            telephone_event_payload_type,
+            PipelineConfig {
+                audio_payload_type: wire_codec.payload_type,
+                clock_rate_hz: wire_codec.clock_rate_hz,
+                decode: request.format,
+                target_depth_packets: TARGET_DEPTH_PACKETS,
+                telephone_event_payload_type,
+            },
             request.duration,
         )?;
         if datagram_log_dir().is_some() {
@@ -324,6 +393,9 @@ pub async fn run(request: TapSpikeRequest, cookie_prefix: u64) -> Result<(), Tap
             dtmf_digits = stats.pipeline.dtmf_digits,
             unknown_payload_type = stats.pipeline.unknown_payload_type,
             unparsable = stats.pipeline.unparsable,
+            undecodable_frames = stats.pipeline.undecodable_frames,
+            frame_size_mismatch = stats.pipeline.frame_size_mismatch,
+            carry_overflow_samples = stats.pipeline.carry_overflow_samples,
             jitter_lost = stats.jitter.lost,
             jitter_duplicates = stats.jitter.duplicates,
             jitter_late_drops = stats.jitter.late_drops,

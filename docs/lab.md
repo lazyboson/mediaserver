@@ -1151,12 +1151,90 @@ Three things worth keeping from this run:
 - **Leg identity gets cleaner without transcoding.** rtpengine no longer
   re-stamps the leg with a generated SSRC, so `unknown_ssrc` stayed 0 without
   elimination having to cover a restamped leg.
-- **The refusal is the safety net.** With the flag off, an Opus or G.722 call
+- **The refusal is the safety net.** With the flag off, a G.722 or EVS call
   would land in `unknown_payload_type`; instead the subscribe is refused by name
   with the offered payload types in the message, naming transcoding as the fix.
+  Opus is no longer in that list — it decodes natively since 2026-08-23, see
+  the Opus tap below.
   Ask the platform team what codecs appear on real customer and agent legs
   before enabling this for a tenant.
 
 **The lab was restored to `MSS_TAP_TRANSCODE=on` after the run**, which is the
 compose default. A non-default lab left running is exactly how the
 `RIGHT_TRACK=mixed` day happened.
+
+## Tapping a call as Opus without a WebRTC endpoint
+
+Opus ingest needed proof against real Opus on the wire, and building a WebRTC
+caller to get it would have been the long way round. rtpengine can be asked to
+transcode *to* Opus on the subscription leg, which produces genuine
+libopus-encoded RTP from an ordinary G.711 call — so the whole path (dynamic
+payload type, RFC 7587 answer, libopus decode, a 48 kHz RTP clock against a
+16 kHz frame, the widened jitter slot) runs against something we did not
+generate ourselves.
+
+This runs **beside** a live lab rather than replacing it: it adds one more call
+to the same rtpengine, so there is nothing to tear down and restore.
+
+```sh
+export DOCKER_API_VERSION=1.43
+NET=mss-microsip_lab           # or mss-lab_lab
+
+docker run -d --name opus-driver --network $NET --ip 172.31.99.120 \
+  -v "$PWD/lab/call_driver.py:/call_driver.py:ro" \
+  -e NG_NODE=172.31.99.10 -e NG_PORT=22222 -e SELF_IP=172.31.99.120 \
+  -e CALL_ID=opus-proof -e FROM_TAG=finA -e TO_TAG=finB -e PUMP_SECONDS=300 \
+  python:3-slim python3 /call_driver.py
+
+docker run --rm --network $NET --ip 172.31.99.121 \
+  -v "$PWD:/build:ro" -v ${NET}-target:/target \
+  -v ${NET}-registry:/usr/local/cargo/registry \
+  -v "$PWD/lab/out:/out" -w /build \
+  -e CARGO_TARGET_DIR=/target -e RUST_LOG=info \
+  -e MSS_RTPENGINE_NODE=172.31.99.10:22222 -e MSS_TAP_LOCAL_IP=172.31.99.121 \
+  -e MSS_TAP_CALL_ID=opus-proof -e MSS_TAP_FROM_TAGS=finA,finB \
+  -e MSS_TAP_FORMAT=opus -e MSS_OPUS_DECODE_RATE_HZ=16000 \
+  -e MSS_TAP_TRANSCODE=on -e MSS_TAP_SECONDS=15 \
+  -e MSS_TAP_OUTPUT=/out/opus_tap.wav -e MSS_TAP_DATAGRAM_LOG_DIR=/out \
+  mss-lab-rust:1.95 cargo run --quiet -p mediaserverd
+```
+
+**The image matters.** `mss-lab-rust:1.95` (built from `lab/Dockerfile.rust`)
+carries cmake, make and g++, which libopus's vendored build needs; the plain
+`rust:1.95-slim` image the lab used before Opus landed fails at
+`CMAKE_MAKE_PROGRAM is not set`. Build it with
+`docker build -t mss-lab-rust:1.95 -f lab/Dockerfile.rust lab/`.
+
+**Two calls expire, so run the tap right after the driver.** A subscribe to a
+call rtpengine has forgotten answers `Unknown call-ID` — that is the expected
+error, not a wiring fault. The first ever run also compiles libopus, which
+takes long enough for a short-lived call to end underneath it; build once, then
+run.
+
+What a healthy Opus tap reported (2026-08-23, rtpengine 14.1.1.8, 15 s):
+
+| track | datagrams | played | undecodable | frame_size_mismatch | carry_overflow | unknown_pt | lost |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| Customer | 142 | 120 | 0 | 0 | 0 | 0 | 0 |
+| Agent | 142 | 120 | 0 | 0 | 0 | 0 | 0 |
+
+`answering the subscription with this codec payload_type=96
+clock_rate_hz=48000 encoding=Opus decode_rate_hz=16000`, DTMF still detected on
+both legs.
+
+**Read the audio, not just the counters.** Zero-error counters only say nothing
+crashed. The verdict is that the captured wav's dominant frequency is **440 Hz**
+— the tone pumped in — at rms 8504, against the 8485 a 12000-amplitude sine
+should give. The datagram log confirms the wire independently: RTP timestamp
+delta **960** on every packet (20 ms at 48 kHz), contiguous sequence numbers,
+TOC byte `0x08` (SILK narrowband, 20 ms, one frame per packet).
+
+**Known: rtpengine under-produces when transcoding to Opus.** ~10 packets/s
+where the same call tapped as PCMU gives ~51, so the tap is ~15% duty cycle and
+mostly silence. Measured out: not CPU (rtpengine at 1–2%), not DTX or VAD (a
+continuous tone behaves the same as the byte-ramp fixture — patch
+`call_driver.py`'s payload line to a µ-law sine to check), not loss (zero jitter
+anomalies), and not MSS (the identical code path on the identical call gives
+1018/1018 for PCMU). Telling an rtpengine pacing bug from a lab artefact needs a
+**native** Opus source. It does not affect the production shape, where the call
+is already Opus and rtpengine transcodes nothing.
