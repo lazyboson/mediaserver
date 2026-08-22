@@ -6,6 +6,7 @@ pub mod frame;
 pub mod g711;
 pub mod jitter;
 pub mod pipeline;
+pub mod plc;
 pub mod replay;
 pub mod rtp;
 

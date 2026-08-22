@@ -114,6 +114,7 @@ pub struct SharedLegStats {
     pub jitter_duplicates: AtomicU64,
     pub jitter_late_drops: AtomicU64,
     pub jitter_resets: AtomicU64,
+    pub jitter_silence_gaps: AtomicU64,
     pub unknown_ssrc: AtomicU64,
     pub unresolved_ssrc: AtomicU64,
     pub ssrc_changes: AtomicU64,
@@ -157,6 +158,8 @@ impl SharedLegStats {
             .store(stats.jitter.late_drops, Ordering::Relaxed);
         self.jitter_resets
             .store(stats.jitter.resets, Ordering::Relaxed);
+        self.jitter_silence_gaps
+            .store(stats.jitter.silence_gaps, Ordering::Relaxed);
         self.unknown_ssrc
             .store(u64::from(stats.unknown_ssrc.is_some()), Ordering::Relaxed);
         self.unresolved_ssrc.store(
@@ -195,6 +198,7 @@ pub struct TapLeg {
     watched_datagrams: u64,
     stalled: bool,
     stalls: u64,
+    epoch: Instant,
 }
 
 impl TapLeg {
@@ -233,6 +237,7 @@ impl TapLeg {
             watched_datagrams: 0,
             stalled: false,
             stalls: 0,
+            epoch: Instant::now(),
         })
     }
 
@@ -416,7 +421,10 @@ impl TapLeg {
             match self.socket.recv_from(buf) {
                 Ok((len, _from)) => {
                     self.log_datagram(&buf[..len]);
-                    let outcome = self.pipeline.ingest(&buf[..len]);
+                    let arrival_micros = Instant::now()
+                        .saturating_duration_since(self.epoch)
+                        .as_micros() as u64;
+                    let outcome = self.pipeline.ingest_at(&buf[..len], arrival_micros);
                     self.observe_ssrc();
                     if let IngestOutcome::Dtmf(digit) = outcome {
                         if self.digits_recorded < MAX_RECORDED_DIGITS {

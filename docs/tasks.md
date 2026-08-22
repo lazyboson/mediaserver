@@ -426,19 +426,32 @@ labels of a recording; a tag-replacing transfer still can.
 ### 16. Opus output
 Item 9 above, unchanged: decide the `audiopus_sys` cmake trade first.
 
-### 17. Jitter hardening (defect D7)
-**Where:** `crates/media-core` (`jitter.rs`, `pipeline.rs`).
-**What:** the M2/M3 hardening list in
-[implementation-notes.md](implementation-notes.md): adaptive target depth
-from observed inter-arrival jitter, timestamp-aware gap handling so
-silence-suppression gaps stop counting as loss, PLC on `PopOutcome::Lost`
-(G.711 Appendix I repeat/attenuate — adopt, don't invent).
-**Direction:** everything here is sans-IO — build it with `replay.rs`
-(`disturb` scripts model loss/reorder/dup) and never against the lab
-first. Re-run `cargo bench -p media-core` after; the pipeline budget is
-the Article-VIII regression bar (~165 ns/packet on the recorded M2 run).
-**Done when:** the impairment matrix in [testing.md](testing.md) passes at
-the profiles it names, and the benchmark delta is recorded.
+### ~~17. Jitter hardening (defect D7)~~ — done 2026-08-22
+**Where:** `crates/media-core` (`jitter.rs`, `pipeline.rs`, new `plc.rs`,
+`replay.rs`), plus the daemon plumbing that feeds arrival times in and
+reports the new counter out.
+**What landed:** adaptive target depth from the RFC 3550 interarrival
+estimate (rises at once, shrinks after 250 calm packets, ceiling 4× the
+configured floor); timestamp-aware gap classification, so a gap the
+timestamps say was sender silence is filled as silence and counted in
+`silence_gaps` instead of `lost`; comfort noise (PT 13) accounted like a
+telephone event rather than dropped as an unknown payload type; G.711
+Appendix I-shaped PLC (AMDF pitch search, period repeat, 10 ms flat then
+fade to silence by 60 ms, cross-fade back in) replacing the silence fill on
+`PopOutcome::Lost`; `restart()` on a mid-call SSRC change, which fixes the
+`TooLate`-run the item-14 handoff described when the new sender starts at a
+nearby sequence number.
+**Measured:** the [testing.md](testing.md) impairment matrix is now a set of
+deterministic replay tests (`impairment_matrix` in `pipeline.rs`) — uniform
+loss 1%/5%, an 8-packet burst, reorder inside and beyond the depth,
+duplication, modelled arrival jitter, silence suppression, DTMF under loss.
+`cargo bench -p media-core` on the dev box: full path 240.9 → 269.8 ns/packet
+(+10%), ingest-only 16.3 → 25.6 ns (+52%); recorded with the machine in
+[implementation-notes.md](implementation-notes.md).
+**Left for later:** no perceptual check of the concealment yet (the
+ASR-as-judge probe under `tc netem` burst loss is the cheap one), the
+adaptive ceiling is a multiple of the floor rather than a millisecond
+budget, and the chosen depth is logged per leg but not exported as a gauge.
 
 ### 18. RESEARCH — eBPF tap ingest (decide, don't build)
 **The question:** can we mirror RTP to MSS with an eBPF program on the
@@ -508,7 +521,7 @@ own it later.
 | D4 | `WS_TWILIO` and `GRPC_STREAM` attachments are served; `FILE_S3` (phase 2) and `RTP_INLINE` (phase 3) are refused by name | `tap_plane.rs` | expected — phase work |
 | ~~D5~~ | ~~Event delivery is **at-most-once**; a broker outage drops events~~ — **fixed 2026-08-22 (item 13)**: bounded retry backlog, order preserved, drop-oldest counted. Now **at-least-once**, so the translator must dedupe by `(external_id, seq)`; a backlog past its 8192 cap or a pod death still loses events | `event_pump.rs` | closed |
 | D6 | `play media` `from-tag` semantics are **unmeasured** — architecture §6's claim was retracted after the instrument turned out to be broken (see lab.md correction) | docs + lab | low, but §6 must not be trusted until re-probed |
-| D7 | Jitter buffer: fixed target depth, no adaptive sizing, no timestamp-aware gap handling, silence instead of real PLC | `jitter.rs`, `pipeline.rs` | medium for quality under real impairment; **item 17** |
+| ~~D7~~ | ~~Jitter buffer: fixed target depth, no adaptive sizing, no timestamp-aware gap handling, silence instead of real PLC~~ — **fixed 2026-08-22 (item 17)**: adaptive depth from the RFC 3550 estimate, timestamp-aware silence gaps, comfort noise accounted, G.711 Appendix I-shaped PLC, restart on SSRC change. Replay-verified across the impairment matrix; **not** yet verified against `tc netem` or judged perceptually | `jitter.rs`, `pipeline.rs`, `plc.rs` | closed |
 | D8 | `owner_pod` is a config string; real placement and load-aware scheduling do not exist | `main.rs` | low until multi-pod |
 
 ## Waiting on other people (M2 close-out)
