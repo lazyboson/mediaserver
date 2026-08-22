@@ -46,6 +46,7 @@ pub struct TapPlaneConfig {
     pub default_node: Option<SocketAddr>,
     pub local_media_address: IpAddr,
     pub format: AudioFormat,
+    pub transcode_at_tap: bool,
     pub cookie_prefix: u64,
     pub sdp_session_id: u64,
     pub recording: RecordingSupport,
@@ -56,6 +57,7 @@ struct LiveSession {
     external_id: String,
     call_id: String,
     to_tag: String,
+    format: AudioFormat,
     hub: HubClient,
     stop: Arc<AtomicBool>,
     capture: Option<std::thread::JoinHandle<()>>,
@@ -465,14 +467,14 @@ impl TapPlane {
     }
 
     fn open_grpc_attachment(&self, view: AttachmentView) -> Result<(), MediaPlaneError> {
-        if !ConsumerEncoder::supports(self.config.format, view.format) {
+        let tap = self.session_format(view.session)?;
+        if !ConsumerEncoder::supports(tap, view.format) {
             return Err(MediaPlaneError(format!(
-                "this tap cannot serve {:?}: g711 and L16 at 20ms mono are served, \
-                 L16 at any rate; opus is not built yet",
-                view.format
+                "a {:?} tap cannot serve {:?}: g711 at the tap rate and L16 at any rate \
+                 are served; opus is not built yet",
+                tap.encoding, view.format
             )));
         }
-        self.session_handles(view.session)?;
         let mut held = self
             .attachments
             .lock()
@@ -615,6 +617,16 @@ impl TapPlane {
         Some(())
     }
 
+    fn session_format(&self, session: SessionId) -> Result<AudioFormat, MediaPlaneError> {
+        let held = self
+            .sessions
+            .lock()
+            .map_err(|_| MediaPlaneError("the session table is poisoned".to_string()))?;
+        held.get(&session)
+            .map(|live| live.format)
+            .ok_or_else(|| MediaPlaneError(format!("{session} is not tapped here")))
+    }
+
     fn session_handles(
         &self,
         session: SessionId,
@@ -648,7 +660,8 @@ impl MediaPlane for TapPlane {
             return Err(MediaPlaneError("a tap needs the call-id".to_string()));
         }
         let node = self.node_for(&view)?;
-        let format = self.config.format;
+        let configured = self.config.format;
+        let transcoding = self.config.transcode_at_tap;
 
         let transport = Arc::new(
             NgTransport::bind(
@@ -669,7 +682,11 @@ impl MediaPlane for TapPlane {
                 from_tags: view.from_tags.clone(),
                 mix: false,
                 accept_codecs: Vec::new(),
-                transcode_codecs: vec![format.encoding.rtpmap_name().to_string()],
+                transcode_codecs: if transcoding {
+                    vec![configured.encoding.rtpmap_name().to_string()]
+                } else {
+                    Vec::new()
+                },
                 label: Some("mss-tap".to_string()),
             })
             .await
@@ -702,6 +719,20 @@ impl MediaPlane for TapPlane {
                 "rtpengine offered a tap stream"
             );
         }
+
+        let format = if transcoding {
+            configured
+        } else {
+            offered_tap_format(&offer, configured.ptime_ms)?
+        };
+        info!(
+            session = %view.id,
+            transcoding,
+            encoding = ?format.encoding,
+            sample_rate_hz = format.sample_rate_hz,
+            ptime_ms = format.ptime_ms,
+            "settled the tap format"
+        );
 
         let mut sockets = Vec::with_capacity(offer.streams.len());
         let mut receive_ports = Vec::with_capacity(offer.streams.len());
@@ -844,6 +875,7 @@ impl MediaPlane for TapPlane {
                 external_id: view.external_id.clone(),
                 call_id: view.call_id.clone(),
                 to_tag,
+                format,
                 hub: hub_client,
                 stop,
                 capture: Some(capture_thread),
@@ -1103,7 +1135,7 @@ impl MediaPlane for TapPlane {
         let pump = tokio::spawn(pump_frames(
             subscription,
             frames.clone(),
-            self.config.format,
+            self.session_format(session)?,
             target_format,
         ));
 
@@ -1231,6 +1263,33 @@ async fn pump_frames(
             return;
         }
     }
+}
+
+fn offered_tap_format(
+    offer: &SubscriptionOffer,
+    ptime_fallback_ms: u32,
+) -> Result<AudioFormat, MediaPlaneError> {
+    let mut settled: Option<AudioFormat> = None;
+    for (index, stream) in offer.streams.iter().enumerate() {
+        let format = stream.offered_format(ptime_fallback_ms).map_err(|error| {
+            MediaPlaneError(format!(
+                "stream {index}: {error}; this call needs transcoding at the tap"
+            ))
+        })?;
+        match settled {
+            None => settled = Some(format),
+            Some(first) if first != format => {
+                return Err(MediaPlaneError(format!(
+                    "rtpengine offered {:?} on one stream and {:?} on another; \
+                     a tap decodes one format for every leg, so this call needs \
+                     transcoding at the tap",
+                    first.encoding, format.encoding
+                )))
+            }
+            Some(_) => {}
+        }
+    }
+    settled.ok_or_else(|| MediaPlaneError("rtpengine offered no streams".to_string()))
 }
 
 fn telcompat_caller_tag_key() -> &'static str {
@@ -1430,6 +1489,7 @@ mod tests {
             default_node: None,
             local_media_address: IpAddr::from([127, 0, 0, 1]),
             format: AudioFormat::pcmu_8k_20ms(),
+            transcode_at_tap: true,
             cookie_prefix: 1,
             sdp_session_id: 1,
             recording,
@@ -1597,7 +1657,82 @@ mod tests {
             ptime_ms: 20,
         };
         let error = plane.open_attachment(opus).await.unwrap_err();
-        assert!(error.to_string().contains("opus is not built yet"));
+        assert!(error.to_string().contains("not tapped here"));
+    }
+
+    #[test]
+    fn a_consumer_format_is_judged_against_the_tap_that_exists_not_a_configured_guess() {
+        let tap = AudioFormat {
+            encoding: media_core::Encoding::Pcma,
+            ..AudioFormat::pcmu_8k_20ms()
+        };
+        assert!(ConsumerEncoder::supports(tap, AudioFormat::pcmu_8k_20ms()));
+        assert!(ConsumerEncoder::supports(tap, AudioFormat::l16_16k_20ms()));
+        assert!(!ConsumerEncoder::supports(
+            tap,
+            AudioFormat {
+                encoding: media_core::Encoding::Opus,
+                sample_rate_hz: 48000,
+                channels: 1,
+                ptime_ms: 20,
+            }
+        ));
+    }
+
+    fn offer_of(payload_types: &str, rtpmaps: &[&str]) -> SubscriptionOffer {
+        let mut sdp = String::from(
+            "v=0\r\no=- 1 1 IN IP4 10.0.0.5\r\ns=rtpengine\r\nc=IN IP4 10.0.0.5\r\nt=0 0\r\n",
+        );
+        sdp.push_str(&format!("m=audio 30000 RTP/AVP {payload_types}\r\n"));
+        for rtpmap in rtpmaps {
+            sdp.push_str(&format!("a=rtpmap:{rtpmap}\r\n"));
+        }
+        sdp.push_str("a=ptime:20\r\na=sendonly\r\n");
+        SubscriptionOffer::parse(&sdp).unwrap()
+    }
+
+    #[test]
+    fn an_untranscoded_tap_takes_the_codec_the_call_is_already_using() {
+        let offer = offer_of("8 101", &["8 PCMA/8000", "101 telephone-event/8000"]);
+        let format = offered_tap_format(&offer, 20).unwrap();
+        assert_eq!(format.encoding, media_core::Encoding::Pcma);
+        assert_eq!(format.sample_rate_hz, 8000);
+        assert_eq!(format.ptime_ms, 20);
+    }
+
+    #[test]
+    fn a_call_whose_codec_this_pipeline_cannot_decode_names_transcoding_as_the_fix() {
+        let offer = offer_of("111 101", &["111 opus/48000", "101 telephone-event/8000"]);
+        let error = offered_tap_format(&offer, 20).unwrap_err();
+        assert!(
+            error.to_string().contains("needs transcoding at the tap"),
+            "{error}"
+        );
+        assert!(error.to_string().contains("111"), "{error}");
+    }
+
+    #[test]
+    fn legs_offered_with_different_codecs_are_refused_rather_than_half_decoded() {
+        let mut offer = offer_of("0 101", &["0 PCMU/8000", "101 telephone-event/8000"]);
+        let alaw = offer_of("8 101", &["8 PCMA/8000", "101 telephone-event/8000"]);
+        offer.streams.push(alaw.streams[0].clone());
+
+        let error = offered_tap_format(&offer, 20).unwrap_err();
+        assert!(
+            error.to_string().contains("one format for every leg"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn two_legs_agreeing_on_one_codec_settle_on_it() {
+        let mut offer = offer_of("8 101", &["8 PCMA/8000", "101 telephone-event/8000"]);
+        let second = offer.streams[0].clone();
+        offer.streams.push(second);
+        assert_eq!(
+            offered_tap_format(&offer, 20).unwrap().encoding,
+            media_core::Encoding::Pcma
+        );
     }
 
     #[tokio::test]
