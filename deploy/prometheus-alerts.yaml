@@ -154,3 +154,39 @@ groups:
           description: >-
             Persist or renew calls against Redis are erroring; sessions on
             this pod may not be recoverable after a pod loss.
+
+  - name: mss-recording
+    rules:
+      - alert: MssRecordingUploadsFailing
+        expr: increase(mss_recording_upload_failures_total[10m]) > 0
+        labels:
+          severity: critical
+        annotations:
+          summary: "A recording did not reach object storage"
+          description: >-
+            The recorder closed a call and the upload failed. If
+            MSS_RECORDING_SPILL_DIR is set the audio is on the pod's disk
+            under the recording identity and can be uploaded by hand; if it
+            is not, that recording is gone. Check bucket credentials,
+            endpoint reachability and mss_recording_spills_total.
+
+      - alert: MssRecordingsSpilled
+        expr: increase(mss_recording_spills_total[10m]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "Recordings are being kept on local pod disk"
+          description: >-
+            Every spilled file is an upload that failed and a recording a
+            downstream consumer cannot see yet. A pod restart loses them.
+
+      - alert: MssRecordingsTruncated
+        expr: increase(mss_recordings_truncated_total[1h]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "A recording hit its length cap and lost its tail"
+          description: >-
+            The recorder buffers the whole call in memory and stops at its
+            cap (2 h of audio). Calls longer than that need the streaming
+            multipart upload that is not built yet.

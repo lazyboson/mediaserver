@@ -18,6 +18,14 @@ allow = [
     "ISC",
     "Unicode-3.0",
     "Zlib",
+    # CDLA-Permissive-2.0 is a data licence, not a code licence, and it is
+    # here for exactly one crate: webpki-root-certs, the Mozilla CA root
+    # bundle that rustls verifies S3 endpoints against (recording uploads,
+    # tasks item 15). It is permissive, imposes no obligation on our own
+    # sources, and every Rust HTTPS client ends up on a Mozilla-derived
+    # bundle under either this licence or MPL-2.0. Do not widen this entry to
+    # cover code.
+    "CDLA-Permissive-2.0",
 ]
 confidence-threshold = 0.9
 

@@ -489,3 +489,100 @@ Two things the drill taught, both about where the outage is absorbed:
 What it does not prove: nothing here involves a real tapped call — the drill
 drives the pump directly, so it exercises the pump and the transport, not
 the call path. A live-call version belongs with item 10/11's lab work.
+
+## MinIO — recording storage for phase 2 (2026-08-22)
+
+Recording uploads (tasks item 15) need an S3 endpoint, so the compose stack
+now carries one. `minio` serves the S3 API on `172.31.99.62:9000` (published
+on the host as `127.0.0.1:9000`, console on `:9001`), and `minio-init` runs
+`mc mb` once to create the bucket — MSS deliberately never creates buckets,
+because a recorder that can create buckets can also create typos. Both use
+the default `minioadmin:minioadmin` unless `MINIO_ROOT_USER` /
+`MINIO_ROOT_PASSWORD` are set in `lab/.env`.
+
+`mss-control` gets the matching env (`MSS_RECORDING_BUCKET`,
+`MSS_RECORDING_S3_ENDPOINT`, region, key id, secret, and
+`MSS_RECORDING_SPILL_DIR=/out/recordings` so a failed upload lands in
+`lab/out/` instead of vanishing). With no bucket configured the daemon still
+starts and refuses `FILE_S3` attachments by name.
+
+Storage alone is enough for the recorder drill, so it runs without the SIP
+half of the lab:
+
+```sh
+DOCKER_API_VERSION=1.43 docker compose -f lab/docker-compose.microsip.yml up -d minio minio-init
+MSS_TEST_S3_ENDPOINT=http://127.0.0.1:9000 \
+  cargo test -p mediaserverd --test minio_upload -- --nocapture
+```
+
+`crates/mediaserverd/tests/minio_upload.rs` (skipped unless
+`MSS_TEST_S3_ENDPOINT` is set) drives the real recorder task from a synthetic
+hub — 500 ms of tone on both legs, a pause, 500 ms of tone the recorder must
+drop, a resume, 500 ms more — then uploads through the production
+`S3RecordingSink` and reads the object back out of the bucket to check it.
+
+First green run against MinIO `RELEASE.2025-08-13`:
+
+```
+drill: uploading to bucket lab-recordings at http://127.0.0.1:9000
+drill: s3://lab-recordings/acct-drill/rec-1787395753639.wav duration_ms=1000 bytes=32044 segments=2
+drill: verified 8000 stereo frames at acct-drill/rec-1787395753639.wav in bucket lab-recordings
+```
+
+Confirmed independently with `mc`, which is inside the MinIO image:
+
+```sh
+DOCKER_API_VERSION=1.43 docker exec mss-microsip-minio-1 \
+  sh -c 'mc alias set lab http://127.0.0.1:9000 minioadmin minioadmin && mc stat lab/lab-recordings/acct-drill/rec-1787395753639.wav'
+```
+
+```
+Size      : 31 KiB
+ETag      : efb92b24f14c20c635edd591a51dc5e6
+Content-Type: audio/wav
+```
+
+Three things worth keeping from that run:
+
+- **The paused second really is absent.** 1500 ms of audio was published,
+  1000 ms is in the file, the pause marker sample appears nowhere in it, and
+  `duration_ms` reported on `RecordingStopped` is 1000 — pause = segment +
+  defer + accumulate, end to end.
+- **The identity is the key, byte for byte.** The object is at
+  `acct-drill/rec-<id>.wav`, and `UploadCompleted.uri` is
+  `s3://bucket/<that key>`.
+- **Identical input gives an identical ETag** across runs, which is what
+  makes the parity harness below meaningful.
+
+What this does not prove: no SIP, no rtpengine, no real speech. It exercises
+the recorder, the segmenter, the WAV writer and the upload against a real
+object store, not the call path. The live-call half (a real tapped call
+recorded to MinIO, with the callbacks read off `mss.events`) is still owed
+and belongs with item 10's lab session.
+
+## recording_parity.py — the FS byte-comparison harness
+
+The Phase-2 exit criterion asks for byte-comparable recordings against
+FreeSWITCH `RECORD_STEREO` output. `lab/recording_parity.py` is that harness:
+
+```sh
+python3 lab/recording_parity.py --mss out/mss.wav --fs out/fs.wav
+```
+
+It compares container (channels, rate, width — a mismatch fails immediately
+and stops), duration, alignment offset found by correlation, and per channel
+the identical-sample ratio, mean absolute difference, worst difference and
+first divergence. Defaults: 200 ms duration tolerance, mean difference ≤ 200,
+identical-sample ratio only reported (`--identical-ratio 1.0` demands
+bit-for-bit). Exit code is 0 only when every bar is met.
+
+Exercised on the drill's own upload (`--mss` and `--fs` the same file):
+`identical=1.0000 mean_diff=0.0` at offset 0, and on deliberately perturbed
+copies, where it fails with numbers. **It has never seen a real FreeSWITCH
+recording** — getting the same call recorded both ways is the human step the
+exit criterion still needs, and the docstring says how to capture it.
+
+One caveat the harness cannot see: bit-for-bit equality is not expected under
+loss, because the two paths conceal differently (MSS grew G.711 Appendix I
+PLC in item 17, FS does not). Compare on a clean link, or compare RMS and
+mean difference rather than identity.

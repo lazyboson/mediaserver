@@ -13,9 +13,11 @@ struct RecordingMediaPlane {
     opened_sessions: Mutex<Vec<String>>,
     opened_attachments: Mutex<Vec<String>>,
     closed_attachments: Mutex<Vec<String>>,
+    updated_attachments: Mutex<Vec<(String, bool)>>,
     refuse_sessions: bool,
     refuse_attachments: bool,
     refuse_playback: bool,
+    refuse_updates: bool,
 }
 
 #[tonic::async_trait]
@@ -43,6 +45,19 @@ impl MediaPlane for RecordingMediaPlane {
             .lock()
             .unwrap()
             .push(attachment.id.to_string());
+        Ok(())
+    }
+
+    async fn update_attachment(&self, attachment: AttachmentView) -> Result<(), MediaPlaneError> {
+        if self.refuse_updates {
+            return Err(MediaPlaneError(
+                "the recorder is already closed".to_string(),
+            ));
+        }
+        self.updated_attachments
+            .lock()
+            .unwrap()
+            .push((attachment.id.to_string(), attachment.paused));
         Ok(())
     }
 
@@ -708,4 +723,215 @@ async fn every_committed_event_reaches_the_sink_in_sequence_order() {
     assert!(seen[0].2.starts_with("AttachmentUp"));
     assert!(seen[1].2.starts_with("AttachmentDown"));
     assert!(seen[2].2.starts_with("SessionEnded"));
+}
+
+#[tokio::test]
+async fn pausing_an_attachment_reaches_the_media_plane() {
+    let media = Arc::new(RecordingMediaPlane::default());
+    let controller = controller().with_media_plane(media.clone());
+    let session = session_with(&controller, "req-pause").await;
+    let attachment = controller
+        .attach(Request::new(attach(
+            &session,
+            proto::Transport::FileS3,
+            &[proto::Capability::Sink],
+        )))
+        .await
+        .unwrap()
+        .into_inner();
+
+    for paused in [true, false] {
+        controller
+            .update_attachment(Request::new(proto::UpdateAttachmentRequest {
+                attachment_id: attachment.attachment_id.clone(),
+                paused: Some(paused),
+                selector: None,
+                format: None,
+                idempotency_key: String::new(),
+            }))
+            .await
+            .unwrap();
+    }
+
+    let seen = media.updated_attachments.lock().unwrap().clone();
+    assert_eq!(
+        seen,
+        vec![
+            (attachment.attachment_id.clone(), true),
+            (attachment.attachment_id, false),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn an_update_the_media_plane_refuses_leaves_the_registry_as_it_was() {
+    let media = Arc::new(RecordingMediaPlane {
+        refuse_updates: true,
+        ..RecordingMediaPlane::default()
+    });
+    let controller = controller().with_media_plane(media);
+    let session = session_with(&controller, "req-pause").await;
+    let attachment = controller
+        .attach(Request::new(attach(
+            &session,
+            proto::Transport::FileS3,
+            &[proto::Capability::Sink],
+        )))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(!attachment.paused);
+
+    let status = controller
+        .update_attachment(Request::new(proto::UpdateAttachmentRequest {
+            attachment_id: attachment.attachment_id.clone(),
+            paused: Some(true),
+            selector: None,
+            format: None,
+            idempotency_key: String::new(),
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(status.code(), Code::Unavailable);
+
+    let described = controller
+        .describe_session(Request::new(proto::SessionRef {
+            id: Some(proto::session_ref::Id::SessionId(session)),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(
+        !described.attachments[0].paused,
+        "a refused pause must not stick in the registry"
+    );
+}
+
+#[derive(Default)]
+struct ClosingObserverPlane {
+    controller: Mutex<Option<std::sync::Weak<SessionController>>>,
+}
+
+#[tonic::async_trait]
+impl MediaPlane for ClosingObserverPlane {
+    async fn open_session(&self, _session: SessionView) -> Result<(), MediaPlaneError> {
+        Ok(())
+    }
+
+    async fn close_session(&self, session: SessionId) -> Result<(), MediaPlaneError> {
+        let held = self.controller.lock().unwrap().clone();
+        if let Some(controller) = held.and_then(|weak| weak.upgrade()) {
+            for observation in [
+                session_core::Observation::RecordingStopped {
+                    recording_id: "rec-99".to_string(),
+                    duration_ms: 4_000,
+                },
+                session_core::Observation::UploadCompleted {
+                    recording_id: "rec-99".to_string(),
+                    uri: "s3-uri".to_string(),
+                },
+            ] {
+                control_api::ObservationSink::observe(controller.as_ref(), session, observation);
+            }
+        }
+        Ok(())
+    }
+
+    async fn open_attachment(&self, _attachment: AttachmentView) -> Result<(), MediaPlaneError> {
+        Ok(())
+    }
+
+    async fn close_attachment(
+        &self,
+        _session: SessionId,
+        _attachment: AttachmentId,
+    ) -> Result<(), MediaPlaneError> {
+        Ok(())
+    }
+
+    async fn send_text(
+        &self,
+        _attachment: AttachmentId,
+        _json: String,
+    ) -> Result<(), MediaPlaneError> {
+        Ok(())
+    }
+
+    async fn start_playback(
+        &self,
+        _session: SessionId,
+        _playback: PlaybackId,
+        _source: PlaybackSource,
+        _target_tag: Option<String>,
+        _block_egress: bool,
+    ) -> Result<(), MediaPlaneError> {
+        Ok(())
+    }
+
+    async fn stop_playback(
+        &self,
+        _session: SessionId,
+        _playback: PlaybackId,
+    ) -> Result<(), MediaPlaneError> {
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn a_recording_closed_by_a_hangup_still_gets_its_callbacks_before_the_session_ends() {
+    #[derive(Default)]
+    struct Collected {
+        seen: Mutex<Vec<String>>,
+    }
+    impl control_api::EventSink for Collected {
+        fn accept(&self, event: session_core::MediaEvent) {
+            let debug = format!("{:?}", event.kind);
+            let name = debug.split([' ', '{']).next().unwrap_or_default();
+            self.seen.lock().unwrap().push(name.to_string());
+        }
+    }
+
+    let plane = Arc::new(ClosingObserverPlane::default());
+    let media: Arc<dyn MediaPlane> = plane.clone();
+    let events = Arc::new(Collected::default());
+    let controller = Arc::new(
+        SessionController::new("record-pod")
+            .with_media_plane(media)
+            .with_event_sink(events.clone()),
+    );
+    *plane.controller.lock().unwrap() = Some(Arc::downgrade(&controller));
+
+    let session = controller
+        .create_session(Request::new(create("req-hangup")))
+        .await
+        .unwrap()
+        .into_inner()
+        .session_id;
+    controller
+        .attach(Request::new(attach(
+            &session,
+            proto::Transport::FileS3,
+            &[proto::Capability::Sink],
+        )))
+        .await
+        .unwrap();
+    controller
+        .destroy_session(Request::new(proto::SessionRef {
+            id: Some(proto::session_ref::Id::SessionId(session)),
+        }))
+        .await
+        .unwrap();
+
+    let seen = events.seen.lock().unwrap().clone();
+    assert_eq!(
+        seen,
+        vec![
+            "AttachmentUp",
+            "RecordingStopped",
+            "UploadCompleted",
+            "AttachmentDown",
+            "SessionEnded",
+        ],
+        "the recording callbacks must land before the session is forgotten: {seen:?}"
+    );
 }
