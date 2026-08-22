@@ -103,6 +103,7 @@ pub struct AttachSpec {
     pub authoritative: bool,
     pub label: String,
     pub endpoint: String,
+    pub group: String,
     pub metadata: BTreeMap<String, String>,
     pub idempotency_key: Option<String>,
 }
@@ -121,6 +122,7 @@ impl AttachSpec {
         self.authoritative.hash(&mut hasher);
         self.label.hash(&mut hasher);
         self.endpoint.hash(&mut hasher);
+        self.group.hash(&mut hasher);
         self.metadata.hash(&mut hasher);
         hasher.finish()
     }
@@ -177,6 +179,7 @@ pub struct AttachmentView {
     pub paused: bool,
     pub label: String,
     pub endpoint: String,
+    pub group: String,
     pub metadata: BTreeMap<String, String>,
 }
 
@@ -203,6 +206,7 @@ struct AttachmentRecord {
     paused: bool,
     label: String,
     endpoint: String,
+    group: String,
     metadata: BTreeMap<String, String>,
     seen_final: bool,
 }
@@ -409,6 +413,7 @@ impl SessionRegistry {
                 paused: false,
                 label: spec.label.clone(),
                 endpoint: spec.endpoint.clone(),
+                group: spec.group.clone(),
                 metadata: spec.metadata.clone(),
                 seen_final: false,
             },
@@ -498,6 +503,7 @@ impl SessionRegistry {
             paused: record.paused,
             label: record.label.clone(),
             endpoint: record.endpoint.clone(),
+            group: record.group.clone(),
             metadata: record.metadata.clone(),
         })
     }
@@ -806,6 +812,7 @@ mod tests {
             authoritative: false,
             label: label.to_string(),
             endpoint: "wss:".to_string(),
+            group: String::new(),
             metadata: BTreeMap::new(),
             idempotency_key: None,
         }
@@ -884,6 +891,40 @@ mod tests {
 
         assert_eq!(
             registry.create_session(second),
+            Err(ControlError::IdempotencyConflict("key-1".to_string()))
+        );
+    }
+
+    #[test]
+    fn an_attachment_carries_its_group_and_defaults_to_none() {
+        let (mut registry, session) = started();
+        let ungrouped = registry.attach(recorder(session)).unwrap();
+        assert_eq!(ungrouped.group, "");
+
+        let mut grouped = recorder(session);
+        grouped.label = "alice".to_string();
+        grouped.group = "conf-9".to_string();
+        let view = registry.attach(grouped).unwrap();
+
+        assert_eq!(view.group, "conf-9");
+        assert_eq!(registry.attachment_view(view.id).unwrap().group, "conf-9");
+    }
+
+    #[test]
+    fn a_retry_that_changes_only_the_group_is_a_different_request() {
+        let (mut registry, session) = started();
+        let mut first = recorder(session);
+        first.group = "conf-9".to_string();
+        first.idempotency_key = Some("key-1".to_string());
+        registry.attach(first.clone()).unwrap();
+
+        let replay = registry.attach(first.clone()).unwrap();
+        assert_eq!(registry.attachment_view(replay.id).unwrap().group, "conf-9");
+
+        let mut moved = first;
+        moved.group = "conf-8".to_string();
+        assert_eq!(
+            registry.attach(moved),
             Err(ControlError::IdempotencyConflict("key-1".to_string()))
         );
     }

@@ -127,6 +127,23 @@ message AttachRequest {
   string endpoint = 8;                // ws url / grpc target / s3 prefix
   map<string, string> metadata = 9;   // audio_fork metadata parity
   string idempotency_key = 10;
+  // Joins this attachment to a named group, so the N sessions a conference
+  // costs (N SIP dialogs = N rtpengine calls = N MSS sessions, each capped at
+  // two legs) can be served as one logical consumer. Empty is exactly the
+  // behavior every attachment had before groups existed.
+  //
+  // For TRANSPORT_FILE_S3 the group is a recording group: each member writes
+  // its own mono object under ${accountID}/${recordingID}/${label}.${format}
+  // — with .customer/.agent suffixes when a member selects both tracks —
+  // while the frozen two-leg identity ${accountID}/${recordingID}.${format}
+  // stays exactly what an ungrouped attach produces. One file per participant
+  // is deliberate: aligning N sessions' clocks into one N-channel file is a
+  // problem per-participant files do not have.
+  //
+  // A group is keyed (accountID, group) in the owning pod's memory, so v1 is
+  // single-pod: every member must attach to the pod that holds the first one,
+  // and an adopted session's grouped recording is refused rather than split.
+  string group = 11;
 }
 
 message Attachment {
@@ -139,6 +156,7 @@ message Attachment {
   bool authoritative = 7;
   bool paused = 8;
   string label = 9;
+  string group = 10;
 }
 
 message AttachmentRef {

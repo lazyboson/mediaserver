@@ -313,6 +313,7 @@ fn attachment_message(view: AttachmentView) -> proto::Attachment {
         authoritative: view.authoritative,
         paused: view.paused,
         label: view.label,
+        group: view.group,
     }
 }
 
@@ -481,6 +482,7 @@ impl MediaControl for SessionController {
                 authoritative: message.authoritative,
                 label: message.label,
                 endpoint: message.endpoint,
+                group: message.group,
                 metadata,
                 idempotency_key: optional(message.idempotency_key),
             })
