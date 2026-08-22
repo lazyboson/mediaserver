@@ -67,6 +67,7 @@ fn session(external_id: &str, owner: &str) -> PersistedSession {
             selector: Some("customer".to_string()),
             authoritative: true,
             paused: true,
+            group: "conf-redis".to_string(),
             metadata: BTreeMap::from([("accountId".to_string(), "acct-1".to_string())]),
         }],
     }

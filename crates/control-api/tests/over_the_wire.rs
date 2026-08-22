@@ -73,6 +73,7 @@ async fn a_client_drives_a_whole_session_across_a_real_socket() {
             authoritative: true,
             label: "rtt".to_string(),
             endpoint: "grpc-target".to_string(),
+            group: String::new(),
             metadata: Default::default(),
             idempotency_key: String::new(),
         })
@@ -141,6 +142,7 @@ async fn a_refusal_reaches_the_client_as_a_status_not_a_broken_connection() {
             authoritative: false,
             label: "recorder".to_string(),
             endpoint: "s3-prefix".to_string(),
+            group: String::new(),
             metadata: Default::default(),
             idempotency_key: String::new(),
         })

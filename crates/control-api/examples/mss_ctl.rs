@@ -6,12 +6,25 @@ mss_ctl <endpoint> create <external-id> <call-id> <from-tag|-> [rtpengine-node]
    a from-tag of - lets MSS resolve the call's participants from rtpengine
 mss_ctl <endpoint> describe <external-id>
 mss_ctl <endpoint> attach <external-id> <ws-url> [label] [authoritative]
-mss_ctl <endpoint> record <external-id> <account/recording.wav> [label]
+mss_ctl <endpoint> record <external-id> <account/recording.wav> [label] [group] [track]
    the endpoint is the frozen recording identity, and the object key
+   a group joins this recording to the other members of that recording
+   group on this pod, and then label names the participant's own file
+   under account/recording/, with track one of customer|agent|all
 mss_ctl <endpoint> pause <attachment-id> <true|false>
 mss_ctl <endpoint> detach <attachment-id>
 mss_ctl <endpoint> play <external-id> <wav-path> [target-tag]
 mss_ctl <endpoint> destroy <external-id>";
+
+fn track_selector(track: Option<&String>) -> proto::TrackSelector {
+    let select = match track.map(String::as_str) {
+        None | Some("all") | Some("") => proto::track_selector::Select::All(true),
+        Some(only) => proto::track_selector::Select::Only(only.to_string()),
+    };
+    proto::TrackSelector {
+        select: Some(select),
+    }
+}
 
 fn reference(external_id: &str) -> proto::SessionRef {
     proto::SessionRef {
@@ -96,6 +109,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         .cloned()
                         .unwrap_or_else(|| "consumer".to_string()),
                     endpoint: args[3].clone(),
+                    group: String::new(),
                     metadata: Default::default(),
                     idempotency_key: String::new(),
                 })
@@ -112,9 +126,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     session: Some(reference(&args[2])),
                     transport: proto::Transport::FileS3 as i32,
                     capabilities: vec![proto::Capability::Sink as i32],
-                    selector: Some(proto::TrackSelector {
-                        select: Some(proto::track_selector::Select::All(true)),
-                    }),
+                    selector: Some(track_selector(args.get(6))),
                     format: None,
                     authoritative: false,
                     label: args
@@ -122,6 +134,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         .cloned()
                         .unwrap_or_else(|| "recorder".to_string()),
                     endpoint: args[3].clone(),
+                    group: args.get(5).cloned().unwrap_or_default(),
                     metadata: Default::default(),
                     idempotency_key: String::new(),
                 })
