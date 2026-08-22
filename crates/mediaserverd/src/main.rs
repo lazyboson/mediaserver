@@ -33,6 +33,9 @@ const POD_NAME_ENV: &str = "MSS_POD_NAME";
 const LOCAL_MEDIA_IP_ENV: &str = "MSS_TAP_LOCAL_IP";
 const METRICS_LISTEN_ENV: &str = "MSS_METRICS_LISTEN";
 const TAP_TRANSCODE_ENV: &str = "MSS_TAP_TRANSCODE";
+const OPUS_DECODE_RATE_ENV: &str = "MSS_OPUS_DECODE_RATE_HZ";
+const TAP_FORMAT_ENV: &str = "MSS_TAP_FORMAT";
+const OPUS_DECODE_RATE_DEFAULT_HZ: u32 = 16000;
 const AUTH_TOKEN_ENV: &str = "MSS_AUTH_TOKEN";
 const RECORDING_BUCKET_ENV: &str = "MSS_RECORDING_BUCKET";
 const DEFAULT_POD_NAME: &str = "mediaserverd";
@@ -175,6 +178,68 @@ fn control_listen_address() -> Option<Result<SocketAddr, String>> {
     Some(configured.parse().map_err(|_| configured))
 }
 
+fn tap_format(opus_decode_rate_hz: u32) -> AudioFormat {
+    let configured = std::env::var(TAP_FORMAT_ENV).unwrap_or_else(|_| "pcmu".to_string());
+    let format = match configured.trim().to_ascii_lowercase().as_str() {
+        "pcma" | "alaw" => Some(AudioFormat {
+            encoding: media_core::Encoding::Pcma,
+            ..AudioFormat::pcmu_8k_20ms()
+        }),
+        "opus" => Some(AudioFormat {
+            encoding: media_core::Encoding::Opus,
+            sample_rate_hz: opus_decode_rate_hz,
+            channels: 1,
+            ptime_ms: 20,
+        }),
+        "pcmu" | "ulaw" => Some(AudioFormat::pcmu_8k_20ms()),
+        _ => None,
+    };
+    match format {
+        Some(format) => {
+            info!(
+                env = TAP_FORMAT_ENV,
+                encoding = ?format.encoding,
+                sample_rate_hz = format.sample_rate_hz,
+                "the tap decodes this format"
+            );
+            format
+        }
+        None => {
+            warn!(
+                env = TAP_FORMAT_ENV,
+                configured = %configured,
+                "a tap decodes pcmu, pcma or opus; falling back to pcmu"
+            );
+            AudioFormat::pcmu_8k_20ms()
+        }
+    }
+}
+
+fn opus_decode_rate_hz() -> u32 {
+    let Ok(configured) = std::env::var(OPUS_DECODE_RATE_ENV) else {
+        return OPUS_DECODE_RATE_DEFAULT_HZ;
+    };
+    match configured.trim().parse::<u32>() {
+        Ok(rate) if media_core::opus::is_decodable_rate(rate) => {
+            info!(
+                env = OPUS_DECODE_RATE_ENV,
+                rate_hz = rate,
+                "decoding opus taps at this rate"
+            );
+            rate
+        }
+        _ => {
+            warn!(
+                env = OPUS_DECODE_RATE_ENV,
+                configured = %configured,
+                fallback_hz = OPUS_DECODE_RATE_DEFAULT_HZ,
+                "libopus decodes 8000, 12000, 16000, 24000 or 48000 only"
+            );
+            OPUS_DECODE_RATE_DEFAULT_HZ
+        }
+    }
+}
+
 fn transcode_at_tap() -> bool {
     let configured = std::env::var(TAP_TRANSCODE_ENV).unwrap_or_else(|_| "on".to_string());
     let transcoding = !matches!(
@@ -238,13 +303,15 @@ async fn serve_control_plane(listen: SocketAddr) {
             "no recording storage configured; file-s3 attachments will be refused"
         );
     }
+    let opus_rate = opus_decode_rate_hz();
     let plane = Arc::new(TapPlane::new(TapPlaneConfig {
         default_node: std::env::var(RTPENGINE_NODE_ENV)
             .ok()
             .and_then(|configured| configured.parse().ok()),
         local_media_address: local_media_address(),
-        format: AudioFormat::pcmu_8k_20ms(),
+        format: tap_format(opus_rate),
         transcode_at_tap: transcode_at_tap(),
+        opus_decode_rate_hz: opus_rate,
         cookie_prefix: cookie_prefix(),
         sdp_session_id: cookie_prefix(),
         recording,

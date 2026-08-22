@@ -3,12 +3,19 @@ use opus_ffi::{OpusDecoder, OpusFfiError};
 
 pub use opus_ffi::{MAX_FRAME_MS as MAX_OPUS_FRAME_MS, MAX_PACKET_BYTES as MAX_OPUS_PACKET_BYTES};
 
+pub const MAX_OPUS_FRAME_SAMPLES: usize =
+    (opus_ffi::HIGHEST_SAMPLE_RATE_HZ as usize / 1000) * MAX_OPUS_FRAME_MS as usize;
+
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum OpusError {
     #[error("{0:?} is not opus")]
     NotOpus(Encoding),
     #[error("{0}")]
     Libopus(#[from] OpusFfiError),
+}
+
+pub fn is_decodable_rate(sample_rate_hz: u32) -> bool {
+    opus_ffi::LEGAL_SAMPLE_RATES_HZ.contains(&sample_rate_hz)
 }
 
 pub struct OpusStreamDecoder {
