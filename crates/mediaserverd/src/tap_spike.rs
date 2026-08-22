@@ -1,5 +1,6 @@
 use crate::hub::{Hub, TapEvent};
 use crate::supervisor::{AudioFlowWatchdog, SessionHealth};
+use crossbeam_queue::ArrayQueue;
 use media_core::jitter;
 use media_core::pipeline::{IngestOutcome, PipelineError, PipelineStats, Playout, StreamPipeline};
 use media_core::{AudioFormat, Track};
@@ -16,6 +17,11 @@ const MAX_DATAGRAMS_PER_DRAIN: usize = 64;
 const MAX_RECORDED_DIGITS: usize = 32;
 const SILENCE: [i16; 480] = [0; 480];
 const LOG_LENGTH_PREFIX: usize = 4;
+
+pub const MAX_SSRC_TRACKS: usize = 8;
+pub const NO_SSRC: u64 = u64::MAX;
+const SSRC_TRACK_COMMANDS: usize = 4;
+const SSRC_CHANGE_CONFIRMATIONS: u16 = 3;
 
 #[derive(Debug, Error)]
 pub enum SpikeError {
@@ -43,8 +49,52 @@ pub struct LegStats {
     pub datagram_log_full: bool,
     pub unknown_ssrc: Option<u32>,
     pub ssrcs_seen: [Option<u32>; 4],
+    pub ssrc_changes: u64,
+    pub reresolutions: u64,
     pub pipeline: PipelineStats,
     pub jitter: jitter::Stats,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct SsrcTracks {
+    entries: [Option<(u32, Track)>; MAX_SSRC_TRACKS],
+}
+
+impl SsrcTracks {
+    pub fn from_pairs(pairs: &[(u32, Track)]) -> SsrcTracks {
+        let mut entries = [None; MAX_SSRC_TRACKS];
+        for (slot, pair) in entries.iter_mut().zip(pairs) {
+            *slot = Some(*pair);
+        }
+        SsrcTracks { entries }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.iter().all(Option::is_none)
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.iter().flatten().count()
+    }
+
+    pub fn track_of(&self, ssrc: u32) -> Option<Track> {
+        self.entries
+            .iter()
+            .flatten()
+            .find(|(known, _)| *known == ssrc)
+            .map(|(_, track)| *track)
+    }
+}
+
+#[derive(Clone)]
+pub struct SsrcTrackPublisher {
+    queue: Arc<ArrayQueue<SsrcTracks>>,
+}
+
+impl SsrcTrackPublisher {
+    pub fn publish(&self, tracks: SsrcTracks) -> bool {
+        self.queue.force_push(tracks).is_none()
+    }
 }
 
 #[derive(Default)]
@@ -65,11 +115,21 @@ pub struct SharedLegStats {
     pub jitter_late_drops: AtomicU64,
     pub jitter_resets: AtomicU64,
     pub unknown_ssrc: AtomicU64,
+    pub unresolved_ssrc: AtomicU64,
+    pub ssrc_changes: AtomicU64,
+    pub reresolutions: AtomicU64,
     pub stalled: AtomicU64,
     pub stalls: AtomicU64,
 }
 
 impl SharedLegStats {
+    pub fn unresolved_ssrc(&self) -> Option<u32> {
+        if self.unknown_ssrc.load(Ordering::Relaxed) == 0 {
+            return None;
+        }
+        u32::try_from(self.unresolved_ssrc.load(Ordering::Relaxed)).ok()
+    }
+
     fn store(&self, stats: &LegStats, stalled: bool, stalls: u64) {
         self.datagrams.store(stats.datagrams, Ordering::Relaxed);
         self.recv_errors.store(stats.recv_errors, Ordering::Relaxed);
@@ -99,6 +159,14 @@ impl SharedLegStats {
             .store(stats.jitter.resets, Ordering::Relaxed);
         self.unknown_ssrc
             .store(u64::from(stats.unknown_ssrc.is_some()), Ordering::Relaxed);
+        self.unresolved_ssrc.store(
+            stats.unknown_ssrc.map_or(NO_SSRC, u64::from),
+            Ordering::Relaxed,
+        );
+        self.ssrc_changes
+            .store(stats.ssrc_changes, Ordering::Relaxed);
+        self.reresolutions
+            .store(stats.reresolutions, Ordering::Relaxed);
         self.stalled.store(u64::from(stalled), Ordering::Relaxed);
         self.stalls.store(stalls, Ordering::Relaxed);
     }
@@ -106,8 +174,12 @@ impl SharedLegStats {
 
 pub struct TapLeg {
     track: Track,
-    ssrc_tracks: Vec<(u32, Track)>,
+    ssrc_tracks: SsrcTracks,
+    ssrc_track_updates: Arc<ArrayQueue<SsrcTracks>>,
     track_resolved: bool,
+    observed_ssrc: Option<u32>,
+    candidate_ssrc: Option<u32>,
+    candidate_packets: u16,
     socket: UdpSocket,
     pipeline: StreamPipeline,
     samples: Vec<i16>,
@@ -140,8 +212,12 @@ impl TapLeg {
         let capacity_samples = capture_capacity_samples(format, max_capture);
         Ok(TapLeg {
             track,
-            ssrc_tracks: Vec::new(),
+            ssrc_tracks: SsrcTracks::default(),
+            ssrc_track_updates: Arc::new(ArrayQueue::new(SSRC_TRACK_COMMANDS)),
             track_resolved: true,
+            observed_ssrc: None,
+            candidate_ssrc: None,
+            candidate_packets: 0,
             socket,
             pipeline,
             samples: Vec::with_capacity(capacity_samples),
@@ -198,23 +274,82 @@ impl TapLeg {
     }
 
     pub fn with_ssrc_tracks(mut self, ssrc_tracks: Vec<(u32, Track)>) -> Self {
-        self.track_resolved = ssrc_tracks.is_empty();
-        self.ssrc_tracks = ssrc_tracks;
+        self.adopt_ssrc_tracks(SsrcTracks::from_pairs(&ssrc_tracks), false);
         self
     }
 
-    fn resolve_track(&mut self) {
+    pub fn ssrc_track_publisher(&self) -> SsrcTrackPublisher {
+        SsrcTrackPublisher {
+            queue: Arc::clone(&self.ssrc_track_updates),
+        }
+    }
+
+    pub fn poll_ssrc_tracks(&mut self) {
+        while let Some(tracks) = self.ssrc_track_updates.pop() {
+            self.adopt_ssrc_tracks(tracks, true);
+        }
+    }
+
+    fn adopt_ssrc_tracks(&mut self, ssrc_tracks: SsrcTracks, count_as_reresolution: bool) {
+        self.ssrc_tracks = ssrc_tracks;
+        self.track_resolved = ssrc_tracks.is_empty();
+        self.name_after_observed_ssrc(count_as_reresolution);
+    }
+
+    fn observe_ssrc(&mut self) {
         let Some(ssrc) = self.pipeline.last_audio_ssrc() else {
             return;
         };
-        self.remember_ssrc(ssrc);
-        if self.track_resolved {
+        if self.observed_ssrc == Some(ssrc) {
+            self.forget_candidate();
             return;
         }
-        self.track_resolved = true;
-        match self.ssrc_tracks.iter().find(|(known, _)| *known == ssrc) {
-            Some((_, track)) => self.track = *track,
-            None => self.stats.unknown_ssrc = Some(ssrc),
+        if self.candidate_ssrc == Some(ssrc) {
+            self.candidate_packets += 1;
+        } else {
+            self.candidate_ssrc = Some(ssrc);
+            self.candidate_packets = 1;
+            self.remember_ssrc(ssrc);
+        }
+        let first_ssrc_on_the_leg = self.observed_ssrc.is_none();
+        if !first_ssrc_on_the_leg && self.candidate_packets < SSRC_CHANGE_CONFIRMATIONS {
+            return;
+        }
+        if !first_ssrc_on_the_leg {
+            self.stats.ssrc_changes += 1;
+        }
+        self.observed_ssrc = Some(ssrc);
+        self.forget_candidate();
+        self.name_after_observed_ssrc(false);
+    }
+
+    fn forget_candidate(&mut self) {
+        self.candidate_ssrc = None;
+        self.candidate_packets = 0;
+    }
+
+    fn name_after_observed_ssrc(&mut self, count_as_reresolution: bool) {
+        let Some(ssrc) = self.observed_ssrc else {
+            return;
+        };
+        if self.ssrc_tracks.is_empty() {
+            return;
+        }
+        match self.ssrc_tracks.track_of(ssrc) {
+            Some(track) => {
+                if count_as_reresolution
+                    && (self.stats.unknown_ssrc.is_some() || self.track != track)
+                {
+                    self.stats.reresolutions += 1;
+                }
+                self.track = track;
+                self.track_resolved = true;
+                self.stats.unknown_ssrc = None;
+            }
+            None => {
+                self.track_resolved = false;
+                self.stats.unknown_ssrc = Some(ssrc);
+            }
         }
     }
 
@@ -282,7 +417,7 @@ impl TapLeg {
                 Ok((len, _from)) => {
                     self.log_datagram(&buf[..len]);
                     let outcome = self.pipeline.ingest(&buf[..len]);
-                    self.resolve_track();
+                    self.observe_ssrc();
                     if let IngestOutcome::Dtmf(digit) = outcome {
                         if self.digits_recorded < MAX_RECORDED_DIGITS {
                             self.digits[self.digits_recorded] = digit;
@@ -417,6 +552,7 @@ pub fn capture(
             hub.poll_commands();
         }
         for leg in legs.iter_mut() {
+            leg.poll_ssrc_tracks();
             leg.drain(&mut buf, hub.as_deref_mut());
         }
         settle_by_elimination(legs);
@@ -939,6 +1075,235 @@ mod ssrc_track_tests {
 
         assert_eq!(leg.track(), Track::Customer);
         assert_eq!(leg.stats().unknown_ssrc, None);
+    }
+}
+
+#[cfg(test)]
+mod reresolution_tests {
+    use super::*;
+    use media_core::replay::G711StreamGenerator;
+    use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket};
+
+    const CUSTOMER_SSRC: u32 = 0xCA11_0001;
+    const AGENT_SSRC: u32 = 0xA6E0_0002;
+    const REINVITE_SSRC: u32 = 0x5EED_0003;
+    const STRANGER_SSRC: u32 = 0xDEAD_BEEF;
+
+    struct Wire {
+        sender: UdpSocket,
+        address: SocketAddr,
+    }
+
+    fn leg_and_wire(map: &[(u32, Track)]) -> (TapLeg, Wire) {
+        let socket = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let address = socket.local_addr().unwrap();
+        let leg = TapLeg::new(
+            Track::Customer,
+            socket,
+            AudioFormat::pcmu_8k_20ms(),
+            1,
+            Some(101),
+            Duration::from_secs(2),
+        )
+        .unwrap()
+        .with_ssrc_tracks(map.to_vec());
+        let sender = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
+        (leg, Wire { sender, address })
+    }
+
+    fn speaker(ssrc: u32, first_sequence: u16) -> G711StreamGenerator {
+        G711StreamGenerator::new(AudioFormat::pcmu_8k_20ms(), ssrc, first_sequence).unwrap()
+    }
+
+    fn send(wire: &Wire, stream: &mut G711StreamGenerator, packets: usize) {
+        for _ in 0..packets {
+            wire.sender
+                .send_to(&stream.next_datagram(), wire.address)
+                .unwrap();
+        }
+    }
+
+    fn run(legs: &mut [TapLeg], window: Duration) {
+        let stop = AtomicBool::new(false);
+        capture(legs, None, AudioFormat::pcmu_8k_20ms(), window, &stop);
+    }
+
+    #[test]
+    fn a_mid_call_ssrc_change_is_renamed_by_a_fresh_speaker_map() {
+        let known = [(CUSTOMER_SSRC, Track::Customer), (AGENT_SSRC, Track::Agent)];
+        let (customer_leg, customer_wire) = leg_and_wire(&known);
+        let (agent_leg, agent_wire) = leg_and_wire(&known);
+        let publishers = [
+            customer_leg.ssrc_track_publisher(),
+            agent_leg.ssrc_track_publisher(),
+        ];
+        let mut legs = vec![customer_leg, agent_leg];
+
+        let mut customer = speaker(CUSTOMER_SSRC, 100);
+        let mut agent = speaker(AGENT_SSRC, 7000);
+        send(&customer_wire, &mut customer, 5);
+        send(&agent_wire, &mut agent, 5);
+        run(&mut legs, Duration::from_millis(200));
+
+        assert_eq!(legs[0].resolved_track(), Some(Track::Customer));
+        assert_eq!(legs[1].resolved_track(), Some(Track::Agent));
+
+        let mut reinvited = speaker(REINVITE_SSRC, 5000);
+        send(&customer_wire, &mut reinvited, 5);
+        run(&mut legs, Duration::from_millis(200));
+
+        let changed = legs[0].stats();
+        assert_eq!(changed.unknown_ssrc, Some(REINVITE_SSRC));
+        assert_eq!(changed.ssrc_changes, 1);
+        assert_eq!(changed.jitter.resets, 1);
+        assert_eq!(legs[0].resolved_track(), None);
+        assert_eq!(legs[0].track(), Track::Customer);
+
+        let refreshed =
+            SsrcTracks::from_pairs(&[(REINVITE_SSRC, Track::Customer), (AGENT_SSRC, Track::Agent)]);
+        for publisher in &publishers {
+            assert!(publisher.publish(refreshed));
+        }
+        send(&customer_wire, &mut reinvited, 5);
+        run(&mut legs, Duration::from_millis(200));
+
+        assert_eq!(legs[0].resolved_track(), Some(Track::Customer));
+        assert_eq!(legs[1].resolved_track(), Some(Track::Agent));
+        let recovered = legs[0].stats();
+        assert_eq!(recovered.unknown_ssrc, None);
+        assert_eq!(recovered.reresolutions, 1);
+        assert_eq!(recovered.ssrc_changes, 1);
+        assert!(recovered.pipeline.frames_played >= 10, "{recovered:?}");
+        assert_eq!(legs[1].stats().reresolutions, 0);
+    }
+
+    #[test]
+    fn a_leg_that_starts_carrying_the_other_speaker_flips_both_names() {
+        let known = [(CUSTOMER_SSRC, Track::Customer), (AGENT_SSRC, Track::Agent)];
+        let (first, first_wire) = leg_and_wire(&known);
+        let (second, second_wire) = leg_and_wire(&known);
+        let mut legs = vec![first, second];
+
+        let mut customer = speaker(CUSTOMER_SSRC, 100);
+        let mut stranger = speaker(STRANGER_SSRC, 300);
+        send(&first_wire, &mut customer, 3);
+        send(&second_wire, &mut stranger, 3);
+        run(&mut legs, Duration::from_millis(160));
+
+        assert_eq!(legs[0].resolved_track(), Some(Track::Customer));
+        assert_eq!(legs[1].track(), Track::Agent);
+        assert_eq!(legs[1].resolved_track(), None);
+
+        let mut agent = speaker(AGENT_SSRC, 5000);
+        send(&first_wire, &mut agent, 4);
+        run(&mut legs, Duration::from_millis(160));
+
+        assert_eq!(legs[0].resolved_track(), Some(Track::Agent));
+        assert_eq!(legs[0].stats().ssrc_changes, 1);
+        assert_eq!(legs[1].track(), Track::Customer);
+    }
+
+    #[test]
+    fn two_ssrcs_interleaved_on_one_leg_never_rename_it() {
+        let known = [(CUSTOMER_SSRC, Track::Customer), (AGENT_SSRC, Track::Agent)];
+        let (mut leg, wire) = leg_and_wire(&known);
+        let mut buf = [0u8; MAX_DATAGRAM];
+        let mut customer = speaker(CUSTOMER_SSRC, 100);
+        let mut intruder = speaker(AGENT_SSRC, 900);
+
+        send(&wire, &mut customer, 1);
+        std::thread::sleep(Duration::from_millis(5));
+        leg.drain(&mut buf, None);
+        assert_eq!(leg.resolved_track(), Some(Track::Customer));
+
+        for _ in 0..6 {
+            send(&wire, &mut intruder, 1);
+            send(&wire, &mut customer, 1);
+            std::thread::sleep(Duration::from_millis(5));
+            leg.drain(&mut buf, None);
+        }
+
+        let stats = leg.stats();
+        assert_eq!(leg.resolved_track(), Some(Track::Customer));
+        assert_eq!(stats.ssrc_changes, 0);
+        assert_eq!(stats.ssrcs_seen[0], Some(CUSTOMER_SSRC));
+        assert_eq!(stats.ssrcs_seen[1], Some(AGENT_SSRC));
+    }
+
+    #[test]
+    fn the_control_world_reads_the_unresolved_ssrc_and_watches_it_recover() {
+        let shared = Arc::new(SharedLegStats::default());
+        assert_eq!(shared.unresolved_ssrc(), None);
+
+        let (leg, wire) = leg_and_wire(&[(CUSTOMER_SSRC, Track::Customer)]);
+        let publisher = leg.ssrc_track_publisher();
+        let mut leg =
+            leg.with_shared_stats(Arc::clone(&shared), Duration::from_secs(10), Instant::now());
+
+        let mut stranger = speaker(STRANGER_SSRC, 40);
+        send(&wire, &mut stranger, 2);
+        let mut buf = [0u8; MAX_DATAGRAM];
+        std::thread::sleep(Duration::from_millis(5));
+        leg.drain(&mut buf, None);
+        leg.publish_shared(Instant::now());
+
+        assert_eq!(shared.unresolved_ssrc(), Some(STRANGER_SSRC));
+        assert_eq!(shared.unknown_ssrc.load(Ordering::Relaxed), 1);
+
+        assert!(publisher.publish(SsrcTracks::from_pairs(&[(STRANGER_SSRC, Track::Agent)])));
+        leg.poll_ssrc_tracks();
+        leg.publish_shared(Instant::now());
+
+        assert_eq!(leg.resolved_track(), Some(Track::Agent));
+        assert_eq!(shared.unresolved_ssrc(), None);
+        assert_eq!(shared.unknown_ssrc.load(Ordering::Relaxed), 0);
+        assert_eq!(shared.reresolutions.load(Ordering::Relaxed), 1);
+        assert_eq!(shared.ssrc_changes.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn the_newest_speaker_map_wins_when_the_capture_loop_is_behind() {
+        let (mut leg, wire) = leg_and_wire(&[(CUSTOMER_SSRC, Track::Customer)]);
+        let publisher = leg.ssrc_track_publisher();
+        let mut stranger = speaker(STRANGER_SSRC, 10);
+        send(&wire, &mut stranger, 2);
+        let mut buf = [0u8; MAX_DATAGRAM];
+        std::thread::sleep(Duration::from_millis(5));
+        leg.drain(&mut buf, None);
+        assert_eq!(leg.stats().unknown_ssrc, Some(STRANGER_SSRC));
+
+        let stale = SsrcTracks::from_pairs(&[(CUSTOMER_SSRC, Track::Customer)]);
+        for _ in 0..SSRC_TRACK_COMMANDS {
+            assert!(publisher.publish(stale));
+        }
+        let fresh = SsrcTracks::from_pairs(&[(STRANGER_SSRC, Track::Agent)]);
+        assert!(!publisher.publish(fresh));
+
+        leg.poll_ssrc_tracks();
+        assert_eq!(leg.resolved_track(), Some(Track::Agent));
+        assert_eq!(leg.stats().reresolutions, 1);
+    }
+
+    #[test]
+    fn a_speaker_map_holds_what_a_tapped_call_can_report_and_no_more() {
+        let empty = SsrcTracks::default();
+        assert!(empty.is_empty());
+        assert_eq!(empty.len(), 0);
+        assert_eq!(empty.track_of(CUSTOMER_SSRC), None);
+
+        let pairs: Vec<(u32, Track)> = (0..MAX_SSRC_TRACKS as u32 + 2)
+            .map(|index| (index, Track::Agent))
+            .collect();
+        let overflowing = SsrcTracks::from_pairs(&pairs);
+        assert_eq!(overflowing.len(), MAX_SSRC_TRACKS);
+        assert_eq!(overflowing.track_of(0), Some(Track::Agent));
+        assert_eq!(overflowing.track_of(MAX_SSRC_TRACKS as u32 + 1), None);
+
+        let two =
+            SsrcTracks::from_pairs(&[(CUSTOMER_SSRC, Track::Customer), (AGENT_SSRC, Track::Agent)]);
+        assert!(!two.is_empty());
+        assert_eq!(two.track_of(AGENT_SSRC), Some(Track::Agent));
+        assert_eq!(two.track_of(REINVITE_SSRC), None);
     }
 }
 

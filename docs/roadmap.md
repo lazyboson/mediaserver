@@ -69,8 +69,13 @@ Work:
   `deploy/prometheus-alerts.yaml` alerts on every drop counter.
 - ✅ Speaker attribution: each tap leg is named from the participant's own
   SSRC (rtpengine `query`) with elimination for transcode-restamped legs, so
-  stereo recording and RTT speaker labels are trustworthy. Open soft spot:
-  a mid-call SSRC change does not re-resolve (tasks.md D1).
+  stereo recording and RTT speaker labels are trustworthy. ✅ A **mid-call
+  SSRC change** now re-resolves too (2026-08-22, tasks.md item 14): the leg
+  re-enters resolution and a control-world task re-queries rtpengine and
+  pushes a fresh map into the capture loop over a bounded queue —
+  replay-verified, not yet watched on a live re-INVITE. Remaining soft spot:
+  a transfer that replaces a from-tag needs a re-subscribe, not a
+  re-resolve.
 - ✅ Codec pipeline (2026-08-22): G.711 → L16 → resample (8k/16k/48k) →
   per-consumer encode, replay-verified; the hub carries PCM and each
   consumer encodes its own format. Opus is deferred until a consumer asks

@@ -481,6 +481,14 @@ How the numbers get out of the media world without locks or allocation:
 (consumer frames, event queue, publish failures, outbox), watchdog stalls,
 jitter loss ratio, and the split-brain signal `mss_registry_lost_total`.
 
+The SSRC re-resolution series (2026-08-22) are meant to be read as one
+sequence: `mss_legs_ssrc_changes_total` (a leg's sender changed),
+`mss_ssrc_requeries_total` (the control world asked rtpengine about it),
+`mss_legs_ssrc_reresolved_total` (a refreshed map renamed a leg), and the
+gauge `mss_legs_unknown_ssrc`, which is the one that must come back **down**.
+`MssLegSpeakerUnresolved` therefore alerts on the gauge holding for 2 m —
+the change itself is normal, a change that never recovers is not.
+
 ### supervisor.rs — the audio-flow watchdog, now wired (2026-08-20)
 
 `AudioFlowWatchdog` finally has a caller: each `TapLeg` with shared stats
@@ -822,9 +830,24 @@ into something that actually taps calls.
   transcode-SSRC case. Unmatched SSRCs are counted (`unknown_ssrc`) and the
   leg keeps its positional default. Acceptance: two consecutive live calls,
   caller's voice on `inbound` (rms 564) and silence on `outbound` (rms 6),
-  independent of stream order. Remaining soft spot: a mid-call SSRC change
-  (re-INVITE, transfer) re-resolves nothing yet — `ssrcs_seen` in the leg
-  stats makes it visible when it happens.
+  independent of stream order.
+- **Mid-call SSRC re-resolution (D1, 2026-08-22).** A leg no longer decides
+  its speaker once and for all. `reresolve_speakers` is the control-world
+  half: a per-session task that wakes every `SSRC_WATCH_INTERVAL` (500 ms),
+  reads each leg's unresolved SSRC out of `SharedLegStats`, and — the first
+  time it sees one it has not already asked about — re-runs `query` +
+  `speaker_ssrcs` and publishes the refreshed map to every leg. `SsrcRequeries`
+  is the rate limit and the reason this cannot become an NG flood: **one query
+  per distinct unknown SSRC**, remembering 16 and forgetting the oldest. It is
+  spawned only when the initial map is non-empty (an empty map means positional
+  naming, which re-resolution cannot improve) and aborted in `close_session`
+  alongside the capture thread's stop flag.
+  Two limits worth knowing before trusting it on a transfer: `from_tags` is
+  frozen at subscribe time, so a transfer that introduces a **new tag** yields
+  an SSRC no map can name — that needs a re-subscribe, not a re-resolve — and
+  the whole loop rests on rtpengine's `query` reporting the *current* SSRC for
+  a tag after a change, which is measured at subscribe time but **not yet
+  measured mid-call**. Probe it before claiming transfer support.
 - **Known gaps:** no Redis registry, so a tap lives and dies with its pod;
   `stop_playback` stops everything on the call rather than one playback,
   because rtpengine's `stop media` targets a participant, not a playback id;
@@ -1005,6 +1028,39 @@ PCM, and write the WAV once capture ends.
 - Stereo mapping is Customer left, Agent right (matching FS
   `RECORD_STEREO`); one leg writes mono; duplicate tracks and more than two
   legs are errors.
+- **Leg identity is now a small state machine (2026-08-22, D1).** Three
+  fields carry it: `observed_ssrc` (the SSRC the current name came from),
+  `candidate_ssrc` + `candidate_packets` (the challenger), and `ssrc_tracks`
+  (a `SsrcTracks` — a fixed `[Option<(u32, Track)>; MAX_SSRC_TRACKS]`, `Copy`,
+  so nothing allocates on the media thread). Rules, in order:
+  1. The **first** SSRC on a leg resolves it on its first packet, as before.
+  2. A **different** SSRC must arrive `SSRC_CHANGE_CONFIRMATIONS` (3) times
+     consecutively to take over; any packet of the incumbent forgets the
+     challenger. This is the anti-flap guard: two SSRCs interleaved on one
+     leg — the dual-SSRC fault the echo-loop sessions found — would otherwise
+     rename the leg per packet and scramble the hub's track fan-out.
+  3. A confirmed SSRC the map does not name puts the leg back into the
+     unresolved state (`unknown_ssrc = Some(new)`, `resolved_track() == None`)
+     but **keeps the name it already had**. A stale-but-stable label beats a
+     flapping one, elimination can still name it from the other leg, and the
+     unresolved SSRC is what the control world reads to know it should
+     re-query.
+  4. A refreshed map arrives over a per-leg bounded `ArrayQueue<SsrcTracks>`
+     (`ssrc_track_publisher()` for the control side, `poll_ssrc_tracks()`
+     once per capture tick for the media side — the hub's command pattern,
+     capacity 4, **drop-oldest** because a newer map supersedes an older one).
+     Applying it re-runs the naming, which is how a leg recovers.
+  `settle_by_elimination` was left alone deliberately: an eliminated leg keeps
+  `unknown_ssrc` set and therefore never reports itself resolved, so the pass
+  re-runs every tick and a re-resolution that flips one leg re-derives the
+  other on the next one.
+- The counters the recovery story is read through: `ssrc_changes` (confirmed
+  takeovers), `reresolutions` (times a pushed map renamed the leg), and the
+  existing `unknown_ssrc`, which now **returns to zero** when a leg recovers.
+  `SharedLegStats` also publishes the unresolved SSRC's value
+  (`unresolved_ssrc()`, sentinel `NO_SSRC` when resolved) — that is the only
+  new thing the control world reads out of the media world, and it reads it
+  the same way as every other counter: relaxed atomics, no lock.
 
 ### tap_session.rs — the Phase-0 orchestration (control world)
 Drives the whole subscribe lifecycle and is env-configured, so the spike
