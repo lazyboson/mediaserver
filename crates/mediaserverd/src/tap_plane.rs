@@ -93,6 +93,7 @@ pub struct LegTotals {
     pub jitter_duplicates: u64,
     pub jitter_late_drops: u64,
     pub jitter_resets: u64,
+    pub jitter_silence_gaps: u64,
     pub ssrc_changes: u64,
     pub reresolutions: u64,
     pub stalls: u64,
@@ -116,6 +117,7 @@ impl LegTotals {
         self.jitter_duplicates += read(&shared.jitter_duplicates);
         self.jitter_late_drops += read(&shared.jitter_late_drops);
         self.jitter_resets += read(&shared.jitter_resets);
+        self.jitter_silence_gaps += read(&shared.jitter_silence_gaps);
         self.ssrc_changes += read(&shared.ssrc_changes);
         self.reresolutions += read(&shared.reresolutions);
         self.stalls += read(&shared.stalls);
@@ -594,6 +596,8 @@ impl MediaPlane for TapPlane {
                         jitter_duplicates = stats.jitter.duplicates,
                         jitter_late_drops = stats.jitter.late_drops,
                         jitter_resets = stats.jitter.resets,
+                        jitter_silence_gaps = stats.jitter.silence_gaps,
+                        jitter_target_depth = stats.jitter.target_depth,
                         recv_errors = stats.recv_errors,
                         unknown_ssrc = stats.unknown_ssrc,
                         ssrcs_seen = ?stats.ssrcs_seen,
