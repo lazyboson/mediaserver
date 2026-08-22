@@ -11,7 +11,8 @@ use crate::tap_spike::{
 use control_api::{MediaPlane, MediaPlaneError, ObservationSink, PlaybackSource, StreamFrame};
 use media_core::{AudioFormat, ConsumerEncoder, Track};
 use rtpengine_ng::{
-    PlayMedia, PlaySource, PlayTarget, SubscribeRequest, SubscriptionAnswer, SubscriptionOffer,
+    NegotiatedCodec, PlayMedia, PlaySource, PlayTarget, SubscribeRequest, SubscriptionAnswer,
+    SubscriptionOffer,
 };
 use session_core::{
     AttachmentId, AttachmentView, Observation, SessionId, SessionKind, SessionView, TrackSelector,
@@ -748,12 +749,26 @@ impl MediaPlane for TapPlane {
             sockets.push(socket);
         }
 
+        let answer_with = if transcoding {
+            NegotiatedCodec::from_static_format(configured)
+                .map_err(|error| MediaPlaneError(format!("answer codec: {error}")))?
+        } else {
+            negotiated_tap_codec(&offer)?
+        };
+        info!(
+            session = %view.id,
+            payload_type = answer_with.payload_type,
+            clock_rate_hz = answer_with.clock_rate_hz,
+            "answering the subscription with this codec"
+        );
+
         let local_address = self.config.local_media_address.to_string();
         let answer_sdp = SubscriptionAnswer {
             session_id: self.config.sdp_session_id,
             local_address: &local_address,
             receive_ports: &receive_ports,
             format,
+            answer_with,
         }
         .to_sdp(&offer)
         .map_err(|error| MediaPlaneError(format!("answer sdp: {error}")))?;
@@ -1265,6 +1280,30 @@ async fn pump_frames(
     }
 }
 
+fn negotiated_tap_codec(offer: &SubscriptionOffer) -> Result<NegotiatedCodec, MediaPlaneError> {
+    let mut settled: Option<NegotiatedCodec> = None;
+    for (index, stream) in offer.streams.iter().enumerate() {
+        let codec = stream.negotiate().map_err(|error| {
+            MediaPlaneError(format!(
+                "stream {index}: {error}; this call needs transcoding at the tap"
+            ))
+        })?;
+        match settled {
+            None => settled = Some(codec),
+            Some(first) if first != codec => {
+                return Err(MediaPlaneError(format!(
+                    "rtpengine offered {:?} on one stream and {:?} on another; \
+                     a tap decodes one codec for every leg, so this call needs \
+                     transcoding at the tap",
+                    first.encoding, codec.encoding
+                )))
+            }
+            Some(_) => {}
+        }
+    }
+    settled.ok_or_else(|| MediaPlaneError("rtpengine offered no streams".to_string()))
+}
+
 fn offered_tap_format(
     offer: &SubscriptionOffer,
     ptime_fallback_ms: u32,
@@ -1702,13 +1741,35 @@ mod tests {
 
     #[test]
     fn a_call_whose_codec_this_pipeline_cannot_decode_names_transcoding_as_the_fix() {
-        let offer = offer_of("111 101", &["111 opus/48000", "101 telephone-event/8000"]);
+        let offer = offer_of("111 101", &["111 EVS/16000", "101 telephone-event/8000"]);
         let error = offered_tap_format(&offer, 20).unwrap_err();
         assert!(
             error.to_string().contains("needs transcoding at the tap"),
             "{error}"
         );
         assert!(error.to_string().contains("111"), "{error}");
+    }
+
+    #[test]
+    fn an_opus_call_is_negotiated_at_the_offers_dynamic_payload_type() {
+        let offer = offer_of("111 101", &["111 opus/48000/2", "101 telephone-event/8000"]);
+        let codec = negotiated_tap_codec(&offer).unwrap();
+        assert_eq!(codec.payload_type, 111);
+        assert_eq!(codec.encoding, media_core::Encoding::Opus);
+        assert_eq!(codec.clock_rate_hz, 48000);
+        assert_eq!(codec.samples_per_packet(20), Some(960));
+    }
+
+    #[test]
+    fn legs_offered_with_different_codecs_are_refused_at_the_codec_level_too() {
+        let mut offer = offer_of("111 101", &["111 opus/48000/2", "101 telephone-event/8000"]);
+        let g711 = offer_of("8 101", &["8 PCMA/8000", "101 telephone-event/8000"]);
+        offer.streams.push(g711.streams[0].clone());
+        let error = negotiated_tap_codec(&offer).unwrap_err();
+        assert!(
+            error.to_string().contains("one codec for every leg"),
+            "{error}"
+        );
     }
 
     #[test]

@@ -4,8 +4,8 @@ use crate::ng_transport::{NgTransport, NgTransportConfig, TransportError};
 use crate::tap_spike::{capture, wav_blob, write_wav, SpikeError, TapLeg};
 use media_core::{AudioFormat, Track};
 use rtpengine_ng::{
-    PlayMedia, PlaySource, PlayTarget, SdpError, SubscribeRequest, SubscriptionAnswer,
-    SubscriptionOffer,
+    NegotiatedCodec, PlayMedia, PlaySource, PlayTarget, SdpError, SubscribeRequest,
+    SubscriptionAnswer, SubscriptionOffer,
 };
 use std::collections::{HashMap, VecDeque};
 use std::net::{IpAddr, SocketAddr, UdpSocket};
@@ -195,6 +195,7 @@ pub async fn run(request: TapSpikeRequest, cookie_prefix: u64) -> Result<(), Tap
         local_address: &local_address,
         receive_ports: &receive_ports,
         format: request.format,
+        answer_with: NegotiatedCodec::from_static_format(request.format)?,
     }
     .to_sdp(&offer)?;
     info!(?receive_ports, to_tag = %to_tag, "answering the subscription");
