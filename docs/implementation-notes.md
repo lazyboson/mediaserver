@@ -1328,7 +1328,13 @@ built and the upload is made after the audio is already in memory.
   account or recording id, a relative segment (`.`/`..`), no extension,
   whitespace or control characters, or a format other than `wav`.
   `object_key()` rebuilds the string byte for byte, and the round-trip is a
-  test (`the_frozen_identity_round_trips_byte_exact`). `TelCompat`
+  test (`the_frozen_identity_round_trips_byte_exact`). Checked in
+  `object_store`'s source rather than assumed: `Path::parse` rejects only
+  `.`/`..`, ASCII control characters and an embedded `/`, all of which this
+  parser already refuses — so a key we accept is always a key the store can
+  address, and `UploadError::Key` is a defensive path rather than a reachable
+  one. That is also why there is no separate key-validation hook on the sink
+  trait: it would be dead code. `TelCompat`
   already composed this endpoint from `acc_id`/`record_id`/`file_format`, so
   `StartRecording` reaches the parser unchanged.
 - **The segmenter is sans-IO and pause is its only interesting state.** Three
