@@ -9,6 +9,7 @@ use thiserror::Error;
 pub const MAX_PACKET_BYTES: usize = 1276;
 pub const MAX_FRAME_MS: u32 = 60;
 pub const LEGAL_SAMPLE_RATES_HZ: [u32; 5] = [8000, 12000, 16000, 24000, 48000];
+pub const HIGHEST_SAMPLE_RATE_HZ: u32 = 48000;
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum OpusFfiError {

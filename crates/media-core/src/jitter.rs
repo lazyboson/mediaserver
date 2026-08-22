@@ -1,4 +1,5 @@
-pub const MAX_PAYLOAD: usize = 480;
+pub const MAX_PAYLOAD: usize = 1276;
+pub const MAX_FRAME_SAMPLES: usize = 960;
 
 const CAPACITY: usize = 64;
 const MAX_TARGET_DEPTH: u16 = (CAPACITY / 2) as u16;

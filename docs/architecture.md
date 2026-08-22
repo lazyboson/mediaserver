@@ -148,7 +148,7 @@ Three properties this diagram is drawn to make explicit, each argued in §5:
 
 **Session Controller** — the control plane. Exposes the `MediaControl` gRPC API over the Session / Attachment / Playback nouns defined in §5.1 (a `TelCompat` façade translates cigol's telsvc verbs, §5.6). It owns the RTPEngine interaction: for each tap it sends `subscribe request {call-id, from-tag | from-tags, …}` to the RTPEngine instance anchoring that call, receives rtpengine's `a=sendonly` SDP offer, allocates a local RTP port, and replies with `subscribe answer` (`a=recvonly`) — optionally requesting a codec on the subscription leg so rtpengine transcodes at the tap (e.g., ask for PCMU even if the leg is Opus). Teardown is `unsubscribe`. This is the same mechanism SIPREC recording servers use with rtpengine, so it is a stable, supported surface.
 
-**Ingest / codec pipeline** — per subscribed stream: UDP socket → RTP depacketization → **jitter buffer** (sequence reorder, loss detection, PLC for G.711) → decode to linear PCM → resample (8 kHz ↔ 16 kHz ↔ 48 kHz) → per-consumer re-encode (L16/16k for ASR, PCMU/8k for Twilio-dialect consumers, Opus for bandwidth-sensitive consumers). One decode per stream, N encodes shared across consumers wanting the same format.
+**Ingest / codec pipeline** — per subscribed stream: UDP socket → RTP depacketization → **jitter buffer** (sequence reorder, loss detection, PLC — G.711 Appendix I for G.711, libopus's own for Opus) → decode to linear PCM → resample (8 kHz ↔ 16 kHz ↔ 48 kHz) → per-consumer re-encode (L16/16k for ASR, PCMU/8k for Twilio-dialect consumers, Opus for bandwidth-sensitive consumers). One decode per stream, N encodes shared across consumers wanting the same format.
 
 **Fan-out hub** — per session, an in-process pub/sub: one ingest (or two, customer + agent leg), N subscribers. Subscribers attach/detach mid-call. Each subscriber has an independent queue with drop-oldest backpressure and per-subscriber metrics, so one slow ASR endpoint can't stall the RTT stream (a failure mode mediagateway has today — its mark-echo write blocks the RTP pacer).
 
@@ -525,7 +525,7 @@ The audit of `mediagateway` produced a concrete list of what the purpose-built s
 | Async runtime / gRPC | `tokio`, `tonic`, `prost` | control world only |
 | RTP/RTCP types | in-tree (`media-core`) or `rtp`/`rtcp` (webrtc-rs) | in-tree parser is ~200 lines, zero-dep |
 | G.711 | in-tree (`media-core::g711`) | verify against ITU vectors before GA |
-| Opus | `audiopus` (libopus FFI) | PLC/FEC come with the decoder |
+| Opus | libopus via `opusic-sys` (crate `opus-ffi`) | PLC/FEC come with the decoder. Landed 2026-08-23; `audiopus` was the original pick and does not build — its vendored libopus 1.3 declares a `cmake_minimum_required` that CMake 4 rejects |
 | Resampling | `rubato` (pure Rust) or libsoxr FFI | 8k/16k/48k |
 | File decode (prompts) / encode (recording) | `symphonia`, `hound`, `ogg` | pure Rust |
 | VAD / denoise (later) | Silero via `ort`, `nnnoiseless` | better than anything FS ships |
@@ -601,7 +601,7 @@ FreeSWITCH itself wraps C libraries (libopus, spandsp, libsndfile, ffmpeg) and o
 | FS capability we use today | What it actually is | Rust path | Build from scratch? |
 | --- | --- | --- | --- |
 | G.711 µ/A-law | Table lookup | in-tree (~150 lines) | Trivial |
-| Opus encode/decode (+PLC/FEC) | libopus (same lib FS uses) | `audiopus` bindings — mature | No |
+| Opus encode/decode (+PLC/FEC) | libopus (same lib FS uses) | `opusic-sys` bindings, vendored and statically linked | No |
 | G.722 | spandsp/libg722 | FFI, or small Rust ports | No |
 | Resampling 8k/16k/48k | DSP | `rubato` (pure Rust) or libsoxr FFI | No |
 | Jitter buffer + reorder | Policy code | pieces exist (str0m, webrtc-rs); NetEQ-class is C++ FFI | **Yes (~1k lines) — and we want to own it** |

@@ -2,8 +2,10 @@ use crate::dtmf::DtmfDetector;
 use crate::frame::{AudioFormat, Encoding};
 use crate::g711;
 use crate::jitter::{
-    self, JitterBuffer, JitterConfig, PopOutcome, PushOutcome, Timing, MAX_PAYLOAD,
+    self, JitterBuffer, JitterConfig, PopOutcome, PushOutcome, Timing, MAX_FRAME_SAMPLES,
+    MAX_PAYLOAD,
 };
+use crate::opus::{OpusStreamDecoder, MAX_OPUS_FRAME_SAMPLES};
 use crate::plc::PacketLossConcealer;
 use crate::rtp::RtpPacket;
 use thiserror::Error;
@@ -21,6 +23,8 @@ pub enum PipelineError {
     UnusableFormat,
     #[error("{samples} samples per packet exceeds the {max}-sample slot size")]
     PacketTooLong { samples: usize, max: usize },
+    #[error("opus: {0}")]
+    Opus(crate::opus::OpusError),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -47,6 +51,9 @@ pub enum Playout<'a> {
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct PipelineStats {
+    pub undecodable_frames: u64,
+    pub frame_size_mismatch: u64,
+    pub carry_overflow_samples: u64,
     pub unparsable: u64,
     pub unknown_payload_type: u64,
     pub companded: u64,
@@ -58,6 +65,43 @@ pub struct PipelineStats {
     pub frames_suppressed: u64,
 }
 
+struct Carry {
+    samples: [i16; MAX_OPUS_FRAME_SAMPLES],
+    len: usize,
+}
+
+impl Carry {
+    fn new() -> Self {
+        Carry {
+            samples: [0; MAX_OPUS_FRAME_SAMPLES],
+            len: 0,
+        }
+    }
+
+    fn push(&mut self, decoded: &[i16]) -> usize {
+        let room = self.samples.len() - self.len;
+        let taken = decoded.len().min(room);
+        self.samples[self.len..self.len + taken].copy_from_slice(&decoded[..taken]);
+        self.len += taken;
+        decoded.len() - taken
+    }
+
+    fn take(&mut self, out: &mut [i16]) -> usize {
+        let taken = self.len.min(out.len());
+        out[..taken].copy_from_slice(&self.samples[..taken]);
+        self.samples.copy_within(taken..self.len, 0);
+        self.len -= taken;
+        if taken < out.len() {
+            out[taken..].fill(0);
+        }
+        taken
+    }
+
+    fn clear(&mut self) {
+        self.len = 0;
+    }
+}
+
 fn companion_payload_type(encoding: Encoding) -> Option<u8> {
     match encoding {
         Encoding::Pcmu => Encoding::Pcma.static_payload_type(),
@@ -66,17 +110,32 @@ fn companion_payload_type(encoding: Encoding) -> Option<u8> {
     }
 }
 
+enum Decoder {
+    G711 { ulaw: bool },
+    Opus(Box<OpusStreamDecoder>),
+}
+
+pub struct PipelineConfig {
+    pub audio_payload_type: u8,
+    pub clock_rate_hz: u32,
+    pub decode: AudioFormat,
+    pub target_depth_packets: u16,
+    pub telephone_event_payload_type: Option<u8>,
+}
+
 pub struct StreamPipeline {
     audio_payload_type: u8,
     companding_payload_type: Option<u8>,
     telephone_event_payload_type: Option<u8>,
-    ulaw: bool,
+    decoder: Decoder,
     samples_per_packet: usize,
     sample_rate_hz: u32,
     jitter: JitterBuffer,
     dtmf: DtmfDetector,
     plc: PacketLossConcealer,
-    pcm: [i16; MAX_PAYLOAD],
+    pcm: [i16; MAX_FRAME_SAMPLES],
+    decoded: [i16; MAX_OPUS_FRAME_SAMPLES],
+    carry: Carry,
     stats: PipelineStats,
     last_audio_ssrc: Option<u32>,
 }
@@ -87,23 +146,48 @@ impl StreamPipeline {
         target_depth_packets: u16,
         telephone_event_payload_type: Option<u8>,
     ) -> Result<Self, PipelineError> {
-        let ulaw = match format.encoding {
-            Encoding::Pcmu => true,
-            Encoding::Pcma => false,
-            other => return Err(PipelineError::UnsupportedEncoding(other)),
-        };
         let audio_payload_type = format
             .encoding
             .static_payload_type()
             .ok_or(PipelineError::UnsupportedEncoding(format.encoding))?;
+        StreamPipeline::with_config(PipelineConfig {
+            audio_payload_type,
+            clock_rate_hz: format.sample_rate_hz,
+            decode: format,
+            target_depth_packets,
+            telephone_event_payload_type,
+        })
+    }
+
+    pub fn with_config(config: PipelineConfig) -> Result<Self, PipelineError> {
+        let PipelineConfig {
+            audio_payload_type,
+            clock_rate_hz,
+            decode: format,
+            target_depth_packets,
+            telephone_event_payload_type,
+        } = config;
+        let decoder = match format.encoding {
+            Encoding::Pcmu => Decoder::G711 { ulaw: true },
+            Encoding::Pcma => Decoder::G711 { ulaw: false },
+            Encoding::Opus => Decoder::Opus(Box::new(
+                OpusStreamDecoder::new(format).map_err(PipelineError::Opus)?,
+            )),
+            other => return Err(PipelineError::UnsupportedEncoding(other)),
+        };
+        let timestamp_increment = if clock_rate_hz == 0 || format.ptime_ms == 0 {
+            return Err(PipelineError::UnusableFormat);
+        } else {
+            clock_rate_hz / 1000 * format.ptime_ms
+        };
         let samples_per_packet = format
             .samples_per_packet()
             .filter(|samples| *samples > 0)
             .ok_or(PipelineError::UnusableFormat)? as usize;
-        if samples_per_packet > MAX_PAYLOAD {
+        if samples_per_packet > MAX_FRAME_SAMPLES {
             return Err(PipelineError::PacketTooLong {
                 samples: samples_per_packet,
-                max: MAX_PAYLOAD,
+                max: MAX_FRAME_SAMPLES,
             });
         }
         let floor_depth = target_depth_packets.max(1);
@@ -111,17 +195,19 @@ impl StreamPipeline {
             audio_payload_type,
             companding_payload_type: companion_payload_type(format.encoding),
             telephone_event_payload_type,
-            ulaw,
+            decoder,
             samples_per_packet,
             sample_rate_hz: format.sample_rate_hz,
             jitter: JitterBuffer::with_config(JitterConfig {
                 target_depth_packets: floor_depth,
                 max_depth_packets: floor_depth.saturating_mul(MAX_DEPTH_MULTIPLIER),
-                timestamp_increment: samples_per_packet as u32,
+                timestamp_increment,
             }),
             dtmf: DtmfDetector::new(),
             plc: PacketLossConcealer::new(format.sample_rate_hz),
-            pcm: [0; MAX_PAYLOAD],
+            pcm: [0; MAX_FRAME_SAMPLES],
+            decoded: [0; MAX_OPUS_FRAME_SAMPLES],
+            carry: Carry::new(),
             stats: PipelineStats::default(),
             last_audio_ssrc: None,
         })
@@ -185,10 +271,11 @@ impl StreamPipeline {
             && packet.payload.len() <= MAX_PAYLOAD
         {
             for (out, byte) in companded.iter_mut().zip(packet.payload) {
-                *out = if self.ulaw {
-                    g711::linear_to_ulaw(g711::alaw_to_linear(*byte))
-                } else {
-                    g711::linear_to_alaw(g711::ulaw_to_linear(*byte))
+                *out = match self.decoder {
+                    Decoder::G711 { ulaw: true } => {
+                        g711::linear_to_ulaw(g711::alaw_to_linear(*byte))
+                    }
+                    _ => g711::linear_to_alaw(g711::ulaw_to_linear(*byte)),
                 };
             }
             self.stats.companded += 1;
@@ -244,31 +331,71 @@ impl StreamPipeline {
             jitter,
             pcm,
             plc,
-            ulaw,
+            decoder,
+            decoded,
+            carry,
             samples_per_packet,
             stats,
             ..
         } = self;
+        let frame = *samples_per_packet;
+        if carry.len >= frame {
+            carry.take(&mut pcm[..frame]);
+            stats.frames_played += 1;
+            return Playout::Pcm(&pcm[..frame]);
+        }
         match jitter.pop() {
             PopOutcome::Packet(payload) => {
-                let decoded = g711::decode_into(*ulaw, payload, pcm);
-                plc.recover_into(&mut pcm[..decoded]);
-                plc.remember(&pcm[..decoded]);
+                match decoder {
+                    Decoder::G711 { ulaw } => {
+                        let samples = g711::decode_into(*ulaw, payload, pcm);
+                        if samples != frame {
+                            stats.frame_size_mismatch += 1;
+                            pcm[samples.min(frame)..frame].fill(0);
+                        }
+                        plc.recover_into(&mut pcm[..frame]);
+                        plc.remember(&pcm[..frame]);
+                    }
+                    Decoder::Opus(opus) => {
+                        let samples = match opus.decode(payload, &mut decoded[..]) {
+                            Ok(samples) => samples,
+                            Err(_) => {
+                                stats.undecodable_frames += 1;
+                                decoded[..frame].fill(0);
+                                frame
+                            }
+                        };
+                        if samples != frame {
+                            stats.frame_size_mismatch += 1;
+                        }
+                        let dropped = carry.push(&decoded[..samples]);
+                        if dropped > 0 {
+                            stats.carry_overflow_samples += dropped as u64;
+                        }
+                        carry.take(&mut pcm[..frame]);
+                    }
+                }
                 stats.frames_played += 1;
-                Playout::Pcm(&pcm[..decoded])
+                Playout::Pcm(&pcm[..frame])
             }
             PopOutcome::Accounted => {
-                let suppressed = *samples_per_packet;
-                pcm[..suppressed].fill(0);
+                pcm[..frame].fill(0);
                 plc.forget();
+                carry.clear();
                 stats.frames_suppressed += 1;
-                Playout::Suppressed(&pcm[..suppressed])
+                Playout::Suppressed(&pcm[..frame])
             }
             PopOutcome::Lost => {
-                let concealed = *samples_per_packet;
-                plc.conceal(&mut pcm[..concealed]);
+                match decoder {
+                    Decoder::G711 { .. } => plc.conceal(&mut pcm[..frame]),
+                    Decoder::Opus(opus) => {
+                        if opus.conceal(&mut pcm[..frame]).is_err() {
+                            pcm[..frame].fill(0);
+                        }
+                    }
+                }
                 stats.frames_concealed += 1;
-                Playout::Concealed(&pcm[..concealed])
+                Playout::Concealed(&pcm[..frame])
             }
             PopOutcome::Waiting => Playout::Waiting,
         }
@@ -356,7 +483,7 @@ mod tests {
         assert_eq!(
             StreamPipeline::new(
                 AudioFormat {
-                    ptime_ms: 100,
+                    ptime_ms: 200,
                     ..AudioFormat::pcmu_8k_20ms()
                 },
                 2,
@@ -364,10 +491,239 @@ mod tests {
             )
             .err(),
             Some(PipelineError::PacketTooLong {
-                samples: 800,
-                max: MAX_PAYLOAD
+                samples: 1600,
+                max: MAX_FRAME_SAMPLES
             })
         );
+    }
+
+    #[test]
+    fn an_opus_pipeline_separates_the_rtp_clock_from_the_rate_it_decodes_to() {
+        let opus_16k = AudioFormat {
+            encoding: Encoding::Opus,
+            sample_rate_hz: 16000,
+            channels: 1,
+            ptime_ms: 20,
+        };
+        let pipeline = StreamPipeline::with_config(PipelineConfig {
+            audio_payload_type: 111,
+            clock_rate_hz: 48000,
+            decode: opus_16k,
+            target_depth_packets: 3,
+            telephone_event_payload_type: Some(101),
+        })
+        .unwrap();
+
+        assert_eq!(pipeline.samples_per_packet(), 320);
+        assert_eq!(pipeline.jitter_stats().target_depth, 3);
+    }
+
+    #[test]
+    fn real_opus_rtp_decodes_into_audible_pcm_at_the_taps_rate() {
+        const OPUS_PT: u8 = 111;
+        let decode = AudioFormat {
+            encoding: Encoding::Opus,
+            sample_rate_hz: 16000,
+            channels: 1,
+            ptime_ms: 20,
+        };
+        let mut pipeline = StreamPipeline::with_config(PipelineConfig {
+            audio_payload_type: OPUS_PT,
+            clock_rate_hz: 48000,
+            decode,
+            target_depth_packets: 2,
+            telephone_event_payload_type: Some(TELEPHONE_EVENT_PT),
+        })
+        .unwrap();
+
+        let mut encoder = opus_ffi::OpusEncoder::new(48000, 1).unwrap();
+        let mut packet = [0u8; 1276];
+        let mut timestamp: u32 = 4000;
+        let mut sequence: u16 = 900;
+        let mut loudest = 0i16;
+        let mut played = 0usize;
+
+        for frame in 0..25 {
+            let tone: Vec<i16> = (0..960)
+                .map(|n| {
+                    let t = (frame * 960 + n) as f32 / 48000.0;
+                    ((t * 440.0 * 2.0 * std::f32::consts::PI).sin() * 10000.0) as i16
+                })
+                .collect();
+            let bytes = encoder.encode(&tone, &mut packet).unwrap();
+
+            let mut datagram = Vec::with_capacity(12 + bytes);
+            datagram.push(0x80);
+            datagram.push(OPUS_PT);
+            datagram.extend_from_slice(&sequence.to_be_bytes());
+            datagram.extend_from_slice(&timestamp.to_be_bytes());
+            datagram.extend_from_slice(&0x0BADF00Du32.to_be_bytes());
+            datagram.extend_from_slice(&packet[..bytes]);
+            assert_eq!(pipeline.ingest(&datagram), IngestOutcome::Buffered);
+            sequence = sequence.wrapping_add(1);
+            timestamp = timestamp.wrapping_add(960);
+
+            if let Playout::Pcm(pcm) = pipeline.release() {
+                assert_eq!(pcm.len(), 320);
+                played += 1;
+                for sample in pcm {
+                    loudest = loudest.max(sample.abs());
+                }
+            }
+        }
+
+        assert!(played >= 20, "only {played} frames reached playout");
+        assert!(loudest > 4000, "decoded peak {loudest} is not audible tone");
+        assert_eq!(pipeline.stats().unknown_payload_type, 0);
+        assert_eq!(pipeline.stats().undecodable_frames, 0);
+        assert_eq!(pipeline.stats().frame_size_mismatch, 0);
+    }
+
+    #[test]
+    fn a_sixty_millisecond_opus_sender_keeps_every_sample_instead_of_being_truncated() {
+        const OPUS_PT: u8 = 111;
+        let mut pipeline = StreamPipeline::with_config(PipelineConfig {
+            audio_payload_type: OPUS_PT,
+            clock_rate_hz: 48000,
+            decode: AudioFormat {
+                encoding: Encoding::Opus,
+                sample_rate_hz: 16000,
+                channels: 1,
+                ptime_ms: 20,
+            },
+            target_depth_packets: 2,
+            telephone_event_payload_type: None,
+        })
+        .unwrap();
+
+        let mut encoder = opus_ffi::OpusEncoder::new(48000, 1).unwrap();
+        let mut packet = [0u8; 1276];
+        let mut timestamp: u32 = 0;
+        let mut sequence: u16 = 0;
+        let long_frame_samples = 2880;
+
+        for frame in 0..6 {
+            let tone: Vec<i16> = (0..long_frame_samples)
+                .map(|n| {
+                    let t = (frame * long_frame_samples + n) as f32 / 48000.0;
+                    ((t * 440.0 * 2.0 * std::f32::consts::PI).sin() * 10000.0) as i16
+                })
+                .collect();
+            let bytes = encoder.encode(&tone, &mut packet).unwrap();
+            let mut datagram = Vec::with_capacity(12 + bytes);
+            datagram.push(0x80);
+            datagram.push(OPUS_PT);
+            datagram.extend_from_slice(&sequence.to_be_bytes());
+            datagram.extend_from_slice(&timestamp.to_be_bytes());
+            datagram.extend_from_slice(&7u32.to_be_bytes());
+            datagram.extend_from_slice(&packet[..bytes]);
+            assert_eq!(pipeline.ingest(&datagram), IngestOutcome::Buffered);
+            sequence = sequence.wrapping_add(1);
+            timestamp = timestamp.wrapping_add(long_frame_samples as u32);
+        }
+
+        let mut played = 0usize;
+        let mut loud_frames = 0usize;
+        for _ in 0..40 {
+            if let Playout::Pcm(pcm) = pipeline.release() {
+                assert_eq!(pcm.len(), 320);
+                played += 1;
+                if pcm.iter().any(|sample| sample.abs() > 4000) {
+                    loud_frames += 1;
+                }
+            }
+        }
+
+        assert!(
+            played >= 12,
+            "a 60 ms sender should yield three 20 ms frames per packet, got {played}"
+        );
+        assert!(
+            loud_frames >= played - 2,
+            "only {loud_frames} of {played} frames carried the tone; the carry dropped audio"
+        );
+        assert_eq!(pipeline.stats().carry_overflow_samples, 0);
+    }
+
+    #[test]
+    fn a_lost_opus_packet_is_concealed_by_libopus_not_by_the_g711_concealer() {
+        const OPUS_PT: u8 = 111;
+        let decode = AudioFormat {
+            encoding: Encoding::Opus,
+            sample_rate_hz: 16000,
+            channels: 1,
+            ptime_ms: 20,
+        };
+        let mut pipeline = StreamPipeline::with_config(PipelineConfig {
+            audio_payload_type: OPUS_PT,
+            clock_rate_hz: 48000,
+            decode,
+            target_depth_packets: 2,
+            telephone_event_payload_type: None,
+        })
+        .unwrap();
+
+        let mut encoder = opus_ffi::OpusEncoder::new(48000, 1).unwrap();
+        let mut packet = [0u8; 1276];
+        let mut timestamp: u32 = 0;
+        let mut sequence: u16 = 0;
+
+        for frame in 0..12 {
+            if frame == 6 {
+                sequence = sequence.wrapping_add(1);
+                timestamp = timestamp.wrapping_add(960);
+                continue;
+            }
+            let tone: Vec<i16> = (0..960)
+                .map(|n| {
+                    let t = (frame * 960 + n) as f32 / 48000.0;
+                    ((t * 440.0 * 2.0 * std::f32::consts::PI).sin() * 10000.0) as i16
+                })
+                .collect();
+            let bytes = encoder.encode(&tone, &mut packet).unwrap();
+            let mut datagram = Vec::with_capacity(12 + bytes);
+            datagram.push(0x80);
+            datagram.push(OPUS_PT);
+            datagram.extend_from_slice(&sequence.to_be_bytes());
+            datagram.extend_from_slice(&timestamp.to_be_bytes());
+            datagram.extend_from_slice(&1u32.to_be_bytes());
+            datagram.extend_from_slice(&packet[..bytes]);
+            pipeline.ingest(&datagram);
+            sequence = sequence.wrapping_add(1);
+            timestamp = timestamp.wrapping_add(960);
+        }
+
+        let mut concealed = Vec::new();
+        for _ in 0..14 {
+            if let Playout::Concealed(pcm) = pipeline.release() {
+                concealed = pcm.to_vec();
+                break;
+            }
+        }
+
+        assert_eq!(concealed.len(), 320, "libopus should conceal a whole frame");
+        assert!(
+            concealed.iter().any(|sample| *sample != 0),
+            "libopus concealment should extrapolate the tone, not emit silence"
+        );
+        assert_eq!(pipeline.stats().frames_concealed, 1);
+    }
+
+    #[test]
+    fn an_opus_pipeline_refuses_a_rate_libopus_does_not_serve() {
+        let outcome = StreamPipeline::with_config(PipelineConfig {
+            audio_payload_type: 111,
+            clock_rate_hz: 48000,
+            decode: AudioFormat {
+                encoding: Encoding::Opus,
+                sample_rate_hz: 44100,
+                channels: 1,
+                ptime_ms: 20,
+            },
+            target_depth_packets: 3,
+            telephone_event_payload_type: None,
+        });
+        assert!(matches!(outcome.err(), Some(PipelineError::Opus(_))));
     }
 
     #[test]

@@ -2,7 +2,9 @@ use crate::hub::{Hub, TapEvent};
 use crate::supervisor::{AudioFlowWatchdog, SessionHealth};
 use crossbeam_queue::ArrayQueue;
 use media_core::jitter;
-use media_core::pipeline::{IngestOutcome, PipelineError, PipelineStats, Playout, StreamPipeline};
+use media_core::pipeline::{
+    IngestOutcome, PipelineConfig, PipelineError, PipelineStats, Playout, StreamPipeline,
+};
 use media_core::{AudioFormat, Track};
 use std::io::ErrorKind;
 use std::net::UdpSocket;
@@ -202,7 +204,19 @@ pub struct TapLeg {
 }
 
 impl TapLeg {
-    pub fn new(
+    pub fn with_pipeline_config(
+        track: Track,
+        socket: UdpSocket,
+        config: PipelineConfig,
+        max_capture: Duration,
+    ) -> Result<Self, SpikeError> {
+        let format = config.decode;
+        let pipeline = StreamPipeline::with_config(config)?;
+        TapLeg::with_pipeline(track, socket, pipeline, format, max_capture)
+    }
+
+    #[cfg(test)]
+    fn g711(
         track: Track,
         socket: UdpSocket,
         format: AudioFormat,
@@ -210,9 +224,19 @@ impl TapLeg {
         telephone_event_payload_type: Option<u8>,
         max_capture: Duration,
     ) -> Result<Self, SpikeError> {
-        socket.set_nonblocking(true)?;
         let pipeline =
             StreamPipeline::new(format, target_depth_packets, telephone_event_payload_type)?;
+        TapLeg::with_pipeline(track, socket, pipeline, format, max_capture)
+    }
+
+    fn with_pipeline(
+        track: Track,
+        socket: UdpSocket,
+        pipeline: StreamPipeline,
+        format: AudioFormat,
+        max_capture: Duration,
+    ) -> Result<Self, SpikeError> {
+        socket.set_nonblocking(true)?;
         let capacity_samples = capture_capacity_samples(format, max_capture);
         Ok(TapLeg {
             track,
@@ -687,7 +711,7 @@ mod tests {
     }
 
     fn leg(track: Track, socket: UdpSocket, max_capture: Duration) -> TapLeg {
-        TapLeg::new(
+        TapLeg::g711(
             track,
             socket,
             AudioFormat::pcmu_8k_20ms(),
@@ -1028,7 +1052,7 @@ mod ssrc_track_tests {
         let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
         let sender = UdpSocket::bind("127.0.0.1:0").unwrap();
         sender.connect(socket.local_addr().unwrap()).unwrap();
-        let leg = TapLeg::new(
+        let leg = TapLeg::g711(
             Track::Customer,
             socket,
             AudioFormat::pcmu_8k_20ms(),
@@ -1105,7 +1129,7 @@ mod reresolution_tests {
     fn leg_and_wire(map: &[(u32, Track)]) -> (TapLeg, Wire) {
         let socket = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
         let address = socket.local_addr().unwrap();
-        let leg = TapLeg::new(
+        let leg = TapLeg::g711(
             Track::Customer,
             socket,
             AudioFormat::pcmu_8k_20ms(),
@@ -1326,7 +1350,7 @@ mod elimination_tests {
         let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
         let sender = UdpSocket::bind("127.0.0.1:0").unwrap();
         sender.connect(socket.local_addr().unwrap()).unwrap();
-        let leg = TapLeg::new(
+        let leg = TapLeg::g711(
             Track::Customer,
             socket,
             AudioFormat::pcmu_8k_20ms(),
