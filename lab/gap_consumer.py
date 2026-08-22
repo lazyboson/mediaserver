@@ -32,7 +32,20 @@ WSL eth0 address is not routable from the lab network at all.
 
 It writes on SIGINT/SIGTERM, which is how pod_kill_drill.sh ends it.
 
-Env: GAP_HOST, GAP_PORT, OUT_DIR, GAP_STAMP, GAP_RATE.
+For the item-19 soak suite the same instrument has to serve N concurrent calls
+for an hour, which the item-11 defaults cannot do: everything is keyed by track
+name (so N calls would merge into one timeline) and every frame's audio is kept
+in memory (so an hour of three tracks is hundreds of megabytes). Two env knobs
+switch that, both defaulting to the item-11 behaviour:
+
+  GAP_BY_CALL=1     key the report by "<callSid>/<track>" instead of "<track>",
+                    so each call gets its own continuity number
+  GAP_KEEP_AUDIO=0  keep only arrival stamps, no payloads and no wavs -- the
+                    longest-arrival-gap survives, the longest-silent-run cannot
+  GAP_JOURNAL=0     do not write the per-frame jsonl (50 lines/s/track)
+
+Env: GAP_HOST, GAP_PORT, OUT_DIR, GAP_STAMP, GAP_RATE, GAP_BY_CALL,
+GAP_KEEP_AUDIO, GAP_JOURNAL.
 """
 
 import base64
@@ -52,6 +65,9 @@ PORT = int(os.environ.get("GAP_PORT", "8095"))
 OUT_DIR = os.environ.get("OUT_DIR", os.path.join(os.path.dirname(__file__), "out"))
 STAMP = os.environ.get("GAP_STAMP", str(int(time.time())))
 RATE = int(os.environ.get("GAP_RATE", "8000"))
+BY_CALL = os.environ.get("GAP_BY_CALL", "0") not in ("0", "no", "false")
+KEEP_AUDIO = os.environ.get("GAP_KEEP_AUDIO", "1") not in ("0", "no", "false")
+JOURNALLING = os.environ.get("GAP_JOURNAL", "1") not in ("0", "no", "false")
 WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
 STATE_LOCK = threading.Lock()
@@ -135,6 +151,13 @@ def note(record):
     JOURNAL.flush()
 
 
+def note_media(record):
+    """Per-frame journalling is 50 lines/s/track, which an hour-long soak does
+    not want. Connection and lifecycle notes stay on regardless."""
+    if JOURNALLING:
+        note(record)
+
+
 def serve_one(conn, peer, index):
     opened = time.time()
     with STATE_LOCK:
@@ -172,13 +195,18 @@ def serve_one(conn, peer, index):
             track = packet.get("track", "unknown")
             audio = base64.b64decode(packet["payload"])
             with STATE_LOCK:
-                ARRIVALS.setdefault(track, []).append((at, index, audio))
+                key = track
+                if BY_CALL:
+                    key = f"{CONNECTIONS[index]['call_sid']}/{track}"
+                ARRIVALS.setdefault(key, []).append(
+                    (at, index, audio if KEEP_AUDIO else len(audio))
+                )
                 CONNECTIONS[index]["media"] += 1
             media += 1
             if media == 1:
                 log(f"connection {index} first media frame on {track}")
-            note({"at": at, "event": "media", "connection": index, "track": track,
-                  "bytes": len(audio), "timestamp": packet.get("timestamp")})
+            note_media({"at": at, "event": "media", "connection": index, "track": track,
+                        "bytes": len(audio), "timestamp": packet.get("timestamp")})
         elif event == "dtmf":
             note({"at": at, "event": "dtmf", "connection": index,
                   "digit": message.get("dtmf", {}).get("digit")})
@@ -223,6 +251,35 @@ def longest_uncovered_run(covered, first, last):
     return longest, longest_at
 
 
+def longest_arrival_gap(frames, t0):
+    stamps = sorted(at for at, _i, _a in frames)
+    biggest = 0.0
+    biggest_at = None
+    for earlier, later in zip(stamps, stamps[1:]):
+        if later - earlier > biggest:
+            biggest, biggest_at = later - earlier, earlier
+    return stamps, biggest, biggest_at
+
+
+def measure_track(track, frames, t0):
+    """The stamps-only report: no payloads were kept, so the longest silent run
+    (which needs to know which sample slots a frame covered) cannot be computed.
+    The longest arrival gap can, and it is the continuity number."""
+    stamps, biggest, biggest_at = longest_arrival_gap(frames, t0)
+    return {
+        "track": track,
+        "path": None,
+        "frames": len(frames),
+        "bytes": sum(a for _at, _i, a in frames),
+        "first_arrival": stamps[0] - t0,
+        "last_arrival": stamps[-1] - t0,
+        "longest_arrival_gap_ms": biggest * 1000.0,
+        "longest_arrival_gap_at": (biggest_at - t0) if biggest_at is not None else None,
+        "longest_silent_run_ms": None,
+        "longest_silent_run_at": None,
+    }
+
+
 def write_track(track, frames, t0):
     placed = {}
     for at, _index, audio in frames:
@@ -247,12 +304,7 @@ def write_track(track, frames, t0):
 
     slots = sorted(covered)
     uncovered, uncovered_at = longest_uncovered_run(covered, slots[0], slots[-1])
-    stamps = sorted(at for at, _i, _a in frames)
-    biggest = 0.0
-    biggest_at = None
-    for earlier, later in zip(stamps, stamps[1:]):
-        if later - earlier > biggest:
-            biggest, biggest_at = later - earlier, earlier
+    stamps, biggest, biggest_at = longest_arrival_gap(frames, t0)
     return {
         "track": track,
         "path": path,
@@ -286,15 +338,17 @@ def report():
         log(f"connection {connection['index']}: media={connection['media']} "
             f"opened={entry['opened_at']:.2f}s closed={closed_text}")
     for track, frames in sorted(arrivals.items()):
-        measured = write_track(track, frames, t0)
+        measured = write_track(track, frames, t0) if KEEP_AUDIO else \
+            measure_track(track, frames, t0)
         summary["tracks"].append(measured)
         when = measured["longest_arrival_gap_at"]
-        log(f"track {track}: frames={measured['frames']} "
-            f"wav={measured['wav_seconds']:.2f}s "
+        tail = f"longest silent run={measured['longest_silent_run_ms']:.0f}ms -> " \
+               f"{measured['path']}" if KEEP_AUDIO else "no audio kept"
+        span = f"wav={measured['wav_seconds']:.2f}s" if KEEP_AUDIO else \
+            f"span={measured['last_arrival'] - measured['first_arrival']:.2f}s"
+        log(f"track {track}: frames={measured['frames']} {span} "
             f"longest arrival gap={measured['longest_arrival_gap_ms']:.0f}ms "
-            f"at {'n/a' if when is None else f'{when:.2f}s'}, "
-            f"longest silent run={measured['longest_silent_run_ms']:.0f}ms -> "
-            f"{measured['path']}")
+            f"at {'n/a' if when is None else f'{when:.2f}s'}, {tail}")
     path = os.path.join(OUT_DIR, f"gap-{STAMP}-summary.json")
     with open(path, "w") as out:
         json.dump(summary, out, indent=1)
