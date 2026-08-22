@@ -57,6 +57,7 @@ Environment (all optional except the listen address):
 | `MSS_CONTROL_LISTEN` | `ip:port` for the gRPC control+data plane |
 | `MSS_RTPENGINE_NODE` | default rtpengine NG address (`ip:port`) |
 | `MSS_TAP_LOCAL_IP` | address rtpengine sends tap media to (must be routable from rtpengine) |
+| `MSS_TAP_TRANSCODE` | `on` (default) asks rtpengine to transcode the tap to PCMU; `off` accepts the call's own codec, which keeps the tap eligible for rtpengine's in-kernel path but refuses a call whose codec MSS cannot decode |
 | `MSS_KAFKA_BROKERS` | comma list; unset = events stay in-process |
 | `MSS_REDIS_URL` | session registry; unset = sessions die with the pod |
 | `MSS_METRICS_LISTEN` | `ip:port` for Prometheus `/metrics` |
