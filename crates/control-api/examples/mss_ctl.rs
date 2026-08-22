@@ -6,6 +6,10 @@ mss_ctl <endpoint> create <external-id> <call-id> <from-tag|-> [rtpengine-node]
    a from-tag of - lets MSS resolve the call's participants from rtpengine
 mss_ctl <endpoint> describe <external-id>
 mss_ctl <endpoint> attach <external-id> <ws-url> [label] [authoritative]
+mss_ctl <endpoint> record <external-id> <account/recording.wav> [label]
+   the endpoint is the frozen recording identity, and the object key
+mss_ctl <endpoint> pause <attachment-id> <true|false>
+mss_ctl <endpoint> detach <attachment-id>
 mss_ctl <endpoint> play <external-id> <wav-path> [target-tag]
 mss_ctl <endpoint> destroy <external-id>";
 
@@ -98,6 +102,54 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .await
                 .map(|response| format!("{:?}", response.into_inner()))
         }
+        "record" => {
+            if args.len() < 4 {
+                eprintln!("{USAGE}");
+                std::process::exit(2);
+            }
+            client
+                .attach(proto::AttachRequest {
+                    session: Some(reference(&args[2])),
+                    transport: proto::Transport::FileS3 as i32,
+                    capabilities: vec![proto::Capability::Sink as i32],
+                    selector: Some(proto::TrackSelector {
+                        select: Some(proto::track_selector::Select::All(true)),
+                    }),
+                    format: None,
+                    authoritative: false,
+                    label: args
+                        .get(4)
+                        .cloned()
+                        .unwrap_or_else(|| "recorder".to_string()),
+                    endpoint: args[3].clone(),
+                    metadata: Default::default(),
+                    idempotency_key: String::new(),
+                })
+                .await
+                .map(|response| format!("{:?}", response.into_inner()))
+        }
+        "pause" => {
+            if args.len() < 4 {
+                eprintln!("{USAGE}");
+                std::process::exit(2);
+            }
+            client
+                .update_attachment(proto::UpdateAttachmentRequest {
+                    attachment_id: args[2].clone(),
+                    paused: Some(args[3] == "true"),
+                    selector: None,
+                    format: None,
+                    idempotency_key: String::new(),
+                })
+                .await
+                .map(|response| format!("{:?}", response.into_inner()))
+        }
+        "detach" => client
+            .detach(proto::AttachmentRef {
+                attachment_id: args[2].clone(),
+            })
+            .await
+            .map(|response| format!("{:?}", response.into_inner())),
         "play" => {
             if args.len() < 4 {
                 eprintln!("{USAGE}");

@@ -13,8 +13,8 @@ Status as of **2026-08-22**.
 | **M1 — scaffold** | workspace, sans-IO cores (RTP, G.711, DTMF, jitter), NG bencode, consumer dialects, two-world daemon skeleton, watchdog | ✅ done (2026-08-13) |
 | **M2 — Phase-0 spike** | real NG subscribe against lab rtpengine, both legs jitter-buffered to WAV, per-tap cost | ✅ **code done**; 3 org-side items open (below) |
 | **M3 — fan-out hub** | per-session pub/sub, N consumers, WS-Twilio adapter, pause/resume/send_text parity | ✅ done |
-| **M4 — control plane** | `MediaControl` gRPC, session state machine, Kafka events, Redis registry, tenant-flag pilot | 🔶 **code complete** — pilot gates: translator merge (external), barge-in number (item 5), live pod-kill drill (item 11), gRPC lab proof (item 10) |
-| **M5 — recording (Phase 2)** | per-leg taps → stereo segmenter → S3, identity + callback contract, dual-recording | 🔶 **code complete (2026-08-22)** — verified against a real MinIO from a synthetic hub; owed: one live tapped call recorded end to end, and FS byte-parity sign-off (harness exists) |
+| **M4 — control plane** | `MediaControl` gRPC, session state machine, Kafka events, Redis registry, tenant-flag pilot | 🔶 **code complete** — pilot gates: translator merge (external), barge-in number (item 5), live pod-kill drill (item 11). The gRPC lab proof (item 10) is **done 2026-08-22** |
+| **M5 — recording (Phase 2)** | per-leg taps → stereo segmenter → S3, identity + callback contract, dual-recording | 🔶 **code complete (2026-08-22)** — a live tapped call recorded end to end to a real MinIO, callbacks read off `mss.events` (2026-08-22, item 10's drill); owed: FS byte-parity sign-off (harness exists) |
 | M6+ | Phases 3–4 (interactive media, full media plane) | ⬜ not started |
 
 ### What landed, concretely
@@ -47,10 +47,13 @@ Status as of **2026-08-22**.
   change** re-resolves too (item 14): the leg re-enters resolution and a
   control-world task re-queries and pushes a fresh map over a bounded queue
   — replay-verified, not yet watched on a live re-INVITE.
-- **Lab** — OpenSIPS/FreeSWITCH/rtpengine/Redpanda compose stack, synthetic
-  caller (`host_test_caller.py`), per-track analyser (`track_dump.py`),
-  RTT and recorder mock consumers, NG probes, `mss_ctl` control-plane CLI,
-  `mss_events_tail` bus consumer.
+- **Lab** — OpenSIPS/FreeSWITCH/rtpengine/Redpanda/MinIO compose stack,
+  synthetic caller (`host_test_caller.py`), per-track analyser
+  (`track_dump.py`), RTT and recorder mock consumers, NG probes, `mss_ctl`
+  control-plane CLI, `mss_events_tail` bus consumer, `mss_stream_probe` gRPC
+  consumer and `grpc_stream_drill.sh` (item 10) which taps a live call over
+  the gRPC data plane, records it to S3 and scrapes the metrics in one
+  command.
 
 ## Next up — ordered
 
@@ -261,7 +264,52 @@ then this list, in that order.** The standing rules that are not optional:
 - A checkbox claims only what was measured. If a thing ran only against a
   fake, say so where you record it done.
 
-### 10. Lab proof of the gRPC data plane
+### 10. Lab proof of the gRPC data plane — ✅ DONE (2026-08-22)
+**What shipped:** `crates/control-api/examples/mss_stream_probe.rs` is the
+gRPC consumer — it attaches a `GRPC_STREAM` attachment at a format it chooses
+(`MSS_PROBE_ENCODING`/`MSS_PROBE_RATE`/`MSS_PROBE_TRACKS`, default L16/16k
+customer), dials `MediaStream::Subscribe` with a `ConsumerHello`, decodes the
+little-endian frames and writes one mono wav per track with frames, bytes,
+duration, rms and peak per track, then detaches. `lab/grpc_stream_drill.sh`
+drives the whole thing against a live call with no human dialing, and
+`mss_ctl` grew `record` / `pause` / `detach` so the same call can carry a
+`FILE_S3` recording. `lab/docker-compose.microsip.yml` now gives
+`mss-control` `MSS_METRICS_LISTEN` on a published port.
+**Verification rung reached: (a) a full SIP lab call.** MicroSIP-shaped host
+caller → OpenSIPS → rtpengine 14.1.1.8 → FreeSWITCH 9000, tapped by the real
+`mediaserverd` control plane in the compose stack. Measured over a 30 s
+probe on a 45 s call, L16/16k, `tracks=all`: customer 1500 frames /
+480,000 samples / 30.00 s at **rms 614.5**, agent rms 8 (FreeSWITCH
+`silence_stream`), mixed rms 0; both tap legs `jitter_lost: 0`,
+`frames_concealed: 0`, `recv_errors: 0`. **Intelligible, ASR-judged**:
+`ear_intelligibility_probe.py` replayed the customer wav into
+stream-llm-bridge and Deepgram returned the sentence verbatim on three of
+three complete repetitions. Metrics scrape:
+`mss_consumer_delivered_total` 3657 → 11088 across the probe window,
+`mss_consumer_dropped_oldest_total 0`, `mss_consumer_queue_depth_frames_max
+0`, `mss_legs_unknown_ssrc 0`, `mss_legs_stalled 0`. Procedure, tables and
+the full scrape are in [lab.md](lab.md).
+**It found a production defect (D12, fixed here).** The third back-to-back
+run was pure silence with `datagrams: 0` on both legs: `CookieSequence`
+restarted its serial at 0 and `TapPlane` binds a new `NgTransport` per
+session, so every session's first NG command was cookie `<prefix>-0` — and
+two sessions inside rtpengine's duplicate-cookie reply-cache window got the
+**same cached subscribe answer**, so the second tap pointed at a
+subscription that no longer existed. The serial is now process-wide. Proved
+both ways in the lab: before, two runs 53 s apart got byte-identical offers
+(source ports 30008/30016) and the second was silent; after, they get
+distinct subscriptions and both carry audio at rms 655.5.
+**Also proved, for item 15:** the same call recorded to MinIO —
+`acct-grpc/rec-<id>.wav`, 2 ch / 8 kHz / 39.88 s exactly equal to the
+reported `duration_ms`, customer left (rms 610) and agent right (rms 7) —
+with `RecordingStarted`, two `RecordingPaused` edges carrying the *same*
+`duration_ms`, `RecordingStopped` and `UploadCompleted` read off the real
+`mss.events` topic with `mss_events_tail`.
+**Left open, recorded as D13:** with `TrackSelector::All` the `StreamStart`
+frame advertises `["customer","agent"]` but a silent `mixed` track arrives
+too, at the full frame rate.
+
+### 10b. (original description, for reference) Lab proof of the gRPC data plane
 **Where:** `crates/control-api/examples/` + `lab/`.
 **What:** the `MediaStream` service (item 6) has only ever run against the
 fake plane. Write `mss_stream_probe.rs` — an example binary using the
@@ -290,6 +338,18 @@ assert exactly one adopter (`mss_registry_adopted_total`), zero
 (NG `query` before/after).
 **Done when:** the drill script lives in `lab/`, the measured gap is
 recorded here, and [lab.md](lab.md) documents the procedure.
+**What item 10's session leaves you** (read its lab.md section first):
+`lab/grpc_stream_drill.sh` already does call discovery → `mss_ctl create` →
+attach → metrics scrape → destroy, so the kill drill is that script plus a
+second daemon and a `kill -9`; `mss_stream_probe` is a better consumer than
+the WS mock for measuring a gap, because it prints per-track sample counts
+and its wav is a silence-run measurement away from the answer. Two traps
+that cost that session real runs: a re-subscribe lands **inside**
+rtpengine's duplicate-cookie window, which was D12 and is fixed — if you see
+a leg with `datagrams: 0` and healthy `underruns`, suspect a stale cached NG
+answer again before anything else; and the compose `mediaserverd` service
+(the Phase-0 spike) must stay **down**, or it taps the same call from its own
+process.
 
 ### 12. Barge-in cut-through measurement
 Item 5 above, unchanged — still gated on the cigol translator merge
@@ -445,9 +505,20 @@ ETag across runs. Procedure and output in [lab.md](lab.md).
 table, the interleave, zero-fill alignment, the pause duration math, the
 saturating bot mix, the mono selector, the length cap, the WAV container, the
 spill path, the `DestroySession` ordering and the pause rollback.
-**Not verified at all:** a real tapped SIP call recorded end to end (needs the
-whole microsip stack, which this session did not run), the callbacks observed
-on `mss.events` from a real broker during a recording, and FS byte-parity —
+**Verified on a live tapped SIP call (2026-08-22, item 10's drill):** the same
+call the gRPC probe listened to was also recorded — `RECORD=1
+./lab/grpc_stream_drill.sh` — and produced `acct-grpc/rec-<id>.wav` in MinIO,
+2 channels at 8 kHz, 319,040 frames = **39.88 s exactly equal to the reported
+`duration_ms` of 39880**, customer left (rms 610) / agent right (rms 7),
+`Content-Type: audio/wav`, 1,276,204 bytes matching
+`mss_recording_bytes_uploaded_total`. The callbacks were read off the real
+`mss.events` topic with `mss_events_tail`: `RecordingStarted`,
+`RecordingPaused{paused:true, duration_ms:8140}`,
+`RecordingPaused{paused:false, duration_ms:8140}` — the same duration on both
+edges, so nothing accumulated while paused — `RecordingStopped{39880}` and
+`UploadCompleted{s3://lab-recordings/acct-grpc/rec-<id>.wav}`, ten events
+accepted and ten published with zero failures.
+**Not verified at all:** FS byte-parity —
 `lab/recording_parity.py` exists and was exercised on the drill's own output
 and on perturbed copies, but **has never seen a FreeSWITCH recording**. That
 comparison is the remaining human step for the Phase-2 exit criterion.
@@ -598,6 +669,8 @@ own it later.
 | D6 | `play media` `from-tag` semantics are **unmeasured** — architecture §6's claim was retracted after the instrument turned out to be broken (see lab.md correction) | docs + lab | low, but §6 must not be trusted until re-probed |
 | ~~D7~~ | ~~Jitter buffer: fixed target depth, no adaptive sizing, no timestamp-aware gap handling, silence instead of real PLC~~ — **fixed 2026-08-22 (item 17)**: adaptive depth from the RFC 3550 estimate, timestamp-aware silence gaps, comfort noise accounted, G.711 Appendix I-shaped PLC, restart on SSRC change. Replay-verified across the impairment matrix; **not** yet verified against `tc netem` or judged perceptually | `jitter.rs`, `pipeline.rs`, `plc.rs` | closed |
 | D8 | `owner_pod` is a config string; real placement and load-aware scheduling do not exist | `main.rs` | low until multi-pod |
+| ~~D12~~ | ~~**NG cookies repeat across sessions on one pod**: `CookieSequence` restarted its serial at 0 and `TapPlane` binds a new `NgTransport` per session, so every session's first command was `<prefix>-0`. Two sessions inside rtpengine's duplicate-cookie reply-cache window get the *same cached subscribe answer*, and the second tap receives **no media at all** while looking healthy~~ — **fixed 2026-08-22 (item 10)**: the serial is process-wide, unit-pinned and lab-proved before/after | `ng_transport.rs` | closed — was **high**, it silently broke every second tap within a minute |
+| D13 | `StreamStart` (and the Twilio `start` frame's `tracks`) advertises `["customer","agent"]` for `TrackSelector::All`, but a silent `mixed` track is delivered too, at the full frame rate: a consumer must tolerate an unannounced track and pays 50% extra bandwidth for silence. Fixing it means either naming `mixed` in the start frame or not carrying it under `All` — the latter touches the frozen Twilio surface | `stream.rs`, `tap_plane.rs`, `hub.rs` | low for correctness, medium for cost |
 
 ## Waiting on other people (M2 close-out)
 

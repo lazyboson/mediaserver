@@ -586,3 +586,157 @@ One caveat the harness cannot see: bit-for-bit equality is not expected under
 loss, because the two paths conceal differently (MSS grew G.711 Appendix I
 PLC in item 17, FS does not). Compare on a clean link, or compare RMS and
 mean difference rather than identity.
+
+## grpc_stream_drill.sh — a live tapped call over the gRPC data plane (2026-08-22)
+
+Item 10. Until this run the `MediaStream` service had only ever served the
+fake plane, so nothing proved that a gRPC consumer hears a real call.
+`crates/control-api/examples/mss_stream_probe.rs` is the consumer: it attaches
+a `GRPC_STREAM` consumer at a format it picks (`L16/16k` by default), dials
+`MediaStream::Subscribe` with a `ConsumerHello`, decodes the little-endian
+frames and writes one wav per track with rms and peak per track.
+`lab/grpc_stream_drill.sh` wires it to a live call with no human dialing:
+
+```sh
+DOCKER_API_VERSION=1.43 docker compose -f lab/docker-compose.microsip.yml \
+  up -d rtpengine opensips freeswitch call-watcher redpanda redis \
+        minio minio-init llm-bridge mss-control
+RECORD=1 ./lab/grpc_stream_drill.sh
+```
+
+`host_test_caller.py` plays the softphone from the WSL host, `call_watcher`
+finds the call and the drill reads its call-id and tags straight out of the
+watcher's `/shared/call.env`, `mss_ctl create` makes the session on the
+running `mss-control` daemon, the probe attaches and subscribes, and the
+metrics endpoint is scraped mid-call and again at the end. `RECORD=1` also
+attaches a `FILE_S3` recording to the same session and pauses/resumes it
+mid-call. Note the compose file now gives `mss-control`
+`MSS_METRICS_LISTEN=0.0.0.0:9464`, published on the host, which is what makes
+the scrape possible at all.
+
+**The `mediaserverd` compose service must stay down** for this: it is the
+Phase-0 spike, and it would tap the same call from its own process.
+
+### The run (2026-08-22, rtpengine 14.1.1.8, 45 s call, 30 s probe)
+
+L16/16k, `MSS_PROBE_TRACKS=all`, one wav per track:
+
+| Track | frames | bytes | samples | seconds | rms | peak |
+| --- | --- | --- | --- | --- | --- | --- |
+| customer | 1500 | 960000 | 480000 | 30.00 | **614.5** | 6180 |
+| agent | 1500 | 960000 | 480000 | 30.00 | 8.0 | 9 |
+| mixed | 1500 | 960000 | 480000 | 30.00 | 0.0 | 0 |
+
+640 bytes per 20 ms frame is 320 samples at 16 kHz, so the resampler is
+doing what item 8 said it does; the agent leg is FreeSWITCH's
+`silence_stream` and `mixed` is the injection track with nothing injected.
+Both tap legs were clean — Customer 2154 datagrams, Agent 2200,
+`jitter_lost: 0`, `frames_concealed: 0`, `frames_suppressed: 0`,
+`recv_errors: 0`, `unknown_payload_type: 0`.
+
+The metrics scrape the Done-when asks for, mid-call and after the probe:
+
+```
+mss_consumer_delivered_total 3657      (mid-call)
+mss_consumer_delivered_total 11088     (after 30s of probe)
+mss_consumer_dropped_oldest_total 0
+mss_consumer_queue_depth_frames 0
+mss_consumer_queue_depth_frames_max 0
+mss_consumers_live 2
+mss_legs_live 2
+mss_legs_unknown_ssrc 0
+mss_legs_stalled 0
+```
+
+**Intelligible, judged by the ASR rather than by ear.**
+`ear_intelligibility_probe.py` (which now accepts any whole multiple of
+8 kHz and averages it down, since the probe's wav is 16 kHz) replayed
+`grpc-probe-*-customer.wav` into stream-llm-bridge, and Deepgram returned the
+spoken sentence verbatim on **three of three complete repetitions**:
+
+```
+'Hello.'
+'This is the media server speaking through your bridge.'
+'If you can hear this, injection works.'
+```
+
+So the chain host softphone → published port → rtpengine PCMA→PCMU
+transcode → tap → hub → `ConsumerEncoder` L16 resample → gRPC → wav is
+intelligible end to end, not merely connected.
+
+### The bug this drill found: NG cookies collided across sessions
+
+The third back-to-back run delivered 750 frames of pure silence — rms 0.0 on
+every track — while the call itself was healthy. The diagnostic order in the
+playbook found it without touching code:
+
+- `tap leg finished` said **`datagrams: 0`, `underruns: 1151`** on both legs,
+  so the consumer path was fine and nothing arrived from rtpengine (the
+  silence is the pipeline keeping the stream continuous on underrun, exactly
+  as intended — which is also why "silence" and "no media" look alike from
+  the consumer's end, and why the leg stats are the first thing to read).
+- The daemon logged `rtpengine offered a tap stream source_port: 30008 …
+  30016` — **byte-identical to the previous session's offer**, and its
+  `unsubscribe` carried the *previous* session's to-tag.
+- rtpengine's own log had **no `subscribe request` at all** for that call-id,
+  and the call's teardown listed only its two call legs, no subscription
+  ports.
+
+So rtpengine never saw the request: it answered from its **duplicate-cookie
+reply cache**. `CookieSequence` mixed a per-process prefix with a serial that
+restarted at 0, and `TapPlane` binds a **new** `NgTransport` per session — so
+every session's first command was cookie `<prefix>-0`. Two sessions inside
+rtpengine's cache window (the failing pair were 53 s apart) got the same
+cookie, and the second one was handed the first one's cached SDP, describing
+a subscription that no longer existed. The serial is now process-wide
+(`ng_transport.rs`), pinned by
+`two_transports_on_one_pod_never_share_a_cookie`.
+
+Measured before and after, same drill, two runs 25 s apart:
+
+| | first subscription | second subscription | second run's audio |
+| --- | --- | --- | --- |
+| before | source ports 30008/30016 | **30008/30016 again** | datagrams 0, rms 0.0 |
+| after | 30004/30010 | 30008/30016 | datagrams 1122/1146, rms 655.5 |
+
+This is a production defect, not a lab artifact: a pod that starts two taps
+within a minute is the normal case, and the second tap would have been
+silent. It also explains why every earlier lab session — which tapped one
+call at a time, minutes apart — never saw it.
+
+### Recording the same call to MinIO (item 15's live-call half)
+
+`RECORD=1` attached `acct-grpc/rec-1787397153.wav` to the same session and
+paused it 8 s in for 4 s. From `mss.events` on the real broker, in order:
+
+```
+RecordingStarted  { recording_id: "rec-1787397153", path: "acct-grpc/rec-1787397153.wav" }
+RecordingPaused   { paused: true,  duration_ms: 8140 }
+RecordingPaused   { paused: false, duration_ms: 8140 }
+RecordingStopped  { duration_ms: 39880 }
+UploadCompleted   { uri: "s3://lab-recordings/acct-grpc/rec-1787397153.wav" }
+```
+
+The two `RecordingPaused` edges reporting the **same** `duration_ms` is the
+pause semantics proved on a live call: no audio accumulated while paused.
+The object read back out of the bucket is 2 channels at 8 kHz, 319,040
+frames = **39.88 s, exactly the reported `duration_ms`**, customer left
+(rms 610), agent right (rms 7), `Content-Type: audio/wav`, 1,276,204 bytes —
+the same number `mss_recording_bytes_uploaded_total` reports. Ten events
+were accepted and ten published with zero failures.
+
+### Two things left open by this run
+
+- **`StreamStart` under-advertises its tracks.** With `TrackSelector::All`
+  the start frame lists `["customer","agent"]`, but a third `mixed` track
+  arrives too, at the full frame rate, silent when nothing is injected
+  (`hub.rs` publishes an injection-track frame every tick so the stream
+  stays gap-free). A consumer must therefore tolerate a track it was never
+  told about, and pays 50% extra bandwidth for silence. Either the start
+  frame should name `mixed` or an `All` selection should not carry it —
+  recorded as D13, not fixed here, because the same `tracks_of` shape feeds
+  the frozen Twilio `start` frame.
+- **`unsubscribe` returns `Unknown call-ID` at the end of every drill.** The
+  synthetic caller hangs up before the drill destroys the session, so
+  rtpengine has already deleted the call. Benign here, and the warning says
+  the right thing, but a production hangup takes the same path.
