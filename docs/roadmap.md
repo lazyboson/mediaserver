@@ -106,11 +106,15 @@ Work:
   re-subscribe via `TapPlane`), and **auth landed 2026-08-20**
   (`MSS_AUTH_TOKEN` bearer interceptor on `MediaControl`, `ConsumerHello`
   token on the data plane; TelCompat deliberately open for client
-  compatibility). Still to come: the translator in the legacy controller that renders
+  compatibility). **Re-subscribe recovery was observed on a live call
+  2026-08-22** (tasks item 11): three pods on one Redis, `kill -9` on the
+  owner mid-call, one survivor adopted 14.6 s later and the consumer's audio
+  resumed after a **14.41 s** gap — bounded by lease TTL 15 s + adopt sweep
+  10 s. It also showed that the dead pod's rtpengine subscription is left
+  behind (D14). Still to come: the translator in the legacy controller that renders
   `mss.events` onto the existing `eventTopic` in the positional format
   `the application server` already consumes (§5.4 — written on the legacy controller branch
-  `feature/legacy-translator`, awaiting review and merge), and a real
-  pod-kill-mid-call observation of re-subscribe recovery.
+  `feature/legacy-translator`, awaiting review and merge).
 - `TelCompat` façade: `the legacy verb API.proto` message shapes verbatim, so a
   per-tenant flag routes `StartStream`/`StartRecording`/
   `StartCallTranscription` to `the legacy gRPC server` or `MSS` with no client
@@ -133,7 +137,9 @@ session and therefore on that critical path — architecture.md §5.5); zero
 for flagged tenants; measured FS CPU-per-call
 reduction; one full quarter (or agreed period) of pilot stability;
 audio-flow watchdog + re-subscribe recovery observed working in
-production incidents, not just tests.
+production incidents, not just tests (the lab half of the re-subscribe
+criterion is met — 2026-08-22, a real `kill -9` mid-call with a measured
+14.41 s gap; what remains is seeing it in production, and D14).
 
 ## Phase 2 — Recording
 
