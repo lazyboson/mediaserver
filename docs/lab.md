@@ -1087,3 +1087,76 @@ recorded for `call_driver.py` — and the pipeline answers it by feeding the
 consumer a silence frame, which is why the stream stays gap-free.
 
 
+
+## MSS_TAP_TRANSCODE=off — tapping the call's own codec (2026-08-22)
+
+The question behind this run is an rtpengine-side one: **does asking for a
+transcode keep a subscription out of rtpengine's kernel fast path?** The kernel
+module has no codec — it forwards and can do SRTP — so a transcoding
+subscription must be handled in userspace. Its own header shows the fan-out is
+there (`num_destinations`, `RTPE_MAX_FORWARD_DESTINATIONS 32`, `do_intercept`),
+so getting a tap onto the kernel path may be one flag on our side rather than an
+eBPF project (tasks.md items 18 and 20).
+
+This box **cannot** answer the rtpengine half: the lab runs `--table=-1`, so
+`/proc/rtpengine` does not exist, and `/lib/modules/$(uname -r)/build` is absent
+with `lsmod` empty, so the out-of-tree module cannot be built without the
+custom-kernel detour. What it *can* answer is the MSS half, and that is what
+this run is.
+
+Procedure — the knob is on every pod as `${MSS_TAP_TRANSCODE:-on}`:
+
+```sh
+export DOCKER_API_VERSION=1.43
+MSS_TAP_TRANSCODE=off docker compose -f lab/docker-compose.microsip.yml \
+    up -d --force-recreate mss-control
+./lab/grpc_stream_drill.sh
+docker run --rm --network mss-microsip_lab -v "$PWD/lab":/lab:ro -w /lab \
+    python:3-slim python3 ear_intelligibility_probe.py out/grpc-probe-<id>-customer.wav
+```
+
+The daemon says which path it took at startup, so a run is never ambiguous:
+`accepting the call's own codec on the tap; rtpengine transcodes nothing`.
+
+What changed on the wire — the lab caller offers PCMA, like MicroSIP:
+
+| | transcode on (baseline) | transcode off |
+| --- | --- | --- |
+| offer's payload types, both streams | `[0, 101]` | **`[8, 101]`** |
+| tap format MSS settled on | `Pcmu/8000/20ms` (from config) | **`Pcma/8000/20ms` (from the offer)** |
+| rtpengine codec work per stream | decode + re-encode | **none** |
+| MSS codec work per stream | decode | decode |
+| `companded` | 0 | **0** |
+
+Leg health, transcode off, 30 s probe on a 45 s call:
+
+| track | datagrams | played | companded | unknown_pt | lost | concealed | recv_err |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| Customer | 2166 | 2166 | 0 | 0 | 0 | 0 | 0 |
+| Agent | 2203 | 2203 | 0 | 0 | 0 | 0 | 0 |
+
+Customer track **rms 613.5** (baseline 614.5), agent rms 8.0 (FreeSWITCH
+`silence_stream`), `mss_consumer_dropped_oldest_total 0`,
+`mss_legs_unknown_ssrc 0`, `mss_legs_stalled 0`. Deepgram transcribed the
+probe's own wav **verbatim** — "If you can hear this, injection works."
+(confidence 0.99), "Hello.", "This is the media server speaking through your
+bridge." — so the A-law tap is intelligible, not merely present.
+
+Three things worth keeping from this run:
+
+- **`companded=0` is the headline.** MSS decoded A-law natively rather than
+  converting it to µ-law first. The system went from three codec operations per
+  stream to one, so "MSS does the extra work" is backwards — rtpengine stops
+  doing two and MSS keeps doing the one it always did.
+- **Leg identity gets cleaner without transcoding.** rtpengine no longer
+  re-stamps the leg with a generated SSRC, so `unknown_ssrc` stayed 0 without
+  elimination having to cover a restamped leg.
+- **The refusal is the safety net.** With the flag off, an Opus or G.722 call
+  would land in `unknown_payload_type`; instead the subscribe is refused by name
+  with the offered payload types in the message, naming transcoding as the fix.
+  Ask the platform team what codecs appear on real customer and agent legs
+  before enabling this for a tenant.
+
+**The lab was restored to `MSS_TAP_TRANSCODE=on` after the run**, which is the
+compose default. A non-default lab left running is exactly how the
+`RIGHT_TRACK=mixed` day happened.

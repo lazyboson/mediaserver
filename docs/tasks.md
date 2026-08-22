@@ -622,6 +622,61 @@ ASR-as-judge probe under `tc netem` burst loss is the cheap one), the
 adaptive ceiling is a multiple of the floor rather than a millisecond
 budget, and the chosen depth is logged per leg but not exported as a gauge.
 
+### 20. Optional transcoding at the tap — ✅ DONE (2026-08-22)
+**Why this exists:** rtpengine's kernel module carries no codec — it forwards
+and can do SRTP, nothing more — so **asking for a transcode is very likely what
+keeps a subscription in rtpengine's userspace**, which is the cost item 18 is
+about. Confirmed from the vendor's own source
+(`kernel-module/nft_rtpengine.h`): a kernel forwarding target has
+`num_destinations` with `RTPE_MAX_FORWARD_DESTINATIONS 32` and a `do_intercept`
+flag, so **in-kernel fan-out to an extra destination is a first-class feature of
+the module**. That reorders item 18's options: getting the tap onto the kernel
+path may be one flag on our side, and eBPF drops to a last resort.
+**What shipped:** `MSS_TAP_TRANSCODE` (default `on`, so an existing deployment
+is bit-for-bit unchanged).
+- `media-core`: `Encoding::from_static_payload_type` / `static_clock_rate_hz`,
+  round-trip tested. Only PT 0/8 map, because those are exactly what the
+  pipeline decodes.
+- `rtpengine-ng`: `OfferedStream::offered_format` picks the first offered
+  payload type we can decode, in **offer order**, with the rtpmap's clock rate
+  and the stream's ptime. `to_sdp` needed no change — handing it the offered
+  format is the fix, because it already lists `format` first and echoes the
+  rest. New error `NoStaticCodecOffered(offered)`.
+- `mediaserverd`: `TapPlaneConfig.transcode_at_tap`; `offered_tap_format`
+  requires every stream to agree; `LiveSession` records the format the tap
+  settled on and `session_format()` feeds the gRPC attachment check and the
+  encode pump, because `config.format` stopped being the truth.
+**Verified live (2026-08-22), full SIP call, `MSS_TAP_TRANSCODE=off`:**
+rtpengine offered **`[8, 101]` on both streams** — PCMA only, nothing
+transcoded, versus `[0, 101]` with the flag on — MSS settled on
+`Pcma/8000/20ms` from the offer, and both legs ran clean: Customer 2166 and
+Agent 2203 datagrams, **every datagram played**, `companded=0`,
+`unknown_payload_type=0`, `jitter_lost=0`, `frames_concealed=0`,
+`recv_errors=0`. Customer track **rms 613.5** against 614.5 on the transcoding
+baseline, and Deepgram transcribed it **verbatim** ("If you can hear this,
+injection works.", confidence 0.99) through
+`ear_intelligibility_probe.py`. `companded=0` is the number that matters: MSS
+decoded A-law **natively** rather than converting it, so the system went from
+three codec operations per stream (rtpengine decode + re-encode, then our
+decode) to one.
+`lab/docker-compose.microsip.yml` carries the knob as
+`MSS_TAP_TRANSCODE: ${MSS_TAP_TRANSCODE:-on}` on every pod, so the run is
+`MSS_TAP_TRANSCODE=off docker compose up -d --force-recreate mss-control`
+then `./lab/grpc_stream_drill.sh`. **The lab was restored to `on` afterwards.**
+**The exposure this creates, and it is real:** with the flag off, MSS sees the
+carrier's codec. G.711 either way is free. **Opus, G.722 and EVS would land in
+`unknown_payload_type` and be dropped** — which is why an undecodable offer is
+refused loudly instead. Before turning this on for a tenant, ask the platform
+team what codecs actually appear on customer and agent legs. The adaptive
+version — `query` the call's codec first and ask for transcoding only when we
+cannot decode it — is the natural follow-up and needs no extra round trip,
+since `complete_from_tags` already queries before subscribing; it was **not**
+built because it rests on `query` reporting per-media codecs, which is
+unprobed.
+**Bonus worth knowing:** without transcoding, rtpengine does not re-stamp the
+leg with a generated SSRC, so leg identity gets *cleaner* — `unknown_ssrc`
+stayed 0 in the drill without needing elimination to cover a restamped leg.
+
 ### 18. RESEARCH — eBPF tap ingest (decide, don't build)
 **The question:** can we mirror RTP to MSS with an eBPF program on the
 rtpengine host instead of NG `subscribe`?
@@ -648,16 +703,38 @@ flow tracking through re-INVITEs, no tap-leg transcode (fine for G.711 —
 MSS compands both variants — but Opus/EVS calls would need decoding in
 MSS), and a second copy path invisible to rtpengine's own accounting.
 
+**Reordered 2026-08-22 by reading the vendor source.** The kernel module
+already fans one forwarding target out to many destinations
+(`num_destinations`, `RTPE_MAX_FORWARD_DESTINATIONS 32`) and carries a
+`do_intercept` flag, so **in-kernel mirroring is a feature of the module, not
+something eBPF must supply.** eBPF cannot "use" that module either — it would
+be a parallel datapath that bypasses rtpengine and re-derives its session
+state. So the ladder is now: (A2) subscribe **without** transcoding — item 20
+shipped the MSS half, verified live; (B) an explicit kernel intercept if NG
+exposes one; (C) eBPF, last resort.
+
 **Decision gate, in order — do not write eBPF before all three:**
   1. Get the rtpengine-side per-tap cost measured (the open org item).
      If `subscribe` at the target tap count costs little, stop here;
-     eBPF is unjustified complexity.
-  2. Probe whether `subscribe` actually kicks legs off kernel forwarding:
-     `cat /proc/rtpengine/*/list` on the lab host before/after a
-     subscribe (`lab/ng_*_probe.py` pattern). rtpengine's kernel module
-     also has a packet-mirroring path used by `rtpengine-recording` —
-     probe whether that reaches an arbitrary UDP destination; if yes,
-     that is the same win with vendor support and no eBPF.
+     eBPF is unjustified complexity. **Fix D14 first** or orphaned taps
+     will pollute the measurement.
+  2. Probe whether a subscription is kernel-forwarded, and **whether
+     dropping the transcode request is what decides it** — that is the
+     hypothesis item 20 exists to make testable, since the kernel module
+     has no codec and therefore cannot transcode. On a host that can load
+     the module: `cat /proc/rtpengine/<table>/list` at baseline, after a
+     subscribe **with** transcode, and after one **without**, comparing
+     `num_destinations` on the target entries. Run rtpengine with
+     `--no-fallback` so it refuses to start rather than silently
+     degrading to userspace. **This cannot be probed in this lab** —
+     `--table=-1`, no `/proc/rtpengine`, and no kernel headers to build
+     the module against. On a production-shaped host that already runs
+     the module it needs **no config change and is read-only**, so bundle
+     it with open items 1 and 2 above in one visit.
+     rtpengine's kernel module also has a packet-mirroring path used by
+     `rtpengine-recording` — probe whether that reaches an arbitrary UDP
+     destination; if yes, that is the same win with vendor support and no
+     eBPF.
   3. Only then: a one-day TC `bpf_clone_redirect` PoC against the lab
      rtpengine container with a hardcoded flow map, measuring per-packet
      overhead and packet integrity at the MSS socket.

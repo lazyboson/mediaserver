@@ -32,6 +32,7 @@ const REDIS_URL_ENV: &str = "MSS_REDIS_URL";
 const POD_NAME_ENV: &str = "MSS_POD_NAME";
 const LOCAL_MEDIA_IP_ENV: &str = "MSS_TAP_LOCAL_IP";
 const METRICS_LISTEN_ENV: &str = "MSS_METRICS_LISTEN";
+const TAP_TRANSCODE_ENV: &str = "MSS_TAP_TRANSCODE";
 const AUTH_TOKEN_ENV: &str = "MSS_AUTH_TOKEN";
 const RECORDING_BUCKET_ENV: &str = "MSS_RECORDING_BUCKET";
 const DEFAULT_POD_NAME: &str = "mediaserverd";
@@ -174,6 +175,27 @@ fn control_listen_address() -> Option<Result<SocketAddr, String>> {
     Some(configured.parse().map_err(|_| configured))
 }
 
+fn transcode_at_tap() -> bool {
+    let configured = std::env::var(TAP_TRANSCODE_ENV).unwrap_or_else(|_| "on".to_string());
+    let transcoding = !matches!(
+        configured.trim().to_ascii_lowercase().as_str(),
+        "off" | "false" | "0" | "no"
+    );
+    if transcoding {
+        info!(
+            env = TAP_TRANSCODE_ENV,
+            "asking rtpengine to transcode the tap to our format"
+        );
+    } else {
+        info!(
+            env = TAP_TRANSCODE_ENV,
+            "accepting the call's own codec on the tap; rtpengine transcodes nothing, \
+             so a call whose codec this pipeline cannot decode will be refused"
+        );
+    }
+    transcoding
+}
+
 fn metrics_listen_address() -> Option<Result<SocketAddr, String>> {
     let configured = std::env::var(METRICS_LISTEN_ENV).ok()?;
     Some(configured.parse().map_err(|_| configured))
@@ -222,6 +244,7 @@ async fn serve_control_plane(listen: SocketAddr) {
             .and_then(|configured| configured.parse().ok()),
         local_media_address: local_media_address(),
         format: AudioFormat::pcmu_8k_20ms(),
+        transcode_at_tap: transcode_at_tap(),
         cookie_prefix: cookie_prefix(),
         sdp_session_id: cookie_prefix(),
         recording,

@@ -251,6 +251,17 @@ track.
 - Refusals are named, never silent: Opus (tasks item 9), G.711 at a
   non-tap rate, stereo, mismatched ptime.
 
+### frame.rs — the codec table, now readable in both directions
+
+`Encoding::static_payload_type` had no inverse, so nothing could answer "what
+codec is payload type 8?". `from_static_payload_type` and
+`static_clock_rate_hz` close that, and a round-trip test pins them against
+each other so the two directions cannot drift. Only PT 0 (PCMU) and 8 (PCMA)
+map — deliberately, because those are exactly the encodings
+`StreamPipeline` can decode. L16's static types (10/11) are **not** listed:
+claiming them would let a tap accept a stream the pipeline would then refuse.
+That is what makes `offered_format` in `rtpengine-ng` a safe question to ask.
+
 ### dtmf.rs — complete for RFC 4733 digit reporting
 - Reports once per press on end-bit, deduped by (digit, RTP timestamp);
   events ≥16 (flash-hook etc.) deliberately ignored.
@@ -329,6 +340,24 @@ track.
 - Depends on `media-core` for `AudioFormat`/`Encoding` rather than
   restating the codec table; `Encoding::rtpmap_name` was added there so
   the vocabulary lives in one crate.
+- **`offered_format` reads the tap's codec out of the offer** (2026-08-22).
+  It walks the offered payload types **in offer order** and returns the first
+  one `media-core` maps to a static encoding, taking the clock rate from that
+  PT's `a=rtpmap` when present and the ptime from the stream (falling back to
+  the caller's). Offer order matters: it means the answer's first payload type
+  is one rtpengine actually offered, which is what makes a no-transcode
+  subscription legal. An offer of nothing decodable is
+  `NoStaticCodecOffered(offered)` — named, with the list, so the log says what
+  the call was using.
+  The companion test is the one worth keeping: with our *configured* PCMU
+  format, the answer to an A-law-only offer is `RTP/AVP 0 8 101` — it **adds**
+  payload type 0. That addition is precisely the mechanism that asks rtpengine
+  to transcode, and it is now pinned
+  (`our_configured_codec_would_have_added_an_unoffered_payload_type`)
+  next to the case that must not add anything
+  (`the_answer_to_an_alaw_only_offer_adds_no_codec_the_offer_did_not_carry`).
+  `to_sdp` itself needed **no change**: it already puts `self.format` first and
+  echoes the rest, so handing it the offered format is the whole fix.
 - **M3:** dynamic rtpmap so L16/Opus can be signalled on the tap leg.
 
 ## crates/protocol — frozen wire contracts
@@ -928,6 +957,40 @@ actually tap.
 Phase-0 spike proved, which is what turns `MediaControl` from a registry
 into something that actually taps calls.
 
+- **Transcoding at the tap is now a choice, not a constant (2026-08-22).**
+  `TapPlaneConfig.transcode_at_tap` (daemon env `MSS_TAP_TRANSCODE`, default
+  `on`, so nothing changed for an existing deployment) selects between two
+  shapes:
+  - **on** — `transcode: [PCMU]` as before. rtpengine normalises whatever the
+    carrier picked, the tap format is `config.format`, and the answer adds
+    payload type 0 to the offer, which is what requests the conversion.
+  - **off** — an empty transcode list. rtpengine converts nothing, the tap
+    format comes from the offer (`offered_tap_format`), and the answer echoes
+    the offered codec first so it adds nothing. A call whose codec the
+    pipeline cannot decode is **refused by name**, with the error naming
+    transcoding as the fix, rather than tapped into silence.
+  Why it exists: transcoding cannot happen in rtpengine's kernel module — the
+  module forwards and can do SRTP, but carries no codec — so asking for a
+  transcode is very likely what keeps a subscription in rtpengine's userspace.
+  This flag is the MSS half of testing that (tasks.md item 18, probe 2); the
+  rtpengine half needs a host that can load the module, which this lab cannot.
+  It is also strictly *less* total codec work: today rtpengine decodes and
+  re-encodes and then MSS decodes again (three operations); with the flag off
+  MSS simply decodes the wire codec (one).
+  **`offered_tap_format` requires every offered stream to agree** on one
+  format, because a tap decodes one format for all its legs; disagreement is
+  an error naming transcoding as the fix. Two legs of one call have never
+  disagreed in the lab, and if they ever do, transcoding is the right answer
+  rather than a per-leg pipeline.
+- **`LiveSession` now carries the format the tap actually settled on**, and
+  `session_format()` is what the attachment paths consult. This matters
+  because `config.format` stopped being the truth the moment transcoding
+  became optional: a gRPC attachment's format is validated against the real
+  tap (`ConsumerEncoder::supports(tap, requested)`) and the encode pump is
+  handed the real tap format as its source. The WS guard is unchanged and
+  still demands PCMU 8k — that is the frozen dialect the bridge speaks, and it
+  is independent of the tap's codec because the hub carries PCM and the bridge
+  encodes µ-law at its own edge.
 - `open_session` does the real NG dance — bind transport, `subscribe
   request`, parse the offer, bind one UDP socket per stream, `subscribe
   answer` — then builds a `TapLeg` per stream, starts a `Hub`, and spawns
