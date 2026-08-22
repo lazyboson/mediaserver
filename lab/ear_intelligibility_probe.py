@@ -77,10 +77,30 @@ def send_text(sock, payload):
     sock.sendall(bytes(header) + bytes(b ^ mask[i % 4] for i, b in enumerate(data)))
 
 
+def downsample(pcm, rate):
+    """The bridge speaks 8 kHz mu-law, so anything wider is averaged down.
+
+    Averaging each group is a crude low-pass, which is enough to keep a 16 kHz
+    L16 tap artifact (what mss_stream_probe writes) intelligible to the ASR.
+    """
+    if rate == 8000:
+        return pcm
+    factor, remainder = divmod(rate, 8000)
+    if remainder or factor < 1:
+        raise SystemExit(f"{rate} Hz is not a whole multiple of 8000")
+    return [
+        sum(pcm[i:i + factor]) // factor
+        for i in range(0, len(pcm) - factor + 1, factor)
+    ]
+
+
 def main():
     path = sys.argv[1]
     with wave.open(path) as w:
         pcm = struct.unpack(f"<{w.getnframes()}h", w.readframes(w.getnframes()))
+        rate = w.getframerate()
+    pcm = downsample(list(pcm), rate)
+    log(f"{path} is {rate} Hz; feeding {len(pcm) / 8000:.2f}s at 8 kHz")
     ulaw = bytes(linear_to_ulaw(s) for s in pcm)
     frames = [ulaw[i:i + 160] for i in range(0, len(ulaw) - 159, 160)]
     log(f"replaying {len(frames)} frames ({len(frames) * 0.02:.1f}s) of {path}")

@@ -78,22 +78,20 @@ impl HealthCounters {
     }
 }
 
+static COOKIE_SERIAL: AtomicU64 = AtomicU64::new(0);
+
 #[derive(Debug)]
 pub struct CookieSequence {
     prefix: u64,
-    next: AtomicU64,
 }
 
 impl CookieSequence {
     pub fn new(prefix: u64) -> Self {
-        CookieSequence {
-            prefix,
-            next: AtomicU64::new(0),
-        }
+        CookieSequence { prefix }
     }
 
     pub fn next_cookie(&self) -> Vec<u8> {
-        let serial = self.next.fetch_add(1, Ordering::Relaxed);
+        let serial = COOKIE_SERIAL.fetch_add(1, Ordering::Relaxed);
         format!("{:x}-{:x}", self.prefix, serial).into_bytes()
     }
 }
@@ -367,6 +365,18 @@ mod tests {
             .unwrap()
     }
 
+    #[test]
+    fn two_transports_on_one_pod_never_share_a_cookie() {
+        let first = CookieSequence::new(0xABCD);
+        let second = CookieSequence::new(0xABCD);
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..8 {
+            assert!(seen.insert(first.next_cookie()));
+            assert!(seen.insert(second.next_cookie()));
+        }
+        assert_eq!(seen.len(), 16);
+    }
+
     #[tokio::test]
     async fn ping_reply_is_correlated_by_cookie() {
         let fake =
@@ -505,8 +515,13 @@ mod tests {
         let first = sequence.next_cookie();
         let second = sequence.next_cookie();
         assert_ne!(first, second);
-        assert_eq!(first, b"1234-0".to_vec());
-        assert_eq!(second, b"1234-1".to_vec());
+        assert!(first.starts_with(b"1234-"));
+        assert!(second.starts_with(b"1234-"));
+        let serial = |cookie: &[u8]| {
+            let text = std::str::from_utf8(cookie).unwrap().to_string();
+            u64::from_str_radix(text.split('-').nth(1).unwrap(), 16).unwrap()
+        };
+        assert!(serial(&second) > serial(&first));
         assert!(!first.contains(&b' '));
     }
 
