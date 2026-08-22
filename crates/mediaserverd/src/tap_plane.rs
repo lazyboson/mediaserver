@@ -1,21 +1,26 @@
 use crate::consumer_ws::{self, ConsumerConfig};
 use crate::hub::{Hub, HubClient, Subscription, SubscriptionMetrics, TapEvent, TrackSelection};
 use crate::ng_transport::{NgTransport, NgTransportConfig};
+use crate::recorder::{
+    self, Layout, RecorderCounters, RecorderHandle, RecorderSpec, RecordingIdentity,
+    RecordingSupport,
+};
 use crate::tap_spike::{
     capture, SharedLegStats, SsrcTrackPublisher, SsrcTracks, TapLeg, MAX_SSRC_TRACKS,
 };
-use control_api::{MediaPlane, MediaPlaneError, PlaybackSource, StreamFrame};
+use control_api::{MediaPlane, MediaPlaneError, ObservationSink, PlaybackSource, StreamFrame};
 use media_core::{AudioFormat, ConsumerEncoder, Track};
 use rtpengine_ng::{
     PlayMedia, PlaySource, PlayTarget, SubscribeRequest, SubscriptionAnswer, SubscriptionOffer,
 };
 use session_core::{
-    AttachmentId, AttachmentView, SessionId, SessionKind, SessionView, TrackSelector, Transport,
+    AttachmentId, AttachmentView, Observation, SessionId, SessionKind, SessionView, TrackSelector,
+    Transport,
 };
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr, UdpSocket};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tracing::{info, warn};
@@ -43,6 +48,7 @@ pub struct TapPlaneConfig {
     pub format: AudioFormat,
     pub cookie_prefix: u64,
     pub sdp_session_id: u64,
+    pub recording: RecordingSupport,
 }
 
 struct LiveSession {
@@ -69,6 +75,21 @@ enum LiveAttachment {
         format: AudioFormat,
         live: Option<GrpcLive>,
     },
+    Recording {
+        session: SessionId,
+        recording_id: String,
+        handle: Option<RecorderHandle>,
+    },
+}
+
+impl LiveAttachment {
+    fn session(&self) -> SessionId {
+        match self {
+            LiveAttachment::Ws { session, .. }
+            | LiveAttachment::Grpc { session, .. }
+            | LiveAttachment::Recording { session, .. } => *session,
+        }
+    }
 }
 
 struct GrpcLive {
@@ -137,6 +158,16 @@ pub struct IngestSnapshot {
     pub consumer_delivered: u64,
     pub consumer_queue_depth: u64,
     pub consumer_queue_depth_max: u64,
+    pub recordings_live: u64,
+    pub recordings_started: u64,
+    pub recordings_stopped: u64,
+    pub recording_pauses: u64,
+    pub recording_uploads: u64,
+    pub recording_upload_failures: u64,
+    pub recording_spills: u64,
+    pub recording_bytes_uploaded: u64,
+    pub recording_seconds: u64,
+    pub recordings_truncated: u64,
 }
 
 #[derive(Default)]
@@ -147,12 +178,20 @@ struct MetricsInner {
     ssrc_requeries: u64,
     legs: HashMap<SessionId, Vec<Arc<SharedLegStats>>>,
     consumers: HashMap<AttachmentId, SubscriptionMetrics>,
+    recorder: Arc<RecorderCounters>,
 }
 
 #[derive(Clone, Default)]
 pub struct TapPlaneMetrics(Arc<Mutex<MetricsInner>>);
 
 impl TapPlaneMetrics {
+    fn with_recorder(recorder: Arc<RecorderCounters>) -> TapPlaneMetrics {
+        TapPlaneMetrics(Arc::new(Mutex::new(MetricsInner {
+            recorder,
+            ..MetricsInner::default()
+        })))
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, MetricsInner> {
         self.0
             .lock()
@@ -194,6 +233,8 @@ impl TapPlaneMetrics {
 
     pub fn snapshot(&self) -> IngestSnapshot {
         let inner = self.lock();
+        let recorder = &inner.recorder;
+        let read = |value: &AtomicU64| value.load(Ordering::Relaxed);
         let mut snapshot = IngestSnapshot {
             totals: inner.retired,
             sessions_live: inner.legs.len() as u64,
@@ -201,6 +242,16 @@ impl TapPlaneMetrics {
             consumer_dropped_oldest: inner.retired_consumer_dropped,
             consumer_delivered: inner.retired_consumer_delivered,
             ssrc_requeries: inner.ssrc_requeries,
+            recordings_live: read(&recorder.live),
+            recordings_started: read(&recorder.started),
+            recordings_stopped: read(&recorder.stopped),
+            recording_pauses: read(&recorder.pauses),
+            recording_uploads: read(&recorder.uploaded),
+            recording_upload_failures: read(&recorder.upload_failures),
+            recording_spills: read(&recorder.spilled),
+            recording_bytes_uploaded: read(&recorder.bytes_uploaded),
+            recording_seconds: read(&recorder.seconds_recorded),
+            recordings_truncated: read(&recorder.truncated),
             ..IngestSnapshot::default()
         };
         for legs in inner.legs.values() {
@@ -227,15 +278,24 @@ pub struct TapPlane {
     sessions: Mutex<HashMap<SessionId, LiveSession>>,
     attachments: Mutex<HashMap<AttachmentId, LiveAttachment>>,
     metrics: TapPlaneMetrics,
+    observations: OnceLock<Weak<dyn ObservationSink>>,
 }
 
 impl TapPlane {
     pub fn new(config: TapPlaneConfig) -> Self {
+        let metrics = TapPlaneMetrics::with_recorder(Arc::clone(&config.recording.counters));
         TapPlane {
             config,
             sessions: Mutex::new(HashMap::new()),
             attachments: Mutex::new(HashMap::new()),
-            metrics: TapPlaneMetrics::default(),
+            metrics,
+            observations: OnceLock::new(),
+        }
+    }
+
+    pub fn observe_through(&self, sink: Weak<dyn ObservationSink>) {
+        if self.observations.set(sink).is_err() {
+            warn!("this tap plane already reports its observations somewhere");
         }
     }
 
@@ -245,6 +305,21 @@ impl TapPlane {
 
     pub fn metrics(&self) -> TapPlaneMetrics {
         self.metrics.clone()
+    }
+
+    fn observer(&self) -> Option<Weak<dyn ObservationSink>> {
+        self.observations.get().cloned()
+    }
+
+    fn observe(&self, session: SessionId, observation: Observation) {
+        match self.observer().as_ref().and_then(Weak::upgrade) {
+            Some(sink) => sink.observe(session, observation),
+            None => warn!(
+                %session,
+                ?observation,
+                "no observation sink is wired; this callback reaches nobody"
+            ),
+        }
     }
 
     fn node_for(&self, view: &SessionView) -> Result<SocketAddr, MediaPlaneError> {
@@ -418,6 +493,126 @@ impl TapPlane {
             "a grpc-stream attachment is waiting for its consumer to subscribe"
         );
         Ok(())
+    }
+
+    fn open_recording_attachment(&self, view: AttachmentView) -> Result<(), MediaPlaneError> {
+        let identity = RecordingIdentity::parse(&view.endpoint).map_err(|error| {
+            MediaPlaneError(format!(
+                "{error}; a file-s3 endpoint is the frozen recording identity {}",
+                recorder::IDENTITY_SCHEME
+            ))
+        })?;
+        if self.config.recording.sink.is_none() {
+            return Err(MediaPlaneError(
+                "no recording storage is configured on this pod, so a file-s3 \
+                 attachment would record into nothing"
+                    .to_string(),
+            ));
+        }
+        let (_, _, hub, _, _) = self.session_handles(view.session)?;
+        let selection = selection_of(view.selector);
+        let subscription = hub
+            .attach(CONSUMER_QUEUE_FRAMES, selection)
+            .ok_or_else(|| {
+                MediaPlaneError("the hub would not take another consumer".to_string())
+            })?;
+        let subscription_metrics = subscription.metrics();
+        let key = identity.object_key();
+        let recording_id = identity.recording_id.clone();
+        let handle = recorder::spawn(
+            RecorderSpec {
+                session: view.session,
+                identity,
+                layout: layout_of(view.selector),
+                sample_rate_hz: self.config.format.sample_rate_hz,
+                max_duration: recorder::MAX_RECORDING,
+            },
+            subscription,
+            self.config.recording.clone(),
+            self.observer(),
+        );
+
+        let mut held = self
+            .attachments
+            .lock()
+            .map_err(|_| MediaPlaneError("the attachment table is poisoned".to_string()))?;
+        held.insert(
+            view.id,
+            LiveAttachment::Recording {
+                session: view.session,
+                recording_id: recording_id.clone(),
+                handle: Some(handle),
+            },
+        );
+        drop(held);
+        self.metrics
+            .register_consumer(view.id, subscription_metrics);
+        self.config
+            .recording
+            .counters
+            .started
+            .fetch_add(1, Ordering::Relaxed);
+        info!(
+            attachment = %view.id,
+            session = %view.session,
+            label = %view.label,
+            %key,
+            ?selection,
+            "recording this call"
+        );
+        self.observe(
+            view.session,
+            Observation::RecordingStarted {
+                recording_id,
+                path: key,
+            },
+        );
+        Ok(())
+    }
+
+    fn take_attachments_of(
+        &self,
+        session: SessionId,
+    ) -> Result<Vec<(AttachmentId, LiveAttachment)>, MediaPlaneError> {
+        let mut held = self
+            .attachments
+            .lock()
+            .map_err(|_| MediaPlaneError("the attachment table is poisoned".to_string()))?;
+        let mine: Vec<AttachmentId> = held
+            .iter()
+            .filter(|(_, live)| live.session() == session)
+            .map(|(id, _)| *id)
+            .collect();
+        Ok(mine
+            .into_iter()
+            .filter_map(|id| held.remove(&id).map(|live| (id, live)))
+            .collect())
+    }
+
+    async fn finish_recording(
+        &self,
+        attachment: AttachmentId,
+        mut live: LiveAttachment,
+    ) -> Option<()> {
+        let LiveAttachment::Recording {
+            session,
+            recording_id,
+            handle,
+        } = &mut live
+        else {
+            return None;
+        };
+        let handle = handle.take()?;
+        let outcome = handle.finish().await;
+        info!(
+            %attachment,
+            session = %session,
+            %recording_id,
+            duration_ms = outcome.as_ref().map(|done| done.duration_ms),
+            uri = ?outcome.as_ref().and_then(|done| done.uri.clone()),
+            "recording finished"
+        );
+        Some(())
     }
 
     fn session_handles(
@@ -673,6 +868,21 @@ impl MediaPlane for TapPlane {
             None => return Ok(()),
         };
 
+        for (attachment, held) in self.take_attachments_of(session)? {
+            match held {
+                LiveAttachment::Ws { task, .. } => task.abort(),
+                LiveAttachment::Grpc { live, .. } => {
+                    if let Some(live) = live {
+                        live.pump.abort();
+                    }
+                }
+                recording @ LiveAttachment::Recording { .. } => {
+                    self.finish_recording(attachment, recording).await;
+                }
+            }
+            self.metrics.retire_consumer(attachment);
+        }
+
         live.stop.store(true, Ordering::Relaxed);
         if let Some(speakers) = live.speakers.take() {
             speakers.abort();
@@ -703,9 +913,56 @@ impl MediaPlane for TapPlane {
         match view.transport {
             Transport::WsTwilio => self.open_ws_attachment(view),
             Transport::GrpcStream => self.open_grpc_attachment(view),
+            Transport::FileS3 => self.open_recording_attachment(view),
             other => Err(MediaPlaneError(format!(
-                "{other} attachments are not served yet; ws-twilio and grpc-stream are"
+                "{other} attachments are not served yet; ws-twilio, grpc-stream \
+                 and file-s3 are"
             ))),
+        }
+    }
+
+    async fn update_attachment(&self, view: AttachmentView) -> Result<(), MediaPlaneError> {
+        let paused = {
+            let held = self
+                .attachments
+                .lock()
+                .map_err(|_| MediaPlaneError("the attachment table is poisoned".to_string()))?;
+            match held.get(&view.id) {
+                Some(LiveAttachment::Recording {
+                    handle: Some(handle),
+                    ..
+                }) => Some(handle.set_paused(view.paused)),
+                Some(LiveAttachment::Recording { handle: None, .. }) => {
+                    return Err(MediaPlaneError(format!(
+                        "{} is a recording that has already been closed",
+                        view.id
+                    )))
+                }
+                Some(_) => None,
+                None => {
+                    return Err(MediaPlaneError(format!(
+                        "{} is not connected here",
+                        view.id
+                    )))
+                }
+            }
+        };
+        match paused {
+            Some(true) => Ok(()),
+            Some(false) => Err(MediaPlaneError(format!(
+                "{} is not taking commands any more",
+                view.id
+            ))),
+            None => {
+                info!(
+                    attachment = %view.id,
+                    paused = view.paused,
+                    transport = %view.transport,
+                    "pause is control-plane state for this transport; \
+                     its media keeps flowing"
+                );
+                Ok(())
+            }
         }
     }
 
@@ -731,6 +988,9 @@ impl MediaPlane for TapPlane {
                     live.pump.abort();
                 }
                 info!(%attachment, %session, "grpc consumer detached");
+            }
+            Some(recording @ LiveAttachment::Recording { .. }) => {
+                self.finish_recording(attachment, recording).await;
             }
             None => {}
         }
@@ -760,6 +1020,11 @@ impl MediaPlane for TapPlane {
                 Some(LiveAttachment::Grpc { live: None, .. }) => {
                     return Err(MediaPlaneError(format!(
                         "{attachment} has no connected grpc consumer to send to"
+                    )))
+                }
+                Some(LiveAttachment::Recording { .. }) => {
+                    return Err(MediaPlaneError(format!(
+                        "{attachment} is a recording; a file sink has no back channel"
                     )))
                 }
                 None => {
@@ -812,6 +1077,11 @@ impl MediaPlane for TapPlane {
                 Some(LiveAttachment::Ws { .. }) => {
                     return Err(MediaPlaneError(format!(
                         "{attachment} is a websocket attachment; it has no grpc stream"
+                    )))
+                }
+                Some(LiveAttachment::Recording { .. }) => {
+                    return Err(MediaPlaneError(format!(
+                        "{attachment} is a recording; it has no grpc stream"
                     )))
                 }
                 None => {
@@ -981,6 +1251,13 @@ fn selection_of(selector: TrackSelector) -> TrackSelection {
     }
 }
 
+fn layout_of(selector: TrackSelector) -> Layout {
+    match selector {
+        TrackSelector::All => Layout::Stereo,
+        TrackSelector::Only(track) => Layout::Mono(track),
+    }
+}
+
 fn tracks_of(selector: TrackSelector) -> Vec<String> {
     match selector {
         TrackSelector::All => vec![
@@ -1124,13 +1401,38 @@ mod tests {
     use session_core::{Capabilities, PlaybackId};
     use std::collections::BTreeMap;
 
+    struct NowhereSink;
+
+    #[control_api::async_trait]
+    impl recorder::RecordingSink for NowhereSink {
+        async fn put(
+            &self,
+            _key: &str,
+            _content_type: &'static str,
+            _body: Vec<u8>,
+        ) -> Result<String, recorder::UploadError> {
+            Err(recorder::UploadError::Refused(
+                "this sink exists only to prove the attachment path".to_string(),
+            ))
+        }
+
+        fn describe(&self) -> String {
+            "nowhere".to_string()
+        }
+    }
+
     fn plane() -> TapPlane {
+        plane_with_recording(RecordingSupport::default())
+    }
+
+    fn plane_with_recording(recording: RecordingSupport) -> TapPlane {
         TapPlane::new(TapPlaneConfig {
             default_node: None,
             local_media_address: IpAddr::from([127, 0, 0, 1]),
             format: AudioFormat::pcmu_8k_20ms(),
             cookie_prefix: 1,
             sdp_session_id: 1,
+            recording,
         })
     }
 
@@ -1198,11 +1500,74 @@ mod tests {
     async fn transports_without_a_bridge_are_refused_by_name() {
         let plane = plane();
         let error = plane
-            .open_attachment(attachment(Transport::FileS3, "acct/rec.wav"))
+            .open_attachment(attachment(Transport::RtpInline, ""))
             .await
             .unwrap_err();
         assert!(error.to_string().contains("not served yet"));
-        assert!(error.to_string().contains("file-s3"));
+        assert!(error.to_string().contains("rtp-inline"));
+    }
+
+    #[tokio::test]
+    async fn a_recording_endpoint_that_is_not_the_frozen_identity_is_refused_before_anything_opens()
+    {
+        let plane = plane();
+        for endpoint in [
+            "",
+            "rec-99.wav",
+            "acct/deeper/rec-99.wav",
+            "acct/rec-99.mp3",
+        ] {
+            let error = plane
+                .open_attachment(attachment(Transport::FileS3, endpoint))
+                .await
+                .unwrap_err();
+            assert!(
+                error.to_string().contains("recording identity"),
+                "{endpoint} was refused with {error}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_recording_is_refused_when_this_pod_has_nowhere_to_upload_it() {
+        let plane = plane();
+        let error = plane
+            .open_attachment(attachment(Transport::FileS3, "acct-42/rec-99.wav"))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("no recording storage"));
+    }
+
+    #[tokio::test]
+    async fn a_configured_recording_still_needs_a_session_this_pod_taps() {
+        let plane = plane_with_recording(RecordingSupport {
+            sink: Some(Arc::new(NowhereSink)),
+            spill_dir: None,
+            counters: Arc::new(RecorderCounters::default()),
+        });
+        let error = plane
+            .open_attachment(attachment(Transport::FileS3, "acct-42/rec-99.wav"))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("not tapped here"));
+    }
+
+    #[tokio::test]
+    async fn pause_is_refused_for_an_attachment_this_pod_never_opened() {
+        let plane = plane();
+        let mut view = attachment(Transport::FileS3, "acct-42/rec-99.wav");
+        view.paused = true;
+        let error = plane.update_attachment(view).await.unwrap_err();
+        assert!(error.to_string().contains("not connected here"));
+    }
+
+    #[test]
+    fn a_selector_that_names_one_track_records_it_alone_in_mono() {
+        assert_eq!(layout_of(TrackSelector::All), Layout::Stereo);
+        assert_eq!(
+            layout_of(TrackSelector::Only(Track::Agent)),
+            Layout::Mono(Track::Agent)
+        );
     }
 
     #[tokio::test]

@@ -641,6 +641,15 @@ impl SessionRegistry {
             Observation::RecordingStarted { recording_id, path } => {
                 EventKind::RecordingStarted { recording_id, path }
             }
+            Observation::RecordingPaused {
+                recording_id,
+                paused,
+                duration_ms,
+            } => EventKind::RecordingPaused {
+                recording_id,
+                paused,
+                duration_ms,
+            },
             Observation::RecordingStopped {
                 recording_id,
                 duration_ms,

@@ -423,8 +423,12 @@ accepted by the same calls.
   rejected as unknown rather than aliased onto a live session).
 - `Observation` covers what MSS witnesses itself (DTMF from the pipeline,
   recording lifecycle). Playback events are emitted by the registry.
-  Recording is a Phase-2 consumer, so those variants exist ahead of the
-  sink that will raise them.
+  **The recording variants have a raiser since 2026-08-22** (M5): the
+  recorder reaches `observe` through `control_api::ObservationSink`, and
+  `RecordingPaused{paused, duration_ms}` was added for the frozen
+  `recordPause` callback. `Observation::Dtmf` is still unraised — the
+  pipeline reports digits into the hub as `TapEvent::Dtmf`, and nothing
+  turns those into a `MediaEvent` yet.
 
 ## crates/control-api — the Session Controller's network surface (M4)
 
@@ -910,9 +914,10 @@ into something that actually taps calls.
 - The capture loop is bounded by `MAX_SESSION_DURATION` (8 h) as well as by
   its stop flag, so a session whose `DestroySession` never arrives cannot
   pin a thread forever.
-- `open_attachment` serves `WS_TWILIO` and (since 2026-08-20) `GRPC_STREAM`;
-  `FILE_S3` and `RTP_INLINE` are refused **by name** rather than silently
-  accepted and ignored. Metadata carries `accountId`/`streamSid` through to
+- `open_attachment` serves `WS_TWILIO`, `GRPC_STREAM` (2026-08-20) and
+  `FILE_S3` (2026-08-22, the recorder — see its own section below);
+  `RTP_INLINE` is refused **by name** rather than silently accepted and
+  ignored. Metadata carries `accountId`/`streamSid` through to
   the Twilio `start` frame, and the `TrackSelector` becomes both the hub's
   `TrackSelection` and the `tracks` list the consumer is told about.
 - **A grpc-stream attachment is two-phase**: `Attach` records it (validating
@@ -1309,6 +1314,162 @@ host. The Phase-0 exit criteria still need the real tap. The useful
 conclusion for now is a negative one: the decode/jitter path is nowhere
 near the constraint, so the per-tap ceiling will be set by syscalls and
 fan-out, which is where the next measurement should go.
+
+### recorder.rs — the stereo segmenter and the S3 sink (M5, landed 2026-08-22)
+
+The Phase-2 recorder is **a hub consumer in the control world**, exactly like
+`consumer_ws`: it owns a `hub::Subscription`, a tokio task, and no part of the
+media thread. Nothing in this module runs on the capture thread — the WAV is
+built and the upload is made after the audio is already in memory.
+
+- **The identity is the contract.** `RecordingIdentity::parse` accepts exactly
+  `${accountID}/${recordingID}.${format}` and refuses everything else *by
+  name*: no separator, a nested prefix (more than one separator), an empty
+  account or recording id, a relative segment (`.`/`..`), no extension,
+  whitespace or control characters, or a format other than `wav`.
+  `object_key()` rebuilds the string byte for byte, and the round-trip is a
+  test (`the_frozen_identity_round_trips_byte_exact`). `TelCompat`
+  already composed this endpoint from `acc_id`/`record_id`/`file_format`, so
+  `StartRecording` reaches the parser unchanged.
+- **The segmenter is sans-IO and pause is its only interesting state.** Three
+  mono buffers (customer, agent, mixed) plus an `anchor_ms` and a
+  `segment_start`; a frame lands at `segment_start + (timestamp_ms - anchor) *
+  rate / 1000`, so a leg that falls silent is zero-filled and both legs stay
+  wall-aligned. `finish()` interleaves customer **left**, agent **right** —
+  the `write_wav` convention from `tap_spike.rs`, which is FS
+  `RECORD_STEREO`'s — and injected bot speech (`Track::Mixed`) is
+  **saturating-summed into the right channel**, because a tapped voice-AI call
+  has no agent leg and a recording without the bot side would be useless.
+  Separate buffers rather than one interleaved buffer is what makes that sum
+  independent of the order the hub publishes a tick's frames.
+- **pause = segment + defer + accumulate, and that is three mechanisms.**
+  `pause()` sets `segment_start` to the current end and clears the anchor;
+  frames arriving while paused are dropped and counted
+  (`frames_while_paused`); `resume()` re-anchors on the first frame after it,
+  so the next segment is written directly after the last one. The audio of a
+  paused interval is therefore absent, the segments are joined end to end with
+  no silence between them, and `duration_ms` (frames / rate) is the
+  accumulated recorded duration rather than wall clock. Nothing is uploaded on
+  pause — that is the "defer".
+- **Command ordering is deliberate.** The task's `select!` is `biased` with
+  the media branch first, so audio that arrived before a pause command is
+  absorbed before the pause takes effect, and audio that arrives during a
+  pause is dropped even if a resume is already queued. At 50 Hz the queue
+  empties between frames, so a command waits at most one ptime; the payoff is
+  that the segment boundary is where the caller asked for it and the tests are
+  deterministic without sleeps.
+- **Events, in the frozen order.** `RecordingStarted` is raised by `TapPlane`
+  when the attachment opens (so it is synchronous with `Attach`);
+  `RecordingPaused{paused, duration_ms}` on both pause edges;
+  `RecordingStopped{duration_ms}` **before** the upload;
+  `UploadCompleted{uri}` only when the object actually landed. All four go
+  through `SessionRegistry::observe` via the new `ObservationSink`, which
+  means they are sequenced, keyed by `external_id` and published to
+  `mss.events` like every other event. `RecordingPaused` is new in
+  `session-core`, `EventKind` and `proto` (field 24) — the legacy contract has
+  a `recordPause` callback and MSS had no way to express it; the resume edge
+  reuses the same variant with `paused: false`, which is our extension and is
+  documented in the proto.
+- **Uploads use `object_store` (`AmazonS3`), never a hand-rolled S3 client.**
+  Configured from `MSS_RECORDING_BUCKET` (presence enables recording),
+  `MSS_RECORDING_S3_ENDPOINT` (set for MinIO; plain http is allowed only for a
+  non-https endpoint, and path-style addressing is forced), region, key id and
+  secret. `put_opts` sets `Content-Type: audio/wav` — verified on the object
+  in MinIO. Retries are `object_store`'s own (3, bounded by
+  `UPLOAD_TIMEOUT`), with a tokio timeout as the outer bound, and the whole
+  finish path is bounded by `FINISH_TIMEOUT` (90 s) so `DestroySession` cannot
+  hang on a dead bucket.
+- **A failed upload spills instead of vanishing.** With
+  `MSS_RECORDING_SPILL_DIR` set, the WAV is written to `dir/<identity>` and
+  counted (`mss_recording_spills_total`, alerted). Without it, a failed upload
+  loses the audio — that is the honest state, and the alert says so.
+- **Bounded, like everything else.** The whole recording is buffered in
+  memory: 8 kHz stereo is ~32 KB/s, so `MAX_RECORDING` (2 h) caps one
+  recording at ~230 MB and further frames are counted
+  (`frames_beyond_cap`, `mss_recordings_truncated_total`) rather than
+  silently dropped. Streaming multipart upload is the fix when calls longer
+  than that matter; it is not built.
+- **`StopRecording` waits for the upload, deliberately.** `Detach` (and
+  `DestroySession`) await the recorder's finish, so a cigol `StopRecording`
+  blocks for as long as the upload takes — bounded by `UPLOAD_TIMEOUT` (60 s)
+  and `FINISH_TIMEOUT` (90 s). The alternative, backgrounding the upload,
+  cannot work today: `observe` refuses a session the registry has forgotten,
+  so `UploadCompleted` would be lost exactly when the call has ended, which is
+  every time. If a pilot finds the added `StopRecording` latency unacceptable,
+  the fix is a session-independent event path (an event that carries
+  `external_id` without needing a live session), not a silent background
+  upload.
+- **Known gaps:** no multipart/streaming upload (hence the cap and the memory
+  cost); `recordingChannels=mono` metadata is not honoured (a single-track
+  *selector* gives a mono file, a mono *mix* of both parties does not exist);
+  no re-upload of spilled files (an operator job today); and a recording is
+  per pod, so a pod that dies mid-call loses the audio it had buffered even
+  though the session itself is adopted elsewhere (the adopted session
+  re-taps, but the recording restarts).
+
+### The rustls/ring dependency this added, and why
+
+An S3 client needs TLS, and TLS in Rust needs a crypto provider. The repo's
+hermetic pure-Rust build (protox over protoc, rskafka over rdkafka) survives
+this addition only because of a specific feature selection, so do not
+"simplify" it:
+
+- `object_store` with `default-features = false` and features
+  `aws-base, reqwest, ring`. The `aws` umbrella feature pulls **aws-lc-rs**,
+  which builds C with **cmake** — not available in `rust:1.95-slim-bookworm`,
+  so it would break the Dockerfile. `ring` builds C/asm with `cc`, which that
+  image has.
+- `reqwest` with `rustls-no-provider` (reqwest 0.13's `rustls` feature also
+  means aws-lc-rs) plus `rustls` with `ring`, and
+  `recorder::install_crypto_provider()` installs the ring provider once
+  before the first client is built. Without that install, building a client
+  **panics at runtime** — which is exactly how the first drill failed.
+- `cargo deny check all` then needed one allowance:
+  **CDLA-Permissive-2.0** for `webpki-root-certs`, the Mozilla CA root bundle
+  rustls verifies against. It is a data licence on certificates, not code,
+  and every Rust HTTPS client lands on a Mozilla-derived bundle under either
+  it or MPL-2.0. The reasoning is in `deny.toml` next to the entry.
+
+### What the recorder changed in the modules around it
+
+- **`control-api/controller.rs`** grew three things: the `ObservationSink`
+  trait (implemented by `SessionController`, so the media world can raise
+  `Observation`s through the registry rather than inventing its own events —
+  `observe` had no caller at all before this), `MediaPlane::update_attachment`
+  (default `Ok(())`), and a reordering of `DestroySession`: **the media plane
+  is now closed before the registry forgets the session.** That reorder is
+  load-bearing — `observe` refuses an unknown session, so a recorder finishing
+  during teardown could not have published `RecordingStopped`/
+  `UploadCompleted` at all. Test:
+  `a_recording_closed_by_a_hangup_still_gets_its_callbacks_before_the_session_ends`
+  asserts the event order is AttachmentUp, RecordingStopped, UploadCompleted,
+  AttachmentDown, SessionEnded.
+- `UpdateAttachment` now reaches the media plane, and **a refused update is
+  rolled back** in the registry (paused/selector/format restored) rather than
+  left claiming a state the media world never accepted.
+- **`tap_plane.rs`** serves `FILE_S3`: parse identity → require a configured
+  sink → require the session → hub-subscribe (all tracks, or one if the
+  selector names one) → spawn the recorder → register it as a consumer for
+  metrics → raise `RecordingStarted`. `update_attachment` forwards pause to
+  the recorder and, for WS/gRPC, logs that pause is still control-plane state
+  only (their media keeps flowing — an unchanged, and now explicit, gap).
+  `close_attachment` **awaits** the recorder's finish so the callbacks land
+  before the caller's `Detach` returns, and `close_session` now sweeps *all*
+  of a session's attachments (previously it left WS tasks and map entries
+  behind on `DestroySession`) finishing recordings first.
+  `TapPlane::observe_through` takes a `Weak<dyn ObservationSink>` — weak, so
+  the controller↔plane cycle cannot leak the controller.
+- **`hub.rs`**: `Subscription::try_next` is no longer test-only. The recorder
+  drains what is already queued after it is told to finish, so a stop does not
+  discard up to 200 buffered frames (4 s) of audio.
+- **`metrics.rs`**: ten new series
+  (`mss_recordings_started_total`, `_stopped_total`,
+  `mss_recording_pauses_total`, `_uploads_total`, `_upload_failures_total`,
+  `_spills_total`, `mss_recordings_truncated_total`,
+  `mss_recording_bytes_uploaded_total`, `mss_recording_seconds_total`, gauge
+  `mss_recordings_live`), read out of one `Arc<RecorderCounters>` shared with
+  `TapPlaneMetrics`. Upload failures, spills and truncation are alerted in
+  `deploy/prometheus-alerts.yaml`.
 
 ## Cross-cutting decisions already made (do not relitigate casually)
 - Codec interchange is L16 internally; one decode per ingest stream,

@@ -394,6 +394,26 @@ Stated plainly, so nobody mistakes a green run for coverage:
 - **Recording compliance gaps.** Whether a re-subscribe gap is acceptable
   is a tenant contract question, not a test result.
 
+## Recording parity (Phase 2)
+
+Two artifacts exist for the "byte-comparable recordings vs FS output" exit
+criterion, and neither has met a real FreeSWITCH recording yet:
+
+- `crates/mediaserverd/tests/minio_upload.rs` — env-gated
+  (`MSS_TEST_S3_ENDPOINT`), drives the real recorder from a synthetic hub
+  against a real MinIO container, then reads the object back and asserts the
+  frozen key, the WAV container, the stereo channel mapping and that a paused
+  interval is absent while the accumulated duration is right. Tier 1½: real
+  storage, no call path.
+- `lab/recording_parity.py` — the comparison harness. Container, duration,
+  correlation offset, per-channel identical ratio / mean / worst difference,
+  with tolerances on the command line. Documented in [lab.md](lab.md).
+
+Do not expect bit-for-bit equality on an impaired link: since the jitter
+hardening, MSS conceals loss with G.711 Appendix I PLC and FreeSWITCH does
+not, so lost packets diverge by construction. Compare on a clean link for an
+identity claim, and on an impaired one only by RMS and mean difference.
+
 ## Running what exists today
 
 See [lab.md](lab.md). In short:
