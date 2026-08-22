@@ -64,7 +64,10 @@ message AudioFrame {
   string track = 1;
   uint64 seq = 2;
   uint64 pts_ms = 3;
-  bytes payload = 4;  // raw audio, NOT base64
+  // Raw audio in the attachment's declared format, NOT base64.
+  // L16 payloads are little-endian signed 16-bit mono (the "linear16"
+  // most ASR vendors consume), not the network-order RTP L16.
+  bytes payload = 4;
 }
 
 message DtmfFrame {

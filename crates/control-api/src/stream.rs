@@ -246,9 +246,21 @@ fn decode_inject(encoding: Encoding, payload: &[u8], out: &mut Vec<i16>) -> Resu
     match encoding {
         Encoding::Pcmu => out.extend(payload.iter().map(|byte| g711::ulaw_to_linear(*byte))),
         Encoding::Pcma => out.extend(payload.iter().map(|byte| g711::alaw_to_linear(*byte))),
-        Encoding::L16 | Encoding::Opus => {
+        Encoding::L16 => {
+            if !payload.len().is_multiple_of(2) {
+                return Err(Status::invalid_argument(
+                    "an L16 inject payload must be whole little-endian samples",
+                ));
+            }
+            out.extend(
+                payload
+                    .chunks_exact(2)
+                    .map(|pair| i16::from_le_bytes([pair[0], pair[1]])),
+            );
+        }
+        Encoding::Opus => {
             return Err(Status::unimplemented(
-                "inject accepts g711 attachments only until the codec pipeline broadens",
+                "opus inject is not built; attach with g711 or L16",
             ))
         }
     }
@@ -363,13 +375,20 @@ mod tests {
     }
 
     #[test]
-    fn inject_decodes_both_g711_variants_and_refuses_the_rest() {
+    fn inject_decodes_g711_and_l16_and_refuses_opus() {
         let mut out = Vec::new();
         decode_inject(Encoding::Pcmu, &[0xFF, 0x7F], &mut out).unwrap();
         assert_eq!(out.len(), 2);
         decode_inject(Encoding::Pcma, &[0xD5], &mut out).unwrap();
         assert_eq!(out.len(), 3);
-        let refused = decode_inject(Encoding::L16, &[0, 0], &mut out).unwrap_err();
+
+        out.clear();
+        decode_inject(Encoding::L16, &[1, 0, 254, 255], &mut out).unwrap();
+        assert_eq!(out, vec![1, -2]);
+        let ragged = decode_inject(Encoding::L16, &[1, 0, 254], &mut out).unwrap_err();
+        assert_eq!(ragged.code(), tonic::Code::InvalidArgument);
+
+        let refused = decode_inject(Encoding::Opus, &[0, 0], &mut out).unwrap_err();
         assert_eq!(refused.code(), tonic::Code::Unimplemented);
     }
 }

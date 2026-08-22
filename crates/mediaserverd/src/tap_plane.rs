@@ -3,7 +3,7 @@ use crate::hub::{Hub, HubClient, Subscription, SubscriptionMetrics, TapEvent, Tr
 use crate::ng_transport::{NgTransport, NgTransportConfig};
 use crate::tap_spike::{capture, SharedLegStats, TapLeg};
 use control_api::{MediaPlane, MediaPlaneError, PlaybackSource, StreamFrame};
-use media_core::{AudioFormat, Track};
+use media_core::{AudioFormat, ConsumerEncoder, Track};
 use rtpengine_ng::{
     PlayMedia, PlaySource, PlayTarget, SubscribeRequest, SubscriptionAnswer, SubscriptionOffer,
 };
@@ -61,6 +61,7 @@ enum LiveAttachment {
     Grpc {
         session: SessionId,
         selection: TrackSelection,
+        format: AudioFormat,
         live: Option<GrpcLive>,
     },
 }
@@ -299,6 +300,13 @@ impl TapPlane {
                 "a ws-twilio attachment needs its endpoint url".to_string(),
             ));
         }
+        if view.format != AudioFormat::pcmu_8k_20ms() {
+            return Err(MediaPlaneError(
+                "the ws-twilio dialect is frozen at PCMU 8k 20ms; \
+                 attach over grpc-stream for other formats"
+                    .to_string(),
+            ));
+        }
 
         let (_, call_id, hub, external_id, _) = self.session_handles(view.session)?;
         let subscription = hub
@@ -364,11 +372,11 @@ impl TapPlane {
     }
 
     fn open_grpc_attachment(&self, view: AttachmentView) -> Result<(), MediaPlaneError> {
-        if view.format != self.config.format {
+        if !ConsumerEncoder::supports(self.config.format, view.format) {
             return Err(MediaPlaneError(format!(
-                "a grpc-stream attachment must use the tap format {:?}; \
-                 per-consumer re-encode is not built yet",
-                self.config.format
+                "this tap cannot serve {:?}: g711 and L16 at 20ms mono are served, \
+                 L16 at any rate; opus is not built yet",
+                view.format
             )));
         }
         self.session_handles(view.session)?;
@@ -381,6 +389,7 @@ impl TapPlane {
             LiveAttachment::Grpc {
                 session: view.session,
                 selection: selection_of(view.selector),
+                format: view.format,
                 live: None,
             },
         );
@@ -737,7 +746,7 @@ impl MediaPlane for TapPlane {
         session: SessionId,
         attachment: AttachmentId,
     ) -> Result<mpsc::Receiver<StreamFrame>, MediaPlaneError> {
-        let selection = {
+        let (selection, target_format) = {
             let held = self
                 .attachments
                 .lock()
@@ -746,6 +755,7 @@ impl MediaPlane for TapPlane {
                 Some(LiveAttachment::Grpc {
                     session: held_session,
                     selection,
+                    format,
                     live,
                 }) => {
                     if *held_session != session {
@@ -758,7 +768,7 @@ impl MediaPlane for TapPlane {
                             "{attachment} already has a connected consumer"
                         )));
                     }
-                    *selection
+                    (*selection, *format)
                 }
                 Some(LiveAttachment::Ws { .. }) => {
                     return Err(MediaPlaneError(format!(
@@ -781,7 +791,12 @@ impl MediaPlane for TapPlane {
             })?;
         let subscription_metrics = subscription.metrics();
         let (frames, receiver) = mpsc::channel(GRPC_FRAME_QUEUE);
-        let pump = tokio::spawn(pump_frames(subscription, frames.clone()));
+        let pump = tokio::spawn(pump_frames(
+            subscription,
+            frames.clone(),
+            self.config.format,
+            target_format,
+        ));
 
         let mut held = self
             .attachments
@@ -859,19 +874,45 @@ impl MediaPlane for TapPlane {
     }
 }
 
-async fn pump_frames(mut subscription: Subscription, frames: mpsc::Sender<StreamFrame>) {
+async fn pump_frames(
+    mut subscription: Subscription,
+    frames: mpsc::Sender<StreamFrame>,
+    source: AudioFormat,
+    target: AudioFormat,
+) {
+    let mut encoders: HashMap<Track, ConsumerEncoder> = HashMap::new();
     while let Some(event) = subscription.next().await {
         let frame = match event {
             TapEvent::Media {
                 track,
                 timestamp_ms,
                 len,
-                bytes,
-            } => StreamFrame::Media {
-                track: control_api::convert::track_name(track),
-                pts_ms: timestamp_ms,
-                payload: bytes[..len].to_vec(),
-            },
+                samples,
+            } => {
+                let encoder = match encoders.entry(track) {
+                    std::collections::hash_map::Entry::Occupied(held) => held.into_mut(),
+                    std::collections::hash_map::Entry::Vacant(slot) => {
+                        match ConsumerEncoder::new(source, target) {
+                            Ok(encoder) => slot.insert(encoder),
+                            Err(error) => {
+                                warn!(%error, "this stream cannot encode; closing it");
+                                return;
+                            }
+                        }
+                    }
+                };
+                match encoder.encode(&samples[..len]) {
+                    Ok(payload) => StreamFrame::Media {
+                        track: control_api::convert::track_name(track),
+                        pts_ms: timestamp_ms,
+                        payload: payload.to_vec(),
+                    },
+                    Err(error) => {
+                        warn!(%error, "a frame did not encode; closing the stream");
+                        return;
+                    }
+                }
+            }
             TapEvent::Dtmf { track, digit } => StreamFrame::Dtmf {
                 track: control_api::convert::track_name(track),
                 digit,
@@ -1055,12 +1096,80 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_grpc_attachment_must_use_the_tap_format_until_reencode_exists() {
+    async fn a_grpc_attachment_may_ask_for_l16_16k_but_not_opus() {
         let plane = plane();
-        let mut wrong = attachment(Transport::GrpcStream, "");
+
+        let mut l16 = attachment(Transport::GrpcStream, "");
+        l16.format = AudioFormat::l16_16k_20ms();
+        let error = plane.open_attachment(l16).await.unwrap_err();
+        assert!(error.to_string().contains("not tapped here"));
+
+        let mut opus = attachment(Transport::GrpcStream, "");
+        opus.format = AudioFormat {
+            encoding: media_core::Encoding::Opus,
+            sample_rate_hz: 48000,
+            channels: 1,
+            ptime_ms: 20,
+        };
+        let error = plane.open_attachment(opus).await.unwrap_err();
+        assert!(error.to_string().contains("opus is not built yet"));
+    }
+
+    #[tokio::test]
+    async fn the_ws_dialect_stays_frozen_at_pcmu() {
+        let plane = plane();
+        let mut wrong = attachment(Transport::WsTwilio, "ws-endpoint");
         wrong.format = AudioFormat::l16_16k_20ms();
         let error = plane.open_attachment(wrong).await.unwrap_err();
-        assert!(error.to_string().contains("re-encode"));
+        assert!(error.to_string().contains("frozen at PCMU"));
+    }
+
+    #[tokio::test]
+    async fn the_pump_encodes_each_track_into_the_consumers_format() {
+        let (mut hub, client) = crate::hub::Hub::new();
+        let subscription = client.attach(8, TrackSelection::All).unwrap();
+        hub.poll_commands();
+
+        let (frames, mut receiver) = mpsc::channel(8);
+        let pump = tokio::spawn(pump_frames(
+            subscription,
+            frames,
+            AudioFormat::pcmu_8k_20ms(),
+            AudioFormat::l16_16k_20ms(),
+        ));
+
+        hub.publish(crate::hub::TapEvent::media(
+            Track::Customer,
+            20,
+            &[100i16; 160],
+        ));
+        hub.publish(crate::hub::TapEvent::Dtmf {
+            track: Track::Agent,
+            digit: '4',
+        });
+        drop(hub);
+
+        match receiver.recv().await.unwrap() {
+            StreamFrame::Media {
+                track,
+                pts_ms,
+                payload,
+            } => {
+                assert_eq!(track, "customer");
+                assert_eq!(pts_ms, 20);
+                assert_eq!(payload.len(), 640);
+            }
+            other => panic!("expected an encoded media frame, got {other:?}"),
+        }
+        match receiver.recv().await.unwrap() {
+            StreamFrame::Dtmf { track, digit } => {
+                assert_eq!(track, "agent");
+                assert_eq!(digit, '4');
+            }
+            other => panic!("expected the dtmf frame, got {other:?}"),
+        }
+        assert!(receiver.recv().await.is_none());
+        pump.await.unwrap();
     }
 
     #[tokio::test]

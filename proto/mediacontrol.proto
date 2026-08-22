@@ -1,11 +1,11 @@
 // MSS control plane — the noun-oriented API from docs/architecture.md §5.1,
 // and the event schema from §5.4.
 //
-// This is deliberately NOT a mirror of cigol's telsvc.proto: those names
+// This is deliberately NOT a mirror of the legacy telsvc.proto: those names
 // (StreamPause, StreamSendText, StartCallTranscription) describe how
 // FreeSWITCH does it, and Phase 3/4 — inline legs, mixing, whisper — do not
-// fit that vocabulary. TelCompat (§5.6) speaks cigol's verbs onto these nouns
-// until cigol no longer needs them.
+// fit that vocabulary. TelCompat (§5.6) speaks the legacy controller's verbs
+// onto these nouns until that controller no longer needs them.
 //
 // Field numbers are provisional until first release, frozen after
 // (Constitution, Article VII).
@@ -51,9 +51,10 @@ enum SessionState {
 }
 
 message CreateSessionRequest {
-  // cigol keys everything by channel UUID because FreeSWITCH owns the
-  // channel; MSS keys by (call_id, from_tags, node) because rtpengine does.
-  // external_id is cigol's request_uuid and the Kafka partition key.
+  // The legacy controller keys everything by channel UUID because FreeSWITCH
+  // owns the channel; MSS keys by (call_id, from_tags, node) because
+  // rtpengine does. external_id is the caller's own correlation id (the
+  // legacy request_uuid) and the Kafka partition key.
   string external_id = 1;
   SessionKind kind = 2;
   string call_id = 3;
@@ -196,15 +197,15 @@ message WatchRequest {
 }
 
 // Published to Kafka topic "mss.events", keyed by external_id, sequence
-// numbered per session, OTel context injected. A small Go translator in
-// cigol renders these onto the legacy eventTopic in the positional
-// Events{repeated string} format appServer already parses.
+// numbered per session, OTel context injected. In a deployment with a legacy
+// event consumer, a small translator owned by that consumer renders these
+// onto its existing topic in whatever format it already parses (in the
+// reference deployment: a positional Events{repeated string} list).
 //
-// The translator lives in cigol, not MSS: the legacy format IS
-// constants.MapKeyIndex, a positional index table defined in Go. Encoding it
-// here would couple MSS to a Go constant file that changes without our
-// knowing, and the day someone inserts an index MSS silently corrupts every
-// event.
+// The translator lives with the legacy consumer, not in MSS: the legacy
+// format IS that consumer's constant table. Encoding it here would couple
+// MSS to a file that changes without our knowing, and the day someone
+// inserts an index MSS silently corrupts every event.
 //
 // Legacy names it renders (only when legacy_eligible is set):
 //   speech_started      -> mod_audio_fork::start_of_transcript

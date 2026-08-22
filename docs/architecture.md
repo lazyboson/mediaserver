@@ -1,8 +1,15 @@
 # Centralized Media Server — Architecture Proposal
 
-**Author:** Prepared for Ashutosh Pandey / 3CLogic Telephony
+**Author:** Ashutosh Pandey
 **Date:** 2026-08-13 (rev. 2 — language decision locked)
 **Status:** Accepted — implementation scaffolded in this repo
+**Reader's note:** this is the original internal design record, kept
+verbatim as the project's decision history. Component names like `cigol`,
+`mediagateway`, `telservice`, `vaiorchestrator` and `appServer` refer to
+the reference deployment this project grew out of — a contact-center
+platform whose FreeSWITCH-centric media path MSS replaces. The
+[README glossary](../README.md#provenance-and-glossary) maps each name to
+its generic role; nothing in the design depends on that specific platform.
 **Decision inputs:** Ingest = RTPEngine tap/forwarding · Build = new purpose-built service in **Rust** (single language, single codebase) · Scope = phased (fork/streaming → recording → playback/injection → full media plane)
 
 ---
