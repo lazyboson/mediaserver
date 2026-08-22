@@ -1055,6 +1055,14 @@ fan-out, which is where the next measurement should go.
   kept its own copy of `ci.yml`. After any dependabot merge that touches a
   workflow, `grep -n 'rust-toolchain@' .github/workflows/*.yml` is worth
   one second of checking.
+- **Dependabot no longer proposes `dtolnay/rust-toolchain` bumps**
+  (`.github/dependabot.yml` ignore rule, plus an `@dependabot ignore this
+  dependency` on PR #14). For that action the tag is the Rust version, so
+  the bump is a toolchain upgrade wearing an action-update costume — and
+  PR #14 proposed 1.100.0 while static.rust-lang.org still 404s it (the
+  action's tags run ahead of actual Rust releases), so every toolchain job
+  failed at setup. Toolchain bumps stay manual and move
+  `rust-toolchain.toml` and the workflow refs together.
 - **There is deliberately no `cargo audit` job.** `cargo deny check all`
   already reads the same RustSec advisory database, so the second tool
   added no coverage — but it did break repeatedly for a reason unrelated to
