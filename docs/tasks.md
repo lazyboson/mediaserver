@@ -14,7 +14,7 @@ Status as of **2026-08-22**.
 | **M2 — Phase-0 spike** | real NG subscribe against lab rtpengine, both legs jitter-buffered to WAV, per-tap cost | ✅ **code done**; 3 org-side items open (below) |
 | **M3 — fan-out hub** | per-session pub/sub, N consumers, WS-Twilio adapter, pause/resume/send_text parity | ✅ done |
 | **M4 — control plane** | `MediaControl` gRPC, session state machine, Kafka events, Redis registry, tenant-flag pilot | 🔶 **code complete** — pilot gates: translator merge (external), barge-in number (item 5), live pod-kill drill (item 11), gRPC lab proof (item 10) |
-| **M5 — recording (Phase 2)** | per-leg taps → stereo segmenter → S3, identity + callback contract, dual-recording | ⬜ next — item 15 below is the plan |
+| **M5 — recording (Phase 2)** | per-leg taps → stereo segmenter → S3, identity + callback contract, dual-recording | 🔶 **code complete (2026-08-22)** — verified against a real MinIO from a synthetic hub; owed: one live tapped call recorded end to end, and FS byte-parity sign-off (harness exists) |
 | M6+ | Phases 3–4 (interactive media, full media plane) | ⬜ not started |
 
 ### What landed, concretely
@@ -392,7 +392,79 @@ new tag's SSRC is not in the map and the leg is named by elimination. Fixing
 that means re-subscribing, not re-resolving; it is the natural follow-up if
 transfer-heavy tenants need it.
 
-### 15. Phase 2 — recording to S3 (milestone M5)
+### 15. Phase 2 — recording to S3 (milestone M5) — ✅ CODE DONE (2026-08-22)
+**What shipped**, in the four slices the plan named:
+1. **`FILE_S3` attachments** (`tap_plane.rs`). The endpoint *is* the frozen
+   identity `${accountID}/${recordingID}.${format}`; `RecordingIdentity::parse`
+   accepts that and refuses everything else by name (no separator, a nested
+   prefix, an empty account or id, `.`/`..`, no extension, whitespace, any
+   format but `wav`), and `object_key()` round-trips it byte for byte.
+   `RecordingStarted` is raised through `SessionRegistry::observe` — which had
+   no caller at all before this item; the seam is the new
+   `control_api::ObservationSink`, held by `TapPlane` as a `Weak`.
+2. **The segmenter** (`recorder.rs`, sans-IO). Three mono buffers placed by
+   `timestamp_ms`, interleaved at the end as Customer **left** / Agent
+   **right** (`write_wav`'s convention), with injected `Track::Mixed` audio
+   saturating-summed into the right channel so a voice-AI call's bot side is
+   not lost. **pause = segment + defer + accumulate**: pause cuts the segment
+   and drops (counts) frames while paused, resume re-anchors so the next
+   segment is written directly after the last, nothing is uploaded until stop,
+   and `duration_ms` is recorded audio rather than wall clock.
+   `UpdateAttachment{paused}` now reaches the media world at all — a new
+   `MediaPlane::update_attachment` (default `Ok(())`), with a refused update
+   rolled back in the registry.
+3. **Upload** via `object_store`'s `AmazonS3` in the control world, never on
+   the capture thread (WAV build and spill both on `spawn_blocking`), with
+   `Content-Type: audio/wav`, bounded retries and timeouts, then
+   `RecordingStopped{duration_ms}` before the upload and `UploadCompleted{uri}`
+   only when the object landed. A failed upload spills to
+   `MSS_RECORDING_SPILL_DIR` rather than vanishing. Ten new metrics series and
+   three alert rules.
+4. **Dual recording** stays the legacy controller's per-tenant flag: nothing here forbids
+   `record_session` running alongside, since MSS records from its own tap and
+   writes its own object.
+**A fifth thing the contract needed:** `RecordingPaused{recording_id, paused,
+duration_ms}` — a new `Observation`/`EventKind`/proto field 24. The frozen
+callback set includes `recordPause` and MSS had no way to express it. The
+resume edge reuses the variant with `paused: false`; that half is our
+extension, and it is documented in `proto/mediacontrol.proto`.
+**Also reordered, deliberately:** `DestroySession` now closes the media plane
+*before* the registry forgets the session. `observe` refuses an unknown
+session, so without that flip a recording ended by a hangup could never
+publish its stop/upload callbacks. Test asserts the order AttachmentUp,
+RecordingStopped, UploadCompleted, AttachmentDown, SessionEnded.
+**Verified live (real infrastructure, no SIP):** `MSS_TEST_S3_ENDPOINT`-gated
+`crates/mediaserverd/tests/minio_upload.rs` against a real MinIO container —
+1500 ms published with a 500 ms paused interval produced a 1000 ms, 32044-byte
+stereo WAV at `acct-drill/rec-<id>.wav`, `Content-Type: audio/wav`,
+`s3://bucket/<key>` on `UploadCompleted`, the pause marker absent from the
+audio, and the four callbacks in order — read back out of the bucket by the
+test and confirmed independently with `mc`. Identical input gave an identical
+ETag across runs. Procedure and output in [lab.md](lab.md).
+**Verified synthetic only (unit/replay):** everything else — the identity
+table, the interleave, zero-fill alignment, the pause duration math, the
+saturating bot mix, the mono selector, the length cap, the WAV container, the
+spill path, the `DestroySession` ordering and the pause rollback.
+**Not verified at all:** a real tapped SIP call recorded end to end (needs the
+whole microsip stack, which this session did not run), the callbacks observed
+on `mss.events` from a real broker during a recording, and FS byte-parity —
+`lab/recording_parity.py` exists and was exercised on the drill's own output
+and on perturbed copies, but **has never seen a FreeSWITCH recording**. That
+comparison is the remaining human step for the Phase-2 exit criterion.
+**One dependency decision to know about:** an S3 client needs TLS, and TLS in
+Rust needs a crypto provider. `object_store`'s `aws` feature pulls aws-lc-rs
+(cmake — absent from `rust:1.95-slim-bookworm`), so the features are
+`aws-base, reqwest, ring` plus `reqwest/rustls-no-provider` and `rustls/ring`,
+with the ring provider installed once at first use (without it, building a
+client panics at runtime). `cargo deny check all` passes with **one added
+allowance: CDLA-Permissive-2.0**, the licence of `webpki-root-certs` — a data
+licence on the Mozilla CA bundle, not code. Reasoning is in `deny.toml`.
+**Item 14's caveat still applies:** a mid-call SSRC change re-resolves, so a
+re-INVITE no longer stales a recording's speaker labels, but a **transfer that
+replaces a from-tag** needs a re-subscribe (out of scope here); a recording of
+one is only as right as elimination makes it.
+
+### 15b. (original description, for reference) Phase 2 — recording to S3
 **Where:** new `crates/mediaserverd/src/recorder.rs`; `tap_plane.rs` for
 the `FILE_S3` transport; `session-core` already has the event variants.
 **What:** the roadmap's Phase 2, most parts already exist. The recorder is
@@ -518,7 +590,10 @@ own it later.
 | ~~D1~~ | ~~A **mid-call SSRC change** (re-INVITE, transfer, codec renegotiation) does not re-resolve leg identity~~ — **fixed 2026-08-22 (item 14)**: the leg re-enters resolution on a confirmed SSRC change and a control-world task re-queries rtpengine and pushes a fresh map through a bounded queue. Replay-verified only, not yet on a live call. Residual: a transfer that replaces a *from-tag* still needs a re-subscribe, not a re-resolve | `tap_spike.rs`, `tap_plane.rs` | closed |
 | D2 | `stop_playback` stops **all** playback on the call: rtpengine's `stop media` targets a participant, not a playback id | `tap_plane.rs` | low until multiple concurrent playbacks exist |
 | D3 | `close_attachment` **aborts** the consumer task instead of closing the websocket politely (no `stop` frame) | `tap_plane.rs` | low, but consumers see a truncated stream |
-| D4 | `WS_TWILIO` and `GRPC_STREAM` attachments are served; `FILE_S3` (phase 2) and `RTP_INLINE` (phase 3) are refused by name | `tap_plane.rs` | expected — phase work |
+| ~~D4~~ | ~~`WS_TWILIO` and `GRPC_STREAM` attachments are served; `FILE_S3` (phase 2) and `RTP_INLINE` (phase 3) are refused by name~~ — **`FILE_S3` now served (2026-08-22, item 15)**: the recorder is a hub consumer with the frozen identity, pause-segmenting and `object_store` upload. `RTP_INLINE` is still refused by name and stays Phase 3 | `tap_plane.rs` | partly closed — inline is phase 3 |
+| D9 | A recording lives in the recording pod's memory until the call ends: a pod death loses the buffered audio even though the *session* is adopted elsewhere, and no upload is resumed. Also caps a recording at `MAX_RECORDING` (2 h) | `recorder.rs` | medium once a tenant records for real |
+| D11 | `StopRecording`/`Detach` **blocks until the upload finishes** (bounded 60 s/90 s), because `observe` needs a live session and a backgrounded upload would lose `UploadCompleted` on every hangup. A pilot may find the latency unacceptable; the fix is a session-independent event path | `tap_plane.rs`, `recorder.rs` | medium — watch it in the pilot |
+| D10 | Pause is honoured by the recorder only. A paused `WS_TWILIO`/`GRPC_STREAM` attachment keeps receiving media (registry state only) — now logged explicitly instead of being invisible, but `StreamPause` still does not stop feeding an ASR | `tap_plane.rs` | medium for cost, low for correctness |
 | ~~D5~~ | ~~Event delivery is **at-most-once**; a broker outage drops events~~ — **fixed 2026-08-22 (item 13)**: bounded retry backlog, order preserved, drop-oldest counted. Now **at-least-once**, so the translator must dedupe by `(external_id, seq)`; a backlog past its 8192 cap or a pod death still loses events | `event_pump.rs` | closed |
 | D6 | `play media` `from-tag` semantics are **unmeasured** — architecture §6's claim was retracted after the instrument turned out to be broken (see lab.md correction) | docs + lab | low, but §6 must not be trusted until re-probed |
 | ~~D7~~ | ~~Jitter buffer: fixed target depth, no adaptive sizing, no timestamp-aware gap handling, silence instead of real PLC~~ — **fixed 2026-08-22 (item 17)**: adaptive depth from the RFC 3550 estimate, timestamp-aware silence gaps, comfort noise accounted, G.711 Appendix I-shaped PLC, restart on SSRC change. Replay-verified across the impairment matrix; **not** yet verified against `tc netem` or judged perceptually | `jitter.rs`, `pipeline.rs`, `plc.rs` | closed |
@@ -544,14 +619,16 @@ These are not code and have blocked since Phase 0:
 
 ## Later phases
 
-**Phase 2 — Recording** is the closest and mostly assembled already —
-**item 15 above is its executable plan.** Per-leg taps with correct speaker
-attribution are done; what remains is the stereo segmenter → direct S3, the
-`${accountID}/${recordingID}.${format}` identity contract, and the
-`recordStart/recordStop/recordPause/uploadCompleted` callback semantics
-including pause = segment + defer + accumulate. D1 (item 14) is fixed for a
-mid-call SSRC change on the same from-tag; a transfer that replaces a tag
-still lands on elimination, so a recording of one is only as right as that.
+**Phase 2 — Recording** is **code complete (item 15, 2026-08-22)**: the
+stereo segmenter, the `${accountID}/${recordingID}.${format}` identity, the
+`recordStart/recordPause/recordStop/uploadCompleted` callbacks with pause =
+segment + defer + accumulate, and direct upload to S3/MinIO all landed and are
+verified against real object storage from a synthetic hub. What the phase
+still owes: a live tapped call recorded end to end, the FS byte-parity
+comparison (harness in `lab/recording_parity.py`), and the tenant decision to
+turn `record_session` off. D1 (item 14) is fixed for a mid-call SSRC change on
+the same from-tag; a transfer that replaces a tag still lands on elimination,
+so a recording of one is only as right as that.
 
 **Phase 3 — Interactive media** needs the inline RTP leg (`SessionKind::INLINE`
 is already accepted by the API), streaming TTS playback, and barge-in

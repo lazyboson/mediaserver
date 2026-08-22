@@ -7,7 +7,8 @@ use crate::proto;
 use crate::proto::media_control_server::{MediaControl, MediaControlServer};
 use session_core::{
     AttachSpec, AttachmentId, AttachmentUpdate, AttachmentView, ControlError, CreateSession,
-    EventKind, MediaEvent, PlaybackId, PlaybackSpec, SessionId, SessionRegistry, SessionView,
+    EventKind, MediaEvent, Observation, PlaybackId, PlaybackSpec, SessionId, SessionRegistry,
+    SessionView,
 };
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -19,6 +20,10 @@ pub const WATCH_CAPACITY: usize = 256;
 
 pub trait EventSink: Send + Sync + 'static {
     fn accept(&self, event: MediaEvent);
+}
+
+pub trait ObservationSink: Send + Sync + 'static {
+    fn observe(&self, session: SessionId, observation: Observation);
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -55,6 +60,11 @@ pub trait MediaPlane: Send + Sync + 'static {
     async fn close_session(&self, session: SessionId) -> Result<(), MediaPlaneError>;
 
     async fn open_attachment(&self, attachment: AttachmentView) -> Result<(), MediaPlaneError>;
+
+    async fn update_attachment(&self, attachment: AttachmentView) -> Result<(), MediaPlaneError> {
+        let _ = attachment;
+        Ok(())
+    }
 
     async fn close_attachment(
         &self,
@@ -179,6 +189,14 @@ impl SessionController {
         self.lock().authorize_inject(attachment).map_err(status_of)
     }
 
+    pub fn record_observation(
+        &self,
+        session: SessionId,
+        observation: Observation,
+    ) -> Result<(), Status> {
+        self.commit(|registry| registry.observe(session, observation))
+    }
+
     pub fn counts(&self) -> (usize, usize) {
         let registry = self.lock();
         (registry.session_count(), registry.attachment_count())
@@ -269,6 +287,18 @@ impl SessionController {
             owner_pod: self.owner.clone(),
             attachments,
         })
+    }
+}
+
+impl ObservationSink for SessionController {
+    fn observe(&self, session: SessionId, observation: Observation) {
+        if let Err(status) = self.record_observation(session, observation) {
+            tracing::warn!(
+                %session,
+                %status,
+                "an observation had nowhere to land; the session is already gone"
+            );
+        }
     }
 }
 
@@ -411,12 +441,13 @@ impl MediaControl for SessionController {
         request: Request<proto::SessionRef>,
     ) -> Result<Response<proto::Ack>, Status> {
         let session = self.resolve(Some(request.into_inner()))?;
-        self.commit(|registry| registry.destroy_session(session, "destroy requested"))?;
+        self.session(session)?;
         if let Some(media) = self.media.clone() {
             if let Err(error) = media.close_session(session).await {
                 tracing::warn!(%session, %error, "the media plane could not close this session");
             }
         }
+        self.commit(|registry| registry.destroy_session(session, "destroy requested"))?;
         Ok(Response::new(proto::Ack {}))
     }
 
@@ -497,6 +528,7 @@ impl MediaControl for SessionController {
             Some(wire) => Some(format(Some(wire))?),
             None => None,
         };
+        let before = self.lock().attachment_view(attachment).map_err(status_of)?;
         let view = self.commit(|registry| {
             registry.update_attachment(
                 attachment,
@@ -507,6 +539,21 @@ impl MediaControl for SessionController {
                 },
             )
         })?;
+        if let Some(media) = self.media.clone() {
+            if let Err(error) = media.update_attachment(view.clone()).await {
+                let _ = self.commit(|registry| {
+                    registry.update_attachment(
+                        attachment,
+                        AttachmentUpdate {
+                            paused: Some(before.paused),
+                            selector: Some(before.selector),
+                            format: Some(before.format),
+                        },
+                    )
+                });
+                return Err(Status::unavailable(error.to_string()));
+            }
+        }
         Ok(Response::new(attachment_message(view)))
     }
 
