@@ -245,7 +245,6 @@ impl Subscription {
         }
     }
 
-    #[cfg(test)]
     pub fn try_next(&mut self) -> Option<TapEvent> {
         self.shared.frames.pop()
     }

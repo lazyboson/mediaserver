@@ -6,6 +6,7 @@ mod hub;
 mod media_rt;
 mod metrics;
 mod ng_transport;
+mod recorder;
 mod registry_keeper;
 mod session_store;
 mod supervisor;
@@ -13,7 +14,7 @@ mod tap_plane;
 mod tap_session;
 mod tap_spike;
 
-use control_api::{AuthPolicy, SessionController};
+use control_api::{AuthPolicy, ObservationSink, SessionController};
 use media_core::AudioFormat;
 use ng_transport::{NgTransport, NgTransportConfig};
 use std::net::{IpAddr, SocketAddr};
@@ -32,6 +33,7 @@ const POD_NAME_ENV: &str = "MSS_POD_NAME";
 const LOCAL_MEDIA_IP_ENV: &str = "MSS_TAP_LOCAL_IP";
 const METRICS_LISTEN_ENV: &str = "MSS_METRICS_LISTEN";
 const AUTH_TOKEN_ENV: &str = "MSS_AUTH_TOKEN";
+const RECORDING_BUCKET_ENV: &str = "MSS_RECORDING_BUCKET";
 const DEFAULT_POD_NAME: &str = "mediaserverd";
 const EVENT_FLUSH_WINDOW: std::time::Duration = std::time::Duration::from_secs(10);
 
@@ -201,6 +203,19 @@ fn local_media_address() -> IpAddr {
 }
 
 async fn serve_control_plane(listen: SocketAddr) {
+    let recording = match recorder::RecordingSupport::from_env() {
+        Ok(recording) => recording,
+        Err(error) => {
+            error!(%error, "the configured recording storage is unusable; refusing to start");
+            return;
+        }
+    };
+    if recording.sink.is_none() {
+        info!(
+            env = RECORDING_BUCKET_ENV,
+            "no recording storage configured; file-s3 attachments will be refused"
+        );
+    }
     let plane = Arc::new(TapPlane::new(TapPlaneConfig {
         default_node: std::env::var(RTPENGINE_NODE_ENV)
             .ok()
@@ -209,9 +224,11 @@ async fn serve_control_plane(listen: SocketAddr) {
         format: AudioFormat::pcmu_8k_20ms(),
         cookie_prefix: cookie_prefix(),
         sdp_session_id: cookie_prefix(),
+        recording,
     }));
     let owner = std::env::var(POD_NAME_ENV).unwrap_or_else(|_| DEFAULT_POD_NAME.to_string());
     let draining = Arc::clone(&plane);
+    let observing = Arc::clone(&plane);
     let tap_metrics = plane.metrics();
     let mut controller = SessionController::new(owner.clone()).with_media_plane(plane);
 
@@ -243,6 +260,7 @@ async fn serve_control_plane(listen: SocketAddr) {
     info!(%listen, owner = %owner, "MediaControl is serving");
 
     let controller = Arc::new(controller);
+    observing.observe_through(Arc::downgrade(&controller) as std::sync::Weak<dyn ObservationSink>);
     let mut keeper_counters = None;
     match session_store_from_env().await {
         Ok(Some(store)) => {

@@ -121,8 +121,12 @@ pipeline triggers on `v*` tags.
 Read [docs/tasks.md](docs/tasks.md) — it holds the milestone state and the
 ordered next-up list with a definition of done for each item.
 
-Short version as of 2026-08-20: M1–M3 are done and **M4 (control plane) is
-code complete (~95%)** — `MediaControl`, `TelCompat` and the gRPC
+Short version as of 2026-08-22: M1–M3 are done, **M4 (control plane) is code
+complete (~95%)** and **M5 (recording to S3) is code complete** — the recorder
+is a hub consumer that segments on pause, keeps the frozen
+`${accountID}/${recordingID}.${format}` identity, and uploads through
+`object_store` (verified against a real MinIO; a live tapped call and FS
+byte-parity are still owed). On M4: `MediaControl`, `TelCompat` and the gRPC
 `MediaStream` data plane are served on one port (bearer auth via
 `MSS_AUTH_TOKEN`), taps and consumers are driven by the API, events publish
 to Kafka `mss.events`, the Redis registry re-subscribes on pod loss, leg

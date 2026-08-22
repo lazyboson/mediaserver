@@ -148,9 +148,27 @@ Work:
 - Compliance option: per-tenant dual-recording (FS + MSS) during
   transition; keep `record_session` as fallback until sign-off.
 
+Status (2026-08-22, tasks item 15): **code complete.** The recorder is a hub
+consumer in the control world — stereo segmenter (customer left, agent right),
+the frozen `${accountID}/${recordingID}.${format}` identity parsed from the
+`FILE_S3` attachment endpoint, `recordStart/recordPause/recordStop/
+uploadCompleted` on `mss.events` with pause = segment + defer + accumulated
+duration, and direct upload through `object_store` to S3 or MinIO. Verified
+against a real MinIO from a synthetic hub, not yet from a live tapped call.
+Hold/pause arrives as `UpdateAttachment{paused}` (which now reaches the media
+world at all) rather than from Redis; cigol drives it through
+`TelCompat`. Dual recording remains a cigol per-tenant flag and nothing here
+prevents it.
+
 Exit criteria: byte-comparable recordings vs FS output across codec/hold/
 transfer scenarios; downstream consumers (playback UI, QA tooling) work
 unmodified; dual-recording disabled for all tenants.
+
+Exit criteria still open: the byte comparison itself — `lab/recording_parity.py`
+is the harness and has never seen a FreeSWITCH recording — plus one live
+tapped call recorded end to end, and the transfer scenario, which still lands
+on speaker naming by elimination until a tag-replacing transfer triggers a
+re-subscribe.
 
 ## Phase 3 — Interactive media
 
