@@ -34,6 +34,11 @@ pub enum Observation {
         recording_id: String,
         path: String,
     },
+    RecordingPaused {
+        recording_id: String,
+        paused: bool,
+        duration_ms: u64,
+    },
     RecordingStopped {
         recording_id: String,
         duration_ms: u64,
@@ -73,6 +78,11 @@ pub enum EventKind {
     RecordingStarted {
         recording_id: String,
         path: String,
+    },
+    RecordingPaused {
+        recording_id: String,
+        paused: bool,
+        duration_ms: u64,
     },
     RecordingStopped {
         recording_id: String,
@@ -173,6 +183,32 @@ mod tests {
             .legacy_name(),
             None
         );
+    }
+
+    #[test]
+    fn the_recording_callbacks_are_their_own_vocabulary_not_mod_audio_fork_names() {
+        let recording_id = "rec-1".to_string();
+        for kind in [
+            EventKind::RecordingStarted {
+                recording_id: recording_id.clone(),
+                path: "acct-1/rec-1.wav".to_string(),
+            },
+            EventKind::RecordingPaused {
+                recording_id: recording_id.clone(),
+                paused: true,
+                duration_ms: 4_000,
+            },
+            EventKind::RecordingStopped {
+                recording_id: recording_id.clone(),
+                duration_ms: 8_000,
+            },
+            EventKind::UploadCompleted {
+                recording_id: recording_id.clone(),
+                uri: "s3:".to_string(),
+            },
+        ] {
+            assert_eq!(kind.legacy_name(), None, "{kind:?} claimed a legacy name");
+        }
     }
 
     #[test]

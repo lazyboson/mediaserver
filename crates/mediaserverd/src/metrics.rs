@@ -141,6 +141,51 @@ pub fn render(sources: &MetricsSources) -> String {
         "Frames queued to consumers",
         snapshot.consumer_delivered,
     );
+    counter(
+        "mss_recordings_started_total",
+        "Recordings opened on this pod",
+        snapshot.recordings_started,
+    );
+    counter(
+        "mss_recordings_stopped_total",
+        "Recordings closed, whether or not the upload then succeeded",
+        snapshot.recordings_stopped,
+    );
+    counter(
+        "mss_recording_pauses_total",
+        "Recording pauses that cut a segment",
+        snapshot.recording_pauses,
+    );
+    counter(
+        "mss_recording_uploads_total",
+        "Recordings that reached object storage",
+        snapshot.recording_uploads,
+    );
+    counter(
+        "mss_recording_upload_failures_total",
+        "Recordings that did not reach object storage",
+        snapshot.recording_upload_failures,
+    );
+    counter(
+        "mss_recording_spills_total",
+        "Recordings written to local disk because their upload failed",
+        snapshot.recording_spills,
+    );
+    counter(
+        "mss_recordings_truncated_total",
+        "Recordings that hit the length cap and lost their tail",
+        snapshot.recordings_truncated,
+    );
+    counter(
+        "mss_recording_bytes_uploaded_total",
+        "Bytes of recorded audio uploaded",
+        snapshot.recording_bytes_uploaded,
+    );
+    counter(
+        "mss_recording_seconds_total",
+        "Seconds of audio recorded, pauses excluded",
+        snapshot.recording_seconds,
+    );
 
     let mut gauge = |name: &str, help: &str, value: u64| {
         let _ = writeln!(out, "# HELP {name} {help}");
@@ -182,6 +227,11 @@ pub fn render(sources: &MetricsSources) -> String {
         "mss_consumer_queue_depth_frames_max",
         "Deepest single consumer queue",
         snapshot.consumer_queue_depth_max,
+    );
+    gauge(
+        "mss_recordings_live",
+        "Recordings currently accumulating audio",
+        snapshot.recordings_live,
     );
     if let Some(pump) = &sources.pump {
         gauge(
@@ -368,6 +418,7 @@ mod tests {
             format: AudioFormat::pcmu_8k_20ms(),
             cookie_prefix: 1,
             sdp_session_id: 1,
+            recording: crate::recorder::RecordingSupport::default(),
         });
         MetricsSources {
             tap: plane.metrics(),
@@ -400,10 +451,29 @@ mod tests {
             "mss_legs_stalled",
             "mss_ingest_stalls_total",
             "mss_jitter_lost_total",
+            "mss_recording_upload_failures_total",
+            "mss_recordings_truncated_total",
+            "mss_recording_spills_total",
         ] {
             assert!(text.contains(name), "missing {name} in:\n{text}");
         }
         assert!(text.contains("mss_build_info{version="));
+    }
+
+    #[test]
+    fn the_exposition_tells_the_whole_recording_story() {
+        let text = render(&sources());
+        for name in [
+            "mss_recordings_started_total",
+            "mss_recordings_stopped_total",
+            "mss_recording_pauses_total",
+            "mss_recording_uploads_total",
+            "mss_recording_bytes_uploaded_total",
+            "mss_recording_seconds_total",
+            "mss_recordings_live",
+        ] {
+            assert!(text.contains(name), "missing {name} in:\n{text}");
+        }
     }
 
     #[test]
