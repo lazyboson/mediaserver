@@ -166,6 +166,7 @@ async fn session_with_grpc_attachment(
         authoritative: false,
         label: "grpc-consumer".to_string(),
         endpoint: String::new(),
+        group: String::new(),
         metadata: [("streamSid".to_string(), "MZ-stream".to_string())]
             .into_iter()
             .collect(),

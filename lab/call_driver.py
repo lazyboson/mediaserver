@@ -22,6 +22,7 @@ FROM_TAG = os.environ.get("FROM_TAG", "tagA")
 TO_TAG = os.environ.get("TO_TAG", "tagB")
 PUMP_SECONDS = float(os.environ.get("PUMP_SECONDS", "60"))
 READY_FILE = os.environ.get("READY_FILE", "/tmp/call-ready")
+COOKIE_PREFIX = os.environ.get("COOKIE_PREFIX", "lab")
 
 CALLER_RTP_PORT = 40000
 CALLEE_RTP_PORT = 40002
@@ -88,7 +89,7 @@ class Ng:
 
     def send(self, command):
         self.serial += 1
-        cookie = f"lab-{self.serial}".encode()
+        cookie = f"{COOKIE_PREFIX}-{self.serial}".encode()
         datagram = cookie + b" " + bencode(command)
         for attempt in range(1, 11):
             self.sock.sendto(datagram, (NODE, PORT))

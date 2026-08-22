@@ -26,6 +26,8 @@ pub struct PersistedAttachment {
     pub selector: Option<String>,
     pub authoritative: bool,
     pub paused: bool,
+    #[serde(default)]
+    pub group: String,
     pub metadata: BTreeMap<String, String>,
 }
 
@@ -316,9 +318,23 @@ mod tests {
                 selector: None,
                 authoritative: true,
                 paused: false,
+                group: String::new(),
                 metadata: BTreeMap::new(),
             }],
         }
+    }
+
+    #[test]
+    fn a_record_written_before_groups_existed_still_decodes() {
+        let stored = concat!(
+            r#"{"external_id":"req-1","kind":1,"call_id":"call-abc","#,
+            r#""from_tags":["from-a"],"rtpengine_node":"10.0.0.5:22222","#,
+            r#""owner":"pod-a","attachments":[{"label":"rec","transport":3,"#,
+            r#""endpoint":"acct/rec.wav","capabilities":[1],"selector":null,"#,
+            r#""authoritative":false,"paused":false,"metadata":{}}]}"#
+        );
+        let decoded: PersistedSession = serde_json::from_str(stored).unwrap();
+        assert_eq!(decoded.attachments[0].group, "");
     }
 
     #[tokio::test]

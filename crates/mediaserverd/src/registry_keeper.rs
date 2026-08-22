@@ -22,6 +22,7 @@ pub struct KeeperCounters {
     pub unrebuildable: AtomicU64,
     pub released: AtomicU64,
     pub failed: AtomicU64,
+    pub grouped_not_adopted: AtomicU64,
 }
 
 pub struct RegistryKeeper {
@@ -194,6 +195,20 @@ impl RegistryKeeper {
             .await?;
 
         for attachment in &session.attachments {
+            if !attachment.group.is_empty() {
+                self.counters
+                    .grouped_not_adopted
+                    .fetch_add(1, Ordering::Relaxed);
+                warn!(
+                    external_id = %session.external_id,
+                    label = %attachment.label,
+                    group = %attachment.group,
+                    "a recording group lives in one pod's memory, so this member is not \
+                     restored on the adopting pod; the group's other members keep recording \
+                     where they are and this participant's file ends at the pod that died"
+                );
+                continue;
+            }
             let restored = self
                 .controller
                 .attach(Request::new(proto::AttachRequest {
@@ -214,6 +229,7 @@ impl RegistryKeeper {
                     authoritative: attachment.authoritative,
                     label: attachment.label.clone(),
                     endpoint: attachment.endpoint.clone(),
+                    group: attachment.group.clone(),
                     metadata: attachment.metadata.clone().into_iter().collect(),
                     idempotency_key: format!("adopt-{}-{}", session.external_id, attachment.label),
                 }))
@@ -260,6 +276,7 @@ impl RegistryKeeper {
                     },
                     authoritative: attachment.authoritative,
                     paused: attachment.paused,
+                    group: attachment.group.clone(),
                     metadata: attachment.metadata.clone(),
                 })
                 .collect(),
@@ -366,6 +383,35 @@ mod tests {
                 authoritative: true,
                 label: "rtt".to_string(),
                 endpoint: "wss-rtt-endpoint".to_string(),
+                group: String::new(),
+                metadata: Default::default(),
+                idempotency_key: String::new(),
+            }))
+            .await
+            .unwrap();
+    }
+
+    async fn attach_group_member(
+        controller: &SessionController,
+        external_id: &str,
+        label: &str,
+        group: &str,
+    ) {
+        controller
+            .attach(Request::new(proto::AttachRequest {
+                session: Some(proto::SessionRef {
+                    id: Some(proto::session_ref::Id::ExternalId(external_id.to_string())),
+                }),
+                transport: proto::Transport::FileS3 as i32,
+                capabilities: vec![proto::Capability::Sink as i32],
+                selector: Some(proto::TrackSelector {
+                    select: Some(proto::track_selector::Select::Only("customer".to_string())),
+                }),
+                format: None,
+                authoritative: false,
+                label: label.to_string(),
+                endpoint: "acct-1/rec-1.wav".to_string(),
+                group: group.to_string(),
                 metadata: Default::default(),
                 idempotency_key: String::new(),
             }))
@@ -429,6 +475,39 @@ mod tests {
             "the consumer must be reconnected to the same endpoint"
         );
         assert_eq!(store.lease_holder("req-1").as_deref(), Some("pod-b"));
+    }
+
+    #[tokio::test]
+    async fn a_grouped_recording_is_persisted_but_refused_on_the_adopting_pod() {
+        let store = Arc::new(MemorySessionStore::default());
+        let (first_pod, _) = pod("pod-a");
+        tap_with_consumer(&first_pod, "req-1").await;
+        attach_group_member(&first_pod, "req-1", "alice", "conf-9").await;
+        RegistryKeeper::new(first_pod, store.clone(), "pod-a")
+            .tick()
+            .await;
+
+        let stored = store.stored();
+        assert_eq!(stored[0].attachments[1].group, "conf-9");
+
+        store.expire_lease("req-1");
+        let (second_pod, second_plane) = pod("pod-b");
+        let keeper = RegistryKeeper::new(second_pod.clone(), store.clone(), "pod-b");
+        keeper.tick().await;
+
+        assert_eq!(keeper.counters().adopted.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            keeper
+                .counters()
+                .grouped_not_adopted
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            second_plane.attached.lock().unwrap().as_slice(),
+            ["rtt@wss-rtt-endpoint".to_string()],
+            "a recording group is per pod, so its member must not be rebuilt elsewhere"
+        );
     }
 
     #[tokio::test]
