@@ -103,6 +103,8 @@ pub fn disturb(datagrams: Vec<Vec<u8>>, script: &[Disturbance]) -> Vec<Vec<u8>> 
     wire
 }
 
+pub const COMFORT_NOISE_PAYLOAD_TYPE: u8 = 13;
+
 pub struct G711StreamGenerator {
     payload_type: u8,
     ssrc: u32,
@@ -110,6 +112,7 @@ pub struct G711StreamGenerator {
     timestamp: u32,
     samples_per_packet: u32,
     next_payload_byte: u8,
+    mark_next: bool,
 }
 
 impl G711StreamGenerator {
@@ -129,11 +132,16 @@ impl G711StreamGenerator {
             timestamp: 0,
             samples_per_packet,
             next_payload_byte: 0,
+            mark_next: false,
         })
     }
 
     pub fn sequence(&self) -> u16 {
         self.sequence
+    }
+
+    pub fn timestamp(&self) -> u32 {
+        self.timestamp
     }
 
     pub fn next_datagram(&mut self) -> Vec<u8> {
@@ -143,6 +151,7 @@ impl G711StreamGenerator {
             self.next_payload_byte = self.next_payload_byte.wrapping_add(1);
         }
         let datagram = self.serialize(self.payload_type, &payload);
+        self.mark_next = false;
         self.timestamp = self.timestamp.wrapping_add(self.samples_per_packet);
         self.sequence = self.sequence.wrapping_add(1);
         datagram
@@ -152,6 +161,20 @@ impl G711StreamGenerator {
         let datagram = self.serialize(payload_type, &payload);
         self.sequence = self.sequence.wrapping_add(1);
         datagram
+    }
+
+    pub fn next_comfort_noise_datagram(&mut self, level: u8) -> Vec<u8> {
+        let datagram = self.serialize(COMFORT_NOISE_PAYLOAD_TYPE, &[level]);
+        self.timestamp = self.timestamp.wrapping_add(self.samples_per_packet);
+        self.sequence = self.sequence.wrapping_add(1);
+        datagram
+    }
+
+    pub fn suppress_silence(&mut self, packets: u32) {
+        let samples = self.samples_per_packet.wrapping_mul(packets);
+        self.timestamp = self.timestamp.wrapping_add(samples);
+        self.next_payload_byte = self.next_payload_byte.wrapping_add(samples as u8);
+        self.mark_next = true;
     }
 
     pub fn skip_one(&mut self) {
@@ -164,7 +187,7 @@ impl G711StreamGenerator {
 
     fn serialize(&self, payload_type: u8, payload: &[u8]) -> Vec<u8> {
         let packet = RtpPacket {
-            marker: false,
+            marker: self.mark_next,
             payload_type,
             sequence: self.sequence,
             timestamp: self.timestamp,

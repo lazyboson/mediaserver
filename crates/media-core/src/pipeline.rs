@@ -1,9 +1,17 @@
 use crate::dtmf::DtmfDetector;
 use crate::frame::{AudioFormat, Encoding};
 use crate::g711;
-use crate::jitter::{self, JitterBuffer, PopOutcome, PushOutcome, MAX_PAYLOAD};
+use crate::jitter::{
+    self, JitterBuffer, JitterConfig, PopOutcome, PushOutcome, Timing, MAX_PAYLOAD,
+};
+use crate::plc::PacketLossConcealer;
 use crate::rtp::RtpPacket;
 use thiserror::Error;
+
+pub const COMFORT_NOISE_PAYLOAD_TYPE: u8 = 13;
+
+const MAX_DEPTH_MULTIPLIER: u16 = 4;
+const MICROS_PER_SECOND: u64 = 1_000_000;
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum PipelineError {
@@ -24,6 +32,7 @@ pub enum IngestOutcome {
     Resynchronized,
     Dtmf(char),
     TelephoneEvent,
+    ComfortNoise,
     UnknownPayloadType(u8),
     Unparsable,
 }
@@ -42,6 +51,7 @@ pub struct PipelineStats {
     pub unknown_payload_type: u64,
     pub companded: u64,
     pub telephone_events: u64,
+    pub comfort_noise: u64,
     pub dtmf_digits: u64,
     pub frames_played: u64,
     pub frames_concealed: u64,
@@ -62,8 +72,10 @@ pub struct StreamPipeline {
     telephone_event_payload_type: Option<u8>,
     ulaw: bool,
     samples_per_packet: usize,
+    sample_rate_hz: u32,
     jitter: JitterBuffer,
     dtmf: DtmfDetector,
+    plc: PacketLossConcealer,
     pcm: [i16; MAX_PAYLOAD],
     stats: PipelineStats,
     last_audio_ssrc: Option<u32>,
@@ -94,14 +106,21 @@ impl StreamPipeline {
                 max: MAX_PAYLOAD,
             });
         }
+        let floor_depth = target_depth_packets.max(1);
         Ok(StreamPipeline {
             audio_payload_type,
             companding_payload_type: companion_payload_type(format.encoding),
             telephone_event_payload_type,
             ulaw,
             samples_per_packet,
-            jitter: JitterBuffer::new(target_depth_packets),
+            sample_rate_hz: format.sample_rate_hz,
+            jitter: JitterBuffer::with_config(JitterConfig {
+                target_depth_packets: floor_depth,
+                max_depth_packets: floor_depth.saturating_mul(MAX_DEPTH_MULTIPLIER),
+                timestamp_increment: samples_per_packet as u32,
+            }),
             dtmf: DtmfDetector::new(),
+            plc: PacketLossConcealer::new(format.sample_rate_hz),
             pcm: [0; MAX_PAYLOAD],
             stats: PipelineStats::default(),
             last_audio_ssrc: None,
@@ -120,7 +139,25 @@ impl StreamPipeline {
         self.samples_per_packet
     }
 
+    pub fn target_depth_packets(&self) -> u16 {
+        self.jitter.target_depth()
+    }
+
     pub fn ingest(&mut self, datagram: &[u8]) -> IngestOutcome {
+        self.admit(datagram, None)
+    }
+
+    pub fn ingest_at(&mut self, datagram: &[u8], arrival_micros: u64) -> IngestOutcome {
+        self.admit(datagram, Some(arrival_micros))
+    }
+
+    fn arrival_ticks(&self, arrival_micros: u64) -> u32 {
+        (arrival_micros
+            .saturating_mul(self.sample_rate_hz as u64)
+            .wrapping_div(MICROS_PER_SECOND)) as u32
+    }
+
+    fn admit(&mut self, datagram: &[u8], arrival_micros: Option<u64>) -> IngestOutcome {
         let Ok(packet) = RtpPacket::parse(datagram) else {
             self.stats.unparsable += 1;
             return IngestOutcome::Unparsable;
@@ -135,6 +172,11 @@ impl StreamPipeline {
                 }
                 None => IngestOutcome::TelephoneEvent,
             };
+        }
+        if packet.payload_type == COMFORT_NOISE_PAYLOAD_TYPE {
+            self.stats.comfort_noise += 1;
+            self.jitter.account(packet.sequence);
+            return IngestOutcome::ComfortNoise;
         }
         let mut companded = [0u8; MAX_PAYLOAD];
         let payload = if packet.payload_type == self.audio_payload_type {
@@ -155,9 +197,37 @@ impl StreamPipeline {
             self.stats.unknown_payload_type += 1;
             return IngestOutcome::UnknownPayloadType(packet.payload_type);
         };
+        let sender_changed = self
+            .last_audio_ssrc
+            .is_some_and(|previous| previous != packet.ssrc);
         self.last_audio_ssrc = Some(packet.ssrc);
-        match self.jitter.push(packet.sequence, payload) {
-            PushOutcome::Buffered => IngestOutcome::Buffered,
+        if sender_changed {
+            self.jitter.restart();
+            self.plc.forget();
+        }
+        let timing = Timing {
+            timestamp: packet.timestamp,
+            arrival_ticks: match arrival_micros {
+                Some(micros) => self.arrival_ticks(micros),
+                None => packet.timestamp,
+            },
+            marker: packet.marker,
+        };
+        let outcome = self.jitter.push_timed(packet.sequence, payload, timing);
+        if matches!(
+            outcome,
+            PushOutcome::BufferedAfterSenderSilence | PushOutcome::Reset
+        ) {
+            self.plc.forget();
+        }
+        match outcome {
+            PushOutcome::Buffered | PushOutcome::BufferedAfterSenderSilence => {
+                if sender_changed {
+                    IngestOutcome::Resynchronized
+                } else {
+                    IngestOutcome::Buffered
+                }
+            }
             PushOutcome::Duplicate => IngestOutcome::Duplicate,
             PushOutcome::TooLate => IngestOutcome::TooLate,
             PushOutcome::TooBig => IngestOutcome::Oversized,
@@ -173,6 +243,7 @@ impl StreamPipeline {
         let Self {
             jitter,
             pcm,
+            plc,
             ulaw,
             samples_per_packet,
             stats,
@@ -181,18 +252,21 @@ impl StreamPipeline {
         match jitter.pop() {
             PopOutcome::Packet(payload) => {
                 let decoded = g711::decode_into(*ulaw, payload, pcm);
+                plc.recover_into(&mut pcm[..decoded]);
+                plc.remember(&pcm[..decoded]);
                 stats.frames_played += 1;
                 Playout::Pcm(&pcm[..decoded])
             }
             PopOutcome::Accounted => {
                 let suppressed = *samples_per_packet;
                 pcm[..suppressed].fill(0);
+                plc.forget();
                 stats.frames_suppressed += 1;
                 Playout::Suppressed(&pcm[..suppressed])
             }
             PopOutcome::Lost => {
                 let concealed = *samples_per_packet;
-                pcm[..concealed].fill(0);
+                plc.conceal(&mut pcm[..concealed]);
                 stats.frames_concealed += 1;
                 Playout::Concealed(&pcm[..concealed])
             }
@@ -375,13 +449,16 @@ mod tests {
     }
 
     #[test]
-    fn conceals_a_dropped_packet_with_silence_and_counts_it() {
+    fn conceals_a_dropped_packet_with_plc_audio_and_counts_it() {
         let mut pipeline = pipeline();
         let mut generator = generator();
-        let clean: Vec<Vec<u8>> = (0..3).map(|_| generator.next_datagram()).collect();
+        let clean: Vec<Vec<u8>> = (0..6).map(|_| generator.next_datagram()).collect();
         let wire = disturb(
             clean,
             &[
+                Disturbance::Deliver,
+                Disturbance::Deliver,
+                Disturbance::Deliver,
                 Disturbance::Deliver,
                 Disturbance::Drop,
                 Disturbance::Deliver,
@@ -391,11 +468,16 @@ mod tests {
             pipeline.ingest(datagram);
         }
 
-        assert!(matches!(pipeline.release(), Playout::Pcm(_)));
+        for _ in 0..4 {
+            assert!(matches!(pipeline.release(), Playout::Pcm(_)));
+        }
         match pipeline.release() {
             Playout::Concealed(pcm) => {
                 assert_eq!(pcm.len(), pipeline_samples());
-                assert!(pcm.iter().all(|&s| s == 0));
+                assert!(
+                    pcm.iter().any(|&s| s != 0),
+                    "concealment must repeat audio, not write silence"
+                );
             }
             other => panic!("expected concealment, got {other:?}"),
         }
@@ -484,6 +566,388 @@ mod tests {
         assert_eq!(pipeline.stats().unparsable, 2);
         assert_eq!(pipeline.jitter_stats().received, 0);
         assert_eq!(pipeline.release(), Playout::Waiting);
+    }
+}
+
+#[cfg(test)]
+mod impairment_matrix {
+    use super::*;
+    use crate::replay::{disturb, Disturbance, G711StreamGenerator};
+
+    const TELEPHONE_EVENT_PT: u8 = 101;
+    const SAMPLES: usize = 160;
+    const PACKET_MICROS: u64 = 20_000;
+
+    #[derive(Debug, Default)]
+    struct Driven {
+        played: u64,
+        concealed: u64,
+        suppressed: u64,
+        waiting: u64,
+        digits: u64,
+        heads: Vec<i16>,
+        concealed_energy: Vec<i64>,
+    }
+
+    fn pipeline_with(target_depth_packets: u16) -> StreamPipeline {
+        StreamPipeline::new(
+            AudioFormat::pcmu_8k_20ms(),
+            target_depth_packets,
+            Some(TELEPHONE_EVENT_PT),
+        )
+        .unwrap()
+    }
+
+    fn generator() -> G711StreamGenerator {
+        G711StreamGenerator::new(AudioFormat::pcmu_8k_20ms(), 0x0BAD_C0DE, 4000).unwrap()
+    }
+
+    fn energy(pcm: &[i16]) -> i64 {
+        pcm.iter().map(|&s| (s as i64).abs()).sum()
+    }
+
+    fn record(pipeline: &mut StreamPipeline, driven: &mut Driven) {
+        match pipeline.release() {
+            Playout::Pcm(pcm) => {
+                driven.played += 1;
+                driven.heads.push(pcm[0]);
+            }
+            Playout::Concealed(pcm) => {
+                driven.concealed += 1;
+                driven.concealed_energy.push(energy(pcm));
+            }
+            Playout::Suppressed(_) => driven.suppressed += 1,
+            Playout::Waiting => driven.waiting += 1,
+        }
+    }
+
+    fn slot_of(datagram: &[u8], first_sequence: u16) -> usize {
+        let sequence = RtpPacket::parse(datagram).unwrap().sequence;
+        (sequence.wrapping_sub(first_sequence) as i16).max(0) as usize
+    }
+
+    fn drive(pipeline: &mut StreamPipeline, wire: &[Vec<u8>], slots: usize) -> Driven {
+        let mut driven = Driven::default();
+        let first_sequence = RtpPacket::parse(&wire[0]).unwrap().sequence;
+        let lag = pipeline.target_depth_packets() as usize;
+        let mut arrived_slots = 0usize;
+        let mut released = 0usize;
+        for datagram in wire {
+            if matches!(pipeline.ingest(datagram), IngestOutcome::Dtmf(_)) {
+                driven.digits += 1;
+            }
+            arrived_slots = arrived_slots.max(slot_of(datagram, first_sequence) + 1);
+            while released + lag < arrived_slots {
+                record(pipeline, &mut driven);
+                released += 1;
+            }
+        }
+        while released < slots {
+            record(pipeline, &mut driven);
+            released += 1;
+        }
+        driven
+    }
+
+    fn clean_stream(packets: usize) -> (Vec<Vec<u8>>, Vec<i16>) {
+        let mut generator = generator();
+        let datagrams: Vec<Vec<u8>> = (0..packets).map(|_| generator.next_datagram()).collect();
+        let heads = datagrams
+            .iter()
+            .map(|d| g711::ulaw_to_linear(RtpPacket::parse(d).unwrap().payload[0]))
+            .collect();
+        (datagrams, heads)
+    }
+
+    fn drop_every(packets: usize, every: usize) -> Vec<Disturbance> {
+        (0..packets)
+            .map(|index| {
+                if index % every == every / 2 {
+                    Disturbance::Drop
+                } else {
+                    Disturbance::Deliver
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn uniform_loss_is_reported_once_and_concealed_once() {
+        for every in [100usize, 20] {
+            let packets = 200;
+            let (clean, _) = clean_stream(packets);
+            let script = drop_every(packets, every);
+            let dropped = script
+                .iter()
+                .filter(|step| **step == Disturbance::Drop)
+                .count() as u64;
+            let mut pipeline = pipeline_with(2);
+            let driven = drive(&mut pipeline, &disturb(clean, &script), packets);
+
+            assert_eq!(pipeline.jitter_stats().lost, dropped, "loss at 1/{every}");
+            assert_eq!(driven.concealed, dropped, "concealment at 1/{every}");
+            assert_eq!(
+                driven.played + driven.concealed,
+                packets as u64,
+                "every sequence number owes exactly one frame at 1/{every}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_burst_of_loss_engages_plc_and_keeps_the_frame_clock_honest() {
+        let packets = 40;
+        let burst = 20..28;
+        let (clean, _) = clean_stream(packets);
+        let script: Vec<Disturbance> = (0..packets)
+            .map(|index| {
+                if burst.contains(&index) {
+                    Disturbance::Drop
+                } else {
+                    Disturbance::Deliver
+                }
+            })
+            .collect();
+        let mut pipeline = pipeline_with(2);
+        let driven = drive(&mut pipeline, &disturb(clean, &script), packets);
+
+        assert_eq!(pipeline.jitter_stats().lost, burst.len() as u64);
+        assert_eq!(driven.concealed, burst.len() as u64);
+        assert_eq!(driven.played + driven.concealed, packets as u64);
+        assert!(
+            driven.concealed_energy[0] > 0,
+            "the first concealed frame must carry repeated audio, not silence"
+        );
+        assert_eq!(
+            driven.concealed_energy.last(),
+            Some(&0),
+            "a burst past 60 ms must fade to silence: {:?}",
+            driven.concealed_energy
+        );
+    }
+
+    #[test]
+    fn reorder_inside_the_buffer_depth_costs_no_loss() {
+        let packets = 60;
+        let (clean, heads) = clean_stream(packets);
+        let script: Vec<Disturbance> = (0..packets)
+            .map(|index| {
+                if index % 10 == 5 {
+                    Disturbance::DelayOne
+                } else {
+                    Disturbance::Deliver
+                }
+            })
+            .collect();
+        let mut pipeline = pipeline_with(4);
+        let driven = drive(&mut pipeline, &disturb(clean, &script), packets);
+
+        assert_eq!(pipeline.jitter_stats().lost, 0);
+        assert_eq!(pipeline.jitter_stats().late_drops, 0);
+        assert_eq!(driven.played, packets as u64);
+        assert_eq!(driven.heads, heads, "samples must emerge in sequence order");
+    }
+
+    #[test]
+    fn reorder_beyond_the_buffer_depth_is_late_not_lost() {
+        let packets = 20;
+        let (clean, _) = clean_stream(packets);
+        let mut wire = clean.clone();
+        let straggler = wire.remove(10);
+        wire.insert(17, straggler);
+        let mut pipeline = pipeline_with(2);
+        let driven = drive(&mut pipeline, &wire, packets);
+
+        let jitter = pipeline.jitter_stats();
+        assert_eq!(jitter.late_drops, 1);
+        assert_eq!(jitter.lost, 1);
+        assert_eq!(jitter.duplicates, 0);
+        assert_eq!(jitter.received, wire.len() as u64);
+        assert_eq!(driven.played, packets as u64 - 1);
+        assert_eq!(driven.concealed, 1);
+    }
+
+    #[test]
+    fn duplication_is_deduped_and_costs_no_samples() {
+        let packets = 100;
+        let (clean, heads) = clean_stream(packets);
+        let script: Vec<Disturbance> = (0..packets)
+            .map(|index| {
+                if index % 20 == 10 {
+                    Disturbance::DeliverTwice
+                } else {
+                    Disturbance::Deliver
+                }
+            })
+            .collect();
+        let duplicated = script
+            .iter()
+            .filter(|step| **step == Disturbance::DeliverTwice)
+            .count() as u64;
+        let mut pipeline = pipeline_with(2);
+        let driven = drive(&mut pipeline, &disturb(clean, &script), packets);
+
+        assert_eq!(pipeline.jitter_stats().duplicates, duplicated);
+        assert_eq!(pipeline.jitter_stats().lost, 0);
+        assert_eq!(driven.played, packets as u64);
+        assert_eq!(driven.heads, heads);
+    }
+
+    #[test]
+    fn arrival_jitter_without_loss_grows_the_cushion_and_plays_everything() {
+        let packets = 300;
+        let (clean, _) = clean_stream(packets);
+        let swing = [0i64, 15_000, -12_000, 9_000, -15_000];
+        let mut pipeline = pipeline_with(2);
+        let floor = pipeline.target_depth_packets();
+        let mut driven = Driven::default();
+        let lag = floor as usize;
+        let mut released = 0usize;
+        for (index, datagram) in clean.iter().enumerate() {
+            let paced = index as u64 * PACKET_MICROS;
+            let arrival = (paced as i64 + swing[index % swing.len()]).max(0) as u64;
+            pipeline.ingest_at(datagram, arrival);
+            while released + lag < index + 1 {
+                record(&mut pipeline, &mut driven);
+                released += 1;
+            }
+        }
+        while released < packets {
+            record(&mut pipeline, &mut driven);
+            released += 1;
+        }
+
+        assert_eq!(pipeline.jitter_stats().lost, 0);
+        assert_eq!(driven.played, packets as u64);
+        assert!(
+            pipeline.target_depth_packets() > floor,
+            "a jittery path must grow the cushion, stayed at {floor}"
+        );
+        assert!(
+            driven.waiting <= pipeline.target_depth_packets() as u64,
+            "underruns must stay bounded by the cushion, saw {}",
+            driven.waiting
+        );
+    }
+
+    #[test]
+    fn a_silence_suppressed_talkspurt_gap_is_not_loss() {
+        let mut generator = generator();
+        let mut wire: Vec<Vec<u8>> = (0..6).map(|_| generator.next_datagram()).collect();
+        wire.push(generator.next_comfort_noise_datagram(60));
+        generator.suppress_silence(50);
+        wire.extend((0..6).map(|_| generator.next_datagram()));
+
+        let mut pipeline = pipeline_with(2);
+        let driven = drive(&mut pipeline, &wire, 13);
+
+        assert_eq!(pipeline.stats().comfort_noise, 1);
+        assert_eq!(pipeline.stats().unknown_payload_type, 0);
+        assert_eq!(pipeline.jitter_stats().lost, 0);
+        assert_eq!(driven.suppressed, 1);
+        assert_eq!(driven.played, 12);
+    }
+
+    #[test]
+    fn a_dropped_comfort_noise_packet_is_absorbed_as_silence_not_loss() {
+        let mut generator = generator();
+        let mut wire: Vec<Vec<u8>> = (0..6).map(|_| generator.next_datagram()).collect();
+        let _dropped_in_transit = generator.next_comfort_noise_datagram(60);
+        generator.suppress_silence(50);
+        wire.extend((0..6).map(|_| generator.next_datagram()));
+
+        let mut pipeline = pipeline_with(2);
+        let driven = drive(&mut pipeline, &wire, 13);
+
+        assert_eq!(pipeline.jitter_stats().silence_gaps, 1);
+        assert_eq!(pipeline.jitter_stats().lost, 0);
+        assert_eq!(pipeline.stats().frames_concealed, 0);
+        assert_eq!(driven.suppressed, 1);
+        assert_eq!(driven.played, 12);
+    }
+
+    #[test]
+    fn a_dtmf_press_under_loss_still_reports_one_digit_and_only_audio_loss() {
+        let mut generator = generator();
+        let mut wire: Vec<Vec<u8>> = Vec::new();
+        for index in 0..20 {
+            if index == 8 {
+                generator.skip_one();
+                continue;
+            }
+            wire.push(generator.next_datagram());
+            if index == 12 {
+                for _ in 0..3 {
+                    wire.push(
+                        generator.next_event_datagram(TELEPHONE_EVENT_PT, [7, 0x0A, 0x01, 0x40]),
+                    );
+                }
+                for _ in 0..3 {
+                    wire.push(
+                        generator.next_event_datagram(TELEPHONE_EVENT_PT, [7, 0x8A, 0x03, 0x20]),
+                    );
+                }
+            }
+        }
+
+        let mut pipeline = pipeline_with(2);
+        let driven = drive(&mut pipeline, &wire, 26);
+
+        assert_eq!(driven.digits, 1);
+        assert_eq!(pipeline.jitter_stats().lost, 1);
+        assert_eq!(driven.suppressed, 6);
+        assert_eq!(driven.concealed, 1);
+        assert_eq!(driven.played, 19);
+    }
+
+    #[test]
+    fn a_new_ssrc_at_a_nearby_sequence_restarts_instead_of_dropping_late() {
+        let mut pipeline = pipeline_with(2);
+        let mut first = G711StreamGenerator::new(AudioFormat::pcmu_8k_20ms(), 0x1111, 500).unwrap();
+        let mut driven = Driven::default();
+        for _ in 0..6 {
+            pipeline.ingest(&first.next_datagram());
+            record(&mut pipeline, &mut driven);
+        }
+
+        let mut second =
+            G711StreamGenerator::new(AudioFormat::pcmu_8k_20ms(), 0x2222, 501).unwrap();
+        assert_eq!(
+            pipeline.ingest(&second.next_datagram()),
+            IngestOutcome::Resynchronized
+        );
+        for _ in 0..5 {
+            pipeline.ingest(&second.next_datagram());
+            record(&mut pipeline, &mut driven);
+        }
+        for _ in 0..8 {
+            record(&mut pipeline, &mut driven);
+        }
+
+        let jitter = pipeline.jitter_stats();
+        assert_eq!(jitter.late_drops, 0);
+        assert_eq!(jitter.resets, 1);
+        assert_eq!(jitter.lost, 0);
+        assert_eq!(pipeline.last_audio_ssrc(), Some(0x2222));
+        assert_eq!(
+            driven.played, 11,
+            "a restart costs the cushion the old sender had already filled"
+        );
+    }
+
+    #[test]
+    fn one_frame_of_pcm_is_always_samples_per_packet_long() {
+        let (clean, _) = clean_stream(4);
+        let mut pipeline = pipeline_with(2);
+        for datagram in &clean {
+            pipeline.ingest(datagram);
+        }
+        for _ in 0..4 {
+            match pipeline.release() {
+                Playout::Pcm(pcm) => assert_eq!(pcm.len(), SAMPLES),
+                other => panic!("expected pcm, got {other:?}"),
+            }
+        }
     }
 }
 

@@ -201,20 +201,32 @@ different things:
   inherits and forwards into the tap. Tests that we attribute loss to the
   right place and do not double-count what was already lost.
 
-| Scenario | Injection | What must hold |
-| --- | --- | --- |
-| Uniform loss | `loss 1%`, `5%` | Reported loss tracks injected loss; concealment count equals detected-loss count |
-| Burst loss | `loss 10% 50%` (correlated) | PLC engages; output sample count stays wall-clock correct across the gap |
-| Reorder inside buffer depth | `delay 30ms 20ms reorder 25% 50%` | Zero reported loss; samples emerge in sequence order |
-| Reorder beyond buffer depth | `delay 120ms 60ms reorder 25% 50%` | Counted as late, not as loss — the counter partition must be exhaustive and non-overlapping |
-| Duplication | `duplicate 1%` | Deduped; total sample count unchanged |
-| Jitter, no loss | `delay 20ms 15ms distribution normal` | Zero loss; underruns bounded; pacer deadline misses stay inside budget |
-| **DTMF on a clean link** | none | **Zero reported loss.** ✅ closed 2026-08-16: events are accounted, not lost (`a_dtmf_press_on_a_clean_link_reports_zero_loss` in CI; lab run shows `jitter_lost: 0`, `frames_suppressed` = event count) |
-| DTMF under loss | `loss 2%` + repeating digits | Digits still deduped once per press; loss count excludes telephone-event sequence numbers |
+| Scenario | Injection | What must hold | Covered by |
+| --- | --- | --- | --- |
+| Uniform loss | `loss 1%`, `5%` | Reported loss tracks injected loss; concealment count equals detected-loss count | ✅ `uniform_loss_is_reported_once_and_concealed_once` (drop 1-in-100 and 1-in-20 over 200 packets) |
+| Burst loss | `loss 10% 50%` (correlated) | PLC engages; output sample count stays wall-clock correct across the gap | ✅ `a_burst_of_loss_engages_plc_and_keeps_the_frame_clock_honest` (8 consecutive drops; first concealed frame carries audio, the tail is muted, played + concealed == packets) |
+| Reorder inside buffer depth | `delay 30ms 20ms reorder 25% 50%` | Zero reported loss; samples emerge in sequence order | ✅ `reorder_inside_the_buffer_depth_costs_no_loss` (`DelayOne` every 10th, depth 4) |
+| Reorder beyond buffer depth | `delay 120ms 60ms reorder 25% 50%` | Counted as late, not as loss — the counter partition must be exhaustive and non-overlapping | ✅ `reorder_beyond_the_buffer_depth_is_late_not_lost` (one packet 7 slots late: 1 late drop, 1 loss, 0 duplicates, `received` == wire length) |
+| Duplication | `duplicate 1%` | Deduped; total sample count unchanged | ✅ `duplication_is_deduped_and_costs_no_samples` |
+| Jitter, no loss | `delay 20ms 15ms distribution normal` | Zero loss; underruns bounded; pacer deadline misses stay inside budget | ✅ `arrival_jitter_without_loss_grows_the_cushion_and_plays_everything` (±15 ms arrival schedule through `ingest_at`; the adaptive depth grows, underruns stay inside the cushion). Pacer deadline misses are a lab measurement, still unmade |
+| **DTMF on a clean link** | none | **Zero reported loss** — events are accounted, not lost | ✅ closed 2026-08-16: `a_dtmf_press_on_a_clean_link_reports_zero_loss` in CI, and the lab run shows `jitter_lost: 0` with `frames_suppressed` = event count |
+| DTMF under loss | `loss 2%` + repeating digits | Digits still deduped once per press; loss count excludes telephone-event sequence numbers | ✅ `a_dtmf_press_under_loss_still_reports_one_digit_and_only_audio_loss` |
+| Silence suppression | endpoint stops sending / sends comfort noise | The gap is **not** loss: timing preserved, `silence_gaps` counted, PLC history forgotten | ✅ `a_silence_suppressed_talkspurt_gap_is_not_loss`, `a_dropped_comfort_noise_packet_is_absorbed_as_silence_not_loss` |
+| Mid-call SSRC change | re-INVITE | Restart, not a run of late drops; `resets` moves with `ssrc_changes` | ✅ `a_new_ssrc_at_a_nearby_sequence_restarts_instead_of_dropping_late` |
 
-Every run in this matrix should dump its datagram log. The interesting ones
-become permanent replay fixtures, which is how an impairment scenario stops
-costing a lab and starts costing 40 ms of CI.
+**Status (2026-08-22, tasks item 17):** every row above is covered at the
+**replay** altitude — `impairment_matrix` in `crates/media-core/src/pipeline.rs`,
+built from `replay.rs` (`disturb` scripts for order and multiplicity, explicit
+arrival schedules for time) and driven through a lag-based pacer so playout
+trails arrival by the target depth the way a wall-clock pacer does. What is
+**not** yet done: none of these has been reproduced with real `tc netem` on a
+real tap link, and nothing has judged the concealment perceptually. Those two
+are the remaining value in this matrix, and `lab/ear_intelligibility_probe.py`
+under burst loss is the cheap version of the second.
+
+Every lab run in this matrix should dump its datagram log. The interesting
+ones become permanent replay fixtures, which is how an impairment scenario
+stops costing a lab and starts costing 40 ms of CI.
 
 ## The load generator problem
 
