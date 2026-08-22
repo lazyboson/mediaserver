@@ -1335,6 +1335,24 @@ row above:
 | `ingest_only_per_packet` | 16.3 ns | **25.6 ns** | +52% |
 | `parse_jitter_decode_per_packet` | 240.9 ns | **269.8 ns** | +10% |
 
+Re-run 2026-08-22 for tasks item 19 (Article VIII asks for the benchmark after a
+pipeline change, and items 14/17 were that), same machine, `cargo bench -p
+media-core` four times:
+
+| Run condition | `parse_jitter_decode_per_packet` | `ingest_only_per_packet` |
+| --- | --- | --- |
+| item 17's recorded numbers | 269.8 ns | 25.6 ns |
+| **quiet box, lab stack stopped** | **262.1 ns**, 281.3 ns | **26.1 ns**, 26.2 ns |
+| lab stack resident, straight after a 47 min soak | 308.5 ns, 302.2 ns | 28.1 ns, 27.8 ns |
+
+**No regression.** The quiet-box pair brackets the item-17 row, and
+`git log -- crates/media-core` shows no commit has touched the crate since item
+17's, so the +14% criterion reported on the first attempt was the eleven
+resident lab containers, not code. The useful by-product is a repeatability
+number for this box: **±9% run to run on the full path**, and ~15% just for
+leaving the lab up. Stop the lab before any future Article-VIII comparison here,
+and treat sub-10% deltas as noise.
+
 The Article-VIII bar is 2× per packet; the full path moved 10%. The ingest
 half costs ~9 ns more because every admitted packet now updates the RFC 3550
 estimate and recomputes the target depth (that recompute carries an integer
