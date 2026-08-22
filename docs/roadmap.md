@@ -71,8 +71,10 @@ Work:
   SSRC (rtpengine `query`) with elimination for transcode-restamped legs, so
   stereo recording and RTT speaker labels are trustworthy. Open soft spot:
   a mid-call SSRC change does not re-resolve (tasks.md D1).
-- Codec pipeline: G.711 → L16 → resample (8k/16k) → per-consumer encode;
-  Opus via `audiopus` when a consumer needs it.
+- ✅ Codec pipeline (2026-08-22): G.711 → L16 → resample (8k/16k/48k) →
+  per-consumer encode, replay-verified; the hub carries PCM and each
+  consumer encodes its own format. Opus is deferred until a consumer asks
+  (tasks.md item 9 — it drags a C toolchain into the hermetic build).
 - ✅ Consumer adapters: WebSocket Twilio dialect first (wire-compatible with
   the legacy media gateway — existing endpoints must not change), then gRPC
   `MediaStream` (proto/mediastream.proto, landed 2026-08-20 — binary frames,

@@ -7,6 +7,7 @@ license.workspace = true
 description = "Sans-IO media pipeline core: RTP, G.711, RFC 2833 DTMF, jitter buffer, frames. No sockets, no async — pure state machines, testable by pcap replay."
 
 [dependencies]
+rubato = "5.0.0"
 thiserror = { workspace = true }
 
 [dev-dependencies]
