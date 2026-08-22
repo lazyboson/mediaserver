@@ -705,10 +705,25 @@ counted down from 15, and the index was empty again after `DestroySession`.
 `xxhash-rust` under **BSL-1.0** (Boost), now allowed in `deny.toml`:
 permissive, OSI-approved, no attribution burden in binaries.
 
+**Observed on a real pod kill (2026-08-22, tasks item 11).** Three pods on one
+Redis, `kill -9` on the owner of a live tapped call: one survivor adopted
+14.6 s later and the consumer's audio resumed after a **14.41 s** gap, which is
+what the constants predict (lease 15 s renewed every 5 s + a 10 s sweep = 25 s
+worst case). Adoption rebuilt the session through the controller, `TapPlane`
+re-subscribed, the WS consumer was re-dialed at its persisted endpoint, and the
+rebuilt legs were named and clean (`jitter_lost: 0`, `recv_errors: 0`).
+
 Gaps: leases are renewed per session per tick with one round trip each (fine
 at hundreds, revisit at thousands); the discovery map (call-id → node + tags)
-is a separate, still-unbuilt concern; and `SessionStore` is a `mediaserverd`
-module rather than a crate, so the integration test re-includes it by path.
+is a separate, still-unbuilt concern; `SessionStore` is a `mediaserverd`
+module rather than a crate, so the integration test re-includes it by path;
+and **the dead pod's rtpengine subscription is never cancelled** (D14) —
+`PersistedSession` carries no `to-tag`, so the adopter cannot `unsubscribe`
+what it did not create, and rtpengine keeps copying media to the dead pod's
+address for the rest of the call (measured: 14,743 packets over 110 s).
+`rebuild` also drops the attachment's negotiated `format` (it passes
+`format: None`), so a consumer that asked for L16/16k is rebuilt at the
+session default.
 
 ### event_pump.rs — events onto Kafka `mss.events` (M4)
 
