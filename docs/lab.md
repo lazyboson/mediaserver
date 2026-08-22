@@ -448,3 +448,44 @@ Leg identity is now solved in the daemon by SSRC correlation with
 elimination; see implementation-notes. When a mock's env var can invert an
 experiment's conclusion, the mock is part of the experiment: verify the
 instrument before trusting a surprising result.
+
+## event_outage_drill.sh — a broker outage costs no event (2026-08-22)
+
+The drill behind item 13 / defect D5. Redpanda alone is enough, so it runs
+without the SIP half of the lab:
+
+```sh
+DOCKER_API_VERSION=1.43 docker compose -f lab/docker-compose.microsip.yml up -d redpanda
+./lab/event_outage_drill.sh
+```
+
+The script builds `crates/mediaserverd/tests/kafka_outage.rs` (skipped
+unless `MSS_TEST_KAFKA_BROKERS` is set), sends 60 `MediaEvent`s at 1/s
+through the production `RskafkaTransport`, `docker stop`s Redpanda 15 s in
+for 30 s, starts it again, and then asserts on the topic itself — every seq
+present, ascending, no duplicate — rather than trusting the pump's own
+counters. `QUIET_BEFORE`, `OUTAGE_SECONDS`, `COUNT` and `INTERVAL_MS`
+override the schedule; the log lands in `lab/out/`.
+
+First green run: `accepted=60 published=60 failed=6 retried=6 dropped=0
+dropped_oldest=0 unsent=0`, 60 distinct seqs 0-59 on partition 0 at
+contiguous offsets, cross-checked with
+
+```sh
+cargo run -q -p mediaserverd --example mss_events_tail -- 127.0.0.1:19092 mss.events.drill 8
+```
+
+Two things the drill taught, both about where the outage is absorbed:
+
+- **rskafka hides most of a short outage.** Only 6 attempts failed across a
+  30 s stop; its producer retries internally and the connection recovers
+  after the broker returns without rebuilding `RskafkaTransport`. Those 6
+  are precisely what the old at-most-once pump would have lost.
+- **A dead broker can park a send indefinitely**, which is why each attempt
+  now carries a 5 s timeout: without it the worker stops draining its
+  handoff queue and the loss moves upstream, where drop-oldest cannot
+  protect it.
+
+What it does not prove: nothing here involves a real tapped call — the drill
+drives the pump directly, so it exercises the pump and the transport, not
+the call path. A live-call version belongs with item 10/11's lab work.
