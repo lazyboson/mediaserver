@@ -4,6 +4,8 @@ use rubato::audioadapter_buffers::direct::SequentialSlice;
 use rubato::{Fft, FixedSync, Resampler};
 use thiserror::Error;
 
+const G711_SAMPLE_RATE_HZ: u32 = 8000;
+
 #[derive(Debug, Error)]
 pub enum EncodeError {
     #[error("cannot encode the {tap:?} tap into {requested:?}: {reason}")]
@@ -37,8 +39,8 @@ fn refusal(source: AudioFormat, target: AudioFormat) -> Option<&'static str> {
     }
     match target.encoding {
         Encoding::Pcmu | Encoding::Pcma => {
-            if target.sample_rate_hz != source.sample_rate_hz {
-                Some("g711 output only exists at the tap rate")
+            if target.sample_rate_hz != G711_SAMPLE_RATE_HZ {
+                Some("g711 is defined at 8 kHz only")
             } else {
                 None
             }
@@ -122,7 +124,13 @@ impl ConsumerEncoder {
                     .map_err(|error| EncodeError::Resample(error.to_string()))?;
                 for value in self.float_out.iter().take(written) {
                     let sample = (value * 32768.0).round().clamp(-32768.0, 32767.0) as i16;
-                    self.bytes.extend_from_slice(&sample.to_le_bytes());
+                    match self.target {
+                        Encoding::Pcmu => self.bytes.push(g711::linear_to_ulaw(sample)),
+                        Encoding::Pcma => self.bytes.push(g711::linear_to_alaw(sample)),
+                        Encoding::L16 | Encoding::Opus => {
+                            self.bytes.extend_from_slice(&sample.to_le_bytes())
+                        }
+                    }
                 }
             }
         }
@@ -234,6 +242,45 @@ mod tests {
             ConsumerEncoder::new(AudioFormat::pcmu_8k_20ms(), AudioFormat::l16_16k_20ms()).unwrap();
         let bytes = encoder.encode(&[100i16; 80]).unwrap();
         assert_eq!(bytes.len(), 640);
+    }
+
+    fn opus_16k() -> AudioFormat {
+        AudioFormat {
+            encoding: Encoding::Opus,
+            sample_rate_hz: 16000,
+            channels: 1,
+            ptime_ms: 20,
+        }
+    }
+
+    #[test]
+    fn a_wideband_tap_still_feeds_the_frozen_pcmu_bridge() {
+        let mut encoder = ConsumerEncoder::new(opus_16k(), AudioFormat::pcmu_8k_20ms()).unwrap();
+        let frames: Vec<Vec<i16>> = (0..50)
+            .map(|frame| {
+                (0..320)
+                    .map(|n| {
+                        let t = (frame * 320 + n) as f32 / 16000.0;
+                        ((t * 400.0 * 2.0 * std::f32::consts::PI).sin() * 8000.0) as i16
+                    })
+                    .collect()
+            })
+            .collect();
+        let input_rms = rms(&frames.concat());
+
+        let mut decoded = Vec::new();
+        for frame in &frames {
+            let bytes = encoder.encode(frame).unwrap();
+            assert_eq!(bytes.len(), 160);
+            decoded.extend(bytes.iter().map(|b| g711::ulaw_to_linear(*b)));
+        }
+
+        assert_eq!(decoded.len(), 50 * 160);
+        let steady_rms = rms(&decoded[decoded.len() / 2..]);
+        assert!(
+            (steady_rms - input_rms).abs() / input_rms < 0.15,
+            "input rms {input_rms}, downsampled rms {steady_rms}"
+        );
     }
 
     #[test]
