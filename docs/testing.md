@@ -218,11 +218,21 @@ different things:
 **replay** altitude — `impairment_matrix` in `crates/media-core/src/pipeline.rs`,
 built from `replay.rs` (`disturb` scripts for order and multiplicity, explicit
 arrival schedules for time) and driven through a lag-based pacer so playout
-trails arrival by the target depth the way a wall-clock pacer does. What is
-**not** yet done: none of these has been reproduced with real `tc netem` on a
-real tap link, and nothing has judged the concealment perceptually. Those two
-are the remaining value in this matrix, and `lab/ear_intelligibility_probe.py`
-under burst loss is the cheap version of the second.
+trails arrival by the target depth the way a wall-clock pacer does.
+
+**Lab altitude (2026-08-22, tasks item 19).** Four of those rows have now also
+been reproduced against a real rtpengine by `lab/soak.py`, with impairment
+injected **at the endpoint** rather than on the tap link, because this box's
+kernel has no netem (see below): uniform loss at 1% and 5% (reported loss
+1.06% and 5.01%, `frames_concealed` equal to `jitter_lost` to the packet),
+reorder inside the buffer depth (zero loss, zero late) and arrival jitter
+(zero loss, zero late). Two rows are still replay-only for a reason worth
+knowing: **duplication cannot be injected from the endpoint at all** —
+rtpengine absorbs the duplicate before the subscription sees it, measured — and
+burst loss and reorder-beyond-depth need the correlated/large-delay shapes only
+netem produces. Nothing has judged the concealment **perceptually** yet;
+`lab/ear_intelligibility_probe.py` under burst loss is still the cheap version
+of that, and still unrun.
 
 Every lab run in this matrix should dump its datagram log. The interesting
 ones become permanent replay fixtures, which is how an impairment scenario
@@ -355,6 +365,26 @@ socket-path measurement or the rtpengine-side delta says otherwise. What
 still genuinely needs the namespace rig: the rtpengine-side per-tap delta
 and receive-path behavior at 500–1000 real sockets.
 
+### Article-VIII re-run after items 14/17 (2026-08-22, tasks item 19)
+
+Article VIII requires the benchmark after a pipeline change, and items 14 and 17
+were that. `cargo bench -p media-core`, same machine as the item-17 row:
+
+| Run condition | `parse_jitter_decode_per_packet` | `ingest_only_per_packet` |
+| --- | --- | --- |
+| item 17's recorded numbers | 269.8 ns | 25.6 ns |
+| **quiet box, lab stopped** (two runs) | **262.1 ns**, 281.3 ns | **26.1 ns**, 26.2 ns |
+| straight after the soak, 11 lab containers resident (two runs) | 308.5 ns, 302.2 ns | 28.1 ns, 27.8 ns |
+
+**No regression:** the quiet-box runs bracket item 17's numbers, and
+`git log -- crates/media-core` confirms nothing has touched that crate since
+item 17's commit, so a code change was never a candidate. What the four runs do
+measure is this box's repeatability: the full path wanders **±9%** depending on
+what else is resident, and merely leaving the lab stack running costs ~15%.
+Two rules follow for anyone re-running this: **stop the lab first**, and treat
+any delta under about 10% on this machine as indistinguishable from noise. That
+is this document's own argument for the metal rig, now with a number on it.
+
 ## What each phase needs
 
 | Phase | Tier 1 | Tier 2 | Tier 3 (FS+the legacy controller) | Tier 4 | Benchmark rig |
@@ -394,7 +424,111 @@ Stated plainly, so nobody mistakes a green run for coverage:
 - **Recording compliance gaps.** Whether a re-subscribe gap is acceptable
   is a tenant contract question, not a test result.
 
-## Recording parity (Phase 2)
+## The soak suite (tasks item 19)
+
+The three altitudes above each answer "does this work". None of them answers
+"is an hour of it boring", and that is the question a pilot asks first.
+`lab/soak.py` is that answer, and it is built to be owned by a cron job rather
+than read by a human: it asserts, it prints the violated assertion by name, and
+it exits non-zero.
+
+### How to re-run it
+
+```sh
+DOCKER_API_VERSION=1.43 docker compose -f lab/docker-compose.microsip.yml \
+  up -d rtpengine opensips freeswitch call-watcher redpanda redis \
+        minio minio-init llm-bridge mss-control mss-control-b mss-control-c
+SOAK_CALLS=3 CALL_SECONDS=120 SCRAPE_SECONDS=60 \
+  SOAK_PHASES="clean:600,loss1:480,loss5:480,reorder:420,jitter:420,duplicate:300" \
+  python3 lab/soak.py
+```
+
+The compose `mediaserverd` service (the Phase-0 spike) must stay **down**; it
+would tap the same calls from its own process. Scale with `SOAK_CALLS` (one
+session per slot, round-robin over the three lab pods) and `SOAK_PHASES`
+(`profile:seconds`, comma separated, any of the impairment-matrix profile
+names). Artifacts land in `lab/out/soak-<stamp>*`; the summary json carries
+every scrape, every call and every violation. Procedure, the instruments it
+needed and the netem verdict are in [lab.md](lab.md).
+
+### What it asserts
+
+Per pod, per scrape, as deltas from a pre-run baseline: `mss_legs_stalled` is 0;
+`mss_consumer_dropped_oldest_total` stays within `MAX_DROPPED_OLDEST` (default
+0); the event pump loses nothing (`failed`, `abandoned`, `dropped`,
+`dropped_oldest` all flat); `mss_ingest_recv_errors_total` and
+`mss_ingest_unparsable_total` flat; `mss_registry_lost_total` and
+`_failed_total` flat; and the consumer is still being fed whenever a session is
+live. Once, at the end: nothing leaked (`sessions_live` / `legs_live` /
+`consumers_live` back to 0, Redis `mss:sessions` empty) and the daemon's RSS —
+read from `/proc` inside the pod, not from `docker stats` — is flat.
+
+### The recorded green run
+
+`soak-1787401045`, 2026-08-22, on the WSL2 functional box against rtpengine
+14.1.1.8. **3 concurrent calls of 120 s, 46 min 57 s, 69 sessions created,
+tapped and destroyed (23 per pod, one slot per pod), zero assertions
+violated.** Six phases: `clean:600,loss1:480,loss5:480,reorder:420,jitter:420,duplicate:300`.
+
+| Asserted | Measured |
+| --- | --- |
+| `mss_legs_stalled` zero at steady state | **0 at every one of 43 scrapes**, and `mss_ingest_stalls_total` never transitioned at all |
+| `dropped_oldest` bounded | **0** on all three pods, bound was 0 |
+| `mss_events_failed_total` zero | **0**; 69 accepted / 69 published per pod, 0 retried, 0 abandoned |
+| RSS flat | **24,272 → 25,472 kB** (A), **26,424 → 27,160** (B), **26,316 → 27,116** (C) — under +1.2 MB each |
+| nothing leaked | `sessions_live` / `legs_live` / `consumers_live` all 0 at the end, Redis `mss:sessions` empty |
+| continuity at the consumer | 1,164,153 frames over 207 tracks; worst arrival gap **67 ms**, median 31 ms, p90 45 ms, none over 100 ms |
+| the tap itself | 768,344 datagrams; `late_drops` / `duplicates` / `silence_gaps` / `resets` / `unparsable` / `recv_errors` **all 0** |
+
+And what the impairment phases cost, which is the part the matrix below cares
+about — injected at the endpoint, so the percentage is against the impaired leg:
+
+| Phase | Injected | Reported loss | Concealed | Late |
+| --- | --- | --- | --- | --- |
+| clean | — | 0 | 0 | 0 |
+| loss1 | 1% | **1.06%** (606) | 606 | 0 |
+| loss5 | 5% | **5.01%** (2,782) | 2,782 | 0 |
+| reorder | 10% adjacent swap | 0 (counter frozen 5 scrapes) | 0 | 0 |
+| jitter | ±35 ms | 0 | 0 | 0 |
+| duplicate | 1% | 0 | 0 | 0 — and `duplicates` 0, see below |
+
+Full tables, the per-phase method and the four findings are in
+[lab.md](lab.md). The three that change what this document claims:
+
+1. **`frames_concealed` equals `jitter_lost` to the packet, on a real link.**
+   Item 17's G.711 Appendix I PLC had only ever run in replay; it has now run
+   against real rtpengine traffic, and `silence_gaps` stayed 0, so the buffer
+   called this loss rather than sender silence.
+2. **Reorder and jitter cost nothing** — matrix rows 3 and 6 reproduced outside
+   the replay tier.
+3. **Duplication never reaches the tap.** rtpengine absorbs a duplicate
+   upstream of the subscription, so `mss_jitter_duplicates_total` stayed 0
+   through a phase that duplicated 1% of the caller's packets. The dedupe path
+   cannot be reached from the endpoint at all — that row needs netem on the tap
+   link, and is the one concrete thing this box's missing netem costs.
+
+### Why netem, and not netem here
+
+`lab/netem.sh` implements the matrix as profiles on the tap link — a `prio`
+qdisc in rtpengine's own namespace, with u32 filters steering only packets
+addressed to the MSS pods into the netem band, so the call legs stay clean and
+loss MSS reports is loss MSS was given. It cannot run on this box:
+**`CONFIG_NET_SCH_NETEM` is not set** in the WSL2 kernel
+(`5.15.153.1-microsoft-standard-WSL2`, which is also the kernel Docker Desktop
+runs containers on), and there is no `sch_*` module to load either. The fix is
+the custom-kernel detour priced above, and it needs a Windows-side
+`.wslconfig` change, so it cannot be made from inside the distro.
+
+`soak.py` therefore probes netem and falls back to injecting at the matrix's
+**other** point — the endpoint, upstream of rtpengine, via
+`host_test_caller.py`'s `IMPAIR_*` knobs. `SOAK_NETEM=auto|on|off` means the
+same script produces the stronger tap-link measurement unchanged on a
+netem-capable box. Until one exists, the honest statement is: **loss, reorder
+and jitter are now reproduced at lab altitude from the endpoint; the tap link
+itself has still never been impaired, and duplication has not been tested
+anywhere but replay.**
+
+
 
 Two artifacts exist for the "byte-comparable recordings vs FS output" exit
 criterion, and neither has met a real FreeSWITCH recording yet:
