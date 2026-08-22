@@ -327,6 +327,8 @@ pub async fn run(request: TapSpikeRequest, cookie_prefix: u64) -> Result<(), Tap
             jitter_duplicates = stats.jitter.duplicates,
             jitter_late_drops = stats.jitter.late_drops,
             jitter_resets = stats.jitter.resets,
+            jitter_silence_gaps = stats.jitter.silence_gaps,
+            jitter_target_depth = stats.jitter.target_depth,
             capture_full = stats.capture_full,
             drain_batches_filled = stats.drain_batches_filled,
             recv_errors = stats.recv_errors,

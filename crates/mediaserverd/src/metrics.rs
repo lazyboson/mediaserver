@@ -107,6 +107,11 @@ pub fn render(sources: &MetricsSources) -> String {
         snapshot.totals.jitter_resets,
     );
     counter(
+        "mss_jitter_silence_gaps_total",
+        "Sequence numbers absorbed as sender silence instead of counted as loss",
+        snapshot.totals.jitter_silence_gaps,
+    );
+    counter(
         "mss_legs_ssrc_changes_total",
         "Times a tap leg started carrying a different sender ssrc mid-call",
         snapshot.totals.ssrc_changes,
