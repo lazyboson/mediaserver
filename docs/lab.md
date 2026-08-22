@@ -878,3 +878,212 @@ per-process wall-clock nanos, and the serial is process-wide since D12.
 Also worth knowing for item 19's soak: D13 reproduces here on every run —
 the start frame advertises `["inbound","outbound"]` and a silent `mixed`
 track arrives anyway, which is why the gap consumer reports three tracks.
+
+## soak.py — N calls for the better part of an hour (2026-08-22)
+
+Item 19. Every drill above answers "does this work once". `lab/soak.py` answers
+"is an hour of it boring", which is a different question and the one a pilot
+actually asks. It runs N concurrent synthetic calls back to back for a
+configurable duration under a walk of impairment profiles, scrapes every pod's
+`/metrics` each minute, and **exits non-zero on any assertion** — so a cron or a
+CI job can own it without anyone reading the log.
+
+```sh
+DOCKER_API_VERSION=1.43 docker compose -f lab/docker-compose.microsip.yml \
+  up -d rtpengine opensips freeswitch call-watcher redpanda redis \
+        minio minio-init llm-bridge mss-control mss-control-b mss-control-c
+SOAK_CALLS=3 CALL_SECONDS=120 SCRAPE_SECONDS=60 \
+  SOAK_PHASES="clean:600,loss1:480,loss5:480,reorder:420,jitter:420,duplicate:300" \
+  python3 lab/soak.py
+```
+
+As with every drill here, the compose `mediaserverd` service — the Phase-0
+spike — **must stay down**: it taps whatever call it finds from its own process.
+
+What it asserts, per pod, as deltas from a pre-run baseline (absolutes are
+useless: these pods have been up through several drills):
+
+| Assertion | Series |
+| --- | --- |
+| no leg is stalled | `mss_legs_stalled` is 0 at every scrape |
+| the consumer queue never overflows | `mss_consumer_dropped_oldest_total` ≤ `MAX_DROPPED_OLDEST` (default 0) |
+| no event is lost | `mss_events_failed_total`, `_abandoned_`, `_dropped_`, `_dropped_oldest_` all flat |
+| the socket never overflows | `mss_ingest_recv_errors_total` flat, `mss_ingest_unparsable_total` flat |
+| no lease is lost | `mss_registry_lost_total`, `mss_registry_failed_total` flat |
+| the consumer is still being fed | `mss_consumer_delivered_total` moves whenever `mss_sessions_live > 0` |
+| nothing leaked | at the end: `sessions_live` / `legs_live` / `consumers_live` all 0 and `mss:sessions` empty in Redis |
+| no memory leak | daemon RSS at the end within `RSS_GROWTH`×start + `RSS_SLACK_KB` |
+
+RSS is read from `/proc/<pid>/status` **inside** each pod, matched on
+`comm == mediaserverd`, not from `docker stats`: the cgroup number folds in page
+cache and the `cargo run` wrapper, and a leak hunt cannot afford that noise.
+
+### Three things the lab needed before a soak was possible
+
+- **`host_test_caller.py` is now N callers.** Everything that must be unique per
+  caller became an env var — `SIP_PORT`, `RTP_PORT`, `CALL_ID`, `FROM_TAG`,
+  `RTP_SSRC`, `EAR_PREFIX`, `WRITE_EARS` — with defaults that are exactly the
+  single caller it has always been, so `grpc_stream_drill.sh` and
+  `pod_kill_drill.sh` are untouched. `CALL_ID` is the one that removes work:
+  with OpenSIPS in the path **rtpengine's call-id is the SIP Call-ID**, so a
+  caller that names its own call-id tells the driver what to tap and no
+  `call_watcher` polling is needed. Pairing that with `mss_ctl create`'s
+  documented behaviour — pass the caller's from-tag and MSS asks rtpengine
+  `query` for the rest — means a soak needs no discovery step at all.
+- **`gap_consumer.py` grew a soak mode.** Its item-11 defaults key arrivals by
+  track name and keep every payload in memory, which merges N calls into one
+  timeline and costs hundreds of megabytes an hour. `GAP_BY_CALL=1` keys by
+  `<callSid>/<track>` so each call gets its own continuity number,
+  `GAP_KEEP_AUDIO=0` keeps only arrival stamps (the longest *arrival gap*
+  survives; the longest *silent run* cannot, since it needs to know which sample
+  slots a frame covered), and `GAP_JOURNAL=0` drops the 50-lines/s/track jsonl.
+  All three default to the item-11 behaviour.
+- **rtpengine's port range was too small for three calls.** One tapped
+  two-party call costs **four port pairs**: one per call leg and one per tap
+  stream. The lab's `--port-min=30000 --port-max=30020` is 10 pairs, so it held
+  exactly **two** tapped calls and the third call's subscribe would have had
+  nowhere to land. It is now 30000-30099 — 50 pairs, ~12 concurrent tapped
+  calls with room for the ports rtpengine holds briefly after a teardown.
+  Publishing 100 UDP ports through Docker Desktop recreates the container in
+  about six seconds, so this costs nothing.
+
+### `tc netem` is impossible on this box, and the probe is checked in
+
+`lab/netem.sh` is the impairment tool testing.md calls "the single
+highest-value item on this list", written the way it should be used:
+`probe | apply <profile> | clear | show`, with the matrix's rows as profile
+names (`loss1`, `loss5`, `burst`, `reorder`, `reorder-far`, `duplicate`,
+`jitter`). It attaches a `prio` qdisc whose priomap sends **all** traffic to
+band 1:1 and then steers only packets addressed to the MSS pods into band 1:3
+where the netem lives — so the impairment lands on the tap link and nowhere
+else, and loss MSS reports is loss MSS was given.
+
+It cannot run here:
+
+```
+$ ./lab/netem.sh probe
+netem: NOT available -- this kernel has no sch_netem
+Error: Specified qdisc kind is unknown.
+$ zcat /proc/config.gz | grep NET_SCH_NETEM
+# CONFIG_NET_SCH_NETEM is not set
+```
+
+Docker Desktop on WSL2 runs containers on the WSL2 kernel itself
+(`uname -r` inside a container is `5.15.153.1-microsoft-standard-WSL2`), and
+that kernel has netem compiled out — not as a module either:
+`/lib/modules/5.15.153.1-microsoft-standard-WSL2/` contains no `sch_*` at all.
+`sudo` needs a password here, so even loading one is out. The documented fix is
+the custom-kernel detour testing.md already prices at half a day
+(`microsoft/WSL2-Linux-Kernel` + a Windows-side `.wslconfig` change), and it is
+a Windows-side change, so it cannot be made from inside the distro.
+
+Two instrument findings from getting that far, both worth keeping:
+
+- **`docker exec` can never do this.** It cannot add a capability to a running
+  container, so `tc` inside `mss-microsip-rtpengine-1` gets
+  `RTNETLINK answers: Operation not permitted`. The way in is a sidecar sharing
+  the namespace: `docker run --net container:<name> --cap-add NET_ADMIN`.
+- **That sidecar needs `--user 0` or `--cap-add` is a no-op.** The rtpengine
+  image's default user is unprivileged, and a non-root process gets
+  `CapEff: 0000000000000000` however many `--cap-add` flags you pass — the same
+  "Operation not permitted", from a different cause, which is exactly the sort
+  of thing that gets misread as "netem does not work in Docker". With
+  `--user 0` the capability is really there (`CapEff: 00000000a80435fb`) and the
+  error changes to the honest one: unknown qdisc kind.
+
+So the soak injects impairment at the matrix's **other** point instead — the
+endpoint, upstream of rtpengine — using `host_test_caller.py`'s own
+`IMPAIR_LOSS` / `IMPAIR_REORDER` / `IMPAIR_DUPLICATE` / `IMPAIR_JITTER_MS`
+knobs, which damage that caller's outbound RTP in userspace and need no kernel
+support. `soak.py` probes netem first and uses it when it is there
+(`SOAK_NETEM=auto|on|off`), so the same script produces the stronger
+measurement on a netem-capable box without an edit.
+
+### The recorded run (2026-08-22)
+
+`soak-1787401045`, 17:47:27 → 18:34:24 — **46 min 57 s**, rtpengine 14.1.1.8,
+3 concurrent calls of 120 s, one slot per pod, scraping every 60 s, six
+impairment phases (`clean:600,loss1:480,loss5:480,reorder:420,jitter:420,duplicate:300`).
+**69 sessions created, tapped and destroyed — 23 per pod — and zero
+assertions violated.**
+
+| | pod A | pod B | pod C |
+| --- | --- | --- | --- |
+| sessions | 23 | 23 | 23 |
+| tap datagrams | 256,066 | 256,170 | 256,108 |
+| frames delivered to the consumer | 388,056 | 388,050 | 388,047 |
+| `jitter_lost` = `frames_concealed` | 1,403 | 1,300 | 1,351 |
+| `late_drops` / `duplicates` / `silence_gaps` / `resets` | 0 / 0 / 0 / 0 | 0 / 0 / 0 / 0 | 0 / 0 / 0 / 0 |
+| `unparsable` / `recv_errors` / `ingest_stalls` | 0 / 0 / 0 | 0 / 0 / 0 | 0 / 0 / 0 |
+| `consumer_dropped_oldest` | 0 | 0 | 0 |
+| events accepted / published / failed / retried | 69 / 69 / 0 / 0 | 69 / 69 / 0 / 0 | 69 / 69 / 0 / 0 |
+| registry persists / adopted / leases lost | 517 / 0 / 0 | 518 / 0 / 0 | 517 / 0 / 0 |
+| **daemon RSS, start → end** | **24,272 → 25,472 kB** | **26,424 → 27,160 kB** | **26,316 → 27,116 kB** |
+
+768,344 tap datagrams and 1,164,153 delivered frames in total, and the leak
+check is the last row: **+1.2 MB, +0.7 MB, +0.8 MB** across 47 minutes and 69
+full session lifecycles each. `mss_ingest_stalls_total` never moved once, which
+says the watchdog never even *transitioned* — the soak destroys each session
+`TEARDOWN_LEAD` (6 s) before its caller hangs up, so no tap ever outlives its
+audio and the 10 s stall window is never approached.
+
+The consumer's own view, from `gap_consumer.py` (69 WS connections, all
+carrying media, 207 tracks = 69 calls × the three D13 tracks):
+
+| longest arrival gap per track | min | median | p90 | max |
+| --- | --- | --- | --- | --- |
+| over 1,164,153 frames | 21 ms | **31 ms** | 45 ms | **67 ms** |
+
+Not one track's worst gap exceeded 100 ms against a 20 ms nominal spacing, and
+the consumer's frame count matches the pods' `mss_consumer_delivered_total`
+exactly, which is the two instruments agreeing.
+
+### What each impairment profile cost
+
+Summed over the three pods, counted only over the scrapes strictly inside each
+phase. "Loss on the impaired leg" is `jitter_lost` against half the datagrams,
+because the injection damages only the caller's leg while `datagrams` counts
+both tap legs:
+
+| Phase | injected | datagrams | lost | concealed | late | dup | loss on the impaired leg |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| clean | — | 132,015 | 0 | 0 | 0 | 0 | 0.00% |
+| loss1 | `IMPAIR_LOSS=0.01` | 114,490 | 606 | 606 | 0 | 0 | **1.06%** |
+| loss5 | `IMPAIR_LOSS=0.05` | 111,158 | 2,782 | 2,782 | 0 | 0 | **5.01%** |
+| reorder | `IMPAIR_REORDER=0.10` | 98,691 | 97 | 97 | 0 | 0 | 0.20% (bleed, below) |
+| jitter | `IMPAIR_JITTER_MS=35` | 98,797 | 0 | 0 | 0 | 0 | 0.00% |
+| duplicate | `IMPAIR_DUPLICATE=0.01` | 65,950 | 0 | 0 | 0 | 0 | 0.00% |
+
+Four things that table settles, none of which a replay test could:
+
+- **Reported loss tracks injected loss, and concealment equals it exactly.**
+  1% injected reads 1.06%; 5% reads 5.01%; and `frames_concealed` equals
+  `jitter_lost` to the packet in every phase. That is the impairment matrix's
+  first row, measured against a real rtpengine for the first time — and it means
+  item 17's G.711 Appendix I PLC has now **run on a real link**, not only in
+  replay. `silence_gaps` stayed 0 throughout, so the buffer correctly called
+  this loss rather than sender silence.
+- **Reorder and jitter cost nothing.** In the reorder phase the loss counter
+  froze at 1403/1300/1351 and stayed there for five consecutive scrapes; in the
+  jitter phase it did not move at all, across ±35 ms of arrival jitter, with
+  `late_drops` 0 — the adaptive depth absorbed it. Matrix rows 3 and 6, on a
+  real link.
+- **Duplication never reaches the tap.** `mss_jitter_duplicates_total` stayed
+  **0** through a phase that duplicated 1% of the caller's packets, so
+  **rtpengine absorbs a duplicate upstream of the subscription**. The dedupe
+  path therefore cannot be exercised from the endpoint at all; only netem on the
+  tap link can reach it, which is one concrete thing this box's missing netem
+  costs us.
+- **Read per-phase numbers from the frozen interior, not the boundary.** The
+  reorder row's 97 lost packets are loss5 bleed: calls are 120 s and scrapes
+  60 s, so a phase's first settled scrape still contains the tail of a call that
+  was dialed under the previous profile. Longer phases or shorter calls shrink
+  it; the honest reading is the run of unchanged scrapes in the middle.
+
+One number that is *not* ours: `underruns` grew at a steady ~0.25/s per leg in
+**every** phase including clean. That is `host_test_caller.py` pacing slightly
+under 50 pps against our wall-clock pacer — the same generator artifact lab.md
+recorded for `call_driver.py` — and the pipeline answers it by feeding the
+consumer a silence frame, which is why the stream stays gap-free.
+
+

@@ -55,7 +55,10 @@ Status as of **2026-08-22**.
   the gRPC data plane, records it to S3 and scrapes the metrics in one
   command. Since item 11 the stack also runs **three MSS pods** on one Redis,
   and `pod_kill_drill.sh` kills the owning one mid-call and measures the
-  consumer's audio gap (`gap_consumer.py`, `ng_call_tags.py`).
+  consumer's audio gap (`gap_consumer.py`, `ng_call_tags.py`). Since item 19
+  there is also `soak.py` — N concurrent calls for hours through a walk of
+  impairment profiles, asserting on `/metrics` every minute and failing loudly —
+  with `netem.sh` for the tap-link impairment on a kernel that has netem.
 
 ## Next up — ordered
 
@@ -662,30 +665,81 @@ MSS), and a second copy path invisible to rtpengine's own accounting.
 [architecture.md](architecture.md) (build / vendor-mirror / stay-on-NG),
 with the three probes' numbers.
 
-### 19. Soak + impairment suite — the "full testing" bar
-**Where:** `lab/` + [testing.md](testing.md).
-**What:** the three test altitudes exist (replay, lab, benchmark); what is
-missing is the standing proof that hours-long operation is boring.
-**Direction:** a `lab/soak.py` that runs N concurrent synthetic calls
-(`host_test_caller.py` is the building block) for ≥1 hour under `tc netem`
-impairment profiles from testing.md (loss 1%/5%, reorder, jitter), scraping
-`/metrics` each minute and asserting: zero `mss_legs_stalled` at steady
-state, `dropped_oldest` bounded, `mss_events_failed_total` zero, process
-RSS flat (no leak). Add the M2 benchmark re-run as the closing step —
-Article VIII requires it after any pipeline change (items 14/17 are that).
-**Done when:** one green soak run is recorded in testing.md with its
-numbers, and the script fails loudly on any assertion so CI or a cron can
-own it later.
-**What item 11 leaves you:** the compose stack now has three pods
-(`mss-control`, `-b`, `-c`) on one Redis and one Redpanda, so a soak can hold
-sessions on several pods at once; `pod_kill_drill.sh` is a reusable shape for
-"do a thing to a live call and assert on `/metrics` afterwards" (preflight
-that the Phase-0 spike is down, call discovery from `call_watcher`, metric
-deltas rather than absolutes, artifacts stamped into `lab/out/`); and
-`gap_consumer.py` is the cheap way to assert continuity — its per-track
-longest-arrival-gap is exactly the number a soak wants to stay near 20 ms.
-Re-measure the pod-kill gap under load while you are there: 14.41 s was
-measured on an idle box.
+### 19. Soak + impairment suite — the "full testing" bar — ✅ DONE (2026-08-22)
+**What shipped:** `lab/soak.py`, plus the three things the lab needed before a
+soak was possible and the netem tool for the box that can run it.
+- **`lab/soak.py`** runs N concurrent synthetic calls back to back for a
+  configurable duration through a walk of impairment phases
+  (`SOAK_PHASES="profile:seconds,…"`), one session per slot round-robin over the
+  three pods, one `gap_consumer.py` keyed per call, scraping every pod's
+  `/metrics` each minute. It asserts, as **deltas from a pre-run baseline**:
+  `mss_legs_stalled` 0; `dropped_oldest` ≤ `MAX_DROPPED_OLDEST` (default 0);
+  the event pump loses nothing (`failed`/`abandoned`/`dropped`/`dropped_oldest`
+  flat); `recv_errors` and `unparsable` flat; `registry_lost`/`_failed` flat;
+  the consumer still fed whenever a session is live; and at the end nothing
+  leaked (`sessions_live`/`legs_live`/`consumers_live` 0, Redis `mss:sessions`
+  empty) with daemon RSS flat — read from `/proc` **inside** the pod matched on
+  `comm == mediaserverd`, since `docker stats` folds in page cache and the
+  `cargo run` wrapper. Every violation prints by name and the exit code is
+  non-zero, so a cron or CI can own it.
+- **`host_test_caller.py` is now N callers**, everything unique per caller behind
+  an env var with the old single-caller defaults intact, so items 10/11's drills
+  are untouched. Naming its own `CALL_ID` removes discovery entirely: with
+  OpenSIPS in the path rtpengine's call-id *is* the SIP Call-ID, and
+  `mss_ctl create` resolves the rest of the tags from `query`. It also grew
+  `IMPAIR_LOSS`/`_REORDER`/`_DUPLICATE`/`_JITTER_MS`.
+- **`gap_consumer.py` grew a soak mode** (`GAP_BY_CALL`, `GAP_KEEP_AUDIO`,
+  `GAP_JOURNAL`), all defaulting to item-11 behaviour, so one consumer can serve
+  N calls for an hour in bounded memory and still report per-call continuity.
+- **`lab/netem.sh`** (`probe|apply|clear|show`) implements the impairment matrix
+  on the tap link: a `prio` qdisc in rtpengine's namespace whose priomap sends
+  everything to band 1:1, with u32 filters steering only MSS-bound packets into
+  the netem band, so the call legs stay clean.
+- **rtpengine's port range went 30000-30020 → 30000-30099.** A tapped two-party
+  call costs four port pairs, so 10 pairs held exactly **two** tapped calls; the
+  soak needs more.
+**The green run (recorded in [testing.md](testing.md) and [lab.md](lab.md)):**
+`soak-1787401045`, **46 min 57 s, 3 concurrent calls of 120 s, 69 sessions
+created/tapped/destroyed (23 per pod), 0 violations.** 768,344 tap datagrams,
+1,164,153 frames delivered. `mss_legs_stalled` 0 at all 43 scrapes and
+`ingest_stalls` never even transitioned; `dropped_oldest` 0; events 69/69 with
+0 failed, 0 retried; `late_drops`/`duplicates`/`silence_gaps`/`resets`/
+`unparsable`/`recv_errors` all 0; registry empty at the end. **RSS 24,272 →
+25,472 kB / 26,424 → 27,160 / 26,316 → 27,116** — under +1.2 MB per pod across
+69 full session lifecycles. Consumer continuity over 207 tracks: worst arrival
+gap **67 ms**, median 31 ms, p90 45 ms, none over 100 ms.
+**The impairment half, and its honest limit.** `tc netem` is **impossible on this
+box**: `CONFIG_NET_SCH_NETEM` is unset in the WSL2 kernel that Docker Desktop
+also runs containers on, with no `sch_*` module to load and no passwordless
+`sudo`; the fix is the custom-kernel detour testing.md prices at half a day and
+it needs a Windows-side change. So the soak injects at the matrix's **other**
+point, the endpoint, and `SOAK_NETEM=auto|on|off` means the same script produces
+the stronger measurement unchanged on a netem-capable box. What that bought:
+1% injected read **1.06%**, 5% read **5.01%**, and `frames_concealed` equalled
+`jitter_lost` **to the packet** in every phase — so item 17's G.711 Appendix I
+PLC has now run on a **real link**, not only in replay, with `silence_gaps` 0
+(the buffer called it loss, not sender silence). Reorder and arrival jitter
+(±35 ms) cost **zero** loss and **zero** late drops. And a measured negative:
+**duplication never reaches the tap** — rtpengine absorbs it upstream of the
+subscription, so `mss_jitter_duplicates_total` stayed 0 through a phase
+duplicating 1% of the caller's packets. That row, plus burst loss and
+reorder-beyond-depth, still needs netem on the tap link.
+**The Article-VIII re-run** (items 14/17 changed the pipeline):
+`parse_jitter_decode_per_packet` **262.1 / 281.3 ns** and
+`ingest_only_per_packet` **26.1 / 26.2 ns** on a quiet box, bracketing item 17's
+269.8 / 25.6 — **no regression**, and `git log -- crates/media-core` confirms no
+commit has touched the crate since. The same benchmark read 308.5 / 28.1 ns with
+the lab stack still resident, which is a **±9% repeatability band** for this
+machine: stop the lab before any future comparison, and treat sub-10% deltas as
+noise.
+**Left open:** the pod-kill gap was **not** re-measured under load (item 11's
+14.41 s is still an idle-box number) — killing pod A mid-soak makes its
+`/metrics` unreachable and trips the soak's own assertions, so the two drills
+need a combined harness rather than one run of each. Phases are also attributed
+a little loosely: calls are 120 s and scrapes 60 s, so a phase's first settled
+scrape still carries the tail of a call dialed under the previous profile (the
+reorder row's 97 lost packets are loss5 bleed) — read the frozen interior, not
+the boundary. And the concealment has still never been judged perceptually.
 
 ## Open defects and soft spots
 
@@ -700,7 +754,7 @@ measured on an idle box.
 | D10 | Pause is honoured by the recorder only. A paused `WS_TWILIO`/`GRPC_STREAM` attachment keeps receiving media (registry state only) — now logged explicitly instead of being invisible, but `StreamPause` still does not stop feeding an ASR | `tap_plane.rs` | medium for cost, low for correctness |
 | ~~D5~~ | ~~Event delivery is **at-most-once**; a broker outage drops events~~ — **fixed 2026-08-22 (item 13)**: bounded retry backlog, order preserved, drop-oldest counted. Now **at-least-once**, so the translator must dedupe by `(external_id, seq)`; a backlog past its 8192 cap or a pod death still loses events | `event_pump.rs` | closed |
 | D6 | `play media` `from-tag` semantics are **unmeasured** — architecture §6's claim was retracted after the instrument turned out to be broken (see lab.md correction) | docs + lab | low, but §6 must not be trusted until re-probed |
-| ~~D7~~ | ~~Jitter buffer: fixed target depth, no adaptive sizing, no timestamp-aware gap handling, silence instead of real PLC~~ — **fixed 2026-08-22 (item 17)**: adaptive depth from the RFC 3550 estimate, timestamp-aware silence gaps, comfort noise accounted, G.711 Appendix I-shaped PLC, restart on SSRC change. Replay-verified across the impairment matrix; **not** yet verified against `tc netem` or judged perceptually | `jitter.rs`, `pipeline.rs`, `plc.rs` | closed |
+| ~~D7~~ | ~~Jitter buffer: fixed target depth, no adaptive sizing, no timestamp-aware gap handling, silence instead of real PLC~~ — **fixed 2026-08-22 (item 17)**: adaptive depth from the RFC 3550 estimate, timestamp-aware silence gaps, comfort noise accounted, G.711 Appendix I-shaped PLC, restart on SSRC change. Replay-verified across the impairment matrix, and since item 19 also **on a real link** in the soak — 1%/5% injected loss reported as 1.06%/5.01% with `frames_concealed` equal to `jitter_lost` to the packet, reorder and ±35 ms jitter costing zero loss and zero late drops. Still open: never impaired with `tc netem` on the **tap link** (this box's kernel has none), so burst loss, reorder-beyond-depth and dedupe stay replay-only, and the concealment has never been judged perceptually | `jitter.rs`, `pipeline.rs`, `plc.rs` | closed |
 | D8 | `owner_pod` is a config string; real placement and load-aware scheduling do not exist | `main.rs` | low until multi-pod |
 | ~~D12~~ | ~~**NG cookies repeat across sessions on one pod**: `CookieSequence` restarted its serial at 0 and `TapPlane` binds a new `NgTransport` per session, so every session's first command was `<prefix>-0`. Two sessions inside rtpengine's duplicate-cookie reply-cache window get the *same cached subscribe answer*, and the second tap receives **no media at all** while looking healthy~~ — **fixed 2026-08-22 (item 10)**: the serial is process-wide, unit-pinned and lab-proved before/after | `ng_transport.rs` | closed — was **high**, it silently broke every second tap within a minute |
 | D15 | An adopted attachment loses its **negotiated format**: `PersistedAttachment` has no format field and `rebuild` passes `format: None`, so a consumer that attached as L16/16k comes back at the session default (g711 at the tap rate). Found by reading the adoption path during item 11, **not** observed — that drill's consumer was WS/PCMU, where the default is the only legal answer. A gRPC consumer would notice | `session_store.rs`, `registry_keeper.rs` | low today, medium once ASR consumers ask for L16/16k |
