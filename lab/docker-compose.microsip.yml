@@ -26,9 +26,14 @@ services:
       - --interface=internal/172.31.99.10
       - --interface=external/172.31.99.10!127.0.0.1
       - --port-min=30000
-      - --port-max=30020
+      - --port-max=30099
     ports:
-      - "30000-30020:30000-30020/udp"
+      # One tapped two-party call costs four port pairs: one per call leg and
+      # one per tap stream. 21 ports (the range this lab used until item 19)
+      # therefore held exactly two tapped calls, and the soak suite needs more
+      # than two. 100 ports is 50 pairs, so ~12 concurrent tapped calls with
+      # room for the ports rtpengine holds briefly after a teardown.
+      - "30000-30099:30000-30099/udp"
     networks:
       lab:
         ipv4_address: 172.31.99.10
