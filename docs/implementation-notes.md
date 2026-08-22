@@ -197,8 +197,8 @@ the DTMF detector and the G.711 decode, and allocates nothing per packet
 - `customParameters` is omitted entirely when empty and emitted when
   present; byte-exact tests cover both. Multi-entry maps have no
   deterministic order, so byte-exact tests use at most one entry.
-- **M3:** the WS consumer bridge must also replicate the the upstream platform-forked
-  mod_audio_fork dialect. **Open item:** the fork's exact wire format is
+- **M3:** the WS consumer bridge must also replicate the reference
+  deployment's forked mod_audio_fork dialect. **Open item:** the fork's exact wire format is
   specified only in the fork's C source (not in this repo, not in the legacy controller);
   pull it and write the byte-exact tests before the first ASR consumer
   migrates (architecture.md risk #4).
