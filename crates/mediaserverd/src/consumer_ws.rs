@@ -253,7 +253,7 @@ mod tests {
     }
 
     #[test]
-    fn tracks_use_the_mediagateway_names() {
+    fn tracks_use_the_legacy_gateway_names() {
         assert_eq!(track_name(Track::Customer), "inbound");
         assert_eq!(track_name(Track::Agent), "outbound");
         assert_eq!(track_name(Track::Mixed), "mixed");

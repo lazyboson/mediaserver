@@ -6,11 +6,12 @@ amendment (see Article X), never by drift.
 
 ## Purpose
 
-mediaserver is 3CLogic's centralized media plane: it taps per-call audio
-from RTPEngine and fans it out to RTT, ASR, recording, and voice-AI
-consumers, and — in later phases — carries inline interactive media and
-mixing, removing all media workloads from FreeSWITCH. It exists because
-media must scale independently of call control.
+mediaserver is a centralized media plane for SIP infrastructures built on
+rtpengine: it taps per-call audio from RTPEngine and fans it out to RTT,
+ASR, recording, and voice-AI consumers, and — in later phases — carries
+inline interactive media and mixing, removing all media workloads from
+FreeSWITCH. It exists because media must scale independently of call
+control.
 
 ## Article I — The media path is sacred
 

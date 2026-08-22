@@ -3,6 +3,7 @@ name = "media-core"
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
+license.workspace = true
 description = "Sans-IO media pipeline core: RTP, G.711, RFC 2833 DTMF, jitter buffer, frames. No sockets, no async — pure state machines, testable by pcap replay."
 
 [dependencies]
