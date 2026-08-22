@@ -103,6 +103,22 @@ groups:
             silence-suppressed caller can trip this briefly; a stall that
             holds for minutes means the subscription or routing broke.
 
+      - alert: MssLegSpeakerUnresolved
+        expr: mss_legs_unknown_ssrc > 0
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "A tap leg's speaker could not be named from rtpengine's ssrcs"
+          description: >-
+            A mid-call ssrc change (re-INVITE, transfer, codec renegotiation)
+            normally clears within one re-resolution cycle — compare
+            mss_legs_ssrc_changes_total, mss_ssrc_requeries_total and
+            mss_legs_ssrc_reresolved_total. A leg that stays unresolved for
+            minutes is labelled by elimination or by stream order, so
+            recordings and transcripts of that call may name the wrong
+            speaker.
+
       - alert: MssJitterLossHigh
         expr: >-
           rate(mss_jitter_lost_total[5m])

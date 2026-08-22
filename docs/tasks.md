@@ -43,7 +43,10 @@ Status as of **2026-08-22**.
   tapped call.
 - **Leg identity** — SSRC correlation from rtpengine `query` plus
   elimination for transcode-restamped legs; verified per-track on two
-  consecutive live calls, independent of stream order.
+  consecutive live calls, independent of stream order. A **mid-call SSRC
+  change** re-resolves too (item 14): the leg re-enters resolution and a
+  control-world task re-queries and pushes a fresh map over a bounded queue
+  — replay-verified, not yet watched on a live re-INVITE.
 - **Lab** — OpenSIPS/FreeSWITCH/rtpengine/Redpanda compose stack, synthetic
   caller (`host_test_caller.py`), per-track analyser (`track_dump.py`),
   RTT and recorder mock consumers, NG probes, `mss_ctl` control-plane CLI,
@@ -335,21 +338,59 @@ through rtpengine, so it proves the pump and the transport, not the whole
 call path. Also still open by design: a pod that dies holding a backlog
 loses it (memory only, no disk spool).
 
-### 14. Mid-call SSRC re-resolution (defect D1)
+### 14. Mid-call SSRC re-resolution (defect D1) — ✅ DONE (2026-08-22)
 **Where:** `crates/mediaserverd/src/tap_spike.rs` + `tap_plane.rs`.
-**What:** a re-INVITE/transfer changes a leg's SSRC; today `ssrcs_seen`
-records it and nothing acts, so speaker labels can go stale. Blocks
-correct Phase-2 recording of transferred calls.
-**Direction:** the media thread must not do NG round trips. Reuse the two
-seams that exist: the capture thread already publishes `ssrcs_seen` into
-`SharedLegStats`-adjacent state, and the hub already shows how to hand
-commands into the capture loop (bounded `ArrayQueue`, polled per tick).
-A control-world task notices an unknown SSRC, re-runs `query` +
-`speaker_ssrcs` (both exist in `tap_plane.rs`), and pushes an updated
-ssrc→track map into the legs through a new command queue.
-**Done when:** a replay/lab test that switches the sender's SSRC mid-call
-(the `G711StreamGenerator` takes an SSRC — send with a second generator)
-keeps customer/agent naming correct, and D1 is struck from the table.
+**What shipped:** a leg now *re-enters* resolution when the sender's SSRC
+changes, and a control-world task answers with a fresh map.
+- `TapLeg` keeps `observed_ssrc` and re-resolves whenever the pipeline
+  reports a different one. A new SSRC that the map does not name puts the
+  leg back into the unresolved state (`unknown_ssrc = Some(new)`) while it
+  **keeps the name it had** — a wrong-but-stable label beats a flapping one,
+  and elimination still covers the two-leg case.
+- A change needs **3 consecutive packets** of the new SSRC to be adopted
+  (`SSRC_CHANGE_CONFIRMATIONS`), so two SSRCs interleaved on one leg (the
+  dual-SSRC fault from the echo-loop sessions) cannot rename it per packet.
+  The first SSRC on a leg still resolves on its first packet.
+- The seam is the hub's: a per-leg bounded `ArrayQueue<SsrcTracks>`
+  (capacity 4, drop-oldest so the newest map wins) polled once per capture
+  tick. `SsrcTracks` is a fixed `[Option<(u32, Track)>; 8]` — `Copy`, so
+  applying a map allocates nothing on the media thread. **No NG round trip
+  moved into the media world.**
+- The control-world half is `reresolve_speakers` in `tap_plane.rs`: every
+  500 ms it reads each leg's unresolved SSRC out of `SharedLegStats`, and
+  the first time it sees one it has not asked about it re-runs
+  `query` + `speaker_ssrcs` and publishes the result to every leg.
+  `SsrcRequeries` bounds that to **one query per distinct unknown SSRC**
+  (memory of 16, oldest forgotten), so a permanently unknown SSRC cannot
+  hammer rtpengine. The task is spawned only when the initial map is
+  non-empty and is aborted with the session.
+- `settle_by_elimination` needed no change but now matters more: it never
+  latches (an eliminated leg stays `resolved_track() == None`), so when
+  a re-resolution flips one leg the other is re-derived on the next tick.
+  Test: `a_leg_that_starts_carrying_the_other_speaker_flips_both_names`.
+- New series: `mss_legs_ssrc_changes_total`, `mss_ssrc_requeries_total`,
+  `mss_legs_ssrc_reresolved_total`, and `mss_legs_unknown_ssrc` now
+  **recovers to 0** when a re-resolution lands. Alert
+  `MssLegSpeakerUnresolved` fires only when it does *not* recover (2m).
+**Verified by replay/unit tests only** (`tap_spike::reresolution_tests`,
+real loopback sockets through the real `capture` loop): a leg whose sender
+switches SSRC mid-call goes unresolved, keeps its name, and is renamed
+correctly when the refreshed map arrives — customer/agent naming intact on
+both legs, `ssrc_changes=1`, `reresolutions=1`, and the sequence jump shows
+up as exactly one jitter `Reset` (a re-INVITE's discontinuity, as expected)
+with audio flowing again after it. Also covered: interleaved SSRCs rename
+nothing, the newest map wins over queued stale ones, and the shared-stats
+seam the control task reads.
+**Not verified on a live call.** Two things a lab run still owes:
+1. that rtpengine's `query` reports the **new** SSRC for a tag after a
+   mid-call change (measured before only for a transcode-restamped leg at
+   subscribe time — implementation-notes tap_plane point 4);
+2. the end-to-end recovery timing on a real re-INVITE.
+**Still open by design:** a transfer that replaces a *tag* (new agent, new
+from-tag) is not resolved — `from_tags` is fixed at subscribe time, so the
+new tag's SSRC is not in the map and the leg is named by elimination. Fixing
+that means re-subscribing, not re-resolving; it is the natural follow-up if
+transfer-heavy tenants need it.
 
 ### 15. Phase 2 — recording to S3 (milestone M5)
 **Where:** new `crates/mediaserverd/src/recorder.rs`; `tap_plane.rs` for
@@ -378,8 +419,9 @@ by `timestamp_ms` (Customer left, Agent right — `write_wav` in
 identity, callbacks appear on `mss.events` in order, a paused interval is
 absent from audio but the duration math matches, and — the roadmap's exit
 bar — a byte-comparison harness against FS `RECORD_STEREO` output exists
-even if FS parity sign-off is a later human step. Requires item 14 for
-transferred calls; note it if shipped without.
+even if FS parity sign-off is a later human step. Item 14 (mid-call SSRC
+re-resolution) has landed, so a re-INVITE no longer stales the speaker
+labels of a recording; a tag-replacing transfer still can.
 
 ### 16. Opus output
 Item 9 above, unchanged: decide the `audiopus_sys` cmake trade first.
@@ -460,7 +502,7 @@ own it later.
 
 | # | Item | Where | Severity |
 | --- | --- | --- | --- |
-| D1 | A **mid-call SSRC change** (re-INVITE, transfer, codec renegotiation) does not re-resolve leg identity; `ssrcs_seen` makes it visible but nothing acts on it | `tap_spike.rs` | medium — affects transferred calls; **item 14** |
+| ~~D1~~ | ~~A **mid-call SSRC change** (re-INVITE, transfer, codec renegotiation) does not re-resolve leg identity~~ — **fixed 2026-08-22 (item 14)**: the leg re-enters resolution on a confirmed SSRC change and a control-world task re-queries rtpengine and pushes a fresh map through a bounded queue. Replay-verified only, not yet on a live call. Residual: a transfer that replaces a *from-tag* still needs a re-subscribe, not a re-resolve | `tap_spike.rs`, `tap_plane.rs` | closed |
 | D2 | `stop_playback` stops **all** playback on the call: rtpengine's `stop media` targets a participant, not a playback id | `tap_plane.rs` | low until multiple concurrent playbacks exist |
 | D3 | `close_attachment` **aborts** the consumer task instead of closing the websocket politely (no `stop` frame) | `tap_plane.rs` | low, but consumers see a truncated stream |
 | D4 | `WS_TWILIO` and `GRPC_STREAM` attachments are served; `FILE_S3` (phase 2) and `RTP_INLINE` (phase 3) are refused by name | `tap_plane.rs` | expected — phase work |
@@ -494,8 +536,9 @@ These are not code and have blocked since Phase 0:
 attribution are done; what remains is the stereo segmenter → direct S3, the
 `${accountID}/${recordingID}.${format}` identity contract, and the
 `recordStart/recordStop/recordPause/uploadCompleted` callback semantics
-including pause = segment + defer + accumulate. Needs D1 (item 14) fixed if
-transferred calls must record correctly.
+including pause = segment + defer + accumulate. D1 (item 14) is fixed for a
+mid-call SSRC change on the same from-tag; a transfer that replaces a tag
+still lands on elimination, so a recording of one is only as right as that.
 
 **Phase 3 — Interactive media** needs the inline RTP leg (`SessionKind::INLINE`
 is already accepted by the API), streaming TTS playback, and barge-in
