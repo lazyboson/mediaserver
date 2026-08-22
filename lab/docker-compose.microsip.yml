@@ -240,6 +240,81 @@ services:
       lab:
         ipv4_address: 172.31.99.31
 
+  # The second and third pods, for the pod-kill re-subscribe drill (item 11).
+  # Identical to mss-control except for the three things that must differ: the
+  # pod name, the published ports, and the address rtpengine sends the tap to.
+  # Same MSS_REDIS_URL is the whole point -- that shared registry is what lets
+  # one of them adopt a session whose owner died, and having *two* survivors is
+  # what makes "exactly one adopter" a real assertion rather than a tautology.
+  # They share the build cache volume, so they start without recompiling.
+  mss-control-b:
+    image: rust:1.95-slim-bookworm
+    working_dir: /build
+    command: ["cargo", "run", "--quiet", "-p", "mediaserverd"]
+    depends_on: [rtpengine, minio-init]
+    volumes:
+      - ..:/build:ro
+      - lab-target:/target
+      - lab-registry:/usr/local/cargo/registry
+      - lab-rustup:/usr/local/rustup
+      - ./out:/out
+    environment:
+      CARGO_TARGET_DIR: /target
+      RUST_LOG: info
+      MSS_CONTROL_LISTEN: 0.0.0.0:50551
+      MSS_METRICS_LISTEN: 0.0.0.0:9464
+      MSS_POD_NAME: lab-control-b
+      MSS_RTPENGINE_NODE: 172.31.99.10:22222
+      MSS_TAP_LOCAL_IP: 172.31.99.32
+      MSS_KAFKA_BROKERS: 172.31.99.60:9092
+      MSS_REDIS_URL: redis://172.31.99.61:6379
+      MSS_RECORDING_BUCKET: ${MSS_RECORDING_BUCKET:-lab-recordings}
+      MSS_RECORDING_S3_ENDPOINT: http://172.31.99.62:9000
+      MSS_RECORDING_S3_REGION: us-east-1
+      MSS_RECORDING_S3_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-minioadmin}
+      MSS_RECORDING_S3_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin}
+      MSS_RECORDING_SPILL_DIR: /out/recordings
+    ports:
+      - "50552:50551"
+      - "9465:9464"
+    networks:
+      lab:
+        ipv4_address: 172.31.99.32
+
+  mss-control-c:
+    image: rust:1.95-slim-bookworm
+    working_dir: /build
+    command: ["cargo", "run", "--quiet", "-p", "mediaserverd"]
+    depends_on: [rtpengine, minio-init]
+    volumes:
+      - ..:/build:ro
+      - lab-target:/target
+      - lab-registry:/usr/local/cargo/registry
+      - lab-rustup:/usr/local/rustup
+      - ./out:/out
+    environment:
+      CARGO_TARGET_DIR: /target
+      RUST_LOG: info
+      MSS_CONTROL_LISTEN: 0.0.0.0:50551
+      MSS_METRICS_LISTEN: 0.0.0.0:9464
+      MSS_POD_NAME: lab-control-c
+      MSS_RTPENGINE_NODE: 172.31.99.10:22222
+      MSS_TAP_LOCAL_IP: 172.31.99.33
+      MSS_KAFKA_BROKERS: 172.31.99.60:9092
+      MSS_REDIS_URL: redis://172.31.99.61:6379
+      MSS_RECORDING_BUCKET: ${MSS_RECORDING_BUCKET:-lab-recordings}
+      MSS_RECORDING_S3_ENDPOINT: http://172.31.99.62:9000
+      MSS_RECORDING_S3_REGION: us-east-1
+      MSS_RECORDING_S3_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-minioadmin}
+      MSS_RECORDING_S3_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin}
+      MSS_RECORDING_SPILL_DIR: /out/recordings
+    ports:
+      - "50553:50551"
+      - "9466:9464"
+    networks:
+      lab:
+        ipv4_address: 172.31.99.33
+
 volumes:
   lab-target:
   lab-registry:

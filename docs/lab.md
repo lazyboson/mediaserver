@@ -740,3 +740,141 @@ were accepted and ten published with zero failures.
   synthetic caller hangs up before the drill destroys the session, so
   rtpengine has already deleted the call. Benign here, and the warning says
   the right thing, but a production hangup takes the same path.
+
+## pod_kill_drill.sh — a pod dies mid-call and another pod re-subscribes (2026-08-22)
+
+Item 11, the Phase-1 exit criterion "re-subscribe recovery observed
+working". The Redis registry (item 3) had been proven at store level — six
+pods racing for one orphan produce exactly one owner — but nothing had ever
+killed a pod that was actually carrying audio.
+
+Three `mediaserverd` pods now share the lab's Redis. They differ in exactly
+the three things that must differ:
+
+| | pod name | control | metrics | tap address |
+| --- | --- | --- | --- | --- |
+| `mss-control` (A, the victim) | `lab-control` | 50551 | 9464 | 172.31.99.31 |
+| `mss-control-b` (B) | `lab-control-b` | 50552 | 9465 | 172.31.99.32 |
+| `mss-control-c` (C) | `lab-control-c` | 50553 | 9466 | 172.31.99.33 |
+
+Two survivors, not one, is deliberate: with a single candidate "exactly one
+adopter" is a tautology. They share the compose build-cache volume, so B and
+C start in seconds without recompiling.
+
+```sh
+DOCKER_API_VERSION=1.43 docker compose -f lab/docker-compose.microsip.yml \
+  up -d rtpengine opensips freeswitch call-watcher redpanda redis \
+        minio minio-init llm-bridge mss-control mss-control-b mss-control-c
+./lab/pod_kill_drill.sh
+# pod A is dead afterwards, on purpose; before the next run:
+DOCKER_API_VERSION=1.43 docker compose -f lab/docker-compose.microsip.yml up -d mss-control
+```
+
+The drill dials with `host_test_caller.py`, reads the call-id and tags from
+`call_watcher`, creates the session on **pod A** with a WS consumer attached,
+lets it run 20 s, then `docker kill --signal=KILL`s pod A — the container's
+PID 1 dies, so the whole namespace goes with it: no shutdown path, no lease
+release, which is what a node loss looks like. Then it polls both survivors'
+`mss_registry_adopted_total` until one moves.
+
+**The consumer is a WS consumer, not `mss_stream_probe`.** With `WS_TWILIO`
+the pod dials the consumer, so the adopting pod re-dials the *same* endpoint
+and one artifact spans the outage; a gRPC consumer dials the pod, and would
+have to discover the new pod and attachment id itself. `lab/gap_consumer.py`
+is that consumer, built for measuring rather than listening: it stamps every
+media frame's arrival, logs each connection open/close, and writes one wav
+per track on an **arrival** timeline (each frame placed at
+`round((arrival - t0) * 8000)`, everything no frame covered left as digital
+silence). The outage is therefore a run of samples no frame ever covered,
+and the drill reports it two ways — longest gap between consecutive
+arrivals, and longest uncovered run.
+
+It runs on the WSL host so it outlives pod A, which forced one lab discovery:
+under Docker Desktop on WSL2 the pods reach the host at
+**`host.docker.internal`** (192.168.65.254, in every container's
+`/etc/hosts`). The lab bridge gateway 172.31.99.1 belongs to the Docker VM,
+not to the WSL distro the script runs in — a connect there is *refused* — and
+the WSL eth0 address (`ADVERTISED_IP`, which the SIP half uses) times out
+from inside the lab network.
+
+### The run (2026-08-22, rtpengine 14.1.1.8, 150 s call, kill 20 s in)
+
+Recorded run: `killdrill-1787399380`, call `host-test-1787399382`.
+
+| | value |
+| --- | --- |
+| **audio gap at the consumer** | **14.41 s** (longest arrival gap 14407 ms; longest uncovered run 14380 ms, identical on all three tracks) |
+| WS connection dead time | closed at 21.13 s, re-dialed at 35.48 s = 14.35 s |
+| adoption latency | 14.6 s after the kill (`subscribe request` on the wire 14.4 s after it) |
+| adopter | pod C — `mss_registry_adopted_total` 1 → 2, pod B unchanged at 1 |
+| lease | `mss:lease:killdrill-…` = `lab-control` with ttl 12 at the kill, `lab-control-c` after |
+| `mss_registry_lost_total` | 0 on both survivors |
+| the rebuilt tap | Customer 5551 datagrams, Agent 5640, `jitter_lost: 0`, `frames_concealed: 0`, `recv_errors: 0`, `unknown_payload_type: 0`, both legs named (not resolved by elimination alone) |
+| the rebuilt consumer | `mss_consumer_dropped_oldest_total 0`, `queue_depth_frames_max 0`, `mss_legs_stalled 0` |
+
+Two earlier runs of the same drill, for the shape of the distribution:
+19.55 s gap / 19.7 s adoption (pod B adopting, before pod C existed) and
+17.97 s gap / 18.6 s adoption (pod C). All three sit inside the arithmetic
+the design implies: the lease is 15 s, renewed every 5 s, and the adopt
+sweep runs every 10 s, so the worst case is **25 s** and the best is the
+sweep landing just after expiry.
+
+So the exit criterion holds: **a pod-kill mid-call costs the consumer one
+bounded gap of ~15-20 s and then the audio comes back, with the tap
+re-established, the leg names re-resolved and the consumer re-dialed, by a
+pod that never saw the original request.**
+
+### What it found: the dead pod's subscription is never torn down (D14)
+
+The adopter creates a *new* subscription; nothing removes the dead pod's.
+rtpengine's own teardown block is the proof, and it prices the leak:
+
+```
+--- Tag '7fc6e5bd…' (label 'mss-tap'), created 2:28 ago
+------ Port 172.31.99.10:30004 <> 172.31.99.31:35533 … out 7317 p, 1258524 b
+------ Port 172.31.99.10:30010 <> 172.31.99.31:38680 … out 7426 p, 1277272 b
+--- Tag '56f4dd52…' (label 'mss-tap'), created 1:52 ago
+------ Port 172.31.99.10:30006 <> 172.31.99.33:48248 … out 5551 p,  954772 b
+------ Port 172.31.99.10:30002 <> 172.31.99.33:48575 … out 5640 p,  970080 b
+```
+
+172.31.99.31 is pod A, which had been dead for 110 s. rtpengine sent it
+**14,743 packets / 2.5 MB** anyway — essentially every packet of the call,
+since the leg totals were 7424 and 7533 — and held four ports for it until
+the call ended. Nothing in rtpengine's log for this call is an `unsubscribe`
+except pod C's own at teardown. Recorded as **D14**: the tap's `to-tag` is
+not persisted, so no survivor can cancel it. Not fixed here — the fix needs
+a new seam (persist the to-tag, and have the adopter `unsubscribe` it before
+re-subscribing) plus a decision about a partitioned-but-alive owner, which is
+more than a lab session should land.
+
+### Instrument notes, all measured rather than assumed
+
+`lab/ng_call_tags.py` asks rtpengine `query` who is attached to a call and
+counts taps (a tap is an entry in a leg's `subscribers` list with
+`"type": "pub/sub"`). Three things about that instrument, learned the hard
+way in this drill:
+
+- **A lone subscription is invisible.** With exactly one tap on the call and
+  20 s of media delivered, `query` reported two tags and *no* pub/sub
+  subscriber. Both taps appeared the moment a second `subscribe` touched the
+  call. So the drill's `tapped-by-A=0` is not a bug in the script, and a 0
+  from it means "0 or 1"; only counts above 1 are trustworthy.
+- **The per-stream numbers in a query reply are stale.** On a call carrying
+  50 packets/s, both `stats_out` and `last packet` came back identical from
+  queries 15-20 s apart. Do not argue from them that media is or is not
+  flowing; the teardown "Final packet stats" block has the real totals.
+- **`created` is the field that separates an orphan from its replacement**
+  (1787399384 for pod A's tap, 1787399420 for pod C's), and our
+  subscriptions carry the label `mss-tap`, which makes them greppable in
+  rtpengine's log.
+
+The D12 trap from item 10 did not fire: the two pods' subscribes are 36 s
+apart in rtpengine's log from two different source addresses, each answered
+individually, so no cached duplicate-cookie reply was served to the
+re-subscribe even though it reuses the same call-id. Cookie prefixes are
+per-process wall-clock nanos, and the serial is process-wide since D12.
+
+Also worth knowing for item 19's soak: D13 reproduces here on every run —
+the start frame advertises `["inbound","outbound"]` and a silent `mixed`
+track arrives anyway, which is why the gap consumer reports three tracks.

@@ -134,7 +134,10 @@ to Kafka `mss.events`, the Redis registry re-subscribes on pod loss, leg
 identity is solved by SSRC correlation, and Prometheus metrics are exported
 on `MSS_METRICS_LISTEN` with alert rules in `deploy/`. What still gates the
 tenant pilot: reviewing and merging the the legacy controller event translator (written, on
-the legacy controller branch `feature/legacy-translator`), the barge-in cut-through
-measurement, and a live pod-kill re-subscribe observation. Two Phase-0 items
+the legacy controller branch `feature/legacy-translator`) and the barge-in cut-through
+measurement. The **pod-kill re-subscribe drill is done** (2026-08-22): a real
+`kill -9` on the owning pod mid-call cost the consumer a **14.41 s** audio gap
+before another pod adopted the session and re-subscribed — and showed that the
+dead pod's subscription is never torn down (D14). Two Phase-0 items
 remain blocked on other people: the production rtpengine version check and
 the rtpengine-side per-tap cost.
