@@ -15,6 +15,21 @@ impl Encoding {
         }
     }
 
+    pub fn from_static_payload_type(payload_type: u8) -> Option<Encoding> {
+        match payload_type {
+            0 => Some(Encoding::Pcmu),
+            8 => Some(Encoding::Pcma),
+            _ => None,
+        }
+    }
+
+    pub fn static_clock_rate_hz(self) -> Option<u32> {
+        match self {
+            Encoding::Pcmu | Encoding::Pcma => Some(8000),
+            _ => None,
+        }
+    }
+
     pub fn rtpmap_name(self) -> &'static str {
         match self {
             Encoding::Pcmu => "PCMU",
@@ -95,6 +110,27 @@ mod tests {
         assert_eq!(Encoding::Pcma.static_payload_type(), Some(8));
         assert_eq!(Encoding::L16.static_payload_type(), None);
         assert_eq!(Encoding::Opus.static_payload_type(), None);
+    }
+
+    #[test]
+    fn the_static_payload_type_map_round_trips_both_ways() {
+        for encoding in [Encoding::Pcmu, Encoding::Pcma] {
+            let payload_type = encoding.static_payload_type().unwrap();
+            assert_eq!(
+                Encoding::from_static_payload_type(payload_type),
+                Some(encoding)
+            );
+            assert_eq!(encoding.static_clock_rate_hz(), Some(8000));
+        }
+    }
+
+    #[test]
+    fn a_payload_type_we_cannot_decode_names_itself_by_returning_none() {
+        for payload_type in [9u8, 11, 13, 96, 101, 111] {
+            assert_eq!(Encoding::from_static_payload_type(payload_type), None);
+        }
+        assert_eq!(Encoding::L16.static_clock_rate_hz(), None);
+        assert_eq!(Encoding::Opus.static_clock_rate_hz(), None);
     }
 
     #[test]

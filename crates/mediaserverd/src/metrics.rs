@@ -416,6 +416,7 @@ mod tests {
             default_node: None,
             local_media_address: IpAddr::from([127, 0, 0, 1]),
             format: AudioFormat::pcmu_8k_20ms(),
+            transcode_at_tap: true,
             cookie_prefix: 1,
             sdp_session_id: 1,
             recording: crate::recorder::RecordingSupport::default(),
