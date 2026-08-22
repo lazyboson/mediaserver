@@ -78,8 +78,13 @@ Work:
   re-resolve.
 - ✅ Codec pipeline (2026-08-22): G.711 → L16 → resample (8k/16k/48k) →
   per-consumer encode, replay-verified; the hub carries PCM and each
-  consumer encodes its own format. Opus is deferred until a consumer asks
-  (tasks.md item 9 — it drags a C toolchain into the hermetic build).
+  consumer encodes its own format.
+- ✅ **Opus ingest (2026-08-23)**: libopus via `opus-ffi` (the only crate with
+  `unsafe`), decoding at 8/12/16/24/48 kHz with libopus's own concealment,
+  proven against real rtpengine-generated Opus on a live call. The build now
+  needs cmake/make/g++ — the hermetic-build objection was real but was the
+  wrong thing to optimise for against codec correctness (tasks.md 16a/16b).
+  Opus **output** to consumers is still deferred until one asks (16d).
 - ✅ Consumer adapters: WebSocket Twilio dialect first (wire-compatible with
   the legacy media gateway — existing endpoints must not change), then gRPC
   `MediaStream` (proto/mediastream.proto, landed 2026-08-20 — binary frames,

@@ -105,6 +105,9 @@ placement a scheduling decision instead of an SDP-routing problem.
 
 ## Working on this repo
 
+Building needs **cmake, make and g++** on the host — `opus-ffi` compiles a
+vendored libopus. `apt install cmake make g++` on Debian/Ubuntu.
+
 ```sh
 cargo test --workspace
 cargo clippy --all-targets -- -D warnings
@@ -121,7 +124,7 @@ pipeline triggers on `v*` tags.
 Read [docs/tasks.md](docs/tasks.md) — it holds the milestone state and the
 ordered next-up list with a definition of done for each item.
 
-Short version as of 2026-08-22: M1–M3 are done, **M4 (control plane) is code
+Short version as of 2026-08-23: M1–M3 are done, **M4 (control plane) is code
 complete (~95%)** and **M5 (recording to S3) is code complete** — the recorder
 is a hub consumer that segments on pause, keeps the frozen
 `${accountID}/${recordingID}.${format}` identity, and uploads through
@@ -138,6 +141,9 @@ the legacy controller branch `feature/legacy-translator`) and the barge-in cut-t
 measurement. The **pod-kill re-subscribe drill is done** (2026-08-22): a real
 `kill -9` on the owning pod mid-call cost the consumer a **14.41 s** audio gap
 before another pod adopted the session and re-subscribed — and showed that the
-dead pod's subscription is never torn down (D14). Two Phase-0 items
-remain blocked on other people: the production rtpengine version check and
-the rtpengine-side per-tap cost.
+dead pod's subscription is never torn down (D14). **Opus ingest landed
+2026-08-23** — libopus via the `opus-ffi` crate, decoding at 8/12/16/24/48 kHz
+with libopus's own concealment, proven on a live call by asking rtpengine to
+`transcode: [opus]` (`MSS_TAP_FORMAT=opus`). Building now needs cmake, make and
+g++. Two Phase-0 items remain blocked on other people: the production rtpengine
+version check and the rtpengine-side per-tap cost.

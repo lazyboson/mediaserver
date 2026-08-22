@@ -104,7 +104,10 @@ Playout semantics as decided (each pinned by a test named after it):
 - ~~**M2:** adaptive target depth~~ — landed 2026-08-22.
 - ~~**M2:** timestamp-aware gap handling~~ — landed 2026-08-22.
 - ~~**M3:** PLC hook on `PopOutcome::Lost`~~ — landed 2026-08-22 (plc.rs).
-- **M3:** slot sizing revisit when Opus lands (payloads up to ~1275 B).
+- ~~**M3:** slot sizing revisit when Opus lands~~ — landed 2026-08-23.
+  `MAX_PAYLOAD` is **1276** (RFC 6716's maximum Opus packet) and sizes the wire
+  slot only; the new `MAX_FRAME_SAMPLES` (960) sizes the PCM scratch. The old
+  single constant did both jobs, which is why widening it needed care.
 - **Still open:** the adaptive ceiling is a multiple of the configured floor
   rather than a millisecond budget, and nothing yet *reports* the chosen
   depth per leg beyond `Stats.target_depth` (exported only in the
@@ -114,8 +117,30 @@ Playout semantics as decided (each pinned by a test named after it):
 `StreamPipeline` is the whole per-stream ingest path as a state machine:
 `ingest(datagram)` classifies and buffers, `release()` emits one frame of
 PCM when the caller's pacing deadline says so. It owns the jitter buffer,
-the DTMF detector and the G.711 decode, and allocates nothing per packet
-(one reusable `[i16; MAX_PAYLOAD]`).
+the DTMF detector and the decoder, and allocates nothing per packet
+(reusable fixed arrays only).
+- **Two ways to build one, and the difference matters.**
+  `StreamPipeline::new(format, ..)` is for a codec whose payload type and clock
+  rate both follow from the static RTP table — G.711. `with_config(PipelineConfig)`
+  is for everything else, because it takes the wire facts (`audio_payload_type`,
+  `clock_rate_hz`) separately from the decode target (`decode: AudioFormat`).
+  Opus needs this: its payload type is dynamic, its RTP clock is always 48000
+  (RFC 7587) whatever rate it decodes to, so a 16 kHz Opus tap advances the
+  jitter buffer by **960** ticks per packet while emitting **320** samples.
+  Conflating those two numbers is the bug this split exists to prevent.
+- **Concealment is per codec, and they are not interchangeable.** G.711 loss
+  is filled by plc.rs; Opus loss is filled by **libopus itself** (a NULL packet
+  handed to `opus_decode`), because Opus carries the decoder state that makes
+  its own extrapolation better than anything generic.
+- **A decoded frame longer than one packet is carried, not truncated.** Opus
+  senders may use 40 or 60 ms frames — legal, and common for WebRTC on a bad
+  network. An early cut normalised every decoded frame to `samples_per_packet`,
+  which silently discarded two thirds of a 60 ms sender's audio. The surplus
+  now goes into a fixed `Carry` (no allocation, capped at libopus's 60 ms at
+  48 kHz) and is released over the following frames; `release()` serves the
+  carry before touching the jitter buffer. `frame_size_mismatch` and
+  `carry_overflow_samples` count the two ways this can bite, and both are
+  logged per leg — the point is that truncation can never again be invisible.
 - **Telephone-event payloads never reach the audio path**, but their
   sequence numbers are accounted to the jitter buffer, so a DTMF press is
   neither decoded as noise nor miscounted as loss. Playout emits
@@ -228,7 +253,7 @@ published algorithm's shape — the same shape spandsp's `plc.c` carries.
 ### encode.rs — per-consumer output formats (landed 2026-08-22)
 
 `ConsumerEncoder` turns the tap's PCM into what one consumer asked for:
-G.711 µ/A passthrough at the tap rate, L16 at the tap rate, or resampled
+G.711 µ/A at 8 kHz from **any** tap rate, L16 at the tap rate, or resampled
 L16 (verified at 16k and 48k). One encoder instance per consumer **per
 track** — a resampler is stateful, so interleaving two tracks through one
 instance would corrupt its filter history; the gRPC pump keys encoders by
@@ -248,8 +273,15 @@ track.
   short output — streams must stay continuous for downstream ASR
   (session-playbook §8); the injected-utterance tail is the case that hits
   this.
-- Refusals are named, never silent: Opus (tasks item 9), G.711 at a
-  non-tap rate, stereo, mismatched ptime.
+- **G.711 output resamples first (landed 2026-08-23).** The refusal used to be
+  "g711 output only exists at the tap rate", which meant a 16 kHz Opus tap
+  could not feed the frozen PCMU-8k WebSocket bridge. The encode now happens
+  after the resample, so the only remaining constraint is the codec's own:
+  G.711 is defined at 8 kHz. Pinned by
+  `a_wideband_tap_still_feeds_the_frozen_pcmu_bridge`, which checks the
+  downsampled tone's rms rather than its length.
+- Refusals are named, never silent: Opus **output** (tasks item 16d — ingest
+  landed), G.711 at anything but 8 kHz, stereo, mismatched ptime.
 
 ## crates/opus-ffi — libopus, and the only place unsafe lives
 
