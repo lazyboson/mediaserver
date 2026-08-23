@@ -331,6 +331,84 @@ Not done here: nothing calls it yet. The wiring — UDP socket pair, SDP answer,
 where the pushed PCM comes from and how the media thread's wakeup maps onto
 `tick` — is P3-2, and Opus egress is still absent everywhere in the crate.
 
+### mixer.rs — the N-way mix matrix (Phase 4 core, landed 2026-08-23)
+
+Phase 4's product is this file: `MixMatrix` is the conference engine, sans-IO
+and thread-free like the rest of the crate. It holds **N contributors x M
+listeners** of `Gain`, mixes one frame per tick, and knows nothing about
+sockets, sessions or rtpengine — P4-2 wires it between the per-leg ingest
+pipelines and one `pacer.rs` per listener.
+
+Contract, decided here so P4-2/P4-3/P4-5 do not re-litigate it:
+
+- **Frame-synchronous, one frame per contributor per tick.** The caller pushes
+  each contributor's frame for tick T (`push` — exactly `frame_samples`, mono,
+  already decoded and resampled to the conference rate), then calls `mix()`
+  once, which returns a `MixOutput` borrow with one frame per occupied
+  listener. A frame is consumed by exactly one tick: a contributor that pushes
+  nothing is silence for that tick and is counted (`absent_frames`), and a
+  second push inside one tick replaces the first (`PushOutcome::Replaced`,
+  counted) rather than summing — two frames in one tick is a caller bug, not a
+  mixing decision.
+- **Contributors and listeners are separate memberships**, which is what makes
+  the three Phase-4 features fall out of the same matrix instead of needing
+  special cases: `join_party()` takes one of each and links them (**minus-self**
+  = that one pair defaults to `Gain::MUTED`, every other pair to unity);
+  `join_listener()` alone is a **monitor** (hears everyone, contributes
+  nothing — no leg at all, matching architecture §Phase 4); `join_contributor()`
+  alone is an injector (a prompt player, or a **whisper** source once
+  `route_only(contributor, listener)` mutes its row everywhere else).
+  `route_to_all` is the **barge** flip. Mute is a zeroed row
+  (`mute_contributor`), deaf is a zeroed column (`deafen_listener`), and their
+  inverses restore the *defaults*, minus-self included — P4-5's member controls
+  are these four calls plus a control-plane verb.
+- **Identity is index + generation.** `ContributorId`/`ListenerId` carry the
+  slot's generation, so a stale handle from a party that left is refused
+  (`MixError::Unknown{Contributor,Listener}`) instead of silently addressing the
+  next occupant. Leaving a slot clears its pending frame, its speech state, its
+  self-link and its gain row/column back to defaults, and zeroes the listener's
+  output region — a slot reused by the next joiner cannot leak the previous
+  party's routing or a tail of their audio. Both directions are reset on *join*
+  as well, because a slot that was never occupied has no history either.
+- **Accumulate in i32, saturate to i16.** Per pair, unity gains add the raw
+  sample and non-unity gains add `(sample * gain_q12) >> 12` (Q12 fixed point,
+  `Gain::MAX_Q12` = 8x, so no product or sum can overflow i32 at conference
+  scale; the accumulator uses `saturating_add` anyway — nothing here panics).
+  Clamping to `i16::MIN/MAX` counts `clipped_samples`, which is the metric that
+  says a conference needs AGC. There is no AGC and no DC filter yet; the
+  roadmap's "sum/saturate DSP, active-speaker, AGC" line is two thirds done.
+- **Active-speaker flags are per contributor, and hysteretic.** Frame energy is
+  the mean square computed once at push time; `SpeechGate { rms_threshold,
+  attack_frames, hangover_frames }` (default 300 / 2 / 12 = 240 ms of hangover
+  at 20 ms frames) needs `attack_frames` consecutive loud frames to raise the
+  flag and more than `hangover_frames` quiet ones to drop it, so alternating
+  loud/quiet frames never flap it (a test asserts exactly that: zero onsets).
+  Absent frames count as quiet. Flags never affect routing — `speaking()`,
+  `level()` (rms) and `active_speakers()` are for events and for the
+  loudest-talker UX, and the mix is unconditional.
+- **No allocation per frame.** The gain matrix (row stride = listener capacity),
+  the i32 accumulator, the per-listener output block and each contributor's
+  frame buffer are sized at construction and grow **only** on membership change
+  — a new contributor extends the matrix by one row, and a listener past the
+  current stride doubles the stride and re-strides the matrix once. A test
+  drives 10 000 ticks of an 8-party conference plus a monitor (with drops,
+  clipping and speaker transitions) and asserts every buffer's length *and*
+  capacity is unchanged at the end.
+
+Mixing is the straightforward O(contributors x listeners) accumulate with muted
+pairs and absent contributors skipped. The obvious optimization for large
+conferences — sum every contributor once, then subtract each listener's own
+contribution — is deliberately *not* here: it is only valid while the matrix is
+the minus-self default, and whisper/mute/per-pair gain (the reason this is a
+matrix) break it. If conference fan-in ever needs it, gate it on a
+"matrix is default" flag rather than on N.
+
+Not done here: nothing calls it yet (media-core has no sockets, and replay is
+the only altitude available). Multi-rate conferences are out of scope — every
+contributor must arrive at the conference's rate and frame size, so P4-2 owns
+resampling per leg. Opus egress is still absent crate-wide, so a conference of
+Opus legs transcodes to G.711/L16 on the way out.
+
 ## crates/opus-ffi — libopus, and the only place unsafe lives
 
 WebRTC legs are Opus, so a tap that cannot decode Opus either depends on

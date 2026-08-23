@@ -1891,6 +1891,60 @@ number — item 5 measures the speech-report→`StopPlayback` hop, this one meas
 `Clear`→silence, and adding them is as close to end-to-end barge-in as MSS can
 honestly get on its own.
 
+### 36. The N-way mixer core (Phase 4) — ✅ DONE (2026-08-23)
+
+Phase 4 is where FreeSWITCH loses its last media job, and this is its engine:
+`crates/media-core/src/mixer.rs`, a sans-IO `MixMatrix` of **N contributors x M
+listeners**. Push each contributor's frame for tick T, call `mix()`, get one
+frame per listener back — i32 accumulate, saturate to i16, minus-self by
+default. Nothing about it knows what a session, a socket or an rtpengine is;
+P4-2 is what puts legs on either side of it (per-leg ingest in, one `pacer.rs`
+per listener out).
+
+The design decision worth recording is that **all three Phase-4 features are
+the same matrix**, not three code paths: contributors and listeners are
+separate memberships, so a *party* is one of each linked by a muted self-pair, a
+**monitor** is a listener with no contributor (hears all, contributes nothing),
+a **whisper** is a contributor whose row is unity into exactly one listener and
+muted elsewhere (`route_only`), and **barge** is `route_to_all` — a matrix
+flip. Mute is a zeroed row, deaf is a zeroed column, and their inverses restore
+the minus-self defaults, which is the whole of P4-5's routing work.
+
+Membership is generational: `ContributorId`/`ListenerId` carry the slot
+generation, so a handle from a party that already left is refused rather than
+addressing whoever reused the index; leaving clears the pending frame, the
+speech state, the self-link, the gain row and column, and the listener's output
+region, so a reused slot cannot leak the previous occupant's routing or a tail
+of their audio. Active-speaker flags are per contributor with attack **and**
+hangover (default 2 frames up, 12 frames ≈ 240 ms down) so they cannot flap;
+they are reported (`speaking`, `level`, `active_speakers`) and never affect
+routing. Per-pair gain is Q12 fixed point, capped at 8x so no sum can overflow
+i32; clipping is counted (`clipped_samples`) rather than hidden, which is the
+signal that a conference wants AGC — AGC and any DC filter are not built.
+
+Replay-tested, 23 tests (`cargo test -p media-core mixer`): 2/3/8 parties each
+hearing exactly everyone-but-self; a frame consumed by one tick only; an absent
+contributor as silence; positive and negative saturation with the clip count
+asserted; per-pair gain scaling one direction only; whisper heard by its target
+and by nobody else, then promoted to all; a monitor hearing the sum and
+contributing nothing; mute/deaf as row/column zeroing and their restore;
+active-speaker attack, hangover and the alternating-frame case that must produce
+**zero** onsets; a stale identity refused after leaving; a reused slot starting
+clean and silent; growth past the initial capacity; and **10 000 ticks of an
+8-party conference plus a monitor with every buffer length and capacity
+unchanged at the end** (the no-allocation-per-frame rule, asserted rather than
+asserted-in-prose).
+
+Deliberately deferred, and recorded in implementation-notes so P4-2 does not
+rediscover them: the sum-once-subtract-self fast path (invalid the moment
+whisper or per-pair gain is in play, so it needs a "matrix is default" flag if
+conference fan-in ever demands it); multi-rate conferences (every contributor
+must arrive at the conference rate and frame size — resampling belongs to the
+leg); AGC; and Opus egress, still absent crate-wide, so a conference of Opus
+legs transcodes on the way out. This is replay-only by construction: media-core
+has no sockets, so mixing quality against real legs cannot be judged until the
+P4-6 drill.
+
 ## Open defects and soft spots
 
 | # | Item | Where | Severity |
@@ -1969,5 +2023,12 @@ a live drill against a real RTP peer (P3-5) — nothing here has met a SIP
 endpoint yet.
 
 **Phase 4 — Full media plane** is the N-way mixer, monitor/whisper as
-attachments and playbacks rather than conference tricks. Do not start before
-Phases 1–3 are boringly stable (Constitution, Article VIII).
+attachments and playbacks rather than conference tricks. Its core landed with
+item 36: `media-core`'s `MixMatrix` mixes N contributors into M listeners with
+minus-self defaults, per-pair gain, and monitor/whisper/barge/mute/deaf all
+expressed as rows and columns of the one matrix — replay-only, since media-core
+has no sockets. What remains is everything around it: conference sessions of
+inline legs (P4-2), the monitor/whisper attachment verbs (P4-3), native
+conference recording of the mixed track (P4-4), the member-control tail and the
+adapter parity table (P4-5), and the three-tone lab drill that judges mixing
+quality against real legs (P4-6).
