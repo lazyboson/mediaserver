@@ -335,10 +335,11 @@ impl Segmenter {
         drop_front(&mut self.customer, frames);
         drop_front(&mut self.agent, frames);
         drop_front(&mut self.mixed, frames);
+        let past_lead = frames.saturating_sub(self.segment_start);
         self.segment_start = self.segment_start.saturating_sub(frames);
         self.spilled_frames = self.spilled_frames.saturating_add(frames);
         if let Some(anchor) = self.anchor_ms.as_mut() {
-            *anchor += (frames / frames_per_ms) as u64;
+            *anchor += (past_lead / frames_per_ms) as u64;
         }
         self.stats.segments_spilled += 1;
     }
@@ -2451,6 +2452,34 @@ mod tests {
         assert_eq!(
             early.render(Layout::Stereo).samples.len(),
             late.render(Layout::Stereo).samples.len()
+        );
+    }
+
+    #[test]
+    fn a_padded_member_keeps_its_whole_tail_across_a_spill() {
+        let mut early = segmenter();
+        let mut late = segmenter();
+        assert!(late.lead_with_silence(Duration::from_millis(1000)));
+        for at in 0..50u64 {
+            early.accept(Track::Customer, at * 20, &tone(100));
+            late.accept(Track::Customer, at * 20, &tone(-100));
+        }
+        for cut in [&mut early, &mut late] {
+            let closable = cut.closable_frames();
+            cut.render_closable(closable, Layout::Mono(Track::Customer));
+            cut.close_segment(closable);
+        }
+        for at in 50..100u64 {
+            early.accept(Track::Customer, at * 20, &tone(100));
+            late.accept(Track::Customer, at * 20, &tone(-100));
+        }
+
+        assert_eq!(early.total_frames(), RATE as usize * 2);
+        assert_eq!(
+            late.total_frames(),
+            early.total_frames() + RATE as usize,
+            "closing a segment must not advance the anchor past the lead silence, \
+             or the padded member loses its lead's worth of audio off the tail"
         );
     }
 

@@ -21,8 +21,17 @@ peer's ear went quiet.
 It also writes one wav per ssrc on the rtp-timestamp timeline (the ear), so a
 human or wav_summary.py can check what the leg actually heard.
 
+In a conference (P4-6) one ear carries several tones at once, so the timeline
+also records a Goertzel per tone named in EAR_TONES. That is the whole basis of
+the conference assertions: "A's ear carries 880 and 1320 but not its own 440" is
+three numbers on the same packet, and a phase window over the wall clock decides
+which of them are supposed to be there.
+
 Env: IO_DIR, PEER_IP, PEER_PORT, TONE_HZ (what we send), INJECT_HZ (what we
-expect to hear), RUN_SECONDS, PAYLOAD_TYPE.
+expect to hear), EAR_TONES (comma-separated Hz measured per packet),
+RUN_SECONDS, PAYLOAD_TYPE, TONE_AMPLITUDE (a conference of four sources must
+stay under full scale or the mixer clips and intermodulation lands on exactly
+the harmonics the drill measures).
 """
 
 import cmath
@@ -45,6 +54,10 @@ INJECT_HZ = float(os.environ.get("INJECT_HZ", "1000"))
 RUN_SECONDS = float(os.environ.get("RUN_SECONDS", "300"))
 PAYLOAD_TYPE = int(os.environ.get("PAYLOAD_TYPE", "0"))
 ANSWER_TIMEOUT = float(os.environ.get("ANSWER_TIMEOUT", "60"))
+TONE_AMPLITUDE = int(os.environ.get("TONE_AMPLITUDE", "24000"))
+EAR_TONES = [
+    float(hz) for hz in os.environ.get("EAR_TONES", "").split(",") if hz.strip()
+]
 
 SAMPLE_RATE = 8000
 FRAME_SAMPLES = 160
@@ -89,7 +102,9 @@ def tone_frames(hz, count):
     for _ in range(count):
         samples = []
         for _ in range(FRAME_SAMPLES):
-            value = int(24000 * math.sin(2 * math.pi * hz * phase / SAMPLE_RATE))
+            value = int(
+                TONE_AMPLITUDE * math.sin(2 * math.pi * hz * phase / SAMPLE_RATE)
+            )
             samples.append(linear_to_ulaw(value))
             phase += 1
         frames.append(bytes(samples))
@@ -179,6 +194,9 @@ def receive(sock, heard, timeline, stop):
             "silent": all(b == SILENCE_BYTE for b in payload),
             "rms": round(rms(samples), 2),
             "tone": round(goertzel(samples, INJECT_HZ), 2),
+            "tones": {
+                f"{hz:g}": round(goertzel(samples, hz), 2) for hz in EAR_TONES
+            },
         }) + "\n")
         timeline.flush()
 

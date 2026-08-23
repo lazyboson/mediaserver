@@ -1968,3 +1968,105 @@ of transport.**
   cost, never a lower one.
 - The peer's ear was checked by Goertzel and rms, **not by a human listening**
   to `peer_ear_*.wav`.
+
+## conference_drill.sh — three legs in one conference, and the whole feature set (2026-08-23)
+
+`lab/conference_drill.sh` is Phase 4's proving run: three `lab/inline_peer.py`
+containers, at 440 / 880 / 1320 Hz, seated in **one conference** by
+`mss_ctl inline <id> <call> <offer> <group>`. There is no FreeSWITCH in the
+path and **no rtpengine either** — an inline leg is MSS's own UDP socket
+answering an SDP offer, so this drill exercises the mix, the routes and the
+recorders with nothing else able to take the blame.
+
+Everything is decided by numbers. Each peer computes a Goertzel **per tone per
+arriving packet** (`EAR_TONES`) and writes it with the packet's arrival wall
+clock; the drill and the injector stamp phase boundaries on the same clock
+(both actors are containers on the lab network, so it is one kernel's clock);
+`lab/conference_report.py` joins the two and judges each tone as present or
+absent **relative to the loudest tone in that same ear during that same
+phase**. Nobody listened to anything.
+
+### The run (stamp 1787515279)
+
+Phases, each 7–8 s with 400 ms trimmed off both edges: `pair` (A+B only),
+`three` (C joins ~10 s late), `whisper`, `barge`, `mute`, `unmute`. Twenty
+expectations, all green. A "present" tone reads **~3000** and an "absent" one
+**36–98** — a **≥30:1** margin, so nothing here is near a threshold:
+
+| phase / ear | present | absent |
+| --- | --- | --- |
+| pair / A | 880 = 2993 | 440 = 69, 1320 = 64, 1760 = 54 |
+| three / A | 880 = 2996, 1320 = 3003 | **440 = 98** (its own tone) |
+| three / B | 440 = 3000, 1320 = 2998 | 880 = 91 |
+| three / C | 440 = 3011, 880 = 2999 | 1320 = 74 |
+| three / monitor (`only=mixed`) | 440 = 2999, 880 = 2992, 1320 = 2999 | 1760 = 69 |
+| whisper / B | 440 = 3011, 1320 = 3014, **1760 = 2989** | — |
+| whisper / A | 880 = 2996, 1320 = 3003 | **1760 = 63** |
+| whisper / C | 440 = 3011, 880 = 2999 | **1760 = 56** |
+| whisper / monitor | all four, 1760 = 2988 | — |
+| barge / A, B, C | 1760 = 2992 / 2989 / 2982, plus the other two members | — |
+| mute / B | 1320 = 3000 | **440 = 53** |
+| mute / C | 880 = 2993 | **440 = 69** |
+| mute / monitor | 880 = 2996, 1320 = 3002 | **440 = 98** |
+| unmute / B, C, monitor | 440 is back (3000 / 3011 / 2999) | — |
+
+So, machine-verified on real sockets: **minus-self** (nobody hears their own
+tone), a **monitor** attached with `only=mixed` hears all three, a **whisper**
+named at one member lands in that member's ear and in **neither** of the other
+two, the **barge** flip puts it in every ear including the injecting leg's,
+**mute** takes a member off every ear *and* off the mixed track, and unmute
+restores it. Identical readings recur across phases (`three/A` == `mute/monitor`
+to the digit) because the sources are deterministic sines — that is the harness
+agreeing with itself, not a copy-paste.
+
+### Both recording shapes, at once, from the same conference
+
+One `FILE_S3` attachment with `only=mixed` (the room) and a recording **group**
+over the three member sessions with `only=customer` (per participant) ran
+together:
+
+| object | length | contents |
+| --- | --- | --- |
+| `acct-conf/room-<stamp>.wav` | 71.88 s, 1 ch | 440 = 2664, 880 = 2993, 1320 = 2583 — all three, the two lower because A was muted for 8 s and C joined late |
+| `party-<stamp>/a.wav` | 71.96 s | 440 = 3000; 880 = 0, 1320 = 8, 1760 = 0 |
+| `party-<stamp>/b.wav` | 72.02 s | 880 = 2992; everything else 0 |
+| `party-<stamp>/c.wav` | 72.10 s | 1320 = 2556; everything else ≤ 3 — and **10.66 s of leading silence**, the P2-1 group anchor pad for its late join |
+
+Cross-talk in a participant file is **0–8** against 3000: an inline leg's own
+track really is its own. The three group files agree to **140 ms** (the
+sequential detaches, D11).
+
+### The bug this drill found in the recorder — and the tone amplitude that nearly hid it
+
+**The first run's `party-c.wav` was 55.88 s against a/b's 66.16/66.24 s** — the
+10.43 s pad was at the front, correctly, and 10.28 s of C's audio was **missing
+off the tail**. `Segmenter::close_segment` subtracted the closed frames from
+*both* `segment_start` (the lead-silence offset) *and* `anchor_ms`, so the first
+spill (30 s by default) advanced the timeline by the pad twice and everything
+after it landed one pad-length early. Ungrouped recordings never showed it
+because their `segment_start` is 0; the group drill never showed it because its
+5 s stagger and 20 s run finished before the first spill. Fixed here
+(`past_lead = frames - segment_start` is what the anchor advances by) with a
+test that fails by exactly the lead, and re-measured live: 71.96 / 72.02 /
+72.10 s.
+
+Also worth keeping: **`TONE_AMPLITUDE` must leave headroom.** At the peers'
+default 24000 a three-way mix plus a whisper clips, and clipping
+intermodulates onto exactly the harmonics being measured (440/880/1320/1760).
+The drill runs all four sources at 6000 and `mss_conference_clipped_samples_total`
+read **0**. A drill whose tones are harmonics of each other and whose mixer has
+no AGC has to be arithmetically incapable of clipping, or its absent-tone
+assertions are measuring their own distortion.
+
+### What this does not prove
+
+- **No SIP, no rtpengine, no human.** The peers are raw UDP sockets; a real
+  B2B leg into a conference is deployment-gated.
+- **One pod.** Conferences, recording groups and member state are all pod-local
+  (D16, D22); nothing here survives a pod kill.
+- The monitor is one consumer on **one member's** session, so it inherits D20:
+  the room recording and the monitor both end if *that* member leaves.
+- `deaf` and `hold` are **not** in this drill — they have socket-level tests
+  from item 40 only.
+- Only PCMU at 8 kHz/20 ms. No per-leg resampler exists, and a conference
+  refuses a rate/ptime mismatch by name.

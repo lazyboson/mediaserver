@@ -2788,6 +2788,17 @@ if they stop together, the same length to within one frame.
   two-hour cap has an hour of its own audio, not two — and against nothing
   else: an ungrouped recording passes `group_anchor: None` and is
   byte-identical to before.
+- **A spill must not advance the anchor past the pad** (D23, found by the
+  conference drill, item 41). `close_segment(frames)` drops `frames` from the
+  front of the buffers, so the timestamp that now maps to buffer index 0 moved
+  by `frames - segment_start`, **not** by `frames`: the first `segment_start`
+  frames of what was dropped were the pad, which no timestamp ever mapped to.
+  Advancing `anchor_ms` by the whole `frames` subtracted the pad a second time
+  and every frame after the first spill landed one pad-length early, so the
+  member's file kept its pad and lost that much audio off its tail (55.88 s
+  against 66.16 s live, before the fix). Only a *padded* recording could see it:
+  `segment_start` is 0 for every ungrouped one. `a_padded_member_keeps_its_whole
+  _tail_across_a_spill` fails by exactly the lead if this is reverted.
 - **Unchanged:** the frozen identity, per-member pause, the refusal shapes, and
   D16 (a group is still one pod's memory, so the anchor is one pod's clock —
   which is also why a monotonic `Instant` is the right type here).
