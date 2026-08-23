@@ -796,22 +796,27 @@ accepted by the same calls.
   sans-IO core has no clock, so it cannot expire by TTL; if the shell wants
   time-based expiry it must drive it.
 
-### Known gaps (M4)
+### Known gaps (M4) — all three closed, kept for the reasoning
 
-- **Not yet wired to tonic.** `proto/mediacontrol.proto` is the contract;
-  the prost/tonic build and the service impl are the next increment, along
-  with mapping `ControlError` onto gRPC status codes (`CapabilityDenied` →
-  `PERMISSION_DENIED`, `AuthoritativeAlreadyBound` → `FAILED_PRECONDITION`,
-  `Unknown*` → `NOT_FOUND`, `IdempotencyConflict` → `ABORTED`).
-- **Not yet wired to the hub.** `TrackSelector` is the control-world twin of
-  `hub::TrackSelection`; the shell converts. They are deliberately separate
-  types — the media world must not depend on control-plane vocabulary — but
+- ~~**Not yet wired to tonic.**~~ **Wired since 2026-08-20**: `crates/control-api`
+  serves `MediaControl` over tonic and `ControlError` maps onto the status codes
+  planned here (`CapabilityDenied` → `PERMISSION_DENIED`,
+  `AuthoritativeAlreadyBound` → `FAILED_PRECONDITION`, `Unknown*` →
+  `NOT_FOUND`, `IdempotencyConflict` → `ABORTED`), with `MixRoute` →
+  `INVALID_ARGUMENT` added by item 38.
+- ~~**Not yet wired to the hub.**~~ **Wired**: `tap_plane` converts
+  `TrackSelector` into `hub::TrackSelection` (which item 27 split into `All` and
+  `Speakers` for D13). The two types stay deliberately separate — the media
+  world must not depend on control-plane vocabulary — and the rule still holds:
   if a third copy ever appears, that is the signal to promote one.
-- **No persistence.** Redis session registry with ownership leases and
-  re-subscribe on pod loss is M4; the registry is per-process today, and
-  `SessionId`/`AttachmentId` counters restart with the process (the wire
-  form is prefixed and parse-checked, so a stale id from another pod is
-  rejected as unknown rather than aliased onto a live session).
+- ~~**No persistence.**~~ **Landed 2026-08-17**: the Redis session registry
+  carries ownership leases and re-subscribes on pod loss (proved on a live
+  `kill -9`, tasks item 11; the orphaned subscription it exposed is fixed in
+  item 25). `SessionId`/`AttachmentId` counters still restart with the process,
+  which is safe by construction: the wire form is prefixed and parse-checked, so
+  a stale id from another pod is rejected as unknown rather than aliased onto a
+  live session. An INLINE or grouped session is deliberately **not** adoptable
+  (items 33 and 37).
 - `Observation` covers what MSS witnesses itself (DTMF from the pipeline,
   recording lifecycle). Playback events are emitted by the registry.
   **The recording variants have a raiser since 2026-08-22** (M5): the
@@ -1707,9 +1712,11 @@ the route intact; detaching the whisperer restores private playback.
 Residuals: `all` includes the injecting leg's own ear (an injector has no
 minus-self link), so a human barging through their own leg hears themselves —
 use a dedicated silent leg until P4-5 decides on a minus-self variant; a whisper
-sourced from a member's **own RTP** (`mix_source=leg`) is not built and belongs
-with P4-5's mute/deaf/hold row/column verbs; and nothing here has faced a real
-SIP peer (P4-6).
+sourced from a member's **own RTP** (`mix_source=leg`) is not built here and
+belongs with P4-5's mute/deaf/hold row/column verbs — **item 40 built it**, see
+the member-controls section below; and nothing here had faced a real SIP peer
+when this was written (item 41 put three legs on real sockets, but still without
+SIP).
 
 ### conference.rs + recorder.rs — native conference recording (item 39, Phase 4, 2026-08-24)
 
@@ -2441,8 +2448,13 @@ successful ping is followed by the first-contact capability report
 (`rtpengine_capability.rs`), which is why the probe now takes the shared
 `NodeCapabilityLog`; a node that fails the ping is not probed further.
 
-### media_rt.rs — thread/tick skeleton real; session work is M2/M3
-The worker loop currently only ticks and counts. Per-iteration plan:
+### media_rt.rs — thread/tick skeleton real; the real capture went elsewhere
+The worker loop still only ticks and counts, and that is not a gap in the media
+path: the plan below was realised in `tap_spike.rs` (per-leg capture, one thread
+per tap), `inline_leg.rs` (the egress pump) and `conference.rs` (one owner
+thread per conference), each driven from `tap_plane.rs` rather than from this
+generic worker. This module is kept as the shape a future *shared* media worker
+would take if per-session threads ever stop scaling. Per-iteration plan:
 1. drain control-plane commands (add/remove session, pause/resume),
 2. `recvmmsg` on owned sockets → `RtpPacket::parse` → per-session
    `JitterBuffer::push` / `DtmfDetector::push`,
@@ -2614,8 +2626,13 @@ recorder.rs — native conference recording* above for the two shapes, the
 - **A failed upload spills instead of vanishing.** With
   `MSS_RECORDING_SPILL_DIR` set, the WAV is written to `dir/<identity>` and
   counted (`mss_recording_spills_total`, alerted). Without it, a failed upload
-  loses the audio — that is the honest state, and the alert says so.
-- **Bounded, like everything else.** The whole recording is buffered in
+  loses the audio — that is the honest state, and the alert says so. Since item
+  30 the same directory also carries the **as-it-runs** segment journal, so the
+  spill is no longer only a last-resort dump on a failed upload.
+- **Bounded, like everything else.** *(Superseded in part by item 30 — see
+  `recording_spill.rs` below: closed segments now spill to disk as the call
+  runs, so only the live tail is in memory. The cap below still applies.)* The
+  recording was buffered entirely in
   memory: 8 kHz stereo is ~32 KB/s, so `MAX_RECORDING` (2 h) caps one
   recording at ~230 MB and further frames are counted
   (`frames_beyond_cap`, `mss_recordings_truncated_total`) rather than

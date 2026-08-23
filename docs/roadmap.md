@@ -13,8 +13,8 @@ is boringly stable in production).
 | --- | --- | --- | --- |
 | — | M1 scaffold | — | ✅ done (2026-08-13) |
 | 0 | Groundwork spike (M2) | — (de-risking only) | ✅ code done; 3 org-side items open |
-| 1 | Passive fan-out (M3–M4) | `uuid_audio_fork`, `uuid_google_transcribe2` media bugs | 🔶 M3 done, M4 ~95% (code complete; translator merge + barge-in measurement remain) |
-| 2 | Recording | `record_session` bugs, shared-FS recording pipeline | ⬜ |
+| 1 | Passive fan-out (M3–M4) | `uuid_audio_fork`, `uuid_google_transcribe2` media bugs | 🔶 M3 done, M4 code complete; the barge-in cut-through is **measured for every MSS-owned hop** (tasks item 5, p50 3.5 ms from a real consumer `SpeechReport`) — what remains is an integrator's own event consumer and the pilot |
+| 2 | Recording | `record_session` bugs, shared-FS recording pipeline | 🔶 code complete (M5, tasks items 15/21/29/30); FS parity measured (item 31) — a two-party production-FS comparison and the tenant cutover remain |
 | 3 | Interactive media | dummy leg + conference-per-AI-interaction; mediagateway service | 🔶 code complete, lab-verified (items 32–35); production integration and org-gated criteria remain |
 | 4 | Full media plane | conference mixing, monitor/whisper (`relate nospeak`), MOH | 🔶 code complete, lab-verified (items 36–41); production integration and org-gated criteria remain |
 
@@ -144,7 +144,7 @@ reduction; one full quarter (or agreed period) of pilot stability;
 audio-flow watchdog + re-subscribe recovery observed working in
 production incidents, not just tests (the lab half of the re-subscribe
 criterion is met — 2026-08-22, a real `kill -9` mid-call with a measured
-14.41 s gap; what remains is seeing it in production, and D14).
+14.41 s gap, and the D14 orphan subscription it exposed is fixed — tasks item 25; what remains is seeing the recovery in production).
 
 ## Phase 2 — Recording
 
@@ -160,13 +160,19 @@ Work:
 - Compliance option: per-tenant dual-recording (FS + MSS) during
   transition; keep `record_session` as fallback until sign-off.
 
-Status (2026-08-22, tasks item 15): **code complete.** The recorder is a hub
+Status (updated 2026-08-24; tasks items 15, 21, 29, 30, 31): **code complete.** The recorder is a hub
 consumer in the control world — stereo segmenter (customer left, agent right),
 the frozen `${accountID}/${recordingID}.${format}` identity parsed from the
 `FILE_S3` attachment endpoint, `recordStart/recordPause/recordStop/
 uploadCompleted` on `mss.events` with pause = segment + defer + accumulated
 duration, and direct upload through `object_store` to S3 or MinIO. Verified
-against a real MinIO from a synthetic hub, not yet from a live tapped call.
+against a real MinIO from a synthetic hub **and on a live tapped call**
+(item 10). Since then: **recording groups** record N sessions as one recording
+with one mono object per participant (item 21), time-aligned on the group's open
+instant (item 29, closing D18), and closed segments **spill to disk as the call
+runs** so a pod death costs the spill interval rather than the call (item 30,
+partly closing D9 — the spill dir is per-pod local disk, so the cross-pod half
+stays open with D16).
 Hold/pause arrives as `UpdateAttachment{paused}` (which now reaches the media
 world at all) rather than from Redis; cigol drives it through
 `TelCompat`. Dual recording remains a cigol per-tenant flag and nothing here
@@ -181,10 +187,21 @@ lab drill: a real SIP call to MinIO, duration matching the reported
 `duration_ms` to the sample, and the recording callbacks read off the real
 `mss.events` topic.
 
-Exit criteria still open: the byte comparison itself — `lab/recording_parity.py`
-is the harness and has never seen a FreeSWITCH recording — and the transfer
-scenario, which still lands on speaker naming by elimination until a
-tag-replacing transfer triggers a re-subscribe.
+The byte comparison ran against a **real FreeSWITCH recording** on 2026-08-23
+(item 31, `lab/fs_parity_drill.sh` records one live call both ways): container,
+channel layout and rms agree exactly, and a re-aligned 2 s window agrees on
+1.0000 of samples at mean difference 0.6/32768 — there is no transform
+difference. That run also **retired "byte-comparable" as a literal bar**: MSS and
+FS conceal loss independently, so the inter-file offset wanders and a single
+global offset fails by construction. The criterion is restated as container +
+layout + duration + rms + windowed agreement.
+
+Exit criteria still open: a **two-party** comparison on a production
+FreeSWITCH — the lab's write side plays silence, so only one channel was truly
+compared — the pause contract and a human listen against the tenant's codec; the
+transfer scenario, which still lands on speaker naming by elimination until a
+tag-replacing transfer triggers a re-subscribe; and the tenant decision to
+disable dual recording.
 
 ## Phase 3 — Interactive media
 
