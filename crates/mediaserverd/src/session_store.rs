@@ -30,7 +30,17 @@ pub struct PersistedAttachment {
     pub group: String,
     #[serde(default)]
     pub format: Option<PersistedFormat>,
+    #[serde(default)]
+    pub recording: Option<PersistedRecording>,
     pub metadata: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PersistedRecording {
+    pub recording_id: String,
+    pub owner: String,
+    pub recorded_ms: u64,
+    pub spilled_ms: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -340,6 +350,7 @@ mod tests {
                     channels: 1,
                     ptime_ms: 20,
                 }),
+                recording: None,
                 metadata: BTreeMap::new(),
             }],
         }
@@ -364,6 +375,26 @@ mod tests {
             decoded.attachments[0].format, None,
             "a record written before the negotiated format was persisted must still decode"
         );
+        assert_eq!(
+            decoded.attachments[0].recording, None,
+            "a record written before recordings were journalled must still decode"
+        );
+    }
+
+    #[test]
+    fn a_recordings_spill_journal_survives_a_json_roundtrip() {
+        let mut written = session("req-1", "pod-a");
+        written.attachments[0].recording = Some(PersistedRecording {
+            recording_id: "rec-9".to_string(),
+            owner: "pod-a".to_string(),
+            recorded_ms: 61_000,
+            spilled_ms: 60_000,
+        });
+        let body = serde_json::to_string(&written).unwrap();
+        let decoded: PersistedSession = serde_json::from_str(&body).unwrap();
+        assert_eq!(decoded, written);
+        let journal = decoded.attachments[0].recording.clone().unwrap();
+        assert_eq!(journal.recorded_ms - journal.spilled_ms, 1_000);
     }
 
     #[test]

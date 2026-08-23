@@ -177,6 +177,36 @@ pub fn render(sources: &MetricsSources) -> String {
         snapshot.recording_spills,
     );
     counter(
+        "mss_recording_spill_segments_total",
+        "Closed recording segments written to local disk while the call was still up",
+        snapshot.recording_segments_spilled,
+    );
+    counter(
+        "mss_recording_spill_failures_total",
+        "Closed recording segments that could not be written to local disk",
+        snapshot.recording_segment_spill_failures,
+    );
+    counter(
+        "mss_recording_salvaged_total",
+        "Recordings uploaded from segments an earlier life of this pod left on disk",
+        snapshot.recording_salvaged,
+    );
+    counter(
+        "mss_recording_salvage_skipped_total",
+        "Spilled recordings left alone because the object was already in storage",
+        snapshot.recording_salvage_skipped,
+    );
+    counter(
+        "mss_recording_salvage_failures_total",
+        "Spilled recordings that could not be uploaded on this pod's start",
+        snapshot.recording_salvage_failures,
+    );
+    counter(
+        "mss_recording_frames_lost_on_adopt_total",
+        "Recorded frames a dead pod held that the adopting pod could not read back",
+        snapshot.recording_frames_lost_on_adopt,
+    );
+    counter(
         "mss_recordings_truncated_total",
         "Recordings that hit the length cap and lost their tail",
         snapshot.recordings_truncated,
@@ -492,6 +522,9 @@ mod tests {
             "mss_recording_upload_failures_total",
             "mss_recordings_truncated_total",
             "mss_recording_spills_total",
+            "mss_recording_spill_segments_total",
+            "mss_recording_salvaged_total",
+            "mss_recording_frames_lost_on_adopt_total",
         ] {
             assert!(text.contains(name), "missing {name} in:\n{text}");
         }

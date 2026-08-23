@@ -396,9 +396,10 @@ Docker Desktop on WSL2 the pods reach a host-run consumer at
 **Also filed:** D15 — an adopted attachment loses its negotiated format
 (`PersistedAttachment` has no format field). Found by reading the adoption
 path, not observed, since this drill's consumer was WS/PCMU.
-**Not covered:** the D9 half of a pod death — a recording buffered in the
-dead pod's memory is still lost, and the adopter starts a new segment; this
-drill attached no recorder. And the gap is a lab number on an idle box; the
+**Not covered:** the D9 half of a pod death — this drill attached no recorder.
+Item 30 has since spilled closed segments to disk and made the adopter pad and
+count what it cannot read, but that is replay-proven only: a pod-kill drill
+*with a recorder attached* has still never been run. And the gap is a lab number on an idle box; the
 soak suite (item 19) should re-measure it under load.
 
 ### 12. Barge-in cut-through measurement — 🔶 **MSS+bus half measured (2026-08-23)**
@@ -1456,6 +1457,86 @@ other. Numbers in lab.md.
 stop together, and D11 (blocking detach) and D16 (a group is one pod's memory,
 so the anchor is one pod's monotonic clock) are unchanged.
 
+### 30. Recording durability across pod death (defect D9) — 🔶 **partly closed (2026-08-23)**
+
+A recording used to live entirely in the recording pod's memory until the call
+ended: `kill -9` on that pod lost every second of it, the adopting pod started
+a fresh recording under the same object key, and nothing said how much audio
+had gone. The spill directory existed but was only ever written *after* a
+failed upload, which never happens if the process dies first.
+
+**What shipped.**
+
+1. **Closed segments leave memory for disk while the call is still up.** The
+   segmenter grew a peek-then-commit seam — `closable_frames()`,
+   `render_closable(frames, layout)`, `close_segment(frames)` — so the recorder
+   renders a whole-millisecond prefix per target, writes it, and only then
+   drops it from memory: a failed disk write loses nothing, it just leaves the
+   audio in RAM and retries on the next tick. Closing rebases the segmenter's
+   timestamp anchor by exactly the frames removed, so track alignment across a
+   segment boundary is preserved rather than re-zeroed (that is what makes this
+   different from a pause, which deliberately drops the wall-clock gap). The
+   2 h `MAX_RECORDING` cap now counts spilled frames too, so spilling does not
+   hand a recording a fresh length budget.
+2. **A spill journal per recording.** `crates/mediaserverd/src/recording_spill.rs`
+   writes `<MSS_RECORDING_SPILL_DIR>/journal/<object key>/{manifest.json,
+   <target>-<seq>.pcm}`: raw interleaved i16 chunks plus a manifest naming the
+   recording id, sample rate, owning pod, frames on disk and one entry per
+   object key. The manifest is rewritten by atomic rename after each segment.
+   Segments close every `MSS_RECORDING_SPILL_SECONDS` (default 30) and on every
+   pause. The final upload **stitches** the journal's chunks with the tail still
+   in memory into one object at the frozen
+   `${accountID}/${recordingID}.${format}` key, then deletes the journal; if
+   the upload fails the journal stays for the next start.
+3. **Restart salvage.** `recording_spill::salvage` runs in `mediaserverd`'s
+   boot path, before it serves: every journal left on this pod's disk is
+   stitched and uploaded. It is guarded by a new `RecordingSink::exists` —
+   if the object is already in storage (because another pod adopted the session
+   and finished it), the salvage is **skipped, counted and left on disk** for an
+   operator, never written over the fuller object.
+4. **A recording's progress is in the registry.** `PersistedAttachment.recording:
+   Option<PersistedRecording>` (serde(default), legacy records decode)
+   carries `{recording_id, owner, recorded_ms, spilled_ms}`, fed by a new
+   `TapSubscriptions::recording_journal(attachment)` seam off the live
+   recorder's `RecordingProgress`. On adoption the keeper injects
+   `mss.recording.resumeMs` / `mss.recording.spillOwner` into the rebuilt
+   attachment's metadata (derived every time, stripped when persisting, so it
+   never accumulates).
+5. **The adopter recovers what it can read and counts what it cannot.** The new
+   recorder opens the journal at the same key: if the journal is on *this* pod's
+   disk (same-pod restart) its segments are picked up and continue the same
+   object. Whatever the registry says was recorded but is not on a disk this pod
+   can read becomes leading silence, so the object keeps its wall-clock
+   timeline, and every one of those frames is counted in
+   **`mss_recording_frames_lost_on_adopt_total`**. Beyond `MAX_ADOPT_LEAD`
+   (5 min) the padding is refused rather than allocated, and the loss is
+   counted and logged.
+
+**What is NOT possible today, honestly.** The spill directory is per-pod local
+disk. An adopter on another pod **cannot read the dead pod's segments**, so
+cross-pod stitching does not exist: the adopter's object contains silence for
+the dead pod's audio, and that audio is only recoverable if the dead pod comes
+back with the same volume *and* the object has not already been written (the
+`exists` guard then keeps the salvage from clobbering it, which is the correct
+choice but means the audio stays on disk as an operator's problem). Making this
+whole needs a spill target every pod can read — a shared volume or a multipart
+upload straight to object storage per segment — which is the same shape D16
+(recording groups are one pod's memory) needs. **The spill directory has no
+retention policy: skipped and failed journals stay until an operator removes
+them.**
+
+**Verified: replay/unit only** (fake `SessionStore`, fake object store, real
+local disk under a scratch directory) — a closed segment leaving memory without
+moving the recording's clock, the cap surviving a spill, a spilled segment plus
+the in-memory tail uploading as **one** object in the right order, a journal
+left behind being salvaged on the next start, salvage refusing to overwrite an
+object that already exists, an adopted recording padding and counting what its
+dead pod never spilled, and an adopted recording that finds its own spill
+keeping that audio (spilled | silence | new). The keeper test proves the
+journal is persisted with the owning pod and handed to the adopter as metadata.
+**Not observed live**: no pod-kill drill was re-run with a recorder attached,
+so the numbers a real `kill -9` costs a recording are still unmeasured.
+
 ## Open defects and soft spots
 
 | # | Item | Where | Severity |
@@ -1464,7 +1545,7 @@ so the anchor is one pod's monotonic clock) are unchanged.
 | ~~D2~~ | ~~`stop_playback` stops **all** playback on the call~~ — **fixed 2026-08-23 (item 27)**: the registry remembers each playback's `target_tag` and `stop_playback` sends NG `stop media` with that `from-tag` (`all: all` only when the playback itself was for everyone). Measured on the lab node with `lab/ng_stop_media_probe.py`, three consistent runs: with a player on each participant, `stop media {from-tag: tagA}` left tagA at **1 packet** (a tail) and tagB still at **75 packets per 1.5 s**; an `all: all` player stopped with one from-tag keeps playing to the *other* participant (1 vs 75), which is why "no target" still maps to `all: all`. **Residual, now measured rather than assumed:** a second `play media` at the *same* from-tag is accepted, and one `stop media` for that from-tag clears the participant entirely (1 packet in a 3 s window) — rtpengine has no playback identifier, so two playbacks aimed at one participant cannot be stopped independently. MSS is now as precise as the protocol allows | `tap_plane.rs`, `registry.rs` | closed (residual documented) |
 | ~~D3~~ | ~~`close_attachment` **aborts** the consumer task instead of closing the websocket politely (no `stop` frame)~~ — **fixed 2026-08-23 (item 27)**: `TapPlane::end_attachment` ends the hub subscription and lets the consumer finish, so a WS consumer sends its Twilio `stop` frame and a gRPC consumer gets a `StreamStop` naming the reason ("the attachment was detached" / "the call ended"); a consumer that will not finish inside `POLITE_CLOSE` (2 s) is still aborted, with a warning. `close_session` takes the same path, so an ordinary hangup is polite too. Replay-verified (the task runs to completion instead of being aborted; the `Stop` frame reaches a real gRPC consumer over the wire); not observed against a live consumer | `tap_plane.rs` | closed |
 | ~~D4~~ | ~~`WS_TWILIO` and `GRPC_STREAM` attachments are served; `FILE_S3` (phase 2) and `RTP_INLINE` (phase 3) are refused by name~~ — **`FILE_S3` now served (2026-08-22, item 15)**: the recorder is a hub consumer with the frozen identity, pause-segmenting and `object_store` upload. `RTP_INLINE` is still refused by name and stays Phase 3 | `tap_plane.rs` | partly closed — inline is phase 3 |
-| D9 | A recording lives in the recording pod's memory until the call ends: a pod death loses the buffered audio even though the *session* is adopted elsewhere, and no upload is resumed. Also caps a recording at `MAX_RECORDING` (2 h) | `recorder.rs` | medium once a tenant records for real |
+| 🔶 D9 | ~~A recording lives in the recording pod's memory until the call ends: a pod death loses the buffered audio and no upload is resumed~~ — **partly closed 2026-08-23 (item 30)**: closed segments now spill to `MSS_RECORDING_SPILL_DIR` every `MSS_RECORDING_SPILL_SECONDS` (default 30) and on pause, the final upload stitches spill + memory tail into the one frozen key, this pod's leftovers are salvaged on its next start (never over an object that already exists), and an adopter recovers what it can read while padding and counting the rest (`mss_recording_frames_lost_on_adopt_total`). **Residual, by construction:** the spill dir is per-pod local disk, so a **cross-pod** adopter still cannot read the dead pod's segments — worst-case loss falls from the whole call to the spill interval *on the same pod*, and stays the whole prefix across pods until the spill lives somewhere every pod can read (same fix as D16). No retention policy on the spill dir. Replay/fake-verified only; no live pod-kill drill with a recorder attached. `MAX_RECORDING` (2 h) is unchanged | `recorder.rs`, `recording_spill.rs`, `registry_keeper.rs` | medium — cross-pod half open |
 | D11 | `StopRecording`/`Detach` **blocks until the upload finishes** (bounded 60 s/90 s), because `observe` needs a live session and a backgrounded upload would lose `UploadCompleted` on every hangup. A pilot may find the latency unacceptable; the fix is a session-independent event path | `tap_plane.rs`, `recorder.rs` | medium — watch it in the pilot |
 | ~~D10~~ | ~~Pause is honoured by the recorder only; a paused `WS_TWILIO`/`GRPC_STREAM` attachment keeps receiving media~~ — **fixed 2026-08-23 (item 27)**: the hub checks a per-subscription pause flag before every frame, so `StreamPause` really stops feeding an ASR; skipped frames are counted (`mss_consumer_suppressed_while_paused_total`) and resume starts at the current tap position rather than replaying a backlog. A gRPC attachment paused before its consumer subscribes stays paused when the stream opens. Recorder pause behaviour is unchanged. Replay-verified through `update_attachment`; not observed live | `tap_plane.rs`, `hub.rs` | closed |
 | ~~D5~~ | ~~Event delivery is **at-most-once**; a broker outage drops events~~ — **fixed 2026-08-22 (item 13)**: bounded retry backlog, order preserved, drop-oldest counted. Now **at-least-once**, so the translator must dedupe by `(external_id, seq)`; a backlog past its 8192 cap or a pod death still loses events | `event_pump.rs` | closed |

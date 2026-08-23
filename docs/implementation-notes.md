@@ -1832,6 +1832,9 @@ The Phase-2 recorder is **a hub consumer in the control world**, exactly like
 `consumer_ws`: it owns a `hub::Subscription`, a tokio task, and no part of the
 media thread. Nothing in this module runs on the capture thread — the WAV is
 built and the upload is made after the audio is already in memory.
+Since item 30 the audio does not all stay in memory: closed segments spill to
+local disk as the call runs — see `recording_spill.rs` below for the journal,
+the restart salvage and what adoption can and cannot recover.
 
 - **The identity is the contract.** `RecordingIdentity::parse` accepts exactly
   `${accountID}/${recordingID}.${format}` and refuses everything else *by
@@ -1923,6 +1926,67 @@ built and the upload is made after the audio is already in memory.
   per pod, so a pod that dies mid-call loses the audio it had buffered even
   though the session itself is adopted elsewhere (the adopted session
   re-taps, but the recording restarts).
+
+### recording_spill.rs — the segment journal and the restart salvage (item 30, D9, 2026-08-23)
+
+The recorder no longer holds a whole call in RAM until the end. Two seams do
+the work, and both are deliberately dumb:
+
+- **Peek then commit, in the segmenter.** `closable_frames()` returns the
+  whole-millisecond prefix that can be closed (millisecond-aligned so the
+  anchor rebase below is exact), `render_closable(frames, layout)` renders it
+  per target *without* mutating, and `close_segment(frames)` drops it from
+  memory. The recorder writes before it commits, so a failed disk write costs
+  nothing: the audio stays in memory and the next tick retries. `close_segment`
+  advances `anchor_ms` by exactly the milliseconds removed instead of clearing
+  it, which is what keeps customer/agent alignment across a segment boundary —
+  the opposite of `pause()`, which clears the anchor on purpose so the paused
+  wall-clock gap is dropped. `spilled_frames` keeps `duration_ms()`,
+  `total_frames()` and the `MAX_RECORDING` cap honest across spills.
+- **The journal on disk.** `<MSS_RECORDING_SPILL_DIR>/journal/<first object
+  key>/` holds `manifest.json` plus `<target index>-<seq>.pcm` — raw
+  interleaved i16 LE, no header, one chunk stream per target of one recorder
+  (a group member with two mono objects keeps both under the member's own
+  directory). The manifest names the recording id, sample rate, owning pod,
+  frames on disk and the chunk list per key, and is replaced by atomic rename
+  after every segment. Chunks and manifest are written on `spawn_blocking`.
+  Segments close every `MSS_RECORDING_SPILL_SECONDS` (default 30, `SPILL_EVERY`)
+  and on every pause.
+
+At finish the recorder reads the journal back and prepends it to the tail it
+still holds, so **one** object lands at the frozen
+`${accountID}/${recordingID}.${format}` key and the journal is deleted. A
+recording that never reached storage leaves its journal behind on purpose.
+
+`salvage()` runs in `main.rs` before the daemon serves: every journal on this
+pod's disk is stitched and uploaded. It asks `RecordingSink::exists` first
+(`object_store`'s `head`, via `ObjectStoreExt`) and **skips** a key that is
+already in storage — that is the case where another pod adopted the session and
+finished the object, and overwriting it with this pod's prefix would be data
+loss. Skipped and failed journals stay on disk, counted
+(`mss_recording_salvage_skipped_total`, `mss_recording_salvage_failures_total`)
+and logged with their path: **the spill directory has no retention policy, an
+operator owns it.**
+
+**Adoption.** `PersistedAttachment.recording` (`{recording_id, owner,
+recorded_ms, spilled_ms}`, `serde(default)`) is filled from the live recorder's
+`RecordingProgress` through `TapSubscriptions::recording_journal(attachment)`
+and the keeper stamps the owning pod. `rebuild` derives
+`mss.recording.resumeMs` / `mss.recording.spillOwner` into the rebuilt
+attachment's metadata (and `persisted_from` strips both, so they are re-derived
+each time and never accumulate); `open_recording_attachment` reads them into
+`RecorderSpec.resume_ms`. The recorder then opens the journal at the same key —
+a same-pod restart finds its own segments and continues them — and turns
+whatever the registry says was recorded but is not readable here into leading
+silence (`Segmenter::lead_with_silence`, item 29's seam), counting every such
+frame in `mss_recording_frames_lost_on_adopt_total`. Past `MAX_ADOPT_LEAD`
+(5 min) the padding is refused rather than allocated, since the pad is real
+memory; the loss is still counted.
+
+**The limit to state plainly:** the spill directory is per-pod local disk, so a
+cross-pod adopter reads nothing and the dead pod's audio becomes counted
+silence. Whole-fix shape (shared spill volume, or one multipart upload per
+segment straight to object storage) is the same shape D16 needs.
 
 ### Recording groups — N sessions, one recording (item 21, landed 2026-08-23)
 
