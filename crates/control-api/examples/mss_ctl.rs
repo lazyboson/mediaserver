@@ -4,7 +4,7 @@ use control_api::proto::media_control_client::MediaControlClient;
 const USAGE: &str = "\
 mss_ctl <endpoint> create <external-id> <call-id> <from-tag|-> [rtpengine-node]
    a from-tag of - lets MSS resolve the call's participants from rtpengine
-mss_ctl <endpoint> inline <external-id> <call-id> <sdp-offer-file>
+mss_ctl <endpoint> inline <external-id> <call-id> <sdp-offer-file> [conference-group]
    creates an INLINE session: MSS binds an rtp socket, answers the offer and
    prints the answer sdp for the caller to put in its SIP dialog
 mss_ctl <endpoint> describe <external-id>
@@ -84,6 +84,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     mix: false,
                     idempotency_key: String::new(),
                     sdp_offer: String::new(),
+                    group: String::new(),
                 })
                 .await
                 .map(|response| format!("{:?}", response.into_inner()))
@@ -104,6 +105,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     mix: false,
                     idempotency_key: String::new(),
                     sdp_offer: offer,
+                    group: args.get(5).cloned().unwrap_or_default(),
                 })
                 .await
                 .map(|response| response.into_inner().sdp_answer)

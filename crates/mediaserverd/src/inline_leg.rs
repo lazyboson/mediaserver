@@ -146,6 +146,7 @@ pub struct InlineEgress {
     shared: Arc<InlineEgressShared>,
     epoch: Instant,
     discarded_from_queue: u64,
+    mixed_in_samples: Option<u64>,
 }
 
 impl InlineEgress {
@@ -187,38 +188,57 @@ impl InlineEgress {
                 shared,
                 epoch,
                 discarded_from_queue: 0,
+                mixed_in_samples: None,
             },
             handle,
         ))
     }
 
     pub fn pump(&mut self, now: Instant) {
-        if self.flush.swap(false, Ordering::Relaxed) {
-            let mut cleared = 0u64;
-            while let Some(pending) = self.queue.pop() {
-                cleared += pending.len() as u64;
-                self.discarded_from_queue += pending.len() as u64;
-            }
-            cleared += self.pacer.clear() as u64;
-            self.shared.clears.fetch_add(1, Ordering::Relaxed);
-            self.shared
-                .cleared_samples
-                .fetch_add(cleared, Ordering::Relaxed);
-        }
+        self.take_flush();
         let prebuffer = self.frame_samples * PREBUFFER_FRAMES;
         for _ in 0..MAX_CHUNKS_PER_TICK {
             if self.pacer.queued_samples() >= prebuffer {
                 break;
             }
-            let Some(pcm) = self.queue.pop() else {
+            let Some(pcm) = self.pop_chunk() else {
                 break;
             };
-            if let EnqueueOutcome::QueuedAfterDrop(dropped) = self.pacer.push(&pcm) {
-                self.shared
-                    .dropped_samples
-                    .fetch_add(dropped as u64, Ordering::Relaxed);
-            }
+            self.queue_frame(&pcm);
         }
+        self.send_tick(now);
+    }
+
+    pub fn take_flush(&mut self) -> bool {
+        if !self.flush.swap(false, Ordering::Relaxed) {
+            return false;
+        }
+        let mut cleared = 0u64;
+        while let Some(pending) = self.queue.pop() {
+            cleared += pending.len() as u64;
+            self.discarded_from_queue += pending.len() as u64;
+        }
+        cleared += self.pacer.clear() as u64;
+        self.shared.clears.fetch_add(1, Ordering::Relaxed);
+        self.shared
+            .cleared_samples
+            .fetch_add(cleared, Ordering::Relaxed);
+        true
+    }
+
+    pub fn pop_chunk(&mut self) -> Option<Vec<i16>> {
+        self.queue.pop()
+    }
+
+    pub fn queue_frame(&mut self, pcm: &[i16]) {
+        if let EnqueueOutcome::QueuedAfterDrop(dropped) = self.pacer.push(pcm) {
+            self.shared
+                .dropped_samples
+                .fetch_add(dropped as u64, Ordering::Relaxed);
+        }
+    }
+
+    pub fn send_tick(&mut self, now: Instant) {
         let elapsed = now.saturating_duration_since(self.epoch);
         if let Some(packet) = self.pacer.tick(elapsed) {
             match self.socket.send_to(packet.datagram, self.peer) {
@@ -227,6 +247,14 @@ impl InlineEgress {
             };
         }
         self.publish(self.pacer.stats());
+    }
+
+    pub fn account_mixed_in(&mut self, samples: u64) {
+        self.mixed_in_samples = Some(self.mixed_in_samples.unwrap_or(0) + samples);
+    }
+
+    pub fn discard_pending(&mut self, samples: u64) {
+        self.discarded_from_queue += samples;
     }
 
     pub fn stats(&self) -> PacerStats {
@@ -238,8 +266,13 @@ impl InlineEgress {
     }
 
     fn publish(&self, stats: PacerStats) {
-        let drained =
-            self.discarded_from_queue + stats.pushed_samples - self.pacer.queued_samples() as u64;
+        let drained = match self.mixed_in_samples {
+            Some(mixed_in) => self.discarded_from_queue + mixed_in,
+            None => {
+                self.discarded_from_queue + stats.pushed_samples
+                    - self.pacer.queued_samples() as u64
+            }
+        };
         self.shared
             .drained_samples
             .store(drained, Ordering::Relaxed);

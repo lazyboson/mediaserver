@@ -68,6 +68,15 @@ message CreateSessionRequest {
   // returns the answer in Session.sdp_answer. A tap needs no SDP: it asks
   // rtpengine for a copy instead.
   string sdp_offer = 8;
+  // INLINE only: the conference this leg joins, mirroring the recording
+  // group on AttachRequest. Legs naming the same group share one mix matrix
+  // driven by one capture-world clock, hear every other member but not
+  // themselves, and publish the conference mix as the "mixed" track on every
+  // member session. Empty is a plain two-party inline leg, which is exactly
+  // what an inline session was before conferences existed. All members must
+  // have negotiated the same sample rate and ptime; a mismatch is refused by
+  // name rather than resampled.
+  string group = 9;
 }
 
 message Session {
@@ -83,6 +92,9 @@ message Session {
   // INLINE only: what MSS answered the peer's offer with. Bound to the pod
   // that answered it, which is why an inline session is not adoptable.
   string sdp_answer = 10;
+  // INLINE only: the conference this leg is mixed into, empty when it is a
+  // plain two-party leg.
+  string group = 11;
 }
 
 message SessionRef {

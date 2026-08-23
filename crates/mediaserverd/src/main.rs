@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+mod conference;
 mod consumer_ws;
 mod event_pump;
 mod hub;

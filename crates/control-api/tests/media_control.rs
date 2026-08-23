@@ -137,6 +137,7 @@ fn create(external_id: &str) -> proto::CreateSessionRequest {
         mix: false,
         idempotency_key: String::new(),
         sdp_offer: String::new(),
+        group: String::new(),
     }
 }
 
@@ -200,6 +201,48 @@ async fn an_inline_session_carries_the_media_plane_s_answer_back_to_the_caller()
     assert_eq!(
         described.sdp_answer, ANSWERED_SDP,
         "the answer stays readable for the life of the session"
+    );
+}
+
+#[tokio::test]
+async fn a_conference_group_rides_on_an_inline_leg_and_nowhere_else() {
+    let plane = Arc::new(RecordingMediaPlane::default());
+    let controller = controller().with_media_plane(plane.clone());
+    let conferenced = controller
+        .create_session(Request::new(proto::CreateSessionRequest {
+            kind: proto::SessionKind::Inline as i32,
+            sdp_offer: "v=0\r\nc=IN IP4 10.9.0.4\r\nm=audio 41000 RTP/AVP 0\r\n".to_string(),
+            group: "standup".to_string(),
+            ..create("req-conf")
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(conferenced.group, "standup");
+
+    let described = controller
+        .describe_session(Request::new(proto::SessionRef {
+            id: Some(proto::session_ref::Id::ExternalId("req-conf".to_string())),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        described.group, "standup",
+        "the conference a leg is mixed into stays readable"
+    );
+
+    let tap_with_group = controller
+        .create_session(Request::new(proto::CreateSessionRequest {
+            group: "standup".to_string(),
+            ..create("req-tap-group")
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(tap_with_group.code(), Code::InvalidArgument);
+    assert!(
+        tap_with_group.message().contains("conference"),
+        "{tap_with_group}"
     );
 }
 

@@ -333,6 +333,7 @@ impl RegistryKeeper {
                 mix: false,
                 idempotency_key: format!("adopt-{}", session.external_id),
                 sdp_offer: String::new(),
+                group: String::new(),
             }))
             .await?;
 
@@ -631,6 +632,7 @@ mod tests {
                 mix: false,
                 idempotency_key: String::new(),
                 sdp_offer: String::new(),
+                group: String::new(),
             }))
             .await
             .unwrap();
@@ -977,6 +979,7 @@ mod tests {
                 mix: false,
                 idempotency_key: String::new(),
                 sdp_offer: String::new(),
+                group: String::new(),
             }))
             .await
             .unwrap();
@@ -1011,6 +1014,7 @@ mod tests {
                 mix: false,
                 idempotency_key: String::new(),
                 sdp_offer: "v=0\r\nc=IN IP4 10.9.0.4\r\nm=audio 41000 RTP/AVP 0\r\n".to_string(),
+                group: String::new(),
             }))
             .await
             .unwrap();
