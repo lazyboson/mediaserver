@@ -48,7 +48,9 @@ async fn expire_now(url: &str, external_id: &str) {
 #[path = "../src/session_store.rs"]
 mod session_store;
 
-use session_store::{PersistedAttachment, PersistedSession, RedisSessionStore, SessionStore};
+use session_store::{
+    PersistedAttachment, PersistedFormat, PersistedSession, RedisSessionStore, SessionStore,
+};
 use std::collections::BTreeMap;
 
 fn session(external_id: &str, owner: &str) -> PersistedSession {
@@ -69,6 +71,12 @@ fn session(external_id: &str, owner: &str) -> PersistedSession {
             authoritative: true,
             paused: true,
             group: "conf-redis".to_string(),
+            format: Some(PersistedFormat {
+                encoding: 3,
+                sample_rate_hz: 16_000,
+                channels: 1,
+                ptime_ms: 20,
+            }),
             metadata: BTreeMap::from([("accountId".to_string(), "acct-1".to_string())]),
         }],
     }
@@ -273,7 +281,9 @@ async fn a_record_written_before_the_tap_tag_existed_is_still_adoptable() {
         concat!(
             r#"{{"external_id":"{id}","kind":1,"call_id":"call-legacy","#,
             r#""from_tags":["from-a"],"rtpengine_node":"10.0.0.5:22222","#,
-            r#""owner":"pod-a","attachments":[]}}"#
+            r#""owner":"pod-a","attachments":[{{"label":"rtt","transport":1,"#,
+            r#""endpoint":"wss-rtt-endpoint","capabilities":[1],"selector":null,"#,
+            r#""authoritative":true,"paused":false,"metadata":{{}}}}]}}"#
         ),
         id = external_id
     );
@@ -299,6 +309,10 @@ async fn a_record_written_before_the_tap_tag_existed_is_still_adoptable() {
         .find(|held| held.external_id == external_id)
         .expect("a record from before this field existed must still be adoptable");
     assert_eq!(restored.subscription_tag, "");
+    assert_eq!(
+        restored.attachments[0].format, None,
+        "a record from before the format was persisted must still be adoptable"
+    );
 
     wipe(&url, external_id).await;
 }

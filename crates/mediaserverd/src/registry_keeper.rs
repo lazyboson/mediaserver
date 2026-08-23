@@ -1,12 +1,15 @@
 use crate::session_store::{
-    PersistedAttachment, PersistedSession, SessionStore, ADOPT_EVERY, MAX_ADOPTIONS_PER_SWEEP,
-    RENEW_EVERY,
+    PersistedAttachment, PersistedFormat, PersistedSession, SessionStore, ADOPT_EVERY,
+    MAX_ADOPTIONS_PER_SWEEP, RENEW_EVERY,
 };
-use control_api::convert::{capabilities_wire, session_kind_wire, track_name, transport_wire};
+use control_api::convert::{
+    capabilities_wire, format_wire, session_kind_wire, track_name, transport_wire,
+};
 use control_api::proto;
 use control_api::proto::media_control_server::MediaControl;
 use control_api::tonic::{self, Request};
 use control_api::{MediaPlaneError, SessionController};
+use media_core::AudioFormat;
 use session_core::{AttachmentView, SessionId, SessionView, TrackSelector};
 use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -346,7 +349,7 @@ impl RegistryKeeper {
                         .map(|only| proto::TrackSelector {
                             select: Some(proto::track_selector::Select::Only(only.clone())),
                         }),
-                    format: None,
+                    format: attachment.format.map(format_from_persisted),
                     authoritative: attachment.authoritative,
                     label: attachment.label.clone(),
                     endpoint: attachment.endpoint.clone(),
@@ -403,6 +406,7 @@ impl RegistryKeeper {
                     authoritative: attachment.authoritative,
                     paused: attachment.paused,
                     group: attachment.group.clone(),
+                    format: Some(format_persisted(attachment.format)),
                     metadata: attachment.metadata.clone(),
                 })
                 .collect(),
@@ -410,11 +414,32 @@ impl RegistryKeeper {
     }
 }
 
+fn format_persisted(format: AudioFormat) -> PersistedFormat {
+    let wire = format_wire(format);
+    PersistedFormat {
+        encoding: wire.encoding,
+        sample_rate_hz: wire.sample_rate_hz,
+        channels: wire.channels,
+        ptime_ms: wire.ptime_ms,
+    }
+}
+
+fn format_from_persisted(format: PersistedFormat) -> proto::AudioFormat {
+    proto::AudioFormat {
+        encoding: format.encoding,
+        sample_rate_hz: format.sample_rate_hz,
+        channels: format.channels,
+        ptime_ms: format.ptime_ms,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::session_store::MemorySessionStore;
+    use crate::session_store::PersistedFormat;
     use control_api::{MediaPlane, MediaPlaneError, PlaybackSource};
+    use media_core::Encoding;
     use session_core::{AttachmentId, PlaybackId, SessionId};
     use std::sync::Mutex;
 
@@ -422,6 +447,7 @@ mod tests {
     struct RecordingPlane {
         opened: Mutex<Vec<String>>,
         attached: Mutex<Vec<String>>,
+        formats: Mutex<Vec<(String, AudioFormat)>>,
         journal: Arc<Mutex<Vec<String>>>,
     }
 
@@ -473,6 +499,10 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push(format!("{}@{}", view.label, view.endpoint));
+            self.formats
+                .lock()
+                .unwrap()
+                .push((view.label.clone(), view.format));
             Ok(())
         }
         async fn close_attachment(
@@ -646,6 +676,84 @@ mod tests {
             "the consumer must be reconnected to the same endpoint"
         );
         assert_eq!(store.lease_holder("req-1").as_deref(), Some("pod-b"));
+    }
+
+    async fn attach_asr_consumer(controller: &SessionController, external_id: &str) {
+        controller
+            .attach(Request::new(proto::AttachRequest {
+                session: Some(proto::SessionRef {
+                    id: Some(proto::session_ref::Id::ExternalId(external_id.to_string())),
+                }),
+                transport: proto::Transport::GrpcStream as i32,
+                capabilities: vec![proto::Capability::Sink as i32],
+                selector: None,
+                format: Some(proto::AudioFormat {
+                    encoding: proto::Encoding::L16 as i32,
+                    sample_rate_hz: 16_000,
+                    channels: 1,
+                    ptime_ms: 20,
+                }),
+                authoritative: false,
+                label: "asr".to_string(),
+                endpoint: "grpc-asr".to_string(),
+                group: String::new(),
+                metadata: Default::default(),
+                idempotency_key: String::new(),
+            }))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_adopted_consumer_keeps_the_format_it_negotiated() {
+        let store = Arc::new(MemorySessionStore::default());
+        let (first_pod, _) = pod("pod-a");
+        tap_with_consumer(&first_pod, "req-1").await;
+        attach_asr_consumer(&first_pod, "req-1").await;
+        RegistryKeeper::new(first_pod, store.clone(), "pod-a")
+            .tick()
+            .await;
+
+        let stored = store.stored();
+        assert_eq!(
+            stored[0].attachments[1].format,
+            Some(PersistedFormat {
+                encoding: proto::Encoding::L16 as i32,
+                sample_rate_hz: 16_000,
+                channels: 1,
+                ptime_ms: 20,
+            }),
+            "the negotiated format must be part of what a rebuild needs"
+        );
+
+        store.expire_lease("req-1");
+        let (second_pod, second_plane) = pod("pod-b");
+        RegistryKeeper::new(second_pod, store.clone(), "pod-b")
+            .tick()
+            .await;
+
+        let reopened = second_plane.formats.lock().unwrap().clone();
+        assert_eq!(
+            reopened
+                .iter()
+                .find(|(label, _)| label == "asr")
+                .map(|(_, format)| *format),
+            Some(AudioFormat {
+                encoding: Encoding::L16,
+                sample_rate_hz: 16_000,
+                channels: 1,
+                ptime_ms: 20,
+            }),
+            "an ASR consumer that attached as L16/16k must not come back at the tap default"
+        );
+        assert_eq!(
+            reopened
+                .iter()
+                .find(|(label, _)| label == "rtt")
+                .map(|(_, format)| *format),
+            Some(AudioFormat::pcmu_8k_20ms()),
+            "a consumer that took the default must still get the default"
+        );
     }
 
     #[tokio::test]

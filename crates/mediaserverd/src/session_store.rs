@@ -28,7 +28,17 @@ pub struct PersistedAttachment {
     pub paused: bool,
     #[serde(default)]
     pub group: String,
+    #[serde(default)]
+    pub format: Option<PersistedFormat>,
     pub metadata: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PersistedFormat {
+    pub encoding: i32,
+    pub sample_rate_hz: u32,
+    pub channels: u32,
+    pub ptime_ms: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -324,6 +334,12 @@ mod tests {
                 authoritative: true,
                 paused: false,
                 group: String::new(),
+                format: Some(PersistedFormat {
+                    encoding: 3,
+                    sample_rate_hz: 16_000,
+                    channels: 1,
+                    ptime_ms: 20,
+                }),
                 metadata: BTreeMap::new(),
             }],
         }
@@ -343,6 +359,27 @@ mod tests {
         assert_eq!(
             decoded.subscription_tag, "",
             "a record written before the tap tag was persisted must still decode"
+        );
+        assert_eq!(
+            decoded.attachments[0].format, None,
+            "a record written before the negotiated format was persisted must still decode"
+        );
+    }
+
+    #[test]
+    fn the_negotiated_format_survives_a_json_roundtrip() {
+        let written = session("req-1", "pod-a");
+        let body = serde_json::to_string(&written).unwrap();
+        let decoded: PersistedSession = serde_json::from_str(&body).unwrap();
+        assert_eq!(decoded, written);
+        assert_eq!(
+            decoded.attachments[0].format,
+            Some(PersistedFormat {
+                encoding: 3,
+                sample_rate_hz: 16_000,
+                channels: 1,
+                ptime_ms: 20,
+            })
         );
     }
 
