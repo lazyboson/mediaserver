@@ -144,6 +144,7 @@ fn attach(
         authoritative: false,
         label: "consumer".to_string(),
         endpoint: "wss:".to_string(),
+        group: String::new(),
         metadata: Default::default(),
         idempotency_key: String::new(),
     }

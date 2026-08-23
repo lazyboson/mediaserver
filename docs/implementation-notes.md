@@ -1684,6 +1684,59 @@ built and the upload is made after the audio is already in memory.
   though the session itself is adopted elsewhere (the adopted session
   re-taps, but the recording restarts).
 
+### Recording groups — N sessions, one recording (item 21, landed 2026-08-23)
+
+A FreeSWITCH conference is N SIP dialogs = N rtpengine calls = N MSS sessions
+(a session is one call-id and at most `MAX_TAPPED_LEGS` = 2 legs), so recording
+a conference cannot be one session's job. A **recording group** is the join:
+`AttachRequest.group` (proto field 11, additive) puts a `FILE_S3` attachment
+into a group keyed `(accountID, group)`, and every member writes **its own mono
+object** under the recording's own prefix.
+
+- **Keys.** `${accountID}/${recordingID}/${label}.${format}` per participant,
+  and `${label}.customer` / `${label}.agent` when a member selects both tracks.
+  The endpoint is still the frozen identity
+  `${accountID}/${recordingID}.${format}` — `RecordingIdentity` is unchanged
+  and gained one method, `participant_key`. An **empty group is byte-identical
+  to before**: same single object at `object_key()`, pinned by
+  `an_ungrouped_recording_still_writes_the_frozen_two_leg_identity`.
+- **Why per-participant files and not one N-channel WAV.** Each member is a
+  different rtpengine call with its own RTP clock and its own tap start time.
+  Interleaving them into one file would mean cross-session alignment — a real
+  problem with no cheap answer — and would make one slow member's buffer the
+  whole conference's. Separate files push that to the consumer, which can
+  align by the `RecordingStarted` timestamps if it ever needs to.
+- **The label is a path segment, so it is validated.** `participant_label`
+  refuses empty, `/`, whitespace, control characters and `.`/`..` by name; an
+  attachment with no label falls back to the session's `external_id`.
+- **A recorder now has targets, not a layout.** `RecorderSpec.targets` is a
+  `Vec<RecordingTarget { key, layout }>`, and `Segmenter` stopped filtering by
+  layout at `accept` — it always buffers customer/agent/mixed and **renders**
+  per target (`render(Layout)`), so one member's task can write two mono files
+  from one buffered call. That is what keeps the callbacks honest: one
+  `RecordingStopped` per member however many files it writes, and one
+  `UploadCompleted` per object, whose `uri` is what disambiguates the
+  participant. `RecordingOutcome.uri` became `uris`.
+  `RecorderSpec::one_object` is the ungrouped constructor.
+- **Refusals, all by name and all counted**
+  (`mss_recording_group_joins_refused_total`): a second member reusing a
+  participant label (it would overwrite the first participant's object), a
+  member naming a different `recordingID` in a group that already has one, and
+  a non-empty group on any transport other than `FILE_S3` — the frozen Twilio
+  dialect is two-track by construction and multi-party gRPC is its own item.
+  Pause is per member: `UpdateAttachment{paused}` reaches that member's
+  recorder only.
+- **The group is in one pod's memory, so v1 is single-pod.** `TapPlane` holds
+  `groups: Mutex<HashMap<GroupKey, RecordingGroup>>`; the group opens with its
+  first member and dies with its last (`mss_recording_groups_live`,
+  `mss_recording_group_members_live`). `PersistedAttachment` carries the group
+  (serde `default`, so records written before this still decode) and
+  `RegistryKeeper::rebuild` **refuses to restore a grouped recording on the
+  adopting pod** — counted `grouped_not_adopted` — because rebuilding it there
+  would split one recording across two pods' memory and two prefixes. That is
+  soft spot D16; the fix is placement (schedule a group's sessions onto one
+  pod, or make groups a shared-storage concept).
+
 ### The rustls/ring dependency this added, and why
 
 An S3 client needs TLS, and TLS in Rust needs a crypto provider. The repo's
@@ -1739,7 +1792,12 @@ this addition only because of a specific feature selection, so do not
 - **`hub.rs`**: `Subscription::try_next` is no longer test-only. The recorder
   drains what is already queued after it is told to finish, so a stop does not
   discard up to 200 buffered frames (4 s) of audio.
-- **`metrics.rs`**: ten new series
+- **`metrics.rs`**: thirteen new series — the ten below plus item 21's
+  `mss_recording_groups_live`, `mss_recording_group_members_live` and
+  `mss_recording_group_joins_refused_total`. Note that
+  `mss_recording_uploads_total` and `mss_recording_bytes_uploaded_total` count
+  **objects**, so a group member writing both tracks moves them by two;
+  `mss_recordings_stopped_total` still counts recordings.
   (`mss_recordings_started_total`, `_stopped_total`,
   `mss_recording_pauses_total`, `_uploads_total`, `_upload_failures_total`,
   `_spills_total`, `mss_recordings_truncated_total`,

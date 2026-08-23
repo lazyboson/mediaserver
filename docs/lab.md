@@ -1238,3 +1238,88 @@ anomalies), and not MSS (the identical code path on the identical call gives
 1018/1018 for PCMU). Telling an rtpengine pacing bug from a lab artefact needs a
 **native** Opus source. It does not affect the production shape, where the call
 is already Opus and rtpengine transcodes nothing.
+
+## group_recording_drill.sh — two calls, one recording (2026-08-23)
+
+Item 21's recording groups had to be proved where they matter: **two separate
+rtpengine calls recorded as one logical recording**, which is what a conference
+is. No SIP is involved — `lab/call_driver.py` fabricates both calls — and the
+drill runs **beside** a live lab on free IPs (`172.31.99.120-122`) with a pod
+and a cargo target volume of its own, so nothing existing is restarted or
+overwritten.
+
+```sh
+DOCKER_API_VERSION=1.43 docker compose -f lab/docker-compose.microsip.yml \
+  up -d rtpengine minio minio-init
+./lab/group_recording_drill.sh
+```
+
+It builds `mediaserverd` in `mss-lab-rust:1.95` into its **own** volume
+(`mss-group-target`, removed on exit — the lab pods' shared
+`mss-microsip_lab-target` is deliberately untouched), starts two call drivers
+and one control-plane pod at `172.31.99.122` with the control port published on
+`127.0.0.1:19090` and metrics on `:19091`, then drives everything with
+`mss_ctl` from the host:
+
+```sh
+mss_ctl $CONTROL create conf-alice group-call-a gaA,gaB
+mss_ctl $CONTROL record conf-alice acct-conf/rec-<id>.wav alice conf-drill customer
+```
+
+`record` grew three optional arguments — `[label] [group] [track]` — where the
+group is what joins two sessions into one recording and the label names the
+participant's own file.
+
+First green run (2026-08-22 20:07 UTC, rtpengine 14.1.1.8, MinIO
+`RELEASE.2025-08-13`):
+
+| gauge | while recording | after both detach |
+| --- | --- | --- |
+| `mss_sessions_live` | 2 | 0 |
+| `mss_recordings_live` | 2 | 0 |
+| `mss_recording_groups_live` | 1 | 0 |
+| `mss_recording_group_members_live` | 2 | 0 |
+| `mss_recording_group_joins_refused_total` | 2 | 2 |
+
+```
+acct-conf/rec-1787429250/alice.wav   740 KiB  47.34 s  mono 8 kHz  rms 9960
+acct-conf/rec-1787429250/bob.wav     741 KiB  47.40 s  mono 8 kHz  rms 9971
+Content-Type: audio/wav
+```
+
+Both files' frame counts equal the `duration_ms` the daemon reported to the
+packet (378,720 / 8000 = 47.340 s), and `acct-conf/rec-1787429250.wav` — the
+frozen two-leg key — does **not** exist, which is the check that a grouped
+recording never writes the ungrouped object as well. (That first pass was
+driven by hand for ~47 s; the scripted run records `RECORD_SECONDS`, 20 s by
+default, and produced the same shape — 314 KiB and 346 KiB. The members differ
+by ~2 s because `Detach` **waits for the upload** (D11) and the drill detaches
+them one after the other, so the second member keeps recording while the first
+one uploads.)
+
+The two refusals in that run are the ones a caller will actually hit, and they
+say what to do:
+
+```
+recording group acct-conf/conf-drill already has a participant writing
+  acct-conf/rec-1787429250/alice.wav; each member needs a label of its own
+recording group acct-conf/conf-drill is already recording rec-1787429250 and
+  one group writes one recording; attach with acct-conf/rec-1787429250.wav or
+  a different group
+```
+
+**The drill found a bug in the instrument first (worth keeping).**
+`call_driver.py` could not fabricate **two** calls at once: both containers
+number their NG cookies from `lab-1`, so rtpengine's duplicate-cookie reply
+cache answered the second driver with the *first* call's SDP — both "calls"
+claimed source ports 30028/30042 and the second tap would have pointed at the
+first call's subscription. This is exactly D12's shape, on the driver side.
+`COOKIE_PREFIX` (default `lab`, so every existing drill behaves as before) is
+the fix; with `grpa`/`grpb` the two calls get 30028/30042 and 30090/30096. If
+you ever write a multi-call drill, give every driver its own prefix.
+
+**What this does not prove:** no SIP, no FreeSWITCH conference, and the audio
+is the driver's byte-ramp fixture rather than speech — it exercises the group,
+the participant keys, the per-member pause and the uploads against real
+rtpengine and real object storage, not a real conference. It also runs one pod
+by construction: a group lives in that pod's memory (D16).

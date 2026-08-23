@@ -137,6 +137,7 @@ impl TelCompat {
                 authoritative: spec.authoritative,
                 label: label.to_string(),
                 endpoint: spec.endpoint,
+                group: String::new(),
                 metadata: spec.metadata,
                 idempotency_key: format!("telcompat-{label}-{external_id}"),
             }))
