@@ -1735,6 +1735,96 @@ is replay or a fake socket in-process. P3-5's `inline_call_drill.sh` is what
 puts a real RTP peer (and a real tone) on it, and only then can the cadence,
 the DTMF path and the 20 ms budget be judged.
 
+### 34. Full duplex to consumers — a continuous inject stream (Phase 3) — ✅ DONE (2026-08-23)
+
+An INJECT-capable attachment on an **INLINE** session now feeds the leg's egress
+queue continuously, on both transports. Nothing about a **TAP** session changed:
+its `Mark` still builds one wav and calls `StartPlayback`, its `Clear` still
+stops that playback, and the one-playback-datagram cap (`MAX_UTTERANCE_SAMPLES`)
+still applies there — an rtpengine `play media` really does carry one datagram,
+so the cap is the protocol, not our choice.
+
+The seam is one trait: `control_api::InlineEgressSink` (`egress_format`,
+`push_pcm`, `flush`, `pushed_watermark`, `drained_watermark`), returned by the
+new `MediaPlane::inline_egress_sink(session)` — default `None`, so a media plane
+that has no inline legs (and every fake) needs no change. `TapPlane` implements
+it over item 33's `InlineEgressHandle`, and the trait is resolved **once** per
+stream, so a per-frame inject costs a lock-free queue push and no async hop into
+the plane.
+
+Decisions, recorded so P3-4/P3-5 and Phase 4 do not re-litigate them:
+
+- **The consumer's declared format is decoded to PCM, and the rate must match
+  the leg.** PCMU/PCMA/L16 decode as they always did (`decode_inject`); Opus is
+  still refused by name. What is *new* is a refusal: an inject stream whose
+  attachment declared a sample rate other than the one the leg negotiated is
+  `FAILED_PRECONDITION` naming both rates, at the first inject frame. The
+  honest reason: one pacer serves the whole leg, its `source` rate is the
+  negotiated rate, and there is no streaming resampler on the inject path —
+  `ConsumerEncoder` resamples a *packet* at a time and truncates past
+  `chunk_in`, so reusing it here would silently eat audio. A 16 kHz TTS
+  consumer therefore attaches at the leg's rate (or as L16/8k) until an inject
+  resampler is built. Mismatch is checked once, at the first inject, not per
+  frame, and never at subscribe time — a SINK-only consumer on an inline leg is
+  perfectly legal and must not be refused for a rate it will never use.
+- **`Clear` flushes the egress; it does not stop a playback.** On an inline
+  session `Clear` calls `flush()` (item 32's queue+pacer clear, so the next tick
+  is silence by construction) and drops every pending mark. It also **requires
+  INJECT**, like `Inject` itself: flushing a leg's mouth is a media-affecting
+  act, and so is `Mark`, so the whole inject sub-protocol is capability-gated on
+  an inline session. On a tap, `Clear`/`Mark` keep their old unauthorized-but-
+  harmless behavior — that path only touches the consumer's own playback.
+- **`Mark` acks when the marked audio has actually drained**, not on enqueue.
+  This is cheaply knowable because every sample the control world queues ends up
+  in exactly one of three places, so `InlineEgressShared` publishes
+  `drained_samples = samples flushed straight out of the chunk queue +
+  pacer.pushed_samples - pacer.queued_samples()` — an exact identity (a partial
+  frame drains the remainder, a ring overflow counts as dropped). A `Mark`
+  records the queue's `pushed_samples` watermark, and the ack goes out when
+  `drained_samples` passes it. The pump does not notify, so each stream **polls
+  every 20 ms while a mark is outstanding** (one ptime; no timer at all when
+  none is) — an ack is therefore accurate to within one frame, late rather than
+  early, which is the safe direction for "the prompt finished". At most 64 marks
+  may be outstanding (gRPC refuses beyond that; the WS dialect drops the oldest,
+  having no error frame).
+- **The gRPC ack needed a wire, so `ServerToConsumer` gained `Mark mark = 6`**
+  (additive; next free tag is 7). The WS dialect already had `Outbound::Mark`
+  and its bytes are untouched — the Twilio serialization tests still pin them.
+  A tap's `Mark` is never acked on either transport: it starts a playback, and
+  rtpengine gives no completion signal.
+- **A full egress queue drops the chunk and counts it** rather than ending the
+  stream. 64 chunks is ≈6.4 s of backlog; a consumer that far ahead of the
+  wire is misbehaving, but killing a live voice-AI stream over a transient
+  overrun is worse than dropping a frame. Visible as
+  `mss_inline_egress_chunks_refused_total` plus a warning, and on WS as
+  `ConsumerStats::inject_dropped`.
+- **WS inbound media on an inline session flows straight through** — no
+  utterance accumulation, no 700 ms idle flush, no `BridgeCommand`. The
+  accumulate-then-play path stays exactly as it was for taps. The dialect's
+  optional `sampleRate` is honored: a value other than the leg's rate is
+  counted as an unknown encoding and dropped. The dialect decodes µ-law to PCM,
+  so a PCMA leg is fed correctly — only the *rate* has to agree.
+
+New metrics: `mss_inline_egress_pushed_samples_total`,
+`mss_inline_egress_drained_samples_total`.
+
+Tested: 4 new over-the-wire gRPC tests (three inject frames land as 480 samples
+of decoded PCM in the sink with **no** playback issued; `Clear` flushes it and
+stops nothing; a mark stays unacked for 300 ms while its audio is queued and is
+acked by name the moment the sink drains; a 16 kHz-vs-8 kHz mismatch refused by
+name; an unprivileged inject still `PERMISSION_DENIED` with an empty sink) and 3
+new WS tests against a **real** `InlineEgress` and a real peer socket (inbound
+media reaches the peer as paced µ-law rather than an utterance, `Clear` makes the
+next paced frame silence, a mark is acked only after six pumps drained it). The
+pre-existing tap tests are the regression proof that taps did not move: the fake
+plane now offers an inline sink for *every* session, and the tap path still
+builds its wav and stops its playback.
+
+**Not verified live.** Both transports were driven against a fake plane or an
+in-process socket; no SIP peer and no real voice-AI consumer has spoken through
+this. P3-5's drill is what proves a real ear hears it, and P3-4 owes the
+measured cut-through.
+
 ## Open defects and soft spots
 
 | # | Item | Where | Severity |
@@ -1806,9 +1896,11 @@ sans-IO `PlayoutPacer`, and item 33 made `CreateSession{INLINE, sdp_offer}` bind
 a socket, answer the offer (PCMU/PCMA + telephone-event) and pump both
 directions — the peer into the tap hub as the `customer` track, queued PCM back
 out one paced packet per ptime, with `StopPlayback` as the barge flush. What is
-left is full duplex to consumers (an INJECT attachment streaming into that
-queue, P3-3), the cut-through measurement (P3-4) and a live drill against a real
-RTP peer (P3-5) — nothing here has met a SIP endpoint yet.
+item 34 made it full duplex: an INJECT attachment on either transport streams
+into that queue continuously, `Clear` flushes it and `Mark` is acked when the
+marked audio has drained. What is left is the cut-through measurement (P3-4) and
+a live drill against a real RTP peer (P3-5) — nothing here has met a SIP
+endpoint yet.
 
 **Phase 4 — Full media plane** is the N-way mixer, monitor/whisper as
 attachments and playbacks rather than conference tricks. Do not start before

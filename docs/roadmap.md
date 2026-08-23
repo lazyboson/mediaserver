@@ -198,9 +198,11 @@ telephone-event; anything else refused by name), returns the answer in
 `Session.sdp_answer`, feeds the peer's audio into the same jitter → decode →
 hub pipeline the taps use as the `customer` track, and paces queued PCM back
 out through the sans-IO `PlayoutPacer` (tasks.md items 32 and 33).
-`StopPlayback` flushes the egress queue, which is the barge seam. Owed:
-full duplex from consumers (INJECT streaming), the measured cut-through, and a
-live drill with a real RTP peer.
+`StopPlayback` flushes the egress queue, which is the barge seam. Item 34 made
+it **full duplex**: an INJECT attachment on either transport (gRPC
+`MediaStream`, WS-Twilio) streams into that queue continuously, `Clear` flushes
+it, and `Mark` is acked once the marked audio has drained out of it. Owed: the
+measured cut-through, and a live drill with a real RTP peer.
 
 Work:
 - Inline RTP endpoint mode: answer OpenSIPS B2B INVITEs

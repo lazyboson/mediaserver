@@ -843,6 +843,28 @@ never silent), then asks the media plane for frames through the new
   registry-tracked, evented onto `mss.events` and attributed; `Clear`
   discards the buffer and stops the last playback — the barge shape, with
   `NOT_FOUND` on the stop tolerated because the playback may have ended.
+- **On an INLINE session the inject path is continuous** (2026-08-23, item 34).
+  The stream resolves `SessionController::inline_egress_sink(session)` **once**,
+  at subscribe, when `session.kind == INLINE`; if it comes back `Some`, every
+  `Inject` frame is decoded to PCM and pushed straight into the leg's egress
+  queue, `Clear` calls `flush()`, and `Mark` becomes a drain barrier instead of
+  a playback. If it comes back `None` — every TAP session, and any plane with no
+  inline legs — the accumulate-`Mark`-`StartPlayback` path above runs unchanged,
+  cap included. Three things a future editor should not "simplify":
+  `authorize_inject_once` also carries the format check (the leg's rate vs the
+  attachment's declared rate; mismatch is `FAILED_PRECONDITION` naming both,
+  because there is no streaming resampler on this path), so it must stay the
+  single entry point for `Inject`/`Mark`/`Clear` on an inline session; the mark
+  poll branch reads `marks_pending` computed **before** `select!` so the async
+  block does not borrow `inject` across the await; and a full egress queue logs
+  and drops one chunk rather than ending the stream (≈6.4 s of backlog means a
+  misbehaving consumer, but killing a live voice-AI stream is worse).
+- **`ServerToConsumer.mark = 6`** exists only for that ack (`Mark` had no
+  server→consumer wire before item 34). It is sent when
+  `drained_watermark() >= ` the watermark the `Mark` recorded, polled every
+  20 ms while any mark is outstanding — so an ack is at most one ptime late and
+  never early. A tap's `Mark` is never acked: it starts an rtpengine playback,
+  which reports no completion.
 - **`SpeechReport` is the consumer's only way to report speech** (2026-08-23,
   item 28, defect D19). `ConsumerToServer.report` carries a kind
   (`STARTED`/`PARTIAL`/`FINAL`/`END_OF_UTTERANCE`/`END_OF_INTERACTION`), track,
@@ -1362,6 +1384,26 @@ summed into `IngestSnapshot.inline` by `TapPlaneMetrics`, which is how
 still happens on the media thread; that is the pre-existing hub-inject shape,
 and the honest residual until a sample-ring handoff replaces both.
 
+`InlineEgressHandle` also carries the leg's `AudioFormat` and two watermarks
+added by item 34, and implements `control_api::InlineEgressSink` so the control
+plane can reach it through `MediaPlane::inline_egress_sink` without knowing this
+type. The trait names are deliberately distinct from the inherent ones
+(`push_pcm`/`flush`/`egress_format` vs `push`/`clear`/`format`) so no call site
+can silently resolve to the wrong one. The drain accounting is one identity,
+recomputed in `publish` every pump:
+
+    drained_samples = (samples a flush discarded straight out of the ArrayQueue)
+                    + pacer.stats().pushed_samples
+                    - pacer.queued_samples()
+
+It is exact, not an estimate: every sample the control world queues is either
+still in the ArrayQueue (uncounted), discarded from it by a flush, or pushed
+into the pacer, where it has either left (paced out, dropped by ring overflow,
+or flushed) or is still queued. `pushed_samples` counts everything *offered* to
+the pacer, which is why a ring overflow needs no separate term. A `Mark` ack is
+`drained_samples >= watermark`, and the tick after a `clear()` is silence, so a
+drained mark means the peer really has heard it.
+
 `egress_ssrc(session, salt)` derives a non-zero SSRC (and the initial sequence
 and timestamp) from the session id and the pod's SDP session id rather than
 adding an RNG dependency; distinctness across sessions and pods is what matters,
@@ -1673,6 +1715,19 @@ never takes a lock and never waits on the control world.
   utterance as a WAV blob and plays it with `play media`, targeted by
   default at the first from-tag so only the customer hears the agent.
   `MSS_INJECT_TARGET=everyone` widens it.
+- **On an INLINE session inbound media flows straight to the leg** (2026-08-23,
+  item 34). `ConsumerConfig.egress: Option<InlineEgressHandle>` is set by
+  `tap_plane` only when the attachment declared INJECT *and* the session has an
+  inline egress; `InlineInject` then holds it. With it present, each `media`
+  event's µ-law is decoded and pushed immediately (no utterance, no 700 ms idle
+  flush, no `BridgeCommand`), `clear` flushes the queue so the next paced frame
+  is silence, and `mark` is remembered and acked with the dialect's existing
+  `Outbound::Mark` bytes once the queue drains past its watermark — polled every
+  20 ms, capped at 64 outstanding (oldest dropped, since the dialect has no
+  error frame). The optional `sampleRate` must equal the leg's rate or the frame
+  is counted as an unknown encoding; the *encoding* need not match the leg's,
+  because the dialect is decoded to PCM and a PCMA leg re-encodes on the way
+  out. Without the handle every branch behaves exactly as it did for taps.
 - **The inbound dialect carries no speech report, and never will (D19, found
   2026-08-23, closed 2026-08-23).** `media`/`mark`/`clear`/`end_of_interaction`
   are all a WS consumer can send, and this dialect's bytes are frozen (Article
