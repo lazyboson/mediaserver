@@ -77,6 +77,7 @@ fn session(external_id: &str, owner: &str) -> PersistedSession {
                 channels: 1,
                 ptime_ms: 20,
             }),
+            recording: None,
             metadata: BTreeMap::from([("accountId".to_string(), "acct-1".to_string())]),
         }],
     }

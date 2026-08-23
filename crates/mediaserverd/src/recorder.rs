@@ -1,8 +1,9 @@
 use crate::hub::{Subscription, TapEvent};
+use crate::recording_spill::SegmentJournal;
 use control_api::ObservationSink;
 use media_core::Track;
 use object_store::aws::AmazonS3Builder;
-use object_store::{ObjectStore, PutPayload, RetryConfig};
+use object_store::{ObjectStore, ObjectStoreExt, PutPayload, RetryConfig};
 use session_core::{Observation, SessionId};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -12,9 +13,13 @@ use tokio::sync::mpsc;
 use tracing::{info, warn};
 
 pub const IDENTITY_SCHEME: &str = "${accountID}/${recordingID}.${format}";
+pub const RESUME_MS_METADATA_KEY: &str = "mss.recording.resumeMs";
+pub const SPILL_OWNER_METADATA_KEY: &str = "mss.recording.spillOwner";
 pub const MAX_RECORDING: Duration = Duration::from_secs(2 * 3600);
 pub const UPLOAD_TIMEOUT: Duration = Duration::from_secs(60);
 pub const FINISH_TIMEOUT: Duration = Duration::from_secs(90);
+pub const SPILL_EVERY: Duration = Duration::from_secs(30);
+pub const MAX_ADOPT_LEAD: Duration = Duration::from_secs(300);
 
 const COMMAND_DEPTH: usize = 8;
 const URI_SCHEME_SEPARATOR: &str = "\x2f\x2f";
@@ -24,6 +29,7 @@ const REGION_ENV: &str = "MSS_RECORDING_S3_REGION";
 const ACCESS_KEY_ENV: &str = "MSS_RECORDING_S3_ACCESS_KEY_ID";
 const SECRET_KEY_ENV: &str = "MSS_RECORDING_S3_SECRET_ACCESS_KEY";
 const SPILL_DIR_ENV: &str = "MSS_RECORDING_SPILL_DIR";
+const SPILL_SECONDS_ENV: &str = "MSS_RECORDING_SPILL_SECONDS";
 const DEFAULT_REGION: &str = "us-east-1";
 const UPLOAD_RETRIES: usize = 3;
 
@@ -197,6 +203,8 @@ pub struct SegmenterStats {
     pub frames_beyond_cap: u64,
     pub segments: u64,
     pub lead_silence_frames: u64,
+    pub segments_spilled: u64,
+    pub frames_lost_on_adopt: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -213,6 +221,7 @@ pub struct Segmenter {
     mixed: Vec<i16>,
     anchor_ms: Option<u64>,
     segment_start: usize,
+    spilled_frames: usize,
     paused: bool,
     stats: SegmenterStats,
 }
@@ -229,6 +238,7 @@ impl Segmenter {
             mixed: Vec::new(),
             anchor_ms: None,
             segment_start: 0,
+            spilled_frames: 0,
             paused: false,
             stats: SegmenterStats {
                 segments: 1,
@@ -254,6 +264,48 @@ impl Segmenter {
         true
     }
 
+    pub fn resume_after(&mut self, frames_on_disk: usize) {
+        self.spilled_frames = frames_on_disk;
+    }
+
+    pub fn lose_on_adopt(&mut self, frames: u64) {
+        self.stats.frames_lost_on_adopt = self.stats.frames_lost_on_adopt.saturating_add(frames);
+    }
+
+    pub fn closable_frames(&self) -> usize {
+        let frames_per_ms = (self.sample_rate_hz / 1000) as usize;
+        if frames_per_ms == 0 {
+            return 0;
+        }
+        self.frames() / frames_per_ms * frames_per_ms
+    }
+
+    pub fn render_closable(&self, frames: usize, layout: Layout) -> RecordedAudio {
+        render_tracks(
+            head(&self.customer, frames),
+            head(&self.agent, frames),
+            head(&self.mixed, frames),
+            frames,
+            layout,
+        )
+    }
+
+    pub fn close_segment(&mut self, frames: usize) {
+        let frames_per_ms = (self.sample_rate_hz / 1000) as usize;
+        if frames == 0 || frames_per_ms == 0 {
+            return;
+        }
+        drop_front(&mut self.customer, frames);
+        drop_front(&mut self.agent, frames);
+        drop_front(&mut self.mixed, frames);
+        self.segment_start = self.segment_start.saturating_sub(frames);
+        self.spilled_frames = self.spilled_frames.saturating_add(frames);
+        if let Some(anchor) = self.anchor_ms.as_mut() {
+            *anchor += (frames / frames_per_ms) as u64;
+        }
+        self.stats.segments_spilled += 1;
+    }
+
     pub fn accept(&mut self, track: Track, timestamp_ms: u64, samples: &[i16]) {
         if samples.is_empty() {
             return;
@@ -268,7 +320,7 @@ impl Segmenter {
         }
         let offset_frames = timestamp_ms.saturating_sub(anchor) * self.sample_rate_hz as u64 / 1000;
         let position = self.segment_start.saturating_add(offset_frames as usize);
-        if position + samples.len() > self.max_frames {
+        if self.spilled_frames + position + samples.len() > self.max_frames {
             self.stats.frames_beyond_cap += 1;
             return;
         }
@@ -307,8 +359,12 @@ impl Segmenter {
             .max(self.mixed.len())
     }
 
+    pub fn total_frames(&self) -> usize {
+        self.spilled_frames.saturating_add(self.frames())
+    }
+
     pub fn duration_ms(&self) -> u64 {
-        self.frames() as u64 * 1000 / self.sample_rate_hz as u64
+        self.total_frames() as u64 * 1000 / self.sample_rate_hz as u64
     }
 
     pub fn stats(&self) -> SegmenterStats {
@@ -316,29 +372,58 @@ impl Segmenter {
     }
 
     pub fn render(&self, layout: Layout) -> RecordedAudio {
-        let frames = self.frames();
-        match layout {
-            Layout::Mono(only) => RecordedAudio {
+        render_tracks(
+            &self.customer,
+            &self.agent,
+            &self.mixed,
+            self.frames(),
+            layout,
+        )
+    }
+}
+
+fn render_tracks(
+    customer: &[i16],
+    agent: &[i16],
+    mixed: &[i16],
+    frames: usize,
+    layout: Layout,
+) -> RecordedAudio {
+    match layout {
+        Layout::Mono(only) => {
+            let track = match only {
+                Track::Customer => customer,
+                Track::Agent => agent,
+                Track::Mixed => mixed,
+            };
+            let mut samples = track.to_vec();
+            samples.resize(frames, 0);
+            RecordedAudio {
                 channels: 1,
-                samples: match only {
-                    Track::Customer => self.customer.clone(),
-                    Track::Agent => self.agent.clone(),
-                    Track::Mixed => self.mixed.clone(),
-                },
-            },
-            Layout::Stereo => {
-                let mut samples = Vec::with_capacity(frames * 2);
-                for frame in 0..frames {
-                    samples.push(at(&self.customer, frame));
-                    samples.push(at(&self.agent, frame).saturating_add(at(&self.mixed, frame)));
-                }
-                RecordedAudio {
-                    channels: 2,
-                    samples,
-                }
+                samples,
+            }
+        }
+        Layout::Stereo => {
+            let mut samples = Vec::with_capacity(frames * 2);
+            for frame in 0..frames {
+                samples.push(at(customer, frame));
+                samples.push(at(agent, frame).saturating_add(at(mixed, frame)));
+            }
+            RecordedAudio {
+                channels: 2,
+                samples,
             }
         }
     }
+}
+
+fn head(buffer: &[i16], frames: usize) -> &[i16] {
+    &buffer[..frames.min(buffer.len())]
+}
+
+fn drop_front(buffer: &mut Vec<i16>, frames: usize) {
+    let take = buffer.len().min(frames);
+    buffer.drain(..take);
 }
 
 fn at(buffer: &[i16], frame: usize) -> i16 {
@@ -407,6 +492,8 @@ pub trait RecordingSink: Send + Sync + 'static {
         content_type: &'static str,
         body: Vec<u8>,
     ) -> Result<String, UploadError>;
+
+    async fn exists(&self, key: &str) -> Result<bool, UploadError>;
 
     fn describe(&self) -> String;
 }
@@ -494,6 +581,16 @@ impl RecordingSink for S3RecordingSink {
         ))
     }
 
+    async fn exists(&self, key: &str) -> Result<bool, UploadError> {
+        let path = object_store::path::Path::parse(key)
+            .map_err(|error| UploadError::Key(key.to_string(), error.to_string()))?;
+        match self.store.head(&path).await {
+            Ok(_) => Ok(true),
+            Err(object_store::Error::NotFound { .. }) => Ok(false),
+            Err(error) => Err(UploadError::Refused(error.to_string())),
+        }
+    }
+
     fn describe(&self) -> String {
         match &self.endpoint {
             Some(endpoint) => format!("bucket {} at {endpoint}", self.bucket),
@@ -510,6 +607,12 @@ pub struct RecorderCounters {
     pub uploaded: AtomicU64,
     pub upload_failures: AtomicU64,
     pub spilled: AtomicU64,
+    pub segments_spilled: AtomicU64,
+    pub segment_spill_failures: AtomicU64,
+    pub salvaged: AtomicU64,
+    pub salvage_skipped: AtomicU64,
+    pub salvage_failures: AtomicU64,
+    pub frames_lost_on_adopt: AtomicU64,
     pub bytes_uploaded: AtomicU64,
     pub seconds_recorded: AtomicU64,
     pub truncated: AtomicU64,
@@ -519,21 +622,43 @@ pub struct RecorderCounters {
     pub group_joins_refused: AtomicU64,
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct RecordingSupport {
     pub sink: Option<Arc<dyn RecordingSink>>,
     pub spill_dir: Option<PathBuf>,
+    pub spill_every: Duration,
     pub counters: Arc<RecorderCounters>,
+    pub owner: String,
+}
+
+impl Default for RecordingSupport {
+    fn default() -> RecordingSupport {
+        RecordingSupport {
+            sink: None,
+            spill_dir: None,
+            spill_every: SPILL_EVERY,
+            counters: Arc::new(RecorderCounters::default()),
+            owner: String::new(),
+        }
+    }
 }
 
 impl RecordingSupport {
-    pub fn from_env() -> Result<RecordingSupport, UploadError> {
+    pub fn from_env(owner: &str) -> Result<RecordingSupport, UploadError> {
         let spill_dir = std::env::var(SPILL_DIR_ENV).ok().map(PathBuf::from);
+        let spill_every = std::env::var(SPILL_SECONDS_ENV)
+            .ok()
+            .and_then(|configured| configured.parse::<u64>().ok())
+            .filter(|seconds| *seconds > 0)
+            .map(Duration::from_secs)
+            .unwrap_or(SPILL_EVERY);
         let Ok(bucket) = std::env::var(BUCKET_ENV) else {
             return Ok(RecordingSupport {
                 sink: None,
                 spill_dir,
+                spill_every,
                 counters: Arc::new(RecorderCounters::default()),
+                owner: owner.to_string(),
             });
         };
         if bucket.is_empty() {
@@ -561,7 +686,9 @@ impl RecordingSupport {
         Ok(RecordingSupport {
             sink: Some(Arc::new(sink)),
             spill_dir,
+            spill_every,
             counters: Arc::new(RecorderCounters::default()),
+            owner: owner.to_string(),
         })
     }
 }
@@ -574,6 +701,7 @@ pub struct RecorderSpec {
     pub sample_rate_hz: u32,
     pub max_duration: Duration,
     pub group_anchor: Option<Instant>,
+    pub resume_ms: u64,
 }
 
 impl RecorderSpec {
@@ -594,6 +722,7 @@ impl RecorderSpec {
             sample_rate_hz,
             max_duration: MAX_RECORDING,
             group_anchor: None,
+            resume_ms: 0,
         }
     }
 }
@@ -613,12 +742,33 @@ pub struct RecordingOutcome {
     pub stats: SegmenterStats,
 }
 
+#[derive(Default)]
+pub struct RecordingProgress {
+    recorded_ms: AtomicU64,
+    spilled_ms: AtomicU64,
+}
+
+impl RecordingProgress {
+    pub fn recorded_ms(&self) -> u64 {
+        self.recorded_ms.load(Ordering::Relaxed)
+    }
+
+    pub fn spilled_ms(&self) -> u64 {
+        self.spilled_ms.load(Ordering::Relaxed)
+    }
+}
+
 pub struct RecorderHandle {
     commands: mpsc::Sender<RecorderCommand>,
     task: tokio::task::JoinHandle<RecordingOutcome>,
+    progress: Arc<RecordingProgress>,
 }
 
 impl RecorderHandle {
+    pub fn progress(&self) -> Arc<RecordingProgress> {
+        Arc::clone(&self.progress)
+    }
+
     pub fn set_paused(&self, paused: bool) -> bool {
         let command = if paused {
             RecorderCommand::Pause
@@ -656,8 +806,20 @@ pub fn spawn(
     observer: Option<Weak<dyn ObservationSink>>,
 ) -> RecorderHandle {
     let (commands, inbox) = mpsc::channel(COMMAND_DEPTH);
-    let task = tokio::spawn(run(spec, subscription, inbox, support, observer));
-    RecorderHandle { commands, task }
+    let progress = Arc::new(RecordingProgress::default());
+    let task = tokio::spawn(run(
+        spec,
+        subscription,
+        inbox,
+        support,
+        observer,
+        Arc::clone(&progress),
+    ));
+    RecorderHandle {
+        commands,
+        task,
+        progress,
+    }
 }
 
 async fn run(
@@ -666,24 +828,84 @@ async fn run(
     mut commands: mpsc::Receiver<RecorderCommand>,
     support: RecordingSupport,
     observer: Option<Weak<dyn ObservationSink>>,
+    progress: Arc<RecordingProgress>,
 ) -> RecordingOutcome {
     let counters = Arc::clone(&support.counters);
     counters.live.fetch_add(1, Ordering::Relaxed);
     let recording_id = spec.recording_id.clone();
     let mut segmenter = Segmenter::new(spec.sample_rate_hz, spec.max_duration);
     let mut group_anchor = spec.group_anchor;
+    let frames_per_second = spec.sample_rate_hz.max(1) as u64;
+    let mut journal = SegmentJournal::open(
+        &support,
+        &spec.recording_id,
+        &support.owner,
+        spec.sample_rate_hz,
+        &spec
+            .targets
+            .iter()
+            .map(|target| (target.key.clone(), channels_of(target.layout)))
+            .collect::<Vec<(String, u16)>>(),
+    )
+    .await;
+    let recovered_frames = journal
+        .as_ref()
+        .map(SegmentJournal::frames_on_disk)
+        .unwrap_or_default();
+    segmenter.resume_after(recovered_frames as usize);
+    progress.spilled_ms.store(
+        recovered_frames * 1000 / frames_per_second,
+        Ordering::Relaxed,
+    );
+    if spec.resume_ms > 0 {
+        group_anchor = None;
+        let recovered_ms = recovered_frames * 1000 / frames_per_second;
+        let missing_ms = spec.resume_ms.saturating_sub(recovered_ms);
+        let lost_frames = missing_ms * frames_per_second / 1000;
+        segmenter.lose_on_adopt(lost_frames);
+        counters
+            .frames_lost_on_adopt
+            .fetch_add(lost_frames, Ordering::Relaxed);
+        let missing = Duration::from_millis(missing_ms);
+        let padded = missing <= MAX_ADOPT_LEAD && segmenter.lead_with_silence(missing);
+        warn!(
+            %recording_id,
+            resume_ms = spec.resume_ms,
+            recovered_ms,
+            missing_ms,
+            padded,
+            "this recording was adopted from another pod; the audio the dead pod held is gone              and only what it had spilled to a disk this pod can read is recovered"
+        );
+    }
+    let mut segment_close = tokio::time::interval_at(
+        tokio::time::Instant::now() + support.spill_every,
+        support.spill_every,
+    );
 
     loop {
         tokio::select! {
             biased;
             event = subscription.next() => match event {
-                Some(event) => absorb(&mut segmenter, event, &mut group_anchor),
+                Some(event) => {
+                    absorb(&mut segmenter, event, &mut group_anchor);
+                    progress
+                        .recorded_ms
+                        .store(segmenter.duration_ms(), Ordering::Relaxed);
+                }
                 None => break,
             },
             command = commands.recv() => match command {
                 Some(RecorderCommand::Pause) => {
                     if segmenter.pause() {
                         counters.pauses.fetch_add(1, Ordering::Relaxed);
+                        spill_closed_segment(
+                            &mut journal,
+                            &mut segmenter,
+                            &spec,
+                            &counters,
+                            &progress,
+                        )
+                        .await;
                         observe(
                             &observer,
                             spec.session,
@@ -710,6 +932,10 @@ async fn run(
                 }
                 Some(RecorderCommand::Finish) | None => break,
             },
+            _ = segment_close.tick(), if journal.is_some() => {
+                spill_closed_segment(&mut journal, &mut segmenter, &spec, &counters, &progress)
+                    .await;
+            }
         }
     }
     while let Some(event) = subscription.try_next() {
@@ -718,7 +944,7 @@ async fn run(
 
     let stats = segmenter.stats();
     let duration_ms = segmenter.duration_ms();
-    let frames = segmenter.frames();
+    let frames = segmenter.total_frames();
     counters.live.fetch_sub(1, Ordering::Relaxed);
     counters.stopped.fetch_add(1, Ordering::Relaxed);
     counters
@@ -746,8 +972,14 @@ async fn run(
     let content_type = spec.format.content_type();
     let mut uris = Vec::with_capacity(spec.targets.len());
     let mut total = 0usize;
-    for target in &spec.targets {
-        let audio = segmenter.render(target.layout);
+    let mut uploaded_all = true;
+    for (index, target) in spec.targets.iter().enumerate() {
+        let mut audio = segmenter.render(target.layout);
+        if let Some(held) = journal.as_ref() {
+            let mut spilled = held.read_back(index).await;
+            spilled.append(&mut audio.samples);
+            audio.samples = spilled;
+        }
         let channels = audio.channels;
         let built =
             tokio::task::spawn_blocking(move || wav_bytes(rate, audio.channels, &audio.samples))
@@ -760,6 +992,7 @@ async fn run(
             Ok(built) => built,
             Err(error) => {
                 counters.upload_failures.fetch_add(1, Ordering::Relaxed);
+                uploaded_all = false;
                 warn!(
                     %recording_id,
                     key = %target.key,
@@ -777,6 +1010,8 @@ async fn run(
             frames,
             channels,
             segments = stats.segments,
+            segments_spilled = stats.segments_spilled,
+            frames_lost_on_adopt = stats.frames_lost_on_adopt,
             lead_silence_frames = stats.lead_silence_frames,
             bytes = size,
             "recording closed; uploading"
@@ -797,6 +1032,20 @@ async fn run(
                 },
             );
             uris.push(uri);
+        } else {
+            uploaded_all = false;
+        }
+    }
+    if let Some(held) = journal {
+        if uploaded_all {
+            held.discard().await;
+        } else {
+            warn!(
+                %recording_id,
+                journal = %held.dir().display(),
+                "this recording did not reach storage; its spilled segments stay on disk for \
+                 the next start of this pod to salvage"
+            );
         }
     }
     RecordingOutcome {
@@ -890,6 +1139,55 @@ fn write_spill(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         std::fs::create_dir_all(parent)?;
     }
     std::fs::write(path, bytes)
+}
+
+fn channels_of(layout: Layout) -> u16 {
+    match layout {
+        Layout::Stereo => 2,
+        Layout::Mono(_) => 1,
+    }
+}
+
+async fn spill_closed_segment(
+    journal: &mut Option<SegmentJournal>,
+    segmenter: &mut Segmenter,
+    spec: &RecorderSpec,
+    counters: &RecorderCounters,
+    progress: &RecordingProgress,
+) {
+    let Some(held) = journal.as_mut() else {
+        return;
+    };
+    let frames = segmenter.closable_frames();
+    if frames == 0 {
+        return;
+    }
+    let rendered: Vec<RecordedAudio> = spec
+        .targets
+        .iter()
+        .map(|target| segmenter.render_closable(frames, target.layout))
+        .collect();
+    match held.append(rendered, frames as u64).await {
+        Ok(()) => {
+            segmenter.close_segment(frames);
+            counters.segments_spilled.fetch_add(1, Ordering::Relaxed);
+            progress.spilled_ms.store(
+                held.frames_on_disk() * 1000 / spec.sample_rate_hz.max(1) as u64,
+                Ordering::Relaxed,
+            );
+        }
+        Err(error) => {
+            counters
+                .segment_spill_failures
+                .fetch_add(1, Ordering::Relaxed);
+            warn!(
+                recording_id = %spec.recording_id,
+                %error,
+                "a closed recording segment could not be spilled to disk; it stays in memory \
+                 and dies with this pod"
+            );
+        }
+    }
 }
 
 fn absorb(segmenter: &mut Segmenter, event: TapEvent, group_anchor: &mut Option<Instant>) {
@@ -1001,6 +1299,15 @@ mod tests {
             }
             self.puts.lock().unwrap().push((key.to_string(), body));
             Ok(format!("s3:{URI_SCHEME_SEPARATOR}lab-recordings/{key}"))
+        }
+
+        async fn exists(&self, key: &str) -> Result<bool, UploadError> {
+            Ok(self
+                .puts
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(held, _)| held == key))
         }
 
         fn describe(&self) -> String {
@@ -1221,8 +1528,365 @@ mod tests {
         RecordingSupport {
             sink: Some(sink),
             spill_dir,
+            spill_every: SPILL_EVERY,
             counters: Arc::new(RecorderCounters::default()),
+            owner: "pod-a".to_string(),
         }
+    }
+
+    fn scratch(name: &str) -> PathBuf {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let directory = std::env::temp_dir().join(format!(
+            "mss-spill-{}-{name}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).expect("a scratch directory");
+        directory
+    }
+
+    fn support_spilling(
+        sink: Arc<dyn RecordingSink>,
+        spill_dir: PathBuf,
+        every: Duration,
+    ) -> RecordingSupport {
+        RecordingSupport {
+            spill_every: every,
+            ..support(sink, Some(spill_dir))
+        }
+    }
+
+    async fn wait_for_segments(counters: &RecorderCounters, segments: u64) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while counters.segments_spilled.load(Ordering::Relaxed) < segments {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "only {} segments reached disk",
+                counters.segments_spilled.load(Ordering::Relaxed)
+            );
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    }
+
+    fn frames_of(body: &[u8]) -> usize {
+        let reader = hound::WavReader::new(std::io::Cursor::new(body.to_vec())).expect("a wav");
+        let channels = reader.spec().channels as usize;
+        reader.len() as usize / channels.max(1)
+    }
+
+    fn samples_of(body: &[u8]) -> Vec<i16> {
+        hound::WavReader::new(std::io::Cursor::new(body.to_vec()))
+            .expect("a wav")
+            .into_samples::<i16>()
+            .map(|sample| sample.expect("a sample"))
+            .collect()
+    }
+
+    #[test]
+    fn a_closed_segment_leaves_memory_without_moving_the_recordings_clock() {
+        let mut segmenter = segmenter();
+        segmenter.accept(Track::Customer, 0, &tone(5));
+        segmenter.accept(Track::Customer, 20, &tone(6));
+
+        let closable = segmenter.closable_frames();
+        assert_eq!(closable, 2 * FRAME);
+        let closed = segmenter.render_closable(closable, Layout::Mono(Track::Customer));
+        assert_eq!(closed.samples.len(), 2 * FRAME);
+        assert_eq!(closed.samples[0], 5);
+        assert_eq!(closed.samples[FRAME], 6);
+
+        segmenter.close_segment(closable);
+        assert_eq!(segmenter.frames(), 0, "closed audio must leave memory");
+        segmenter.accept(Track::Customer, 40, &tone(7));
+
+        let tail = segmenter.render(Layout::Mono(Track::Customer));
+        assert_eq!(
+            tail.samples.len(),
+            FRAME,
+            "the tail must not carry the closed segment's silence again"
+        );
+        assert_eq!(tail.samples[0], 7);
+        assert_eq!(segmenter.total_frames(), 3 * FRAME);
+        assert_eq!(segmenter.duration_ms(), 60);
+        assert_eq!(segmenter.stats().segments_spilled, 1);
+    }
+
+    #[test]
+    fn a_recording_that_spills_still_stops_at_its_cap() {
+        let mut segmenter = Segmenter::new(RATE, Duration::from_secs(1));
+        for index in 0..25u64 {
+            segmenter.accept(Track::Customer, index * 20, &tone(1));
+        }
+        segmenter.close_segment(segmenter.closable_frames());
+        for index in 25..51u64 {
+            segmenter.accept(Track::Customer, index * 20, &tone(2));
+        }
+
+        assert_eq!(
+            segmenter.stats().frames_beyond_cap,
+            1,
+            "spilling a segment must not hand the recording a fresh length budget"
+        );
+        assert_eq!(segmenter.total_frames(), RATE as usize);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_spilled_segment_and_the_tail_in_memory_upload_as_one_recording() {
+        let directory = scratch("stitch");
+        let (mut hub, client) = Hub::new();
+        let subscription = client.attach(64, TrackSelection::All).unwrap();
+        hub.poll_commands();
+        let sink = Arc::new(MemorySink::accepting());
+        let support = support_spilling(
+            Arc::clone(&sink) as Arc<dyn RecordingSink>,
+            directory.clone(),
+            Duration::from_millis(10),
+        );
+        let counters = Arc::clone(&support.counters);
+        let handle = spawn(spec(), subscription, support, None);
+
+        hub.publish(TapEvent::media(Track::Customer, 0, &tone(5)));
+        wait_for_segments(&counters, 1).await;
+        hub.publish(TapEvent::media(Track::Customer, 20, &tone(6)));
+        let outcome = handle.finish().await.expect("the recorder had no outcome");
+        drop(hub);
+
+        assert_eq!(outcome.frames, 2 * FRAME, "{outcome:?}");
+        assert_eq!(outcome.duration_ms, 40);
+        let (key, body) = sink.last().expect("nothing was uploaded");
+        assert_eq!(key, "acct-42/rec-99.wav");
+        assert_eq!(frames_of(&body), 2 * FRAME);
+        let samples = samples_of(&body);
+        assert_eq!(samples[0], 5, "the spilled segment must open the object");
+        assert_eq!(
+            samples[2 * FRAME],
+            6,
+            "the tail held in memory must follow it without a gap"
+        );
+        assert!(
+            !directory
+                .join(crate::recording_spill::JOURNAL_DIR)
+                .join(&key)
+                .exists(),
+            "an uploaded recording must not leave its segments on disk"
+        );
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[tokio::test]
+    async fn a_recording_left_behind_by_a_dead_pod_is_uploaded_on_the_next_start() {
+        let directory = scratch("salvage");
+        let sink = Arc::new(MemorySink::accepting());
+        let support = support_spilling(
+            Arc::clone(&sink) as Arc<dyn RecordingSink>,
+            directory.clone(),
+            SPILL_EVERY,
+        );
+        let key = identity().object_key();
+        let mut journal = crate::recording_spill::SegmentJournal::open(
+            &support,
+            "rec-99",
+            "pod-a",
+            RATE,
+            &[(key.clone(), 2)],
+        )
+        .await
+        .expect("a journal needs a spill directory");
+        journal
+            .append(
+                vec![RecordedAudio {
+                    channels: 2,
+                    samples: vec![9; 2 * FRAME],
+                }],
+                FRAME as u64,
+            )
+            .await
+            .unwrap();
+        drop(journal);
+
+        let summary = crate::recording_spill::salvage(&support).await;
+
+        assert_eq!(summary.uploaded, 1, "{summary:?}");
+        assert_eq!(support.counters.salvaged.load(Ordering::Relaxed), 1);
+        let (uploaded, body) = sink.last().expect("nothing was salvaged");
+        assert_eq!(uploaded, key);
+        assert_eq!(frames_of(&body), FRAME);
+        assert_eq!(samples_of(&body)[0], 9);
+        assert!(
+            !directory
+                .join(crate::recording_spill::JOURNAL_DIR)
+                .join(&key)
+                .exists(),
+            "a salvaged journal must be cleaned up"
+        );
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[tokio::test]
+    async fn salvage_never_overwrites_a_recording_that_already_reached_storage() {
+        let directory = scratch("no-clobber");
+        let sink = Arc::new(MemorySink::accepting());
+        let support = support_spilling(
+            Arc::clone(&sink) as Arc<dyn RecordingSink>,
+            directory.clone(),
+            SPILL_EVERY,
+        );
+        let key = identity().object_key();
+        let mut journal = crate::recording_spill::SegmentJournal::open(
+            &support,
+            "rec-99",
+            "pod-a",
+            RATE,
+            &[(key.clone(), 2)],
+        )
+        .await
+        .expect("a journal needs a spill directory");
+        journal
+            .append(
+                vec![RecordedAudio {
+                    channels: 2,
+                    samples: vec![9; 2 * FRAME],
+                }],
+                FRAME as u64,
+            )
+            .await
+            .unwrap();
+        drop(journal);
+        sink.put(&key, "audio/wav", vec![1, 2, 3]).await.unwrap();
+
+        let summary = crate::recording_spill::salvage(&support).await;
+
+        assert_eq!(
+            summary,
+            crate::recording_spill::SalvageSummary {
+                uploaded: 0,
+                already_present: 1,
+                failed: 0,
+            }
+        );
+        assert_eq!(
+            sink.body(&key),
+            vec![1, 2, 3],
+            "a pod coming back must not replace the object another pod finished"
+        );
+        assert!(
+            directory
+                .join(crate::recording_spill::JOURNAL_DIR)
+                .join(&key)
+                .exists(),
+            "the segments it could not use must stay for an operator to judge"
+        );
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_adopted_recording_pads_what_its_dead_pod_never_spilled_and_counts_it() {
+        let directory = scratch("adopt-nothing");
+        let (mut hub, client) = Hub::new();
+        let subscription = client.attach(64, TrackSelection::All).unwrap();
+        hub.poll_commands();
+        let sink = Arc::new(MemorySink::accepting());
+        let support = support_spilling(
+            Arc::clone(&sink) as Arc<dyn RecordingSink>,
+            directory.clone(),
+            SPILL_EVERY,
+        );
+        let counters = Arc::clone(&support.counters);
+        let handle = spawn(
+            RecorderSpec {
+                resume_ms: 1_000,
+                ..spec()
+            },
+            subscription,
+            support,
+            None,
+        );
+
+        hub.publish(TapEvent::media(Track::Customer, 0, &tone(5)));
+        let outcome = handle.finish().await.expect("the recorder had no outcome");
+        drop(hub);
+
+        assert_eq!(
+            counters.frames_lost_on_adopt.load(Ordering::Relaxed),
+            8_000,
+            "a second of audio the dead pod never spilled must be counted as lost"
+        );
+        assert_eq!(outcome.stats.frames_lost_on_adopt, 8_000);
+        let (_, body) = sink.last().expect("nothing was uploaded");
+        assert_eq!(frames_of(&body), 8_000 + FRAME);
+        let samples = samples_of(&body);
+        assert_eq!(samples[0], 0, "the lost second must read as silence");
+        assert_eq!(
+            samples[2 * 8_000],
+            5,
+            "audio after the adoption must sit at its own wall-clock offset"
+        );
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_adopted_recording_that_finds_its_own_spill_keeps_that_audio() {
+        let directory = scratch("adopt-spill");
+        let sink = Arc::new(MemorySink::accepting());
+        let support = support_spilling(
+            Arc::clone(&sink) as Arc<dyn RecordingSink>,
+            directory.clone(),
+            SPILL_EVERY,
+        );
+        let key = identity().object_key();
+        let mut journal = crate::recording_spill::SegmentJournal::open(
+            &support,
+            "rec-99",
+            "pod-a",
+            RATE,
+            &[(key.clone(), 2)],
+        )
+        .await
+        .expect("a journal needs a spill directory");
+        journal
+            .append(
+                vec![RecordedAudio {
+                    channels: 2,
+                    samples: vec![9; 2 * FRAME],
+                }],
+                FRAME as u64,
+            )
+            .await
+            .unwrap();
+        drop(journal);
+
+        let (mut hub, client) = Hub::new();
+        let subscription = client.attach(64, TrackSelection::All).unwrap();
+        hub.poll_commands();
+        let counters = Arc::clone(&support.counters);
+        let handle = spawn(
+            RecorderSpec {
+                resume_ms: 60,
+                ..spec()
+            },
+            subscription,
+            support.clone(),
+            None,
+        );
+
+        hub.publish(TapEvent::media(Track::Customer, 0, &tone(5)));
+        let outcome = handle.finish().await.expect("the recorder had no outcome");
+        drop(hub);
+
+        assert_eq!(
+            counters.frames_lost_on_adopt.load(Ordering::Relaxed),
+            2 * FRAME as u64,
+            "only the 40 ms this pod could not read may count as lost"
+        );
+        assert_eq!(outcome.duration_ms, 80);
+        let (_, body) = sink.last().expect("nothing was uploaded");
+        assert_eq!(frames_of(&body), 4 * FRAME);
+        let samples = samples_of(&body);
+        assert_eq!(samples[0], 9, "the spilled segment must open the object");
+        assert_eq!(samples[2 * FRAME], 0, "the lost 40 ms must read as silence");
+        assert_eq!(samples[2 * 3 * FRAME], 5);
+        let _ = std::fs::remove_dir_all(&directory);
     }
 
     async fn wait_for(seen: &Collected, count: usize) {
@@ -1257,6 +1921,7 @@ mod tests {
             sample_rate_hz: RATE,
             max_duration: MAX_RECORDING,
             group_anchor: None,
+            resume_ms: 0,
         }
     }
 
