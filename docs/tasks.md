@@ -1253,6 +1253,35 @@ pod image, so no new rtpengine teardown block was collected. Re-running it is
 the honest close-out for the rtpengine-side per-tap cost handoff, which was
 blocked on this fix.
 
+### 26. An adopted attachment kept the session default, not its format (defect D15) — ✅ DONE (2026-08-23)
+
+`PersistedAttachment` carried no format, so `rebuild` passed
+`format: None` on every re-`Attach` — and `None` means
+`AudioFormat::pcmu_8k_20ms()` in `control_api::convert::format`. A consumer
+that negotiated L16/16 kHz came back after an adoption as g711/8 kHz on the
+same stream: not an error, a silently wrong sample rate feeding an ASR.
+
+**What shipped.** `PersistedAttachment.format: Option<PersistedFormat>`
+(`#[serde(default)]`), persisted from `AttachmentView.format` on every keeper
+tick and replayed into the `AttachRequest` on adoption. `PersistedFormat` is
+the **wire** shape — encoding as the `proto.Encoding` number, plus
+`sample_rate_hz` / `channels` / `ptime_ms` — matching how `kind`, `transport`
+and `capabilities` are already persisted, so no new mapping table exists to
+drift from the proto. `None` keeps meaning "the default", which is exactly the
+right reading of a record written before this field existed.
+
+**Verified against what.** Unit tests: the JSON roundtrip, a legacy record
+without the field decoding to `None`, and an adoption test where two
+attachments on one session — a WS consumer on the default and a gRPC consumer
+on L16/16 kHz/20 ms — are both re-opened on the adopting pod with the format
+each one asked for (asserted on the `AttachmentView` the media plane receives,
+against a fake plane). Plus the whole `redis_registry` suite against the lab's
+real Redis (19 tests, `MSS_TEST_REDIS_URL=redis://127.0.0.1:16379`), whose
+roundtrip asserts full attachment equality — that legacy-record test now
+carries an attachment, since it had asserted its field on an empty list. **Not**
+observed on a live call: it would take a live pod kill with a gRPC L16
+consumer attached, which is the D14 close-out drill's shape.
+
 ## Open defects and soft spots
 
 | # | Item | Where | Severity |
@@ -1269,7 +1298,7 @@ blocked on this fix.
 | ~~D7~~ | ~~Jitter buffer: fixed target depth, no adaptive sizing, no timestamp-aware gap handling, silence instead of real PLC~~ — **fixed 2026-08-22 (item 17)**: adaptive depth from the RFC 3550 estimate, timestamp-aware silence gaps, comfort noise accounted, G.711 Appendix I-shaped PLC, restart on SSRC change. Replay-verified across the impairment matrix, and since item 19 also **on a real link** in the soak — 1%/5% injected loss reported as 1.06%/5.01% with `frames_concealed` equal to `jitter_lost` to the packet, reorder and ±35 ms jitter costing zero loss and zero late drops. Still open: never impaired with `tc netem` on the **tap link** (this box's kernel has none), so burst loss, reorder-beyond-depth and dedupe stay replay-only, and the concealment has never been judged perceptually | `jitter.rs`, `pipeline.rs`, `plc.rs` | closed |
 | D8 | `owner_pod` is a config string; real placement and load-aware scheduling do not exist | `main.rs` | low until multi-pod |
 | ~~D12~~ | ~~**NG cookies repeat across sessions on one pod**: `CookieSequence` restarted its serial at 0 and `TapPlane` binds a new `NgTransport` per session, so every session's first command was `<prefix>-0`. Two sessions inside rtpengine's duplicate-cookie reply-cache window get the *same cached subscribe answer*, and the second tap receives **no media at all** while looking healthy~~ — **fixed 2026-08-22 (item 10)**: the serial is process-wide, unit-pinned and lab-proved before/after | `ng_transport.rs` | closed — was **high**, it silently broke every second tap within a minute |
-| D15 | An adopted attachment loses its **negotiated format**: `PersistedAttachment` has no format field and `rebuild` passes `format: None`, so a consumer that attached as L16/16k comes back at the session default (g711 at the tap rate). Found by reading the adoption path during item 11, **not** observed — that drill's consumer was WS/PCMU, where the default is the only legal answer. A gRPC consumer would notice | `session_store.rs`, `registry_keeper.rs` | low today, medium once ASR consumers ask for L16/16k |
+| ~~D15~~ | ~~An adopted attachment loses its **negotiated format**: `rebuild` passes `format: None`, so a consumer that attached as L16/16k comes back at the session default.~~ — **fixed 2026-08-23 (item 26)**: `PersistedAttachment.format` (`Option<PersistedFormat>`, `serde(default)`, the wire shape used for the other persisted enums) is written every keeper tick and replayed on adoption; a record without it still decodes and still means the default. Unit-tested (roundtrip, legacy record, an L16/16k gRPC consumer and a default WS consumer re-opened side by side on the adopting pod) and run against the lab's real Redis; **never observed live** — that needs a pod kill with a gRPC L16 consumer attached | `session_store.rs`, `registry_keeper.rs` | closed |
 | ~~D14~~ | ~~**A dead pod's rtpengine subscription is never torn down.**~~ — **fixed 2026-08-23 (item 25)**: `PersistedSession` now carries the tap's `to-tag` (`subscription_tag`, `serde(default)` so older records still decode), the adopter sends NG `unsubscribe` for it **before** re-subscribing (after winning the atomic claim), and a pod that loses its lease destroys the session locally so a partitioned-but-alive owner unsubscribes its own tap instead of double-tapping. `upsert` also stopped rewriting the lease key unconditionally (now `SET NX`) — it had made a lease unloseable, so the partitioned case could never be detected. New counters `mss_registry_orphans_unsubscribed_total`, `mss_registry_orphans_still_subscribed_total`, `mss_registry_surrendered_total`. **Verified in unit tests, against a fake rtpengine socket (the `unsubscribe` bytes) and against the lab's real Redis — not re-measured on a live pod kill**; the residual is that a refused `unsubscribe` still leaks one tap, counted rather than retried | `session_store.rs`, `registry_keeper.rs`, `tap_plane.rs` | closed |
 | D16 | **A recording group is one pod's memory.** `TapPlane` holds the group, so every member of a conference recording must attach to the same pod: there is no placement that guarantees it (D8), a member whose session is adopted elsewhere is **refused** rather than restored (`grouped_not_adopted`, so the participant's file simply ends at the pod that died — the D9 shape per participant), and a group name reused on a second pod silently produces a second half-recording under the same prefix. Fix shape: schedule a group's sessions onto one pod, or move the group into shared storage so any pod can serve a member | `tap_plane.rs`, `registry_keeper.rs` | medium once a tenant records conferences across pods |
 | D13 | `StreamStart` (and the Twilio `start` frame's `tracks`) advertises `["customer","agent"]` for `TrackSelector::All`, but a silent `mixed` track is delivered too, at the full frame rate: a consumer must tolerate an unannounced track and pays 50% extra bandwidth for silence. Fixing it means either naming `mixed` in the start frame or not carrying it under `All` — the latter touches the frozen Twilio surface | `stream.rs`, `tap_plane.rs`, `hub.rs` | low for correctness, medium for cost |
