@@ -1942,10 +1942,10 @@ object** under the recording's own prefix.
   `an_ungrouped_recording_still_writes_the_frozen_two_leg_identity`.
 - **Why per-participant files and not one N-channel WAV.** Each member is a
   different rtpengine call with its own RTP clock and its own tap start time.
-  Interleaving them into one file would mean cross-session alignment — a real
-  problem with no cheap answer — and would make one slow member's buffer the
-  whole conference's. Separate files push that to the consumer, which can
-  align by the `RecordingStarted` timestamps if it ever needs to.
+  Interleaving them into one file would make one slow member's buffer the whole
+  conference's. Separate files keep the members independent; the group time
+  anchor below is what makes them line up anyway, so a consumer can lay the
+  objects side by side without consulting the event timeline.
 - **The label is a path segment, so it is validated.** `participant_label`
   refuses empty, `/`, whitespace, control characters and `.`/`..` by name; an
   attachment with no label falls back to the session's `external_id`.
@@ -1976,6 +1976,45 @@ object** under the recording's own prefix.
   would split one recording across two pods' memory and two prefixes. That is
   soft spot D16; the fix is placement (schedule a group's sessions onto one
   pod, or make groups a shared-storage concept).
+
+### The recording-group time anchor (P2-1, closes D18, 2026-08-23)
+
+D18: every member's segmenter anchored on **its own first frame**, so a member
+that joined ten seconds into a conference produced a file whose sample 0 was
+ten seconds later than the first member's — two objects of different lengths
+with nothing in the audio to say where the second one starts. Reassembly
+needed the `RecordingStarted` event timeline, and the two-node drill's members
+came back 90.32 s vs 90.26 s.
+
+Now **the group owns t=0**. `RecordingGroup` records `opened_at: Instant` when
+its first member joins; `join_group` returns that instant to every later
+member, `RecorderSpec.group_anchor: Option<Instant>` carries it into the
+recorder task, and when that member's **first media frame** arrives the task
+turns `now - anchor` into leading silence via
+`Segmenter::lead_with_silence(Duration)`. All members therefore share t=0 and,
+if they stop together, the same length to within one frame.
+
+- **Why the first frame and not the attach.** The pad has to cover everything
+  between group open and the member's own audio, including its subscribe
+  round-trip; measuring at the first frame folds that in, and the same latency
+  on every member cancels out of their relative alignment.
+- **`lead_with_silence` is the sans-IO seam** — a `Duration` in, no clock
+  inside `Segmenter` — so the padding, the pause interaction and the
+  equal-length property are all replay tests. Wall time is read once, in
+  `absorb`, which is control-plane code.
+- **Pause cannot double-count it.** The pad is written into `segment_start`
+  exactly once (guarded by `stats.lead_silence_frames`, which is also the
+  reported quantity: `SegmenterStats.lead_silence_frames`, logged as
+  `lead_silence_frames` when the file closes). A later `pause` sets
+  `segment_start = frames().max(segment_start)`, so a pause before the first
+  frame cannot erase the pad and a pause after it cannot re-add it.
+- **The pad counts against `MAX_RECORDING`** — a member joining an hour into a
+  two-hour cap has an hour of its own audio, not two — and against nothing
+  else: an ungrouped recording passes `group_anchor: None` and is
+  byte-identical to before.
+- **Unchanged:** the frozen identity, per-member pause, the refusal shapes, and
+  D16 (a group is still one pod's memory, so the anchor is one pod's clock —
+  which is also why a monotonic `Instant` is the right type here).
 
 ### The rustls/ring dependency this added, and why
 
