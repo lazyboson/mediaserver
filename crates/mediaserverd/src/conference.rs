@@ -216,6 +216,7 @@ struct Mixed {
 struct Seated {
     session: SessionId,
     external_id: String,
+    seated_at_frame: u64,
     leg: TapLeg,
     hub: Hub,
     egress: InlineEgress,
@@ -321,6 +322,7 @@ impl Mixed {
                         seated.push(Seated {
                             session,
                             external_id: member.external_id,
+                            seated_at_frame: frames,
                             leg: member.leg,
                             hub: member.hub,
                             egress: member.egress,
@@ -408,7 +410,7 @@ impl Mixed {
             }
 
             if now >= next_release {
-                let timestamp_ms = frames * self.format.ptime_ms.max(1) as u64;
+                let ptime_ms = self.format.ptime_ms.max(1) as u64;
                 for member in seated.iter_mut() {
                     let contributor = member.party.contributor;
                     let mut rejected = 0u64;
@@ -438,6 +440,7 @@ impl Mixed {
                         member.egress.queue_frame(ear);
                     }
                     if let Some(mixed) = conference_frame {
+                        let timestamp_ms = frames.saturating_sub(member.seated_at_frame) * ptime_ms;
                         member
                             .hub
                             .publish(TapEvent::media(Track::Mixed, timestamp_ms, mixed));

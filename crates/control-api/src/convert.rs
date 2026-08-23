@@ -253,9 +253,15 @@ fn payload_wire(kind: EventKind) -> proto::media_event::Payload {
             track: track_name(track).to_string(),
             digit: digit.to_string(),
         }),
-        EventKind::RecordingStarted { recording_id, path } => {
-            Payload::RecordingStarted(proto::RecordingStarted { recording_id, path })
-        }
+        EventKind::RecordingStarted {
+            recording_id,
+            path,
+            shape,
+        } => Payload::RecordingStarted(proto::RecordingStarted {
+            recording_id,
+            path,
+            shape,
+        }),
         EventKind::RecordingPaused {
             recording_id,
             paused,

@@ -734,9 +734,15 @@ impl SessionRegistry {
         }
         let kind = match observation {
             Observation::Dtmf { track, digit } => EventKind::Dtmf { track, digit },
-            Observation::RecordingStarted { recording_id, path } => {
-                EventKind::RecordingStarted { recording_id, path }
-            }
+            Observation::RecordingStarted {
+                recording_id,
+                path,
+                shape,
+            } => EventKind::RecordingStarted {
+                recording_id,
+                path,
+                shape,
+            },
             Observation::RecordingPaused {
                 recording_id,
                 paused,

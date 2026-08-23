@@ -314,7 +314,7 @@ message EndOfUtterance { string track = 1; }
 message Dtmf { string track = 1; string digit = 2; }
 message PlaybackStarted { string playback_id = 1; }
 message PlaybackStopped { string playback_id = 1; string reason = 2; }
-message RecordingStarted { string recording_id = 1; string path = 2; }
+message RecordingStarted { string recording_id = 1; string path = 2; string shape = 3; }
 // The frozen recording callback contract is recordStart / recordPause /
 // recordStop / uploadCompleted, and pause means "cut a segment, defer the
 // upload, keep accumulating duration". duration_ms is therefore the audio

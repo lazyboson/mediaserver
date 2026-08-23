@@ -1711,6 +1711,71 @@ sourced from a member's **own RTP** (`mix_source=leg`) is not built and belongs
 with P4-5's mute/deaf/hold row/column verbs; and nothing here has faced a real
 SIP peer (P4-6).
 
+### conference.rs + recorder.rs — native conference recording (item 39, Phase 4, 2026-08-24)
+
+Two shapes, both reusing surfaces that already existed, both under the frozen
+`${accountID}/${recordingID}.${format}`. Neither needed a new RPC or transport.
+
+- **The room, one mono object.** `Attach{FILE_S3, selector.only="mixed"}` on any
+  member session. The conference publishes its full sum to every member's hub as
+  `Track::Mixed` (item 37), `recording_selection_of` maps `only=mixed` to
+  `TrackSelection::Only(Track::Mixed)` and `layout_of` to
+  `Layout::Mono(Track::Mixed)`, so the recorder is an ordinary one-track hub
+  consumer. Pause excises the paused span from that single object; a spilled
+  segment (item 30) renders per target layout, so it stays mono and stitches
+  back in order. Nothing in `recorder.rs` needed changing for this — the tests
+  are what proves it, which is the point of them.
+- **Every participant, one object each.** A recording **group** over the member
+  sessions with `selector.only="customer"` (an inline leg's own audio is on
+  `Track::Customer`), writing `<account>/<recording>/<label>.wav` per member,
+  time-aligned on the group's `opened_at` through item 29's
+  `Segmenter::lead_with_silence`. A member that joins the conference — and the
+  group — late opens its file with silence back to t=0.
+
+**The mix is published on each member's own clock.** This was the real defect
+here. A member's own audio carries the **leg's** frame counter (0 at its join);
+the mix used to carry the **conference's** (0 at the conference's open), so on
+any member that joined late the two tracks on one hub were offset by the join
+delay — 640 ms in the test that now guards it. `Seated` gained
+`seated_at_frame`, stamped from the conference's `frames` at seat time, and the
+per-member publish is `(frames - seated_at_frame) * ptime_ms`. Mono shapes never
+noticed (the segmenter anchors on the first timestamp it sees); a stereo
+`selector=all` object of a member ("me left, the room right") and any
+cross-track timestamp correlation did. **Keep this invariant** when touching the
+release block: anything published to a *member's* hub is on that member's clock,
+not the conference's.
+
+**A recording group of the mixed track is refused on a conference.** Every
+member's `mixed` track is the same audio, so a group of them writes N identical
+objects under one prefix. `open_recording_attachment` checks
+`conference_of(session)` and refuses by name, naming both supported shapes in
+the message. The refusal is scoped to a conferenced session on purpose: on a
+plain tap `only=mixed` is the injected/playback track and differs per session,
+so a group of those is legitimate.
+
+**The event names the shape.** `RecordingStarted` gained `string shape = 3`
+(additive, wire-compatible), emitted per object:
+
+| shape | what it is |
+| --- | --- |
+| `stereo` | the two-party object, customer left / agent right |
+| `track` | one named track as a mono object |
+| `mixed` | the mixed track as one object (injected audio on a tap) |
+| `participant` | one member of a recording group |
+| `conference-mixed` | the whole room as one object |
+| `conference-participant` | one member of a conference recording group |
+
+`recorder::RecordingShape::of(layout, grouped).named(conferenced)` is the only
+place that string is built — a new shape goes there and nowhere else. A consumer
+therefore never has to parse the object key or know the session's group to tell
+a room recording from a participant recording.
+
+Residuals: the room object hangs off **one member's** session, so it ends when
+that member leaves and its t=0 is its attach moment rather than the conference's
+open (tasks.md D20); D16's pod-local recording group still applies to the
+per-participant shape; and there is no AGC, so the room object clips exactly
+when the mix clips.
+
 ### tap_plane.rs — the control plane's hands in the media world
 
 `TapPlane` implements `control_api::MediaPlane` over the machinery the
@@ -2377,6 +2442,10 @@ built and the upload is made after the audio is already in memory.
 Since item 30 the audio does not all stay in memory: closed segments spill to
 local disk as the call runs — see `recording_spill.rs` below for the journal,
 the restart salvage and what adoption can and cannot recover.
+Since item 39 the same recorder also serves a conference, both as one mono
+object of the room and as one object per participant — see *conference.rs +
+recorder.rs — native conference recording* above for the two shapes, the
+`RecordingStarted.shape` vocabulary and the mix-clock invariant.
 
 - **The identity is the contract.** `RecordingIdentity::parse` accepts exactly
   `${accountID}/${recordingID}.${format}` and refuses everything else *by
