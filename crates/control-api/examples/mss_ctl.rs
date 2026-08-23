@@ -18,6 +18,12 @@ mss_ctl <endpoint> record <external-id> <account/recording.wav> [label] [group] 
    group on this pod, and then label names the participant's own file
    under account/recording/, with track one of customer|agent|all
 mss_ctl <endpoint> pause <attachment-id> <true|false>
+mss_ctl <endpoint> mix <attachment-id> <own|all|member-external-id> [include|exclude]
+   routes an INJECT attachment's audio inside its conference: own is private
+   playback into its own leg, a member's external id is a whisper only that
+   member hears, all is the barge flip; the last argument decides whether the
+   conference's mixed track carries it (default: include for a whisper or a
+   barge, exclude for private playback)
 mss_ctl <endpoint> detach <attachment-id>
 mss_ctl <endpoint> play <external-id> <wav-path> [target-tag]
 mss_ctl <endpoint> destroy <external-id>";
@@ -210,6 +216,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     selector: None,
                     format: None,
                     idempotency_key: String::new(),
+                    metadata: Default::default(),
+                })
+                .await
+                .map(|response| format!("{:?}", response.into_inner()))
+        }
+        "mix" => {
+            if args.len() < 4 {
+                eprintln!("{USAGE}");
+                std::process::exit(2);
+            }
+            let mut metadata = std::collections::HashMap::new();
+            metadata.insert("mix_target".to_string(), args[3].clone());
+            if let Some(monitor) = args.get(4) {
+                metadata.insert("mix_monitor".to_string(), monitor.clone());
+            }
+            client
+                .update_attachment(proto::UpdateAttachmentRequest {
+                    attachment_id: args[2].clone(),
+                    paused: None,
+                    selector: None,
+                    format: None,
+                    idempotency_key: String::new(),
+                    metadata,
                 })
                 .await
                 .map(|response| format!("{:?}", response.into_inner()))

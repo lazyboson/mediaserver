@@ -189,6 +189,12 @@ message UpdateAttachmentRequest {
   TrackSelector selector = 3;
   AudioFormat format = 4;
   string idempotency_key = 5;
+  // Merged into the attachment's metadata: present keys are overwritten,
+  // absent keys are left alone. This is how a metadata-carried verb changes
+  // mid-stream without a new RPC — today that verb is mix_target, which flips
+  // a whisper into a barge (docs/tasks.md item 38, and implementation-notes
+  // "conference.rs — monitor, whisper and barge").
+  map<string, string> metadata = 6;
 }
 
 // send_text parity: forwarded verbatim to the far end, which is why the
@@ -281,6 +287,7 @@ message MediaEvent {
     SessionEnded session_ended = 22;
     EndOfInteraction end_of_interaction = 23;
     RecordingPaused recording_paused = 24;
+    MixRouted mix_routed = 25;
   }
 }
 
@@ -318,6 +325,12 @@ message RecordingPaused { string recording_id = 1; bool paused = 2; uint64 durat
 message RecordingStopped { string recording_id = 1; uint64 duration_ms = 2; }
 message UploadCompleted { string recording_id = 1; string uri = 2; }
 message AttachmentUp { string label = 1; }
+// Where an INJECT attachment's audio lands in its conference's mix: "own" is
+// private playback into its own leg (the default), a member's external id is a
+// whisper heard only by that member, "all" is the barge flip. monitor_audible
+// says whether the conference's mixed track — the monitor and recording feed —
+// carries it, so an integrator can audit who whispered to whom.
+message MixRouted { string mix_target = 1; bool monitor_audible = 2; }
 message AttachmentDown { string label = 1; string reason = 2; }
 message SessionEnded { string reason = 1; }
 message EndOfInteraction { string reason = 1; }
