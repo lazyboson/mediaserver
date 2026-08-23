@@ -145,5 +145,12 @@ dead pod's subscription is never torn down (D14). **Opus ingest landed
 2026-08-23** — libopus via the `opus-ffi` crate, decoding at 8/12/16/24/48 kHz
 with libopus's own concealment, proven on a live call by asking rtpengine to
 `transcode: [opus]` (`MSS_TAP_FORMAT=opus`). Building now needs cmake, make and
-g++. Two Phase-0 items remain blocked on other people: the production rtpengine
-version check and the rtpengine-side per-tap cost.
+g++. **Kernel-module readiness landed 2026-08-23** (item 23): NG `statistics`
+and a kernel-forwarding verdict in `rtpengine-ng`, a per-node capability log in
+mediaserverd, `lab/kernel_probe.sh` (machine-verified on the lab's no-module
+path), and the on-metal checklist in architecture §8.1 — plus the verdict that
+rtpengine's *transcoder*, not its relay, was under-producing Opus: a native
+Opus call taps at **50.0 pkt/s** against 3.8 transcoded. Two Phase-0 items
+remain blocked on other people: the production rtpengine version check — which
+**cannot** be asked over NG, since rtpengine has no NG `version` command — and
+the rtpengine-side per-tap cost.

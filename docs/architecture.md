@@ -547,8 +547,83 @@ The audit of `the legacy media gateway` produced a concrete list of what the pur
 - **Placement:** the controller assigns each new session to a pod (least-loaded / consistent-hash on call-id). Because taps are pull-initiated, no ingress SDP routing problem exists for passive sessions. Inline legs (Phase 3) still need pod-addressable RTP — same hostNetwork/port-range exposure the legacy media gateway uses today (35000–65000/udp per pod), or a small dedicated port range per pod.
 - **Autoscaling:** HPA on active-session count + CPU; graceful drain = stop accepting sessions, let existing ones end (calls are minutes-long, so scale-in is slow by nature — plan for it).
 - **HA:** ownership leases in Redis (TTL'd, renewed by heartbeat). On pod loss: passive taps are *re-subscribed* from another pod within a second or two (audio gap, session survives — dramatically better than today, where a the legacy media gateway pod crash orphans the call until the B2B leg times out); inline sessions fail like any media endpoint failure and need call-control-level recovery.
-- **Kernel-module note:** RTPEngine's kernel fast path keeps doing the primary A↔B forwarding; each subscription adds userspace work on the rtpengine host (packet copy + optional transcode). Capacity-plan rtpengine for "every call tapped" — measure, and scale rtpengine horizontally (you already run multiple instances; taps go to the instance owning the call).
+- **Kernel-module note:** RTPEngine's kernel fast path keeps doing the primary A↔B forwarding; each subscription adds userspace work on the rtpengine host (packet copy + optional transcode). Capacity-plan rtpengine for "every call tapped" — measure, and scale rtpengine horizontally (you already run multiple instances; taps go to the instance owning the call). What decides whether a tap stays on the kernel path is **transcoding**, not tapping — see §8.1 for the eligibility checklist and the on-metal probes.
 - **Observability:** per-session/per-consumer metrics (ingest loss %, jitter, queue depth, consumer lag, injected-audio underruns), pprof, and RTP-level counters exported to Prometheus. Silent-drop counters (today's `"queue full, dropping"` logs) must be first-class metrics with alerts.
+
+### 8.1 Running MSS against a kernel-module rtpengine
+
+The reference deployment runs rtpengine with its own kernel module
+(`xt_RTPENGINE`), which forwards media in-kernel and never enters userspace.
+The question this raises is whether a tap drags the tapped legs out of that fast
+path, because that — not MSS's own cost — is what a platform team will be asked
+to capacity-plan. **No MSS media-path code is involved either way:** MSS speaks
+NG over UDP and receives plain RTP, so a kernel-forwarded subscription and a
+userspace one look identical at our socket.
+
+**What decides it is transcoding, not tapping.** The kernel module carries no
+codec — it forwards and can do SRTP, nothing more — so any stream rtpengine must
+convert is necessarily handled in its userspace. Fan-out itself is a first-class
+feature of the module: a forwarding target holds `num_destinations` up to
+`RTPE_MAX_FORWARD_DESTINATIONS` (32) and carries a `do_intercept` flag
+(`kernel-module/nft_rtpengine.h`), so an extra subscriber destination is
+something the module is built to do.
+
+**Eligibility checklist for a tenant, in order:**
+
+1. **Turn transcoding off at the tap.** `MSS_TAP_TRANSCODE=off` asks rtpengine
+   to convert nothing and takes the call's own codec. This is the only knob on
+   our side that matters. With it on, every tap is a userspace tap by
+   construction, and the daemon says so at startup.
+2. **Confirm codec coverage first.** With transcoding off MSS sees the
+   carrier's codec: PCMU, PCMA and Opus decode natively (Opus since
+   2026-08-23); G.722 and EVS would be refused by name at subscribe time rather
+   than silently dropped. Ask the platform team which codecs actually appear on
+   customer and agent legs before enabling this.
+3. **Check the node with `lab/kernel_probe.sh <host> <port>`.** It reports, over
+   NG alone, whether that rtpengine is forwarding in the kernel, has done so, is
+   entirely userspace, or cannot be told (and why). Exit codes 0/1/2/3. Run on
+   the rtpengine host it adds the `/proc/rtpengine` and `lsmod` evidence NG
+   cannot expose.
+4. **Read the daemon's own first-contact line.** On first NG contact with each
+   node mediaserverd logs `rtpengine node capabilities on first contact`
+   (version where obtainable, uptime, relayed packets split kernel vs
+   userspace, live session and transcoded-media counts, and a plain-English
+   kernel-forwarding verdict), followed by `tap kernel eligibility` — a WARN
+   when transcoding is on, saying plainly that transcoded taps are processed in
+   rtpengine userspace and the kernel module cannot help them.
+
+**The version is not available over NG.** rtpengine has no NG `version`
+command — not in 14.1.1.8 and not in the upstream protocol at all. MSS probes
+for one so a future build is picked up automatically, and otherwise reports
+"unknown: this rtpengine's NG protocol has no version command". Get the version
+from the process, the package, or rtpengine's CLI interface (`--listen-cli`).
+
+**On-metal checklist, for the visit that also answers the two open Phase-0
+questions** (production rtpengine version, rtpengine-side per-tap cost). All of
+it is read-only except the optional `--no-fallback` restart:
+
+- `lab/kernel_probe.sh <ng-host> <ng-port>` at baseline, then again with taps
+  running. The verdict should flip to kernel-forwarding, and
+  `relayedpackets_kernel` should be the bulk of the traffic.
+- `cat /proc/rtpengine/<table>/list` at three moments — baseline, after a
+  subscribe **with** transcoding, and after one **without** — comparing
+  `num_destinations` on the target entries. That is the direct measurement of
+  whether a tap adds a kernel destination or evicts the legs to userspace.
+- Watch `currentstatistics.media_kernel` / `media_userspace` / `media_mixed`
+  and `transcodedmedia` across the same three moments; a tap that stays in the
+  kernel should leave `media_userspace` flat.
+- Run rtpengine with `--no-fallback` so it refuses to start rather than
+  silently degrading to userspace, which would make every reading above look
+  like a negative result.
+
+**This box cannot answer it.** The lab runs `--table=-1`, so
+`/proc/rtpengine` does not exist, `lsmod` is empty and
+`/lib/modules/$(uname -r)/build` is absent, so the out-of-tree module cannot be
+built without a custom-kernel detour. `kernel_probe.sh` was machine-verified
+against it on its "no module" path: 150k packets relayed, every one in
+userspace, exit code 1. The MSS half — transcode-off taps decoding PCMU, PCMA
+and native Opus at full rate — is proven in the lab (see
+[lab.md](lab.md)); the rtpengine half is a checklist for the platform team.
 
 ---
 

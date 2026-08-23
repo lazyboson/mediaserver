@@ -71,6 +71,10 @@ impl NgReply {
             .collect()
     }
 
+    pub fn rtpengine_version(&self) -> Option<&str> {
+        self.body.get("version").and_then(Value::as_str)
+    }
+
     pub fn ssrc_by_tag(&self) -> Vec<(String, u32)> {
         let mut found = Vec::new();
         let Some(Value::Dict(tags)) = self.body.get("tags") else {
@@ -115,6 +119,18 @@ impl NgClient {
     pub fn ping(cookie: &[u8]) -> Vec<u8> {
         let mut d = BTreeMap::new();
         d.insert(b"command".to_vec(), Value::str("ping"));
+        Self::build(cookie, d)
+    }
+
+    pub fn version(cookie: &[u8]) -> Vec<u8> {
+        let mut d = BTreeMap::new();
+        d.insert(b"command".to_vec(), Value::str("version"));
+        Self::build(cookie, d)
+    }
+
+    pub fn statistics(cookie: &[u8]) -> Vec<u8> {
+        let mut d = BTreeMap::new();
+        d.insert(b"command".to_vec(), Value::str("statistics"));
         Self::build(cookie, d)
     }
 
