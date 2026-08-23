@@ -8,6 +8,7 @@ mod metrics;
 mod ng_transport;
 mod recorder;
 mod registry_keeper;
+mod rtpengine_capability;
 mod session_store;
 mod supervisor;
 mod tap_plane;
@@ -80,10 +81,13 @@ fn main() {
             }
         }
 
-        probe_configured_rtpengine_node().await;
+        let capabilities = Arc::new(rtpengine_capability::NodeCapabilityLog::new(
+            transcode_at_tap(),
+        ));
+        probe_configured_rtpengine_node(&capabilities).await;
 
         match control_listen_address() {
-            Some(Ok(listen)) => serve_control_plane(listen).await,
+            Some(Ok(listen)) => serve_control_plane(listen, capabilities).await,
             Some(Err(configured)) => {
                 error!(
                     configured,
@@ -108,7 +112,7 @@ fn main() {
     info!("mediaserverd stopped");
 }
 
-async fn probe_configured_rtpengine_node() {
+async fn probe_configured_rtpengine_node(capabilities: &rtpengine_capability::NodeCapabilityLog) {
     let Ok(configured) = std::env::var(RTPENGINE_NODE_ENV) else {
         info!(
             env = RTPENGINE_NODE_ENV,
@@ -148,13 +152,16 @@ async fn probe_configured_rtpengine_node() {
     let outcome = transport.ping().await;
     let health = transport.health();
     match outcome {
-        Ok(_) => info!(
-            %node,
-            local = ?transport.local_addr().ok(),
-            healthy = health.healthy,
-            replies = health.replies,
-            "rtpengine NG node answered ping"
-        ),
+        Ok(_) => {
+            info!(
+                %node,
+                local = ?transport.local_addr().ok(),
+                healthy = health.healthy,
+                replies = health.replies,
+                "rtpengine NG node answered ping"
+            );
+            capabilities.report_first_contact(node, &transport).await;
+        }
         Err(error) => error!(
             %node,
             %error,
@@ -289,7 +296,10 @@ fn local_media_address() -> IpAddr {
         .unwrap_or(IpAddr::from([0, 0, 0, 0]))
 }
 
-async fn serve_control_plane(listen: SocketAddr) {
+async fn serve_control_plane(
+    listen: SocketAddr,
+    capabilities: Arc<rtpengine_capability::NodeCapabilityLog>,
+) {
     let recording = match recorder::RecordingSupport::from_env() {
         Ok(recording) => recording,
         Err(error) => {
@@ -310,11 +320,12 @@ async fn serve_control_plane(listen: SocketAddr) {
             .and_then(|configured| configured.parse().ok()),
         local_media_address: local_media_address(),
         format: tap_format(opus_rate),
-        transcode_at_tap: transcode_at_tap(),
+        transcode_at_tap: capabilities.transcode_at_tap(),
         opus_decode_rate_hz: opus_rate,
         cookie_prefix: cookie_prefix(),
         sdp_session_id: cookie_prefix(),
         recording,
+        capabilities,
     }));
     let owner = std::env::var(POD_NAME_ENV).unwrap_or_else(|_| DEFAULT_POD_NAME.to_string());
     let draining = Arc::clone(&plane);

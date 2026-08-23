@@ -1,4 +1,6 @@
-use rtpengine_ng::{NgClient, NgError, NgReply, PlayMedia, PlayTarget, SubscribeRequest};
+use rtpengine_ng::{
+    NgClient, NgError, NgReply, PlayMedia, PlayTarget, RtpengineStatistics, SubscribeRequest,
+};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -170,6 +172,15 @@ impl NgTransport {
 
     pub async fn ping(&self) -> Result<NgReply, TransportError> {
         self.roundtrip(NgClient::ping).await
+    }
+
+    pub async fn version(&self) -> Result<NgReply, TransportError> {
+        self.roundtrip(NgClient::version).await
+    }
+
+    pub async fn statistics(&self) -> Result<RtpengineStatistics, TransportError> {
+        let reply = self.roundtrip(NgClient::statistics).await?;
+        Ok(RtpengineStatistics::from_reply(&reply)?)
     }
 
     pub async fn subscribe_request(
@@ -387,6 +398,64 @@ mod tests {
         assert_eq!(reply.cookie, fake.cookies()[0]);
         assert_eq!(transport.health().replies, 1);
         assert!(transport.health().healthy);
+    }
+
+    #[tokio::test]
+    async fn statistics_arrives_as_the_kernel_and_userspace_split() {
+        let fake = FakeRtpengine::spawn(|_, datagram| {
+            vec![reply_to(
+                datagram,
+                "d6:result2:ok10:statisticsd15:totalstatisticsd\
+14:relayedpacketsi90e21:relayedpackets_kerneli90e19:relayedpackets_useri0e6:uptime3:512e\
+17:currentstatisticsd17:packetrate_kerneli51eeee",
+            )]
+        })
+        .await;
+        let transport = transport_to(fake.addr, fast_config()).await;
+
+        let statistics = transport.statistics().await.unwrap();
+        assert_eq!(statistics.totals.packets_in_kernel, 90);
+        assert_eq!(statistics.uptime_seconds, Some(512));
+        assert_eq!(
+            statistics.kernel_forwarding(),
+            rtpengine_ng::KernelForwarding::ForwardingInKernelNow
+        );
+        let sent = String::from_utf8_lossy(&fake.received.lock().unwrap()[0]).to_string();
+        assert!(sent.contains("7:command10:statistics"), "{sent}");
+    }
+
+    #[tokio::test]
+    async fn an_rtpengine_that_does_not_know_the_version_command_says_so_instead_of_hanging() {
+        let fake = FakeRtpengine::spawn(|_, datagram| {
+            vec![reply_to(
+                datagram,
+                "d12:error-reason20:Unrecognized command6:result5:errore",
+            )]
+        })
+        .await;
+        let transport = transport_to(fake.addr, fast_config()).await;
+
+        match transport.version().await {
+            Err(TransportError::Ng(NgError::Remote(reason))) => {
+                assert_eq!(reason, rtpengine_ng::UNRECOGNIZED_COMMAND)
+            }
+            other => panic!("expected the remote refusal, got {other:?}"),
+        }
+        assert_eq!(fake.request_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_statistics_reply_without_a_statistics_dict_is_an_error_not_a_zeroed_report() {
+        let fake =
+            FakeRtpengine::spawn(|_, datagram| vec![reply_to(datagram, "d6:result2:oke")]).await;
+        let transport = transport_to(fake.addr, fast_config()).await;
+
+        match transport.statistics().await {
+            Err(TransportError::Ng(NgError::MissingField(field))) => {
+                assert_eq!(field, "statistics")
+            }
+            other => panic!("expected a missing field error, got {other:?}"),
+        }
     }
 
     #[tokio::test]
