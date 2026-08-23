@@ -1,6 +1,7 @@
+use crate::recorder::{RESUME_MS_METADATA_KEY, SPILL_OWNER_METADATA_KEY};
 use crate::session_store::{
-    PersistedAttachment, PersistedFormat, PersistedSession, SessionStore, ADOPT_EVERY,
-    MAX_ADOPTIONS_PER_SWEEP, RENEW_EVERY,
+    PersistedAttachment, PersistedFormat, PersistedRecording, PersistedSession, SessionStore,
+    ADOPT_EVERY, MAX_ADOPTIONS_PER_SWEEP, RENEW_EVERY,
 };
 use control_api::convert::{
     capabilities_wire, format_wire, session_kind_wire, track_name, transport_wire,
@@ -10,7 +11,7 @@ use control_api::proto::media_control_server::MediaControl;
 use control_api::tonic::{self, Request};
 use control_api::{MediaPlaneError, SessionController};
 use media_core::AudioFormat;
-use session_core::{AttachmentView, SessionId, SessionView, TrackSelector};
+use session_core::{AttachmentId, AttachmentView, SessionId, SessionView, TrackSelector};
 use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -34,6 +35,8 @@ pub struct KeeperCounters {
 #[control_api::async_trait]
 pub trait TapSubscriptions: Send + Sync + 'static {
     fn subscription_tag(&self, session: SessionId) -> Option<String>;
+
+    fn recording_journal(&self, attachment: AttachmentId) -> Option<PersistedRecording>;
 
     async fn unsubscribe_orphan(
         &self,
@@ -354,7 +357,7 @@ impl RegistryKeeper {
                     label: attachment.label.clone(),
                     endpoint: attachment.endpoint.clone(),
                     group: attachment.group.clone(),
-                    metadata: attachment.metadata.clone().into_iter().collect(),
+                    metadata: resume_metadata(attachment),
                     idempotency_key: format!("adopt-{}-{}", session.external_id, attachment.label),
                 }))
                 .await?
@@ -407,11 +410,45 @@ impl RegistryKeeper {
                     paused: attachment.paused,
                     group: attachment.group.clone(),
                     format: Some(format_persisted(attachment.format)),
-                    metadata: attachment.metadata.clone(),
+                    recording: self.subscriptions.as_ref().and_then(|subscriptions| {
+                        subscriptions
+                            .recording_journal(attachment.id)
+                            .map(|journal| PersistedRecording {
+                                owner: self.owner.clone(),
+                                ..journal
+                            })
+                    }),
+                    metadata: attachment
+                        .metadata
+                        .iter()
+                        .filter(|(key, _)| !is_resume_key(key))
+                        .map(|(key, value)| (key.clone(), value.clone()))
+                        .collect(),
                 })
                 .collect(),
         }
     }
+}
+
+fn is_resume_key(key: &str) -> bool {
+    key == RESUME_MS_METADATA_KEY || key == SPILL_OWNER_METADATA_KEY
+}
+
+fn resume_metadata(attachment: &PersistedAttachment) -> std::collections::HashMap<String, String> {
+    let mut metadata: std::collections::HashMap<String, String> = attachment
+        .metadata
+        .iter()
+        .filter(|(key, _)| !is_resume_key(key))
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect();
+    if let Some(journal) = &attachment.recording {
+        metadata.insert(
+            RESUME_MS_METADATA_KEY.to_string(),
+            journal.recorded_ms.to_string(),
+        );
+        metadata.insert(SPILL_OWNER_METADATA_KEY.to_string(), journal.owner.clone());
+    }
+    metadata
 }
 
 fn format_persisted(format: AudioFormat) -> PersistedFormat {
@@ -448,6 +485,7 @@ mod tests {
         opened: Mutex<Vec<String>>,
         attached: Mutex<Vec<String>>,
         formats: Mutex<Vec<(String, AudioFormat)>>,
+        metadata: Mutex<Vec<(String, std::collections::BTreeMap<String, String>)>>,
         journal: Arc<Mutex<Vec<String>>>,
     }
 
@@ -456,12 +494,17 @@ mod tests {
         tag: Option<String>,
         journal: Arc<Mutex<Vec<String>>>,
         refuse: bool,
+        recording: Option<PersistedRecording>,
     }
 
     #[control_api::async_trait]
     impl TapSubscriptions for FakeSubscriptions {
         fn subscription_tag(&self, _session: SessionId) -> Option<String> {
             self.tag.clone()
+        }
+
+        fn recording_journal(&self, _attachment: AttachmentId) -> Option<PersistedRecording> {
+            self.recording.clone()
         }
 
         async fn unsubscribe_orphan(
@@ -499,6 +542,10 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push(format!("{}@{}", view.label, view.endpoint));
+            self.metadata
+                .lock()
+                .unwrap()
+                .push((view.label.clone(), view.metadata.clone()));
             self.formats
                 .lock()
                 .unwrap()
@@ -585,6 +632,27 @@ mod tests {
                 authoritative: true,
                 label: "rtt".to_string(),
                 endpoint: "wss-rtt-endpoint".to_string(),
+                group: String::new(),
+                metadata: Default::default(),
+                idempotency_key: String::new(),
+            }))
+            .await
+            .unwrap();
+    }
+
+    async fn attach_recording(controller: &SessionController, external_id: &str, label: &str) {
+        controller
+            .attach(Request::new(proto::AttachRequest {
+                session: Some(proto::SessionRef {
+                    id: Some(proto::session_ref::Id::ExternalId(external_id.to_string())),
+                }),
+                transport: proto::Transport::FileS3 as i32,
+                capabilities: vec![proto::Capability::Sink as i32],
+                selector: None,
+                format: None,
+                authoritative: false,
+                label: label.to_string(),
+                endpoint: "acct-1/rec-1.wav".to_string(),
                 group: String::new(),
                 metadata: Default::default(),
                 idempotency_key: String::new(),
@@ -758,6 +826,71 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_adopting_pod_is_told_how_much_recording_the_dead_pod_held() {
+        let store = Arc::new(MemorySessionStore::default());
+        let (first_pod, _) = pod("pod-a");
+        tap_with_consumer(&first_pod, "req-1").await;
+        attach_recording(&first_pod, "req-1", "rec").await;
+        RegistryKeeper::new(first_pod, store.clone(), "pod-a")
+            .with_subscriptions(Arc::new(FakeSubscriptions {
+                tag: Some("tap-a".to_string()),
+                journal: Arc::new(Mutex::new(Vec::new())),
+                refuse: false,
+                recording: Some(PersistedRecording {
+                    recording_id: "rec-1".to_string(),
+                    owner: String::new(),
+                    recorded_ms: 61_000,
+                    spilled_ms: 60_000,
+                }),
+            }))
+            .tick()
+            .await;
+
+        let stored = store.stored();
+        assert_eq!(
+            stored[0].attachments[1].recording,
+            Some(PersistedRecording {
+                recording_id: "rec-1".to_string(),
+                owner: "pod-a".to_string(),
+                recorded_ms: 61_000,
+                spilled_ms: 60_000,
+            }),
+            "the registry must name the pod whose disk holds the spilled segments"
+        );
+
+        store.expire_lease("req-1");
+        let (second_pod, second_plane) = pod("pod-b");
+        let keeper = RegistryKeeper::new(second_pod, store.clone(), "pod-b");
+        keeper.tick().await;
+
+        let restored = second_plane.metadata.lock().unwrap().clone();
+        let carried = restored
+            .iter()
+            .find(|(label, _)| label == "rec")
+            .map(|(_, metadata)| metadata.clone())
+            .expect("the recording was not rebuilt");
+        assert_eq!(
+            carried.get(RESUME_MS_METADATA_KEY).map(String::as_str),
+            Some("61000"),
+            "the adopter must know where the recording had reached"
+        );
+        assert_eq!(
+            carried.get(SPILL_OWNER_METADATA_KEY).map(String::as_str),
+            Some("pod-a"),
+            "the adopter must know whose disk holds what it cannot read"
+        );
+
+        let persisted_again = store.stored();
+        assert!(
+            !persisted_again[0]
+                .attachments
+                .iter()
+                .any(|attachment| { attachment.metadata.contains_key(RESUME_MS_METADATA_KEY) }),
+            "the resume hint is derived on every adoption, never accumulated in metadata"
+        );
+    }
+
+    #[tokio::test]
     async fn a_grouped_recording_is_persisted_but_refused_on_the_adopting_pod() {
         let store = Arc::new(MemorySessionStore::default());
         let (first_pod, _) = pod("pod-a");
@@ -882,6 +1015,7 @@ mod tests {
                 tag: Some("tap-b".to_string()),
                 journal: Arc::clone(&journal),
                 refuse: false,
+                recording: None,
             }));
         keeper.tick().await;
 
@@ -930,6 +1064,7 @@ mod tests {
                 tag: Some("tap-b".to_string()),
                 journal: Arc::new(Mutex::new(Vec::new())),
                 refuse: true,
+                recording: None,
             }));
         keeper.tick().await;
 

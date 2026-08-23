@@ -6,10 +6,11 @@ use crate::hub::{
 use crate::ng_transport::{NgTransport, NgTransportConfig};
 use crate::recorder::{
     self, Layout, RecorderCounters, RecorderHandle, RecorderSpec, RecordingFormat,
-    RecordingIdentity, RecordingSupport, RecordingTarget,
+    RecordingIdentity, RecordingProgress, RecordingSupport, RecordingTarget,
 };
 use crate::registry_keeper::TapSubscriptions;
 use crate::rtpengine_capability::NodeCapabilityLog;
+use crate::session_store::PersistedRecording;
 use crate::tap_spike::{
     capture, SharedLegStats, SsrcTrackPublisher, SsrcTracks, TapLeg, MAX_SSRC_TRACKS,
 };
@@ -94,6 +95,7 @@ enum LiveAttachment {
         recording_id: String,
         member_of: Option<GroupKey>,
         handle: Option<RecorderHandle>,
+        progress: Arc<RecordingProgress>,
     },
 }
 
@@ -209,6 +211,12 @@ pub struct IngestSnapshot {
     pub recording_uploads: u64,
     pub recording_upload_failures: u64,
     pub recording_spills: u64,
+    pub recording_segments_spilled: u64,
+    pub recording_segment_spill_failures: u64,
+    pub recording_salvaged: u64,
+    pub recording_salvage_skipped: u64,
+    pub recording_salvage_failures: u64,
+    pub recording_frames_lost_on_adopt: u64,
     pub recording_bytes_uploaded: u64,
     pub recording_seconds: u64,
     pub recordings_truncated: u64,
@@ -300,6 +308,12 @@ impl TapPlaneMetrics {
             recording_uploads: read(&recorder.uploaded),
             recording_upload_failures: read(&recorder.upload_failures),
             recording_spills: read(&recorder.spilled),
+            recording_segments_spilled: read(&recorder.segments_spilled),
+            recording_segment_spill_failures: read(&recorder.segment_spill_failures),
+            recording_salvaged: read(&recorder.salvaged),
+            recording_salvage_skipped: read(&recorder.salvage_skipped),
+            recording_salvage_failures: read(&recorder.salvage_failures),
+            recording_frames_lost_on_adopt: read(&recorder.frames_lost_on_adopt),
             recording_bytes_uploaded: read(&recorder.bytes_uploaded),
             recording_seconds: read(&recorder.seconds_recorded),
             recordings_truncated: read(&recorder.truncated),
@@ -585,6 +599,16 @@ impl TapPlane {
             Some((key, targets, anchor))
         };
         let rate = self.config.format.sample_rate_hz;
+        let resume_ms = view
+            .metadata
+            .get(recorder::RESUME_MS_METADATA_KEY)
+            .and_then(|held| held.parse::<u64>().ok())
+            .unwrap_or_default();
+        let spill_owner = view
+            .metadata
+            .get(recorder::SPILL_OWNER_METADATA_KEY)
+            .cloned()
+            .unwrap_or_default();
         let (member_of, spec) = match grouped {
             Some((key, targets, anchor)) => (
                 Some(key),
@@ -596,11 +620,20 @@ impl TapPlane {
                     sample_rate_hz: rate,
                     max_duration: recorder::MAX_RECORDING,
                     group_anchor: Some(anchor),
+                    resume_ms,
                 },
             ),
             None => (
                 None,
-                RecorderSpec::one_object(view.session, &identity, layout_of(view.selector), rate),
+                RecorderSpec {
+                    resume_ms,
+                    ..RecorderSpec::one_object(
+                        view.session,
+                        &identity,
+                        layout_of(view.selector),
+                        rate,
+                    )
+                },
             ),
         };
         let subscription = match hub.attach(CONSUMER_QUEUE_FRAMES, selection) {
@@ -627,6 +660,7 @@ impl TapPlane {
             self.config.recording.clone(),
             self.observer(),
         );
+        let progress = handle.progress();
 
         let mut held = self
             .attachments
@@ -639,6 +673,7 @@ impl TapPlane {
                 recording_id: recording_id.clone(),
                 member_of,
                 handle: Some(handle),
+                progress,
             },
         );
         drop(held);
@@ -656,6 +691,8 @@ impl TapPlane {
             group = %view.group,
             ?keys,
             ?selection,
+            resume_ms,
+            spill_owner = %spill_owner,
             "recording this call"
         );
         for key in keys {
@@ -784,6 +821,7 @@ impl TapPlane {
             recording_id,
             member_of,
             handle,
+            ..
         } = &mut live
         else {
             return None;
@@ -1514,6 +1552,22 @@ impl TapSubscriptions for TapPlane {
             .map(|live| live.to_tag.clone())
     }
 
+    fn recording_journal(&self, attachment: AttachmentId) -> Option<PersistedRecording> {
+        match self.attachments.lock().ok()?.get(&attachment)? {
+            LiveAttachment::Recording {
+                recording_id,
+                progress,
+                ..
+            } => Some(PersistedRecording {
+                recording_id: recording_id.clone(),
+                owner: String::new(),
+                recorded_ms: progress.recorded_ms(),
+                spilled_ms: progress.spilled_ms(),
+            }),
+            _ => None,
+        }
+    }
+
     async fn unsubscribe_orphan(
         &self,
         node: &str,
@@ -1912,6 +1966,10 @@ mod tests {
             ))
         }
 
+        async fn exists(&self, _key: &str) -> Result<bool, recorder::UploadError> {
+            Ok(false)
+        }
+
         fn describe(&self) -> String {
             "nowhere".to_string()
         }
@@ -1969,7 +2027,9 @@ mod tests {
         RecordingSupport {
             sink: Some(Arc::new(NowhereSink)),
             spill_dir: None,
+            spill_every: recorder::SPILL_EVERY,
             counters: Arc::new(RecorderCounters::default()),
+            owner: "pod-a".to_string(),
         }
     }
 
@@ -2103,7 +2163,9 @@ mod tests {
         let plane = plane_with_recording(RecordingSupport {
             sink: Some(Arc::new(NowhereSink)),
             spill_dir: None,
+            spill_every: recorder::SPILL_EVERY,
             counters: Arc::new(RecorderCounters::default()),
+            owner: "pod-a".to_string(),
         });
         let error = plane
             .open_attachment(attachment(Transport::FileS3, "acct-42/rec-99.wav"))

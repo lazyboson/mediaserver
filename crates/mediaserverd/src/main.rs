@@ -7,6 +7,7 @@ mod media_rt;
 mod metrics;
 mod ng_transport;
 mod recorder;
+mod recording_spill;
 mod registry_keeper;
 mod rtpengine_capability;
 mod session_store;
@@ -300,7 +301,8 @@ async fn serve_control_plane(
     listen: SocketAddr,
     capabilities: Arc<rtpengine_capability::NodeCapabilityLog>,
 ) {
-    let recording = match recorder::RecordingSupport::from_env() {
+    let owner = std::env::var(POD_NAME_ENV).unwrap_or_else(|_| DEFAULT_POD_NAME.to_string());
+    let recording = match recorder::RecordingSupport::from_env(&owner) {
         Ok(recording) => recording,
         Err(error) => {
             error!(%error, "the configured recording storage is unusable; refusing to start");
@@ -311,6 +313,15 @@ async fn serve_control_plane(
         info!(
             env = RECORDING_BUCKET_ENV,
             "no recording storage configured; file-s3 attachments will be refused"
+        );
+    }
+    let salvaged = recording_spill::salvage(&recording).await;
+    if salvaged != recording_spill::SalvageSummary::default() {
+        info!(
+            uploaded = salvaged.uploaded,
+            already_present = salvaged.already_present,
+            failed = salvaged.failed,
+            "recordings spilled by an earlier life of this pod were reconciled with storage"
         );
     }
     let opus_rate = opus_decode_rate_hz();
@@ -327,7 +338,6 @@ async fn serve_control_plane(
         recording,
         capabilities,
     }));
-    let owner = std::env::var(POD_NAME_ENV).unwrap_or_else(|_| DEFAULT_POD_NAME.to_string());
     let draining = Arc::clone(&plane);
     let observing = Arc::clone(&plane);
     let tap_metrics = plane.metrics();
