@@ -223,6 +223,7 @@ async fn grpc_attachment_on(
         } else {
             String::new()
         },
+        group: String::new(),
     });
     if let Some(token) = bearer {
         create
@@ -584,6 +585,7 @@ async fn the_shared_secret_guards_media_control_and_the_consumer_hello() {
             mix: false,
             idempotency_key: String::new(),
             sdp_offer: String::new(),
+            group: String::new(),
         })
         .await
         .unwrap_err();

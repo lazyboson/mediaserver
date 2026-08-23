@@ -79,6 +79,7 @@ pub struct CreateSession {
     pub from_tags: Vec<String>,
     pub rtpengine_node: String,
     pub sdp_offer: Option<String>,
+    pub group: String,
     pub idempotency_key: Option<String>,
 }
 
@@ -91,6 +92,7 @@ impl CreateSession {
         self.from_tags.hash(&mut hasher);
         self.rtpengine_node.hash(&mut hasher);
         self.sdp_offer.hash(&mut hasher);
+        self.group.hash(&mut hasher);
         hasher.finish()
     }
 }
@@ -167,6 +169,7 @@ pub struct SessionView {
     pub rtpengine_node: String,
     pub sdp_offer: Option<String>,
     pub sdp_answer: Option<String>,
+    pub group: String,
     pub attachments: Vec<AttachmentId>,
     pub authoritative: Option<AttachmentId>,
 }
@@ -196,6 +199,7 @@ struct SessionRecord {
     rtpengine_node: String,
     sdp_offer: Option<String>,
     sdp_answer: Option<String>,
+    group: String,
     attachments: Vec<AttachmentId>,
     authoritative: Option<AttachmentId>,
     next_seq: u64,
@@ -301,6 +305,7 @@ impl SessionRegistry {
                 rtpengine_node: request.rtpengine_node.clone(),
                 sdp_offer: request.sdp_offer.clone(),
                 sdp_answer: None,
+                group: request.group.clone(),
                 attachments: Vec::new(),
                 authoritative: None,
                 next_seq: 0,
@@ -374,6 +379,7 @@ impl SessionRegistry {
             rtpengine_node: record.rtpengine_node.clone(),
             sdp_offer: record.sdp_offer.clone(),
             sdp_answer: record.sdp_answer.clone(),
+            group: record.group.clone(),
             attachments: record.attachments.clone(),
             authoritative: record.authoritative,
         })
@@ -829,6 +835,7 @@ mod tests {
             from_tags: vec!["from-a".to_string()],
             rtpengine_node: "rtpengine-1".to_string(),
             sdp_offer: None,
+            group: String::new(),
             idempotency_key: None,
         }
     }
@@ -924,6 +931,7 @@ mod tests {
         let inline = CreateSession {
             kind: SessionKind::Inline,
             sdp_offer: Some("v=0 first".to_string()),
+            group: String::new(),
             idempotency_key: Some("key-1".to_string()),
             ..tap("req-inline")
         };

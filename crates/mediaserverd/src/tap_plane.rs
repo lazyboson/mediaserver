@@ -1,3 +1,4 @@
+use crate::conference::{Conference, ConferenceMember, ConferenceShared, ConferenceTotals};
 use crate::consumer_ws::{self, ConsumerConfig};
 use crate::hub::{
     Hub, HubClient, Subscription, SubscriptionControl, SubscriptionMetrics, TapEvent,
@@ -89,6 +90,7 @@ struct LiveSession {
     egress: Option<InlineEgressHandle>,
     stop: Arc<AtomicBool>,
     capture: Option<std::thread::JoinHandle<()>>,
+    conference: Option<String>,
     speakers: Option<tokio::task::JoinHandle<()>>,
 }
 
@@ -242,6 +244,9 @@ pub struct IngestSnapshot {
     pub recording_group_joins_refused: u64,
     pub inline_legs_live: u64,
     pub inline: InlineEgressTotals,
+    pub conferences_live: u64,
+    pub conference_members_live: u64,
+    pub conference: ConferenceTotals,
 }
 
 #[derive(Default)]
@@ -254,6 +259,8 @@ struct MetricsInner {
     legs: HashMap<SessionId, Vec<Arc<SharedLegStats>>>,
     inline: HashMap<SessionId, Arc<InlineEgressShared>>,
     retired_inline: InlineEgressTotals,
+    conferences: HashMap<String, Arc<ConferenceShared>>,
+    retired_conferences: ConferenceTotals,
     consumers: HashMap<AttachmentId, SubscriptionMetrics>,
     recorder: Arc<RecorderCounters>,
 }
@@ -281,6 +288,17 @@ impl TapPlaneMetrics {
 
     fn register_inline(&self, session: SessionId, egress: Arc<InlineEgressShared>) {
         self.lock().inline.insert(session, egress);
+    }
+
+    fn register_conference(&self, name: &str, shared: Arc<ConferenceShared>) {
+        self.lock().conferences.insert(name.to_string(), shared);
+    }
+
+    fn retire_conference(&self, name: &str) {
+        let mut inner = self.lock();
+        if let Some(shared) = inner.conferences.remove(name) {
+            inner.retired_conferences.add_shared(&shared);
+        }
     }
 
     fn retire_session(&self, session: SessionId) {
@@ -350,10 +368,16 @@ impl TapPlaneMetrics {
             recording_group_joins_refused: read(&recorder.group_joins_refused),
             inline_legs_live: inner.inline.len() as u64,
             inline: inner.retired_inline,
+            conferences_live: inner.conferences.len() as u64,
+            conference: inner.retired_conferences,
             ..IngestSnapshot::default()
         };
         for egress in inner.inline.values() {
             snapshot.inline.add_shared(egress);
+        }
+        for conference in inner.conferences.values() {
+            snapshot.conference.add_shared(conference);
+            snapshot.conference_members_live += conference.members_live.load(Ordering::Relaxed);
         }
         for legs in inner.legs.values() {
             for leg in legs {
@@ -380,6 +404,7 @@ pub struct TapPlane {
     sessions: Mutex<HashMap<SessionId, LiveSession>>,
     attachments: Mutex<HashMap<AttachmentId, LiveAttachment>>,
     groups: Mutex<HashMap<GroupKey, RecordingGroup>>,
+    conferences: Mutex<HashMap<String, Conference>>,
     metrics: TapPlaneMetrics,
     observations: OnceLock<Weak<dyn ObservationSink>>,
 }
@@ -392,6 +417,7 @@ impl TapPlane {
             sessions: Mutex::new(HashMap::new()),
             attachments: Mutex::new(HashMap::new()),
             groups: Mutex::new(HashMap::new()),
+            conferences: Mutex::new(HashMap::new()),
             metrics,
             observations: OnceLock::new(),
         }
@@ -1136,6 +1162,7 @@ impl TapPlane {
                 egress: None,
                 stop,
                 capture: Some(capture_thread),
+                conference: None,
                 speakers,
             },
         );
@@ -1216,6 +1243,56 @@ impl TapPlane {
         let stop = Arc::new(AtomicBool::new(false));
         let capture_stop = Arc::clone(&stop);
         let session = view.id;
+        let conference = (!view.group.is_empty()).then(|| view.group.clone());
+        if let Some(name) = conference.as_deref() {
+            self.seat_in_conference(
+                name,
+                format,
+                ConferenceMember {
+                    session,
+                    leg,
+                    hub,
+                    egress,
+                },
+            )?;
+            let mut held = self
+                .sessions
+                .lock()
+                .map_err(|_| MediaPlaneError("the session table is poisoned".to_string()))?;
+            held.insert(
+                view.id,
+                LiveSession {
+                    kind: SessionKind::Inline,
+                    transport: None,
+                    external_id: view.external_id.clone(),
+                    call_id: view.call_id.clone(),
+                    to_tag: String::new(),
+                    format,
+                    hub: hub_client,
+                    egress: Some(egress_handle.clone()),
+                    stop,
+                    capture: None,
+                    conference,
+                    speakers: None,
+                },
+            );
+            drop(held);
+            self.metrics.register_session(view.id, vec![shared]);
+            self.metrics
+                .register_inline(view.id, egress_handle.shared());
+            info!(
+                session = %view.id,
+                external_id = %view.external_id,
+                conference = %view.group,
+                %peer,
+                receive_port,
+                encoding = ?format.encoding,
+                sample_rate_hz = format.sample_rate_hz,
+                ptime_ms = format.ptime_ms,
+                "answered an inline leg and seated it in a conference"
+            );
+            return Ok(OpenedSession::answered(answer_sdp));
+        }
         let mut legs = vec![leg];
         let capture_thread = std::thread::Builder::new()
             .name(format!("mss-inline-{}", view.id.raw()))
@@ -1297,6 +1374,7 @@ impl TapPlane {
                 egress: Some(egress_handle.clone()),
                 stop,
                 capture: Some(capture_thread),
+                conference: None,
                 speakers: None,
             },
         );
@@ -1305,6 +1383,68 @@ impl TapPlane {
         self.metrics
             .register_inline(view.id, egress_handle.shared());
         Ok(OpenedSession::answered(answer_sdp))
+    }
+
+    fn seat_in_conference(
+        &self,
+        name: &str,
+        format: AudioFormat,
+        member: ConferenceMember,
+    ) -> Result<(), MediaPlaneError> {
+        let session = member.session;
+        let mut held = self
+            .conferences
+            .lock()
+            .map_err(|_| MediaPlaneError("the conference table is poisoned".to_string()))?;
+        if let Some(conference) = held.get_mut(name) {
+            conference
+                .accepts(format)
+                .map_err(|error| MediaPlaneError(format!("conference {name}: {error}")))?;
+            conference
+                .seat(member)
+                .map_err(|error| MediaPlaneError(format!("conference {name}: {error}")))?;
+            info!(
+                conference = %name,
+                %session,
+                members = conference.member_count(),
+                "seated a leg in a live conference"
+            );
+            return Ok(());
+        }
+        let mut opened = Conference::start(name, format)
+            .map_err(|error| MediaPlaneError(format!("conference {name}: {error}")))?;
+        if let Err(error) = opened.seat(member) {
+            if let Some(thread) = opened.unseat(session) {
+                drop(thread);
+            }
+            return Err(MediaPlaneError(format!("conference {name}: {error}")));
+        }
+        self.metrics.register_conference(name, opened.shared());
+        held.insert(name.to_string(), opened);
+        info!(conference = %name, %session, "opened a conference for its first leg");
+        Ok(())
+    }
+
+    fn leave_conference(
+        &self,
+        name: &str,
+        session: SessionId,
+    ) -> Option<std::thread::JoinHandle<()>> {
+        let mut held = match self.conferences.lock() {
+            Ok(held) => held,
+            Err(_) => {
+                warn!(conference = %name, "the conference table is poisoned; the mix is left behind");
+                return None;
+            }
+        };
+        let conference = held.get_mut(name)?;
+        let thread = conference.unseat(session);
+        if thread.is_some() {
+            held.remove(name);
+            self.metrics.retire_conference(name);
+            info!(conference = %name, "the last leg left this conference; it is closed");
+        }
+        thread
     }
 
     pub fn inline_egress(&self, session: SessionId) -> Option<InlineEgressHandle> {
@@ -1516,7 +1656,11 @@ impl MediaPlane for TapPlane {
                 );
             }
         }
-        if let Some(thread) = live.capture.take() {
+        let mixing = live
+            .conference
+            .as_deref()
+            .and_then(|name| self.leave_conference(name, session));
+        if let Some(thread) = live.capture.take().or(mixing) {
             let joined = tokio::task::spawn_blocking(move || thread.join()).await;
             if joined.is_err() {
                 warn!(%session, "the capture thread did not join cleanly");
@@ -2342,6 +2486,7 @@ mod tests {
             rtpengine_node: node.to_string(),
             sdp_offer: None,
             sdp_answer: None,
+            group: String::new(),
             attachments: Vec::new(),
             authoritative: None,
         }
@@ -2593,6 +2738,275 @@ a=rtpmap:101 telephone-event/8000\r\na=ptime:20\r\n"
             .close_session(session)
             .await
             .expect("the inline leg closes");
+    }
+
+    fn inline_offer_with_ptime(peer_port: u16, ptime_ms: u32) -> String {
+        format!(
+            "v=0\r\no=peer 1 1 IN IP4 127.0.0.1\r\ns=-\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\n\
+m=audio {peer_port} RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\na=ptime:{ptime_ms}\r\n"
+        )
+    }
+
+    fn conference_session(id: u64, offer: &str, group: &str) -> SessionView {
+        SessionView {
+            id: SessionId::from_raw(id),
+            external_id: format!("req-{id}"),
+            sdp_offer: Some(offer.to_string()),
+            group: group.to_string(),
+            ..session(SessionKind::Inline, "")
+        }
+    }
+
+    struct FakePeer {
+        socket: UdpSocket,
+        leg: SocketAddr,
+        session: SessionId,
+        sequence: u16,
+    }
+
+    impl FakePeer {
+        fn speak(&mut self, level: i16, packets: u16) {
+            for _ in 0..packets {
+                let datagram = tone_datagram(self.sequence, level);
+                self.socket
+                    .send_to(&datagram, self.leg)
+                    .expect("the peer can reach its conference leg");
+                self.sequence = self.sequence.wrapping_add(1);
+            }
+        }
+
+        fn loudest_ear(&self) -> i16 {
+            let mut buf = [0u8; 2048];
+            let mut loudest = 0i16;
+            while let Ok((len, _)) = self.socket.recv_from(&mut buf) {
+                let Ok(packet) = media_core::rtp::RtpPacket::parse(&buf[..len]) else {
+                    continue;
+                };
+                for byte in packet.payload {
+                    loudest = loudest.max(media_core::g711::ulaw_to_linear(*byte));
+                }
+            }
+            loudest
+        }
+    }
+
+    async fn seat_peer(plane: &TapPlane, id: u64, group: &str) -> FakePeer {
+        let socket = UdpSocket::bind("127.0.0.1:0").expect("a fake peer socket");
+        socket.set_nonblocking(true).expect("nonblocking peer");
+        let peer_port = socket.local_addr().expect("peer address").port();
+        let opened = plane
+            .open_session(conference_session(id, &inline_offer_sdp(peer_port), group))
+            .await
+            .expect("a conference leg answers a pcmu offer");
+        let answer = opened
+            .sdp_answer
+            .expect("a conference leg answers with sdp");
+        let answered = InlineOffer::parse(&answer, 20).expect("our own answer is valid sdp");
+        FakePeer {
+            socket,
+            leg: SocketAddr::new(IpAddr::from([127, 0, 0, 1]), answered.peer_port),
+            session: SessionId::from_raw(id),
+            sequence: 0,
+        }
+    }
+
+    #[tokio::test]
+    async fn three_conference_legs_each_hear_the_other_two_and_never_themselves() {
+        let plane = plane();
+        let mut alice = seat_peer(&plane, 1, "sales-standup").await;
+        let mut bob = seat_peer(&plane, 2, "sales-standup").await;
+        let mut carol = seat_peer(&plane, 3, "sales-standup").await;
+        assert_eq!(
+            plane.metrics().snapshot().conferences_live,
+            1,
+            "three legs naming one group share one mix"
+        );
+
+        let SessionHandles { hub, .. } = plane
+            .session_handles(alice.session)
+            .expect("the conference leg is live here");
+        let mut monitor = hub
+            .attach(512, TrackSelection::All)
+            .expect("the hub takes a monitor");
+
+        for _ in 0..10 {
+            alice.speak(1_000, 4);
+            bob.speak(2_000, 4);
+            carol.speak(4_000, 4);
+            tokio::time::sleep(Duration::from_millis(80)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let alice_ear = alice.loudest_ear();
+        let bob_ear = bob.loudest_ear();
+        let carol_ear = carol.loudest_ear();
+        assert!(
+            (5_600..=6_400).contains(&alice_ear),
+            "alice hears bob plus carol and not her own 1000: {alice_ear}"
+        );
+        assert!(
+            (4_600..=5_400).contains(&bob_ear),
+            "bob hears alice plus carol and not his own 2000: {bob_ear}"
+        );
+        assert!(
+            (2_700..=3_300).contains(&carol_ear),
+            "carol hears alice plus bob and not her own 4000: {carol_ear}"
+        );
+
+        let mut mixed_frames = 0;
+        let mut loudest_mixed = 0i16;
+        while let Some(event) = monitor.try_next() {
+            if let TapEvent::Media {
+                track: Track::Mixed,
+                len,
+                samples,
+                ..
+            } = event
+            {
+                mixed_frames += 1;
+                loudest_mixed =
+                    loudest_mixed.max(samples[..len].iter().copied().max().unwrap_or(0));
+            }
+        }
+        assert!(
+            mixed_frames >= 10,
+            "the hub carries the conference mix: {mixed_frames} frames"
+        );
+        assert!(
+            (6_500..=7_500).contains(&loudest_mixed),
+            "the mixed track carries all three legs, self included: {loudest_mixed}"
+        );
+
+        for peer in [&alice, &bob, &carol] {
+            plane
+                .close_session(peer.session)
+                .await
+                .expect("a conference leg closes");
+        }
+        assert_eq!(
+            plane.metrics().snapshot().conferences_live,
+            0,
+            "the last leg out closes the conference"
+        );
+        assert_eq!(plane.live_sessions(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_leg_leaving_a_conference_does_not_disturb_the_legs_that_stay() {
+        let plane = plane();
+        let mut alice = seat_peer(&plane, 1, "handoff").await;
+        let mut bob = seat_peer(&plane, 2, "handoff").await;
+        let mut carol = seat_peer(&plane, 3, "handoff").await;
+
+        for _ in 0..6 {
+            alice.speak(1_000, 4);
+            bob.speak(2_000, 4);
+            carol.speak(4_000, 4);
+            tokio::time::sleep(Duration::from_millis(80)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let before = alice.loudest_ear();
+        assert!(
+            (5_600..=6_400).contains(&before),
+            "alice hears both of the others first: {before}"
+        );
+
+        plane
+            .close_session(carol.session)
+            .await
+            .expect("carol leaves the conference");
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        let _ = alice.loudest_ear();
+        let _ = bob.loudest_ear();
+
+        for _ in 0..6 {
+            alice.speak(1_000, 4);
+            bob.speak(2_000, 4);
+            tokio::time::sleep(Duration::from_millis(80)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        let alice_ear = alice.loudest_ear();
+        let bob_ear = bob.loudest_ear();
+        assert!(
+            (1_700..=2_300).contains(&alice_ear),
+            "alice hears bob alone once carol is gone: {alice_ear}"
+        );
+        assert!(
+            (700..=1_300).contains(&bob_ear),
+            "bob still hears alice, uninterrupted: {bob_ear}"
+        );
+        assert_eq!(
+            plane.metrics().snapshot().conferences_live,
+            1,
+            "the mix keeps running for the survivors"
+        );
+
+        plane.close_session(alice.session).await.expect("alice out");
+        plane.close_session(bob.session).await.expect("bob out");
+        assert_eq!(plane.metrics().snapshot().conferences_live, 0);
+    }
+
+    #[tokio::test]
+    async fn audio_played_into_one_conference_leg_is_heard_by_that_leg_alone() {
+        let plane = plane();
+        let alice = seat_peer(&plane, 1, "prompt").await;
+        let bob = seat_peer(&plane, 2, "prompt").await;
+
+        let pcm = vec![3_000i16; 1_600];
+        let wav =
+            crate::tap_spike::wav_blob(AudioFormat::pcmu_8k_20ms(), &pcm).expect("a playback wav");
+        plane
+            .start_playback(
+                alice.session,
+                session_core::PlaybackId::from_raw(9),
+                PlaybackSource::Blob(wav),
+                None,
+                false,
+            )
+            .await
+            .expect("a wav queues into the conference leg's egress");
+        tokio::time::sleep(Duration::from_millis(400)).await;
+
+        let alice_ear = alice.loudest_ear();
+        let bob_ear = bob.loudest_ear();
+        assert!(
+            alice_ear > 2_700,
+            "the prompt reaches the leg it was played into: {alice_ear}"
+        );
+        assert!(
+            bob_ear < 300,
+            "a prompt played into one leg is not in the other's ear: {bob_ear}"
+        );
+
+        plane.close_session(alice.session).await.expect("alice out");
+        plane.close_session(bob.session).await.expect("bob out");
+    }
+
+    #[tokio::test]
+    async fn a_conference_refuses_a_leg_whose_frame_the_mix_cannot_carry() {
+        let plane = plane();
+        let alice = seat_peer(&plane, 1, "mixed-rates").await;
+        let slow = UdpSocket::bind("127.0.0.1:0").expect("a fake peer socket");
+        let slow_port = slow.local_addr().expect("peer address").port();
+        let error = plane
+            .open_session(conference_session(
+                2,
+                &inline_offer_with_ptime(slow_port, 40),
+                "mixed-rates",
+            ))
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("same rate and ptime"),
+            "the refusal names the rule: {error}"
+        );
+        assert_eq!(
+            plane.live_sessions(),
+            1,
+            "a refused leg leaves no half-open session behind"
+        );
+        plane.close_session(alice.session).await.expect("alice out");
     }
 
     #[tokio::test]

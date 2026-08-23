@@ -172,6 +172,41 @@ pub fn render(sources: &MetricsSources) -> String {
         snapshot.inline.drained_samples,
     );
     counter(
+        "mss_conference_joins_total",
+        "Inline legs seated in a conference mix",
+        snapshot.conference.joins,
+    );
+    counter(
+        "mss_conference_leaves_total",
+        "Inline legs that left a conference mix",
+        snapshot.conference.leaves,
+    );
+    counter(
+        "mss_conference_mixed_frames_total",
+        "Frames a conference mixed and paced to its members",
+        snapshot.conference.mixed_frames,
+    );
+    counter(
+        "mss_conference_clipped_samples_total",
+        "Mixed samples saturated at the i16 rail; a conference that wants AGC",
+        snapshot.conference.clipped_samples,
+    );
+    counter(
+        "mss_conference_absent_frames_total",
+        "Conference ticks a member contributed no frame to and was mixed as silence",
+        snapshot.conference.absent_frames,
+    );
+    counter(
+        "mss_conference_reanchors_total",
+        "Times a conference clock fell a whole frame behind and re-anchored",
+        snapshot.conference.reanchors,
+    );
+    counter(
+        "mss_conference_frames_refused_total",
+        "Frames the mix matrix refused, by frame size or a stale membership handle",
+        snapshot.conference.frames_refused,
+    );
+    counter(
         "mss_inline_egress_encode_errors_total",
         "Inline egress frames that could not be encoded or serialized",
         snapshot.inline.encode_errors,
@@ -312,6 +347,16 @@ pub fn render(sources: &MetricsSources) -> String {
         "mss_inline_legs_live",
         "Inline rtp endpoints this pod is pacing audio out of",
         snapshot.inline_legs_live,
+    );
+    gauge(
+        "mss_conferences_live",
+        "Conference mixes this pod is running",
+        snapshot.conferences_live,
+    );
+    gauge(
+        "mss_conference_members_live",
+        "Inline legs seated in a conference on this pod",
+        snapshot.conference_members_live,
     );
     gauge(
         "mss_consumers_live",

@@ -113,6 +113,7 @@ impl TelCompat {
                     mix: false,
                     idempotency_key: format!("telcompat-session-{external_id}"),
                     sdp_offer: String::new(),
+                    group: String::new(),
                 }))
                 .await
                 .map(Response::into_inner),

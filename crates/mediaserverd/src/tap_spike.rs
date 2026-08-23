@@ -15,7 +15,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use thiserror::Error;
 
-const MAX_DATAGRAM: usize = 2048;
+pub const MAX_DATAGRAM: usize = 2048;
 const MAX_DATAGRAMS_PER_DRAIN: usize = 64;
 const MAX_RECORDED_DIGITS: usize = 32;
 const SILENCE: [i16; 480] = [0; 480];
@@ -177,6 +177,8 @@ impl SharedLegStats {
         self.stalls.store(stalls, Ordering::Relaxed);
     }
 }
+
+pub type MixedFrameSink<'a> = &'a mut dyn FnMut(&[i16]);
 
 pub struct TapLeg {
     track: Track,
@@ -441,7 +443,7 @@ impl TapLeg {
         }
     }
 
-    fn drain(&mut self, buf: &mut [u8], mut hub: Option<&mut Hub>) {
+    pub fn drain(&mut self, buf: &mut [u8], mut hub: Option<&mut Hub>) {
         for received in 0..MAX_DATAGRAMS_PER_DRAIN {
             match self.socket.recv_from(buf) {
                 Ok((len, _from)) => {
@@ -490,7 +492,15 @@ impl TapLeg {
         self.datagram_log.extend_from_slice(datagram);
     }
 
-    fn release_frame(&mut self, hub: Option<&mut Hub>) {
+    pub fn release_frame(&mut self, hub: Option<&mut Hub>) {
+        self.release_frame_with(hub, None)
+    }
+
+    pub fn release_frame_with(
+        &mut self,
+        hub: Option<&mut Hub>,
+        mixed_into: Option<MixedFrameSink<'_>>,
+    ) {
         let Self {
             track,
             pipeline,
@@ -508,6 +518,9 @@ impl TapLeg {
             Playout::Pcm(pcm) | Playout::Concealed(pcm) | Playout::Suppressed(pcm) => {
                 if let Some(hub) = hub {
                     hub.publish(TapEvent::media(*track, timestamp_ms, pcm));
+                }
+                if let Some(sink) = mixed_into {
+                    sink(pcm);
                 }
                 append_within_capacity(samples, *capacity_samples, pcm, stats)
             }
