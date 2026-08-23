@@ -6,6 +6,9 @@ mss_ctl <endpoint> create <external-id> <call-id> <from-tag|-> [rtpengine-node]
    a from-tag of - lets MSS resolve the call's participants from rtpengine
 mss_ctl <endpoint> describe <external-id>
 mss_ctl <endpoint> attach <external-id> <ws-url> [label] [authoritative]
+mss_ctl <endpoint> consume <external-id> [label] [track]
+   a grpc-stream consumer with SINK and EVENTS: it subscribes on
+   MediaStream.Subscribe and may report speech back
 mss_ctl <endpoint> record <external-id> <account/recording.wav> [label] [group] [track]
    the endpoint is the frozen recording identity, and the object key
    a group joins this recording to the other members of that recording
@@ -109,6 +112,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         .cloned()
                         .unwrap_or_else(|| "consumer".to_string()),
                     endpoint: args[3].clone(),
+                    group: String::new(),
+                    metadata: Default::default(),
+                    idempotency_key: String::new(),
+                })
+                .await
+                .map(|response| format!("{:?}", response.into_inner()))
+        }
+        "consume" => {
+            if args.len() < 3 {
+                eprintln!("{USAGE}");
+                std::process::exit(2);
+            }
+            client
+                .attach(proto::AttachRequest {
+                    session: Some(reference(&args[2])),
+                    transport: proto::Transport::GrpcStream as i32,
+                    capabilities: vec![
+                        proto::Capability::Sink as i32,
+                        proto::Capability::Events as i32,
+                    ],
+                    selector: Some(track_selector(args.get(4))),
+                    format: None,
+                    authoritative: false,
+                    label: args
+                        .get(3)
+                        .cloned()
+                        .unwrap_or_else(|| "grpc-consumer".to_string()),
+                    endpoint: String::new(),
                     group: String::new(),
                     metadata: Default::default(),
                     idempotency_key: String::new(),

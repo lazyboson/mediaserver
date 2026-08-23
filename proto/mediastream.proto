@@ -16,6 +16,7 @@ syntax = "proto3";
 package mss.v1;
 
 import "mediacontrol.proto";
+import "google/protobuf/timestamp.proto";
 
 service MediaStream {
   rpc Subscribe(stream ConsumerToServer) returns (stream ServerToConsumer);
@@ -39,6 +40,13 @@ message ConsumerToServer {
     AudioFrame inject = 2;
     Mark mark = 3;
     Clear clear = 4;
+    // Honored only when the attachment declared CAPABILITY_EVENTS; from any
+    // other attachment this is a protocol violation, not a no-op. This is
+    // the only wire on which a consumer can say "the human started talking"
+    // -- the WS-Twilio dialect has no such message and never will, its bytes
+    // being frozen (Constitution, Article VII), so a WS consumer cannot
+    // report speech and cannot drive barge-in.
+    SpeechReport report = 5;
   }
 }
 
@@ -78,6 +86,36 @@ message DtmfFrame {
 // send_text passthrough, in the fork_events shapes.
 message TextFrame {
   string json = 1;
+}
+
+// What a consumer observed in the audio MSS handed it. MSS turns one of
+// these into the matching MediaEvent (SpeechStarted / PartialTranscript /
+// FinalTranscript / EndOfUtterance / EndOfInteraction) and publishes it on
+// the event bus, where a translator can act on it -- the first hop of
+// barge-in cut-through.
+message SpeechReport {
+  SpeechReportKind kind = 1;
+  // "customer" | "agent" | "mixed"; required for every kind but
+  // END_OF_INTERACTION, which is about the interaction, not a track.
+  string track = 2;
+  // Carried by PARTIAL and FINAL; ignored otherwise.
+  string text = 3;
+  double confidence = 4;
+  // When the consumer itself observed this, on the consumer's clock. MSS
+  // stamps the published MediaEvent on its own clock instead of trusting
+  // this one; it is carried so the consumer's detection lag is visible.
+  google.protobuf.Timestamp observed_at = 5;
+  // Carried by END_OF_INTERACTION only.
+  string reason = 6;
+}
+
+enum SpeechReportKind {
+  SPEECH_REPORT_KIND_UNSPECIFIED = 0;
+  SPEECH_REPORT_KIND_STARTED = 1;
+  SPEECH_REPORT_KIND_PARTIAL = 2;
+  SPEECH_REPORT_KIND_FINAL = 3;
+  SPEECH_REPORT_KIND_END_OF_UTTERANCE = 4;
+  SPEECH_REPORT_KIND_END_OF_INTERACTION = 5;
 }
 
 message Mark {

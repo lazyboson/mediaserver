@@ -6,9 +6,9 @@ use crate::convert::{
 use crate::proto;
 use crate::proto::media_control_server::{MediaControl, MediaControlServer};
 use session_core::{
-    AttachSpec, AttachmentId, AttachmentUpdate, AttachmentView, ControlError, CreateSession,
-    EventKind, MediaEvent, Observation, PlaybackId, PlaybackSpec, SessionId, SessionRegistry,
-    SessionView,
+    AttachSpec, AttachmentId, AttachmentUpdate, AttachmentView, ConsumerEvent, ControlError,
+    CreateSession, EventKind, MediaEvent, Observation, PlaybackId, PlaybackSpec, SessionId,
+    SessionRegistry, SessionView,
 };
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -191,6 +191,14 @@ impl SessionController {
 
     pub fn authorize_inject(&self, attachment: AttachmentId) -> Result<(), Status> {
         self.lock().authorize_inject(attachment).map_err(status_of)
+    }
+
+    pub fn record_report(
+        &self,
+        attachment: AttachmentId,
+        event: ConsumerEvent,
+    ) -> Result<(), Status> {
+        self.commit(|registry| registry.report(attachment, event))
     }
 
     pub fn record_observation(
