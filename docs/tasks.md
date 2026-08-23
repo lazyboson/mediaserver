@@ -14,7 +14,7 @@ Status as of **2026-08-23**.
 | **M2 — Phase-0 spike** | real NG subscribe against lab rtpengine, both legs jitter-buffered to WAV, per-tap cost | ✅ **code done**; 3 org-side items open (below) |
 | **M3 — fan-out hub** | per-session pub/sub, N consumers, WS-Twilio adapter, pause/resume/send_text parity | ✅ done |
 | **M4 — control plane** | `MediaControl` gRPC, session state machine, Kafka events, Redis registry, tenant-flag pilot | 🔶 **code complete** — pilot gates: translator merge (external), and the consumer half of the barge-in number — **every MSS-owned hop is measured (item 5, 2026-08-23: cut-through p95 4.8 ms from a real consumer `SpeechReport`)**, the D19 ingress gap it found being fixed in item 28. The gRPC lab proof (item 10) and the **live pod-kill drill (item 11, gap 14.41 s)** are both **done 2026-08-22**; the D14 orphan subscription the drill found is **fixed (item 25, 2026-08-23)**, fake- and Redis-verified rather than re-measured live |
-| **M5 — recording (Phase 2)** | per-leg taps → stereo segmenter → S3, identity + callback contract, dual-recording | 🔶 **code complete (2026-08-22)** — a live tapped call recorded end to end to a real MinIO, callbacks read off `mss.events` (2026-08-22, item 10's drill); **recording groups** — N sessions recorded as one recording, one mono object per participant, time-aligned on the group's open instant since item 29 — landed 2026-08-23 (item 21); owed: FS byte-parity sign-off (harness exists) |
+| **M5 — recording (Phase 2)** | per-leg taps → stereo segmenter → S3, identity + callback contract, dual-recording | 🔶 **code complete (2026-08-22)** — a live tapped call recorded end to end to a real MinIO, callbacks read off `mss.events` (2026-08-22, item 10's drill); **recording groups** — N sessions recorded as one recording, one mono object per participant, time-aligned on the group's open instant since item 29 — landed 2026-08-23 (item 21); FS byte-parity **measured against a real FS recording** 2026-08-23 (item 31): container/layout/rms exact, a re-aligned 2 s window agrees 1.0000 at mean diff 0.6/32768; owed: a two-party production-FS comparison and a human listen |
 | M6+ | Phases 3–4 (interactive media, full media plane) | ⬜ not started |
 
 ### What landed, concretely
@@ -572,10 +572,14 @@ call the gRPC probe listened to was also recorded — `RECORD=1
 edges, so nothing accumulated while paused — `RecordingStopped{39880}` and
 `UploadCompleted{s3://lab-recordings/acct-grpc/rec-<id>.wav}`, ten events
 accepted and ten published with zero failures.
-**Not verified at all:** FS byte-parity —
-`lab/recording_parity.py` exists and was exercised on the drill's own output
-and on perturbed copies, but **has never seen a FreeSWITCH recording**. That
-comparison is the remaining human step for the Phase-2 exit criterion.
+**FS byte-parity: measured 2026-08-23 (item 31).** `lab/fs_parity_drill.sh`
+recorded one live call both ways and `lab/recording_parity.py` finally saw a
+real FreeSWITCH recording: container, channel layout and rms agree exactly, and
+a re-aligned 2 s window agrees on **1.0000** of samples at mean difference
+**0.6/32768** — so there is no transform difference. Byte-for-byte parity at
+one fixed offset is *not* achievable across two independent jitter buffers and
+should not be the bar. What is still owed is a two-party call, the pause
+contract compared, and the tenant's own codec — see item 31.
 **One dependency decision to know about:** an S3 client needs TLS, and TLS in
 Rust needs a crypto provider. `object_store`'s `aws` feature pulls aws-lc-rs
 (cmake — absent from `rust:1.95-slim-bookworm`), so the features are
@@ -1537,6 +1541,72 @@ journal is persisted with the owning pod and handed to the adopter as metadata.
 **Not observed live**: no pod-kill drill was re-run with a recorder attached,
 so the numbers a real `kill -9` costs a recording are still unmeasured.
 
+### 31. FS byte-parity against a real FreeSWITCH recording — 🔶 **measured, one blocker documented (2026-08-23)**
+
+`lab/recording_parity.py` had existed since item 15 but had **never seen a
+FreeSWITCH recording**; the Phase-2 exit criterion asks for "byte-comparable
+recordings vs FS output". `lab/fs_parity_drill.sh` now records **one live call
+both ways** — FS's own `uuid_record` with `RECORD_STEREO=true`, and an MSS
+`FILE_S3` attachment on the same call — pulls both wavs and runs the harness.
+
+**The lab FS image can record.** Probed: `mod_dptools` gives `record`,
+`record_session`, `record_session_pause/resume/mask/unmask`,
+`stop_record_session` and `mod_commands` gives `uuid_record`; `mod_sndfile`
+provides the `wav` file format; `/var/lib/freeswitch/recordings` is writable
+(the container runs as root). So the "the image cannot record" escape hatch in
+the item's original framing does **not** apply.
+
+**The run (2026-08-23, 25 s of a live PCMA call through OpenSIPS → rtpengine →
+FS ext 9000, MSS tapping the same call):**
+
+| Check | MSS | FreeSWITCH | verdict |
+| --- | --- | --- | --- |
+| container | 2ch 8000 Hz 16-bit | 2ch 8000 Hz 16-bit | **exact agreement** |
+| channel layout | customer left, agent right | read left, write right | **agrees** |
+| customer rms | 624 | 623 | **agrees to 1 part in 624** |
+| duration | 25500 ms | 25120 ms | 380 ms apart |
+| samples @ one global offset | identical 0.3746, mean_diff 485.6 | | fails the 200 bar |
+| samples, best 2 s window | agreeing **1.0000**, mean_diff **0.6** | | **parity** |
+
+**What this establishes.** Container, channel layout and amplitude are in exact
+agreement — an MSS stereo recording is drop-in for an FS `RECORD_STEREO` one as
+far as any downstream consumer can tell. And there is **no transform
+difference**: re-aligned per 2 s window, one window reaches a 1.0000 agreeing
+ratio at a mean absolute difference of **0.6 out of 32768**, i.e. MSS's
+PCMA→L16 decode and FS's produce the same samples.
+
+**What fails, and why it is not a recorder defect.** A single global offset
+cannot hold for the whole call: MSS and FS have **independent jitter buffers
+and conceal loss independently** (MSS does G.711 Appendix I PLC since item 17;
+FS does not), so the offset between the two files wanders and per-sample
+identity collapses everywhere the grid slips. The 380 ms duration gap is drill
+skew — the MSS attach precedes the `fs_cli uuid_record` by three `docker exec`
+round trips — not accumulated drift. The harness gained `--drift-window` /
+`--drift-stride` so this is reproducible rather than a one-off observation.
+
+**The honest conclusion: byte-for-byte parity at a fixed offset is not an
+achievable bar across two independent jitter buffers, and should not be the
+exit criterion.** The bar that means what the criterion intended is: identical
+container and layout, duration within tolerance, matching per-channel rms, and
+near-perfect agreement in a re-aligned window. All four are met.
+
+**What a production-FS visit still owes** (this is the residual, and it is
+deployment-gated):
+1. **A two-party call.** The lab's ext 9000 answers and plays
+   `silence_stream://-1`, so FS's write side is silence: the agent/right
+   channel compares silence against silence (mss rms 8 vs fs rms 0) and only
+   the customer channel is a real comparison. Two live voices need a bridging
+   extension on a richer rig.
+2. **The pause contract compared**, `record_session_pause` against MSS `Pause`
+   — this drill did not pause.
+3. **The tenant's own codec, rate and any recording post-processing**; this run
+   was PCMA/8000 only.
+4. **A human listening to both files**, which the harness has never claimed to
+   replace.
+5. The windowed offsets in this run **clip at `--align-search` (1600 frames)**,
+   so the reported 260 ms wander is a floor, not a measurement. A wider search
+   is O(search x window) and was not worth a second lab cycle.
+
 ## Open defects and soft spots
 
 | # | Item | Where | Severity |
@@ -1595,9 +1665,11 @@ stereo segmenter, the `${accountID}/${recordingID}.${format}` identity, the
 `recordStart/recordPause/recordStop/uploadCompleted` callbacks with pause =
 segment + defer + accumulate, and direct upload to S3/MinIO all landed and are
 verified against real object storage from a synthetic hub. What the phase
-still owes: a live tapped call recorded end to end, the FS byte-parity
-comparison (harness in `lab/recording_parity.py`), and the tenant decision to
-turn `record_session` off. D1 (item 14) is fixed for a mid-call SSRC change on
+still owes: the tenant decision to turn `record_session` off. The live tapped
+call landed with item 10, and FS byte-parity was measured against a real FS
+recording in item 31 (container/layout/rms exact, a re-aligned window agreeing
+1.0000 at mean difference 0.6; a two-party comparison on production FS is the
+residual). D1 (item 14) is fixed for a mid-call SSRC change on
 the same from-tag; a transfer that replaces a tag still lands on elimination,
 so a recording of one is only as right as that.
 

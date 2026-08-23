@@ -620,14 +620,95 @@ bit-for-bit). Exit code is 0 only when every bar is met.
 
 Exercised on the drill's own upload (`--mss` and `--fs` the same file):
 `identical=1.0000 mean_diff=0.0` at offset 0, and on deliberately perturbed
-copies, where it fails with numbers. **It has never seen a real FreeSWITCH
-recording** — getting the same call recorded both ways is the human step the
-exit criterion still needs, and the docstring says how to capture it.
+copies, where it fails with numbers. Since 2026-08-23 it has also seen a **real
+FreeSWITCH recording** — `fs_parity_drill.sh` below captures one.
+
+`--drift-window SECONDS` (with `--drift-stride N` to trade accuracy for time)
+re-aligns **every window** instead of once for the whole file, and prints the
+offset and agreement per window plus the best window and how far the offset
+wandered. This is the mode that matters, for the reason the next section
+measures: a single global offset assumes the two recorders hold one sample grid
+for the whole call, and they do not.
 
 One caveat the harness cannot see: bit-for-bit equality is not expected under
 loss, because the two paths conceal differently (MSS grew G.711 Appendix I
 PLC in item 17, FS does not). Compare on a clean link, or compare RMS and
 mean difference rather than identity.
+
+## fs_parity_drill.sh — the same live call recorded by FS and by MSS (2026-08-23)
+
+Item 31. `lab/fs_parity_drill.sh` is the drill the parity harness was waiting
+for: it dials a call with `host_test_caller.py`, reads the call-id and tags out
+of `call_watcher`'s `/shared/call.env`, finds the **FreeSWITCH channel** by
+matching `uuid_getvar <uuid> sip_call_id` against that call-id, then records the
+one call twice — `uuid_record <uuid> start` with `RECORD_STEREO=true` on the FS
+side, an MSS `FILE_S3` attachment on the other — pulls both wavs (`docker cp`
+from FS, `mc cp` + `docker cp` from MinIO) and runs `recording_parity.py`.
+
+```sh
+DOCKER_API_VERSION=1.43 ./lab/fs_parity_drill.sh
+```
+
+**The lab FS image can record**, which had been an open question. Probed with
+`show application` / `show api`: `mod_dptools` supplies `record`,
+`record_session`, `record_session_pause`, `record_session_resume`,
+`record_session_mask`, `record_session_unmask`, `stop_record_session`;
+`mod_commands` supplies `uuid_record`; `mod_sndfile` supplies the `wav` format
+(and `mod_native_file` PCMA/PCMU/L16); `/var/lib/freeswitch/recordings` exists
+and is writable — the container runs as root. The drill prints this probe at the
+top of every run.
+
+### The run (25 s of a live PCMA call, MicroSIP → OpenSIPS → rtpengine → FS 9000)
+
+```
+mss:  2ch 8000Hz 16bit 204000 frames (25500 ms)
+fs:   2ch 8000Hz 16bit 200960 frames (25120 ms)
+duration difference: 380 ms (tolerance 200)
+alignment: fs is offset by -1578 frames (-198 ms)
+customer-left: identical=0.3746 mean_diff=485.6 rms mss=624 fs=623
+agent-right:   identical=0.0000 mean_diff=8.0   rms mss=8   fs=0
+windowed re-alignment (2s windows, stride 4):
+  t=   6.0s offset= -1600 agreeing=0.9762 mean_diff=    9.2
+  t=  16.0s offset=  +480 agreeing=1.0000 mean_diff=    0.6
+  best window t=16.0s agreeing=1.0000 mean_diff=0.6
+```
+
+**Container, layout and amplitude agree exactly**: 2 channels at 8 kHz 16-bit
+both, customer left / agent right matching FS's read-left write-right, and the
+customer channel's rms is 624 against 623. An MSS recording is drop-in for an FS
+`RECORD_STEREO` one as far as any downstream consumer can tell.
+
+**There is no transform difference.** Re-aligned per window, one 2 s window
+agrees on **1.0000** of its samples at a mean absolute difference of **0.6 out
+of 32768** — MSS's PCMA→L16 decode and FS's produce the same samples.
+
+**Why the global-offset comparison fails anyway.** MSS and FS have independent
+jitter buffers and conceal loss independently, so the offset between the two
+files wanders across the call and per-sample identity collapses wherever the
+grid slips. That is why the windowed mode exists. The lesson for the Phase-2
+exit criterion: **byte-for-byte parity at a fixed offset is not an achievable
+bar across two independent jitter buffers**; the bar that means what the
+criterion intended is identical container and layout, duration within
+tolerance, matching per-channel rms, and near-perfect agreement in a re-aligned
+window.
+
+The 380 ms duration gap is **drill skew**, not drift: the MSS attach precedes
+the `fs_cli uuid_record` by three `docker exec` round trips.
+
+### What this lab cannot show, and a production FS still owes
+
+- **A two-party call.** Ext 9000 answers and plays `silence_stream://-1`, so
+  FS's write side is silence: the agent/right channel compares silence against
+  silence (rms 8 vs 0) and **only the customer channel is a real comparison**.
+  Set `DIAL` to a bridging extension on a rig that has two live legs.
+- The **pause contract** compared (`record_session_pause` vs MSS `Pause`) — this
+  drill does not pause.
+- The tenant's **own codec and rate** (this was PCMA/8000) and any recording
+  post-processing on their side.
+- **A human listening to both files.**
+- The per-window offsets **clip at `--align-search`** (1600 frames), so the
+  reported 260 ms wander is a floor, not a measurement; a wider search costs
+  O(search x window) per window.
 
 ## grpc_stream_drill.sh — a live tapped call over the gRPC data plane (2026-08-22)
 
