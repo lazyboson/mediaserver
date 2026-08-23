@@ -759,6 +759,25 @@ never silent), then asks the media plane for frames through the new
   registry-tracked, evented onto `mss.events` and attributed; `Clear`
   discards the buffer and stops the last playback — the barge shape, with
   `NOT_FOUND` on the stop tolerated because the playback may have ended.
+- **`SpeechReport` is the consumer's only way to report speech** (2026-08-23,
+  item 28, defect D19). `ConsumerToServer.report` carries a kind
+  (`STARTED`/`PARTIAL`/`FINAL`/`END_OF_UTTERANCE`/`END_OF_INTERACTION`), track,
+  text, confidence and the consumer's own `observed_at`;
+  `convert::speech_report` turns it into a `ConsumerEvent` and
+  `SessionController::record_report` commits it through the registry, so it
+  publishes on `mss.events` like any other event and MSS — not the consumer —
+  still decides `first_final`. `Registry::report` requires
+  `Capabilities::EVENTS`, so a `SINK`-only consumer that reports gets
+  `PERMISSION_DENIED` and the stream ends: the same protocol-violation shape as
+  an unprivileged inject, deliberately, because a consumer whose barge trigger
+  is being silently discarded needs to know. Two choices to keep in mind when
+  extending this: an unspecified or unknown `kind` is `INVALID_ARGUMENT` rather
+  than a default, and `observed_at` is **logged as a lag, never published** —
+  the bus event's `at` is MSS's own clock, because a consumer's clock cannot be
+  reconciled with it downstream. **The WS-Twilio dialect has no equivalent and
+  will not get one** (frozen bytes): a WS consumer cannot report speech, so
+  interactive voice-AI belongs on the gRPC transport. Measured live — cut-through
+  from `SpeechReport` to `StopPlayback` acked, p50 3.54–3.98 ms (lab.md).
 - **Utterances are capped at one playback datagram** (~3.7 s at 8 kHz,
   `MAX_UTTERANCE_SAMPLES`); over the cap is `RESOURCE_EXHAUSTED` naming
   chunked playback as unimplemented. The WS bridge keeps the piece-paced
@@ -777,14 +796,14 @@ never silent), then asks the media plane for frames through the new
   reference consumer — attach, `ConsumerHello`, decode, one wav per track —
   and `lab/grpc_stream_drill.sh` runs it against a real tapped SIP call. The
   customer track came out at rms 614.5 and Deepgram transcribed it verbatim.
-- **Known wart found by that run (D13):** `start_message` derives its
-  `tracks` list from the selector, so `TrackSelector::All` advertises
-  `["customer","agent"]` — but the hub also delivers `Track::Mixed` (the
-  injection feed, silence-filled every tick so it stays gap-free), so a
-  consumer receives a track it was never told about and 50% more bytes than
-  the start frame implies. The same `tracks_of` shape feeds the frozen Twilio
-  `start` frame, which is why it was left alone here rather than "fixed" in
-  passing.
+- **Known wart found by that run (D13) — closed in item 27:** `start_message`
+  derives its `tracks` list from the selector, so `TrackSelector::All`
+  advertises `["customer","agent"]`, while the hub also delivered
+  `Track::Mixed` (the injection feed, silence-filled every tick so it stays
+  gap-free) — a track the consumer was never told about and 50% more bytes than
+  the start frame implied. Fixed by narrowing the *delivery* to the
+  advertisement (hub `Speakers`), not by touching the frozen Twilio `start`
+  frame.
 
 ### auth.rs — the shared-secret policy (M4, landed 2026-08-20)
 
@@ -1388,8 +1407,10 @@ attempts`, and the follow-up `DescribeSession` returns `NotFound` — the
 rollback works in the daemon, not only against the test fake.
 `crates/control-api/examples/mss_ctl.rs` is the small client used for that
 and is the quickest way to poke a running control plane by hand; it covers
-`create`, `describe`, `attach` (ws), `record` (the `FILE_S3` identity),
-`pause`, `detach`, `play` and `destroy`.
+`create`, `describe`, `attach` (ws), `consume` (a `GRPC_STREAM` consumer with
+`SINK`+`EVENTS`, so it may report speech — added 2026-08-23 for the barge
+drill, since `attach` only makes WS consumers), `record` (the `FILE_S3`
+identity), `pause`, `detach`, `play` and `destroy`.
 `crates/control-api/examples/mss_stream_probe.rs` is its data-plane sibling:
 it attaches a `GRPC_STREAM` consumer, subscribes, and writes what it hears
 as a wav per track with rms and peak — the tool the item-10 lab proof used.
@@ -1483,16 +1504,18 @@ never takes a lock and never waits on the control world.
   utterance as a WAV blob and plays it with `play media`, targeted by
   default at the first from-tag so only the customer hears the agent.
   `MSS_INJECT_TARGET=everyone` widens it.
-- **The inbound dialect carries no speech report (D19, found 2026-08-23).**
-  `media`/`mark`/`clear`/`end_of_interaction` are all a WS consumer can send,
-  and the gRPC `ConsumerToServer` stream is no richer, so
-  `SessionRegistry::report` — the `ConsumerEvent` → `SpeechStarted`/`Partial`/
-  `Final` ingress, and the first hop of barge-in — has **no caller outside
-  unit tests**. `clear` does barge, but by a different road: a direct
-  rtpengine `stop media` from `tap_session`, unevented and untargeted. That is
-  why `lab/barge_drill.sh` triggers on `PlaybackStarted` and measures only
-  hops 2–4 of the chain (MSS publish → bus → translator → `StopPlayback`
-  acked: p95 4.2 ms, see lab.md).
+- **The inbound dialect carries no speech report, and never will (D19, found
+  2026-08-23, closed 2026-08-23).** `media`/`mark`/`clear`/`end_of_interaction`
+  are all a WS consumer can send, and this dialect's bytes are frozen (Article
+  VII), so there is nowhere to put one. The fix went to the **native** surface
+  instead: `ConsumerToServer.SpeechReport` on the gRPC `MediaStream` stream
+  reaches `SessionRegistry::report` (see stream.rs above), and
+  `lab/barge_drill.sh` now triggers on a real report — cut-through p95 4.8 ms,
+  see lab.md. The consequence for this adapter is permanent and worth stating
+  plainly: **a WS consumer cannot report speech**. Its only barge stays `clear`,
+  which takes a different road — a direct rtpengine `stop media` from
+  `tap_session`, unevented and untargeted. Interactive voice-AI that needs
+  barge-in should attach over gRPC.
 - **The end of an utterance is inferred, not signalled.** stream-llm-bridge
   streams TTS as a run of `media` events and never sends `mark`, so the
   consumer flushes after `UTTERANCE_IDLE` (700 ms) without inbound audio.

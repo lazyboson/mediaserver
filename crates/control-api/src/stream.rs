@@ -1,6 +1,8 @@
 use crate::auth::AuthPolicy;
 use crate::controller::{SessionController, StreamFrame};
-use crate::convert::{attachment_id, format, format_wire, track_name};
+use crate::convert::{
+    attachment_id, format, format_wire, observed_lag_ms, speech_report, track_name,
+};
 use crate::proto;
 use crate::proto::media_control_server::MediaControl;
 use crate::proto::media_stream_server::{MediaStream, MediaStreamServer};
@@ -10,7 +12,7 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, Streaming};
-use tracing::info;
+use tracing::{debug, info};
 
 pub const STREAM_QUEUE_DEPTH: usize = 64;
 pub const MAX_UTTERANCE_SAMPLES: usize = 29_900;
@@ -239,6 +241,18 @@ async fn handle_consumer(
                 Err(status) if status.code() == tonic::Code::NotFound => Ok(()),
                 Err(status) => Err(status),
             }
+        }
+        Some(proto::consumer_to_server::Msg::Report(report)) => {
+            if let Some(lag_ms) = observed_lag_ms(report.observed_at.as_ref()) {
+                debug!(
+                    attachment = %view.id,
+                    kind = report.kind,
+                    lag_ms,
+                    "a consumer reported speech it observed on its own clock"
+                );
+            }
+            let event = speech_report(report)?;
+            controller.record_report(view.id, event)
         }
         None => Err(Status::invalid_argument(
             "a consumer message carried no payload",
