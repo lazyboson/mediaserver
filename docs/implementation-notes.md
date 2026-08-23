@@ -283,6 +283,54 @@ track.
 - Refusals are named, never silent: Opus **output** (tasks item 16d — ingest
   landed), G.711 at anything but 8 kHz, stereo, mismatched ptime.
 
+### pacer.rs — the egress playout pacer (Phase 3 groundwork, landed 2026-08-23)
+
+The first piece of the inline leg, and the mirror image of `pipeline.rs`: where
+the pipeline turns arriving RTP into PCM, `PlayoutPacer` turns queued PCM into
+departing RTP. Sans-IO in the strict sense — no sockets, no threads, no clock:
+`tick(now: Duration)` takes elapsed monotonic time as a parameter and returns
+`Option<PacedPacket>`, whose `datagram` is a complete RTP packet the caller can
+hand to `send_to` unchanged.
+
+Structure:
+
+- `SampleQueue` is a fixed `Vec<i16>` ring (capacity = `queue_frames` × source
+  frame). `push` copies in with at most two `copy_from_slice` calls and, when
+  full, advances the read cursor — drop-oldest, returning how many samples it
+  dropped. `take_into` fills the frame scratch buffer and zero-pads the tail, so
+  a half-frame of TTS still leaves on time.
+- Encoding is `ConsumerEncoder`, unchanged and reused per tick: it clears and
+  refills its own byte buffer, so nothing allocates at steady state. That is
+  also why the pacer inherits its rules — mono only, source and wire ptime must
+  match, no Opus output.
+- The datagram buffer is `12 + (wire frame + 8 samples) × bytes-per-sample`; the
+  slack covers the FFT resampler's output rounding. `RtpPacket::serialize`
+  writes into it in place.
+- State is exactly what an RTP sender owes: `sequence`, `timestamp`, `ssrc`,
+  `payload_type`, `in_silence`, `started`, plus `next_deadline`.
+
+Decisions worth knowing before extending it:
+
+- **Two underrun policies, `Silence` (default) and `Suppress`.** Silence keeps
+  the far end's jitter buffer fed and is what P3-2 should use for a plain SIP
+  peer. Suppress advances the timestamp but consumes no sequence number, which
+  is the honest wire shape for a DTX/comfort-noise peer; it is untested against
+  a real endpoint.
+- **Catch-up is one packet per call**, never a burst inside one tick, so a late
+  media thread cannot dump five packets into the network in one wakeup; the
+  missed deadlines show up as `late_ticks` in `PacerStats` and should be
+  exported as a metric when the pacer is wired into mediaserverd.
+- **`clear()` is the barge-in seam.** Flushing the queue makes the next tick a
+  silence frame (or a suppression), which is the ≤ one-ptime cut-through P3-4
+  wants to measure. It is deliberately a queue operation, not a session verb.
+- **Failures are counted, not fatal.** An encoder or serializer error increments
+  `encode_errors`, still advances sequence and timestamp (the far end reads one
+  lost packet, which is what happened) and returns `None`.
+
+Not done here: nothing calls it yet. The wiring — UDP socket pair, SDP answer,
+where the pushed PCM comes from and how the media thread's wakeup maps onto
+`tick` — is P3-2, and Opus egress is still absent everywhere in the crate.
+
 ## crates/opus-ffi — libopus, and the only place unsafe lives
 
 WebRTC legs are Opus, so a tap that cannot decode Opus either depends on
