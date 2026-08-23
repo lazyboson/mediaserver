@@ -1607,6 +1607,57 @@ deployment-gated):
    so the reported 260 ms wander is a floor, not a measurement. A wider search
    is O(search x window) and was not worth a second lab cycle.
 
+### 32. Inline-leg egress groundwork — the playout pacer (Phase 3) — ✅ DONE (2026-08-23)
+
+Phase 3 needs a *mouth*: taps can only listen, so an interactive session has to
+own an RTP sender. `crates/media-core/src/pacer.rs` is that sender's brain,
+sans-IO and thread-free: the control world pushes PCM, the media thread calls
+`tick(now)` once per wakeup, and the pacer hands back at most **one
+ready-to-send RTP datagram per ptime** — header included (SSRC, sequence,
+timestamp, payload type, marker), built with the `rtp.rs` serializer that
+already existed, and payload encoded by the existing `ConsumerEncoder` (so
+G.711 µ-law/A-law, L16, and 8→16/48 kHz resampling come for free; Opus
+**output** is still unbuilt — decode-only, as `encode.rs` says by name).
+
+Contract, decided here and recorded so P3-2/P3-3 do not re-litigate it:
+
+- **Deadlines are wall-clock-anchored** (architecture §7): the first `tick`
+  anchors, each emission advances the deadline by exactly one ptime. A caller
+  that overslept catches up one packet per call and every skipped deadline is
+  counted in `late_ticks` — no burst inside one tick, no drift.
+- **Underrun never starves the far end.** Default `UnderrunPolicy::Silence`
+  emits an encoded silence frame (counted `silence_frames`); a partially
+  filled frame is zero-padded (`partial_frames`). `UnderrunPolicy::Suppress`
+  is the DTX-shaped alternative: it emits nothing, still advances the
+  timestamp (`suppressed_frames`) and does **not** consume a sequence number,
+  so a far-end jitter buffer reads the gap as silence, not as loss.
+- **Marker on talkspurt start** — the first packet of the stream and the first
+  voice packet after any silence or suppression carry it.
+- **The queue is bounded and drops the oldest**, in samples, counted
+  (`dropped_samples`); a push larger than the whole queue keeps only its tail.
+  `clear()` flushes it and counts `flushed_samples` — that is the barge-in
+  cut-through seam P3-3's `Clear` and P3-4's measurement will use: the tick
+  after a `clear()` is silence.
+- **No allocation after construction.** The sample ring, the frame scratch
+  buffer and the datagram buffer are sized once from the negotiated formats
+  (payload capacity carries 8 samples of resampler slack). An encode or
+  serialize failure is counted (`encode_errors`) and drops that one frame
+  instead of panicking.
+
+Replay-tested (14 tests, `cargo test -p media-core pacer`): tick cadence at 5 ms
+polling emits exactly at 0/20/40… ms; oversleeping is counted and caught up;
+underrun → silence → marker on resume; header fields on the wire re-parsed and
+compared against the reported ones with timestamps stepping 160 with no skip;
+suppression advancing timestamp but not sequence; drop-oldest keeping the newest
+two frames; sequence/timestamp wrap; partial-frame padding; the wideband→G.711
+resampling path; and **10 000 ticks with all three internal buffer capacities
+unchanged** at the end (with drops and silence both exercised in the loop).
+
+This is replay-only by construction — media-core has no sockets. The pacer is
+not wired to anything yet; P3-2 (inline session + SDP answer + UDP socket pair)
+is what puts it on the wire, and only then can the cadence be judged against a
+real far end.
+
 ## Open defects and soft spots
 
 | # | Item | Where | Severity |
@@ -1675,7 +1726,9 @@ so a recording of one is only as right as that.
 
 **Phase 3 — Interactive media** needs the inline RTP leg (`SessionKind::INLINE`
 is already accepted by the API), streaming TTS playback, and barge-in
-cut-through in MSS.
+cut-through in MSS. Its egress brain landed with item 32: a sans-IO
+`PlayoutPacer` in media-core that turns queued PCM into one paced RTP packet
+per ptime. The socket, the SDP answer and the consumer plumbing are next.
 
 **Phase 4 — Full media plane** is the N-way mixer, monitor/whisper as
 attachments and playbacks rather than conference tricks. Do not start before
