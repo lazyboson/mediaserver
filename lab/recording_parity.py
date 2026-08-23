@@ -139,6 +139,46 @@ def compare_track(name, mine, theirs, offset, tolerance):
     }
 
 
+def windowed_agreement(mine, theirs, rate, window_seconds, search, tolerance, stride):
+    """Re-align every window instead of once for the whole file.
+
+    A single global offset assumes the two recorders keep one sample grid for
+    the whole call. They do not: MSS and FreeSWITCH have independent jitter
+    buffers and conceal loss independently, so the offset between the files
+    wanders. This reports the offset and agreement per window, which separates
+    "the audio transform differs" (agreement poor in every window) from "only
+    the timing differs" (agreement near-perfect in the windows that lock).
+    """
+    window = max(int(rate * window_seconds), 1)
+    rows = []
+    for start in range(0, max(len(theirs) - window, 0), window):
+        segment = theirs[start : start + window]
+        offset, _ = best_offset(mine[start:], segment, min(window, len(segment)), search)
+        compared = 0
+        identical = 0
+        total_difference = 0
+        for index in range(0, len(segment), stride):
+            other = start + index + offset
+            if other < 0 or other >= len(mine):
+                continue
+            difference = abs(int(mine[other]) - int(segment[index]))
+            compared += 1
+            total_difference += difference
+            if difference <= tolerance:
+                identical += 1
+        if compared == 0:
+            continue
+        rows.append(
+            {
+                "at_seconds": start / rate,
+                "offset": offset,
+                "agreeing_ratio": identical / compared,
+                "mean_difference": total_difference / compared,
+            }
+        )
+    return rows
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--mss", required=True, help="the recording MSS uploaded")
@@ -172,6 +212,18 @@ def main():
         type=int,
         default=8000,
         help="frames used to find the alignment offset (default 8000)",
+    )
+    parser.add_argument(
+        "--drift-window",
+        type=float,
+        default=0.0,
+        help="seconds per window for the windowed re-alignment report (0 = off)",
+    )
+    parser.add_argument(
+        "--drift-stride",
+        type=int,
+        default=1,
+        help="sample stride inside a drift window, to trade accuracy for time",
     )
     parser.add_argument(
         "--align-search",
@@ -252,6 +304,39 @@ def main():
             failures.append(
                 f"{name}: mean difference {report['mean_difference']:.1f} "
                 f"exceeds {arguments.mean_tolerance:.1f}"
+            )
+
+    if arguments.drift_window > 0:
+        rows = windowed_agreement(
+            mine["tracks"][0],
+            theirs["tracks"][0],
+            rate,
+            arguments.drift_window,
+            arguments.align_search,
+            arguments.sample_tolerance,
+            max(arguments.drift_stride, 1),
+        )
+        print(
+            f"windowed re-alignment ({arguments.drift_window:g}s windows, "
+            f"stride {max(arguments.drift_stride, 1)}):"
+        )
+        for row in rows:
+            print(
+                f"  t={row['at_seconds']:6.1f}s offset={row['offset']:+6d} "
+                f"agreeing={row['agreeing_ratio']:.4f} "
+                f"mean_diff={row['mean_difference']:7.1f}"
+            )
+        if rows:
+            best = max(rows, key=lambda row: row["agreeing_ratio"])
+            spread = max(row["offset"] for row in rows) - min(
+                row["offset"] for row in rows
+            )
+            print(
+                f"  best window t={best['at_seconds']:.1f}s "
+                f"agreeing={best['agreeing_ratio']:.4f} "
+                f"mean_diff={best['mean_difference']:.1f}; "
+                f"offset wanders over {spread} frames "
+                f"({spread * 1000 // max(rate, 1)} ms)"
             )
 
     if failures:
