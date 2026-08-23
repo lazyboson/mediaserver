@@ -20,6 +20,7 @@ pub const UPLOAD_TIMEOUT: Duration = Duration::from_secs(60);
 pub const FINISH_TIMEOUT: Duration = Duration::from_secs(90);
 pub const SPILL_EVERY: Duration = Duration::from_secs(30);
 pub const MAX_ADOPT_LEAD: Duration = Duration::from_secs(300);
+pub const CONFERENCE_SHAPE_PREFIX: &str = "conference-";
 
 const COMMAND_DEPTH: usize = 8;
 const URI_SCHEME_SEPARATOR: &str = "\x2f\x2f";
@@ -193,6 +194,42 @@ pub enum Layout {
 pub struct RecordingTarget {
     pub key: String,
     pub layout: Layout,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecordingShape {
+    Stereo,
+    Track,
+    Mixed,
+    Participant,
+}
+
+impl RecordingShape {
+    pub fn of(layout: Layout, grouped: bool) -> RecordingShape {
+        match (grouped, layout) {
+            (true, _) => RecordingShape::Participant,
+            (false, Layout::Mono(Track::Mixed)) => RecordingShape::Mixed,
+            (false, Layout::Mono(_)) => RecordingShape::Track,
+            (false, Layout::Stereo) => RecordingShape::Stereo,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RecordingShape::Stereo => "stereo",
+            RecordingShape::Track => "track",
+            RecordingShape::Mixed => "mixed",
+            RecordingShape::Participant => "participant",
+        }
+    }
+
+    pub fn named(self, conferenced: bool) -> String {
+        if conferenced {
+            format!("{CONFERENCE_SHAPE_PREFIX}{}", self.as_str())
+        } else {
+            self.as_str().to_string()
+        }
+    }
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -1903,6 +1940,183 @@ mod tests {
 
     fn spec() -> RecorderSpec {
         RecorderSpec::one_object(SessionId::from_raw(1), &identity(), Layout::Stereo, RATE)
+    }
+
+    fn mixed_spec() -> RecorderSpec {
+        RecorderSpec::one_object(
+            SessionId::from_raw(1),
+            &identity(),
+            Layout::Mono(Track::Mixed),
+            RATE,
+        )
+    }
+
+    fn channels_of(body: &[u8]) -> u16 {
+        hound::WavReader::new(std::io::Cursor::new(body.to_vec()))
+            .expect("a wav")
+            .spec()
+            .channels
+    }
+
+    #[test]
+    fn a_recording_names_its_shape_so_a_conference_object_is_never_mistaken_for_a_call() {
+        assert_eq!(
+            RecordingShape::of(Layout::Stereo, false).named(false),
+            "stereo"
+        );
+        assert_eq!(
+            RecordingShape::of(Layout::Mono(Track::Customer), false).named(false),
+            "track"
+        );
+        assert_eq!(
+            RecordingShape::of(Layout::Mono(Track::Mixed), false).named(false),
+            "mixed"
+        );
+        assert_eq!(
+            RecordingShape::of(Layout::Mono(Track::Mixed), false).named(true),
+            "conference-mixed"
+        );
+        assert_eq!(
+            RecordingShape::of(Layout::Mono(Track::Customer), true).named(true),
+            "conference-participant"
+        );
+        assert_eq!(
+            RecordingShape::of(Layout::Stereo, true).named(false),
+            "participant"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_mixed_only_recording_is_one_mono_object_of_the_whole_room() {
+        let (mut hub, client) = Hub::new();
+        let subscription = client
+            .attach(64, TrackSelection::Only(Track::Mixed))
+            .unwrap();
+        hub.poll_commands();
+        let sink = Arc::new(MemorySink::accepting());
+        let handle = spawn(
+            mixed_spec(),
+            subscription,
+            support(Arc::clone(&sink) as Arc<dyn RecordingSink>, None),
+            None,
+        );
+
+        for at in 0..5u64 {
+            hub.publish(TapEvent::media(Track::Customer, at * 20, &tone(111)));
+            hub.publish(TapEvent::media(Track::Agent, at * 20, &tone(-111)));
+            hub.publish(TapEvent::media(Track::Mixed, at * 20, &tone(700)));
+        }
+
+        let outcome = handle.finish().await.expect("the recorder had no outcome");
+        drop(hub);
+
+        assert_eq!(outcome.duration_ms, 100);
+        let (key, body) = sink.last().expect("nothing was uploaded");
+        assert_eq!(
+            key, "acct-42/rec-99.wav",
+            "the room object keeps the frozen identity"
+        );
+        assert_eq!(
+            channels_of(&body),
+            1,
+            "a conference records as one mono mix"
+        );
+        assert_eq!(frames_of(&body), 5 * FRAME);
+        assert!(
+            samples_of(&body).iter().all(|sample| *sample == 700),
+            "only the mixed track may reach a mixed-only object"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pausing_a_mixed_only_recording_cuts_the_room_out_of_the_object() {
+        let (mut hub, client) = Hub::new();
+        let subscription = client
+            .attach(256, TrackSelection::Only(Track::Mixed))
+            .unwrap();
+        hub.poll_commands();
+        let sink = Arc::new(MemorySink::accepting());
+        let seen = Arc::new(Collected::default());
+        let strong: Arc<dyn ObservationSink> = seen.clone();
+        let observer = Arc::downgrade(&strong);
+        let handle = spawn(
+            mixed_spec(),
+            subscription,
+            support(Arc::clone(&sink) as Arc<dyn RecordingSink>, None),
+            Some(observer),
+        );
+
+        for at in 0..5u64 {
+            hub.publish(TapEvent::media(Track::Mixed, at * 20, &tone(700)));
+        }
+        assert!(handle.set_paused(true));
+        wait_for(&seen, 1).await;
+        for at in 5..25u64 {
+            hub.publish(TapEvent::media(Track::Mixed, at * 20, &tone(9)));
+        }
+        assert!(handle.set_paused(false));
+        wait_for(&seen, 2).await;
+        for at in 25..30u64 {
+            hub.publish(TapEvent::media(Track::Mixed, at * 20, &tone(-700)));
+        }
+
+        let outcome = handle.finish().await.expect("the recorder had no outcome");
+        drop(hub);
+
+        assert_eq!(
+            outcome.duration_ms, 200,
+            "a paused conference recording accumulates only what it kept"
+        );
+        assert_eq!(outcome.stats.frames_while_paused, 20);
+        let (_, body) = sink.last().expect("nothing was uploaded");
+        assert_eq!(channels_of(&body), 1);
+        assert_eq!(frames_of(&body), 10 * FRAME);
+        let samples = samples_of(&body);
+        assert!(
+            samples.iter().all(|sample| *sample != 9),
+            "the room the recording was deaf to must not be in the object"
+        );
+        assert_eq!(samples[0], 700);
+        assert_eq!(
+            samples[5 * FRAME],
+            -700,
+            "the audio after resume follows the audio before pause with no gap"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_mixed_only_recording_spills_mono_segments_and_stitches_them_back() {
+        let directory = scratch("room");
+        let (mut hub, client) = Hub::new();
+        let subscription = client
+            .attach(64, TrackSelection::Only(Track::Mixed))
+            .unwrap();
+        hub.poll_commands();
+        let sink = Arc::new(MemorySink::accepting());
+        let support = support_spilling(
+            Arc::clone(&sink) as Arc<dyn RecordingSink>,
+            directory.clone(),
+            Duration::from_millis(10),
+        );
+        let counters = Arc::clone(&support.counters);
+        let handle = spawn(mixed_spec(), subscription, support, None);
+
+        hub.publish(TapEvent::media(Track::Mixed, 0, &tone(5)));
+        wait_for_segments(&counters, 1).await;
+        hub.publish(TapEvent::media(Track::Mixed, 20, &tone(6)));
+
+        let outcome = handle.finish().await.expect("the recorder had no outcome");
+        drop(hub);
+
+        assert_eq!(outcome.frames, 2 * FRAME, "{outcome:?}");
+        let (key, body) = sink.last().expect("nothing was uploaded");
+        assert_eq!(key, "acct-42/rec-99.wav");
+        assert_eq!(channels_of(&body), 1, "a spilled room segment stays mono");
+        assert_eq!(frames_of(&body), 2 * FRAME);
+        let samples = samples_of(&body);
+        assert_eq!(samples[0], 5, "the spilled segment opens the room object");
+        assert_eq!(samples[FRAME], 6, "the tail in memory follows it");
+        let _ = std::fs::remove_dir_all(&directory);
     }
 
     fn group_spec(labels: &[(&str, Layout)]) -> RecorderSpec {
