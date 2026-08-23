@@ -218,6 +218,19 @@ fn mark(name: &str) -> proto::ConsumerToServer {
     }
 }
 
+fn speech_report(kind: proto::SpeechReportKind, text: &str) -> proto::ConsumerToServer {
+    proto::ConsumerToServer {
+        msg: Some(consumer_to_server::Msg::Report(proto::SpeechReport {
+            kind: kind as i32,
+            track: "customer".to_string(),
+            text: text.to_string(),
+            confidence: 0.9,
+            observed_at: None,
+            reason: String::new(),
+        })),
+    }
+}
+
 fn clear() -> proto::ConsumerToServer {
     proto::ConsumerToServer {
         msg: Some(consumer_to_server::Msg::Clear(proto::Clear {})),
@@ -553,6 +566,120 @@ async fn legacy_the legacy verb API_verbs_stay_open_because_their_clients_cannot
         })
         .await
         .unwrap();
+
+    let _ = wire.stop.send(());
+    wire.serving.await.unwrap();
+}
+
+#[tokio::test]
+async fn a_consumer_speech_report_reaches_the_event_bus_as_the_event_it_names() {
+    let wire = listening(AuthPolicy::open()).await;
+    let attachment = session_with_grpc_attachment(
+        &wire.endpoint,
+        vec![
+            proto::Capability::Sink as i32,
+            proto::Capability::Events as i32,
+        ],
+        None,
+    )
+    .await;
+
+    let mut control = MediaControlClient::connect(wire.endpoint.clone())
+        .await
+        .unwrap();
+    let mut events = control
+        .watch_events(Request::new(proto::WatchRequest { session: None }))
+        .await
+        .unwrap()
+        .into_inner();
+
+    let mut client = MediaStreamClient::connect(wire.endpoint.clone())
+        .await
+        .unwrap();
+    let (to_server, outbound) = mpsc::channel(8);
+    to_server.send(hello(&attachment, "")).await.unwrap();
+    let mut inbound = client
+        .subscribe(ReceiverStream::new(outbound))
+        .await
+        .unwrap()
+        .into_inner();
+    inbound.message().await.unwrap().unwrap();
+
+    to_server
+        .send(speech_report(proto::SpeechReportKind::Started, ""))
+        .await
+        .unwrap();
+    to_server
+        .send(speech_report(
+            proto::SpeechReportKind::Final,
+            "stop talking",
+        ))
+        .await
+        .unwrap();
+
+    let mut seen = Vec::new();
+    while seen.len() < 2 {
+        let event = tokio::time::timeout(Duration::from_secs(5), events.message())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(event.attachment_id, attachment);
+        match event.payload {
+            Some(proto::media_event::Payload::SpeechStarted(started)) => {
+                seen.push(format!("started/{}", started.track))
+            }
+            Some(proto::media_event::Payload::Final(transcript)) => seen.push(format!(
+                "final/{}/{}/{}",
+                transcript.track, transcript.text, transcript.first_final
+            )),
+            _ => continue,
+        }
+    }
+    assert_eq!(
+        seen,
+        vec![
+            "started/customer".to_string(),
+            "final/customer/stop talking/true".to_string()
+        ]
+    );
+
+    let _ = wire.stop.send(());
+    wire.serving.await.unwrap();
+}
+
+#[tokio::test]
+async fn a_speech_report_without_the_events_capability_is_a_protocol_violation() {
+    let wire = listening(AuthPolicy::open()).await;
+    let attachment =
+        session_with_grpc_attachment(&wire.endpoint, vec![proto::Capability::Sink as i32], None)
+            .await;
+
+    let mut client = MediaStreamClient::connect(wire.endpoint.clone())
+        .await
+        .unwrap();
+    let (to_server, outbound) = mpsc::channel(8);
+    to_server.send(hello(&attachment, "")).await.unwrap();
+    let mut inbound = client
+        .subscribe(ReceiverStream::new(outbound))
+        .await
+        .unwrap()
+        .into_inner();
+    inbound.message().await.unwrap().unwrap();
+
+    to_server
+        .send(speech_report(proto::SpeechReportKind::Started, ""))
+        .await
+        .unwrap();
+    let denied = loop {
+        match inbound.message().await {
+            Ok(Some(_)) => continue,
+            Ok(None) => panic!("the stream ended without the denial"),
+            Err(status) => break status,
+        }
+    };
+    assert_eq!(denied.code(), tonic::Code::PermissionDenied);
+    assert!(denied.message().contains("EVENTS"));
 
     let _ = wire.stop.send(());
     wire.serving.await.unwrap();

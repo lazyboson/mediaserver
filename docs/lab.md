@@ -1650,9 +1650,9 @@ Until then MSS has decoded browser **G.711**, not browser **Opus** — and the
 gap between browser Opus and `opus_call_driver.py` is spelled out in
 [testing.md](testing.md).
 
-## barge_drill.sh — the half of barge-in cut-through that MSS owns (2026-08-23)
+## barge_drill.sh — barge-in cut-through, all four hops (2026-08-23)
 
-Barge-in is four hops, and only three of them are MSS's:
+Barge-in is four hops, and all four are MSS's once D19 is fixed:
 
 1. a consumer (ASR, voice-AI) decides the caller started talking and **tells
    MSS**;
@@ -1661,19 +1661,25 @@ Barge-in is four hops, and only three of them are MSS's:
 4. that translator calls `StopPlayback` on `MediaControl`, and MSS stops the
    media.
 
-`lab/barge_drill.sh` + `lab/barge_translator.py` measure hops 2–4 against the
-live lab. **Hop 1 has no wire today** (see the D19 row in
-[tasks.md](tasks.md)): `session-core`'s `Registry::report` — the
-`ConsumerEvent` → `SpeechStarted`/`Partial`/`Final` path that feeds the pump —
-is reachable only from unit tests. Neither the `WS_TWILIO` inbound dialect nor
-the gRPC `ConsumerToServer` stream carries a speech report, and the Twilio
-`clear` message takes a different road entirely: it becomes a direct
-rtpengine `stop media` from `tap_session.rs`, never an event. So the drill's
-**trigger event is `PlaybackStarted`, not `SpeechStarted`**. For the bus half
-that costs nothing in fidelity — every `MediaEvent` goes through the same
-`event_pump`, the same topic and the same per-`external_id` partition key
-whatever payload it carries — but the consumer's own detection latency and
-whatever hop 1 will eventually cost are out of frame.
+`lab/barge_drill.sh` + `lab/barge_translator.py` measure all four hops against
+the live lab.
+
+**The first version of this drill could only measure hops 2–4**, because hop 1
+had no wire: `session-core`'s `Registry::report` — the `ConsumerEvent` →
+`SpeechStarted`/`Partial`/`Final` path that feeds the pump — was reachable only
+from unit tests (defect D19, found by that run). Its trigger event was
+therefore `PlaybackStarted`. **D19 is fixed** (2026-08-23): a gRPC consumer
+holding `CAPABILITY_EVENTS` sends `ConsumerToServer.SpeechReport` on its
+`MediaStream.Subscribe` stream and MSS publishes the event the report names, so
+the drill now triggers on a **real `SpeechReport(STARTED)` → `SpeechStarted`**.
+
+Two things are still out of frame, both by nature rather than by omission. The
+consumer's own **detection** latency — how long an ASR takes to decide speech
+began — belongs to whatever consumer an integrator runs and nothing in MSS can
+measure it. And a **WS-Twilio consumer cannot report speech at all**: that
+dialect's bytes are frozen and carry no such message, so its only barge is the
+Twilio `clear`, which takes a different road entirely (a direct rtpengine
+`stop media` from `tap_session.rs`, never an event).
 
 The drill runs **beside** the live compose lab and adds one container: a
 fabricated call (`lab/call_driver.py`, no SIP) at 172.31.99.123, tapped by the
@@ -1681,28 +1687,47 @@ lab's own `mss-control` pod, so events travel the real pump into the real
 Redpanda (`mss.events`, published to the host at 127.0.0.1:19092). The mock
 translator runs on the WSL host: a `kafka-python-ng` consumer parked at the
 end of the topic plus a warm gRPC channel to 127.0.0.1:50551. It plays **both**
-integrator roles on purpose — it starts the prompt *and* barges it — so every
-interval in the headline is measured on one clock, with no container/host skew
-in it. Skew was measured anyway (`PlaybackStopped` is stamped inside the
+integrator roles on purpose — it starts the prompt, **reports the speech** as
+the gRPC consumer, *and* barges it as the translator — so every interval in the
+headline is measured on one clock, with no container/host skew in it. The
+consumer role is a real attachment (`mss_ctl <endpoint> consume`, transport
+`GRPC_STREAM`, capabilities `SINK`+`EVENTS`) on a live stream: it took **378
+tapped audio frames** while measuring, drained on a thread because a consumer
+that lets its outbound queue back up gets dropped. Skew was measured anyway (`PlaybackStopped` is stamped inside the
 `StopPlayback` call, so its `at` must fall inside this process's send/ack
 window): **median −0.12 ms**, i.e. negligible.
 
-### Numbers (two runs of 25 iterations, 2026-08-23)
+### Numbers with the real speech report (two runs of 10 iterations, 2026-08-23)
+
+Every hop MSS owns, from the consumer's word to the stop being acked. 10/10
+iterations completed in both runs, no event missed.
 
 | interval | run A p50 / p95 / max | run B p50 / p95 / max |
 | --- | --- | --- |
-| **cut-through**: `StartPlayback` acked → `StopPlayback` acked | **3.31 / 4.19 / 4.27 ms** | **3.15 / 3.64 / 3.90 ms** |
-| event on the bus after the `StartPlayback` ack | 1.50 / 1.84 / 1.84 ms | 1.41 / 1.61 / 1.68 ms |
-| translator decides: event in hand → `StopPlayback` acked | 1.86 / 2.35 / 2.57 ms | 1.78 / 2.03 / 2.36 ms |
-| publish → consume, measured on `PlaybackStopped` | 1.09 / 1.33 / 1.38 ms | 1.02 / 1.16 / 1.56 ms |
-| MSS's own event `at` → consumed | 11.01 / 11.95 / 38.88 ms | 10.67 / 11.25 / 12.50 ms |
+| **cut-through**: `SpeechReport` sent → `StopPlayback` acked | **3.98 / 4.78 / 4.78 ms** | **3.54 / 4.38 / 4.38 ms** |
+| hops 1–2: `SpeechReport` sent → `SpeechStarted` consumed | 1.79 / 2.43 / 2.43 ms | 1.73 / 2.23 / 2.23 ms |
+| hops 3–4: event in hand → `StopPlayback` acked | 2.04 / 2.63 / 2.63 ms | 1.86 / 2.15 / 2.15 ms |
+| MSS's event `at` → consumed (skewed) | 0.93 / 1.46 / 1.46 ms | 0.94 / 1.23 / 1.23 ms |
+| `StartPlayback` acked → `PlaybackStarted` consumed | 1.57 / 2.43 / 2.43 ms | 1.62 / 2.01 / 2.01 ms |
+
+**Adding the missing first hop cost under a millisecond.** The earlier
+`PlaybackStarted`-triggered runs (25 iterations each, same stack, same day)
+read cut-through p50 3.31 / 3.15 ms and p95 4.19 / 3.64 ms; putting the real
+consumer wire in front of the bus moved p50 to 3.54–3.98 ms. The consumer
+report is, to the measurement's resolution, free.
 
 Per-iteration rows are kept in `lab/out/barge-drill-<stamp>.jsonl`.
 
-**The Kafka hop is not the problem.** The whole MSS+bus half fits inside a
-single 20 ms frame with an order of magnitude to spare — p95 4.2 ms — so
+**The Kafka hop is not the problem.** The whole chain MSS owns fits inside a
+single 20 ms frame with an order of magnitude to spare — p95 4.8 ms — so
 architecture §9 risk 9's fallback (a gRPC stream *for speech events only*) is not
-needed on these numbers.
+needed on these numbers. `StartPlayback` itself is the slow call in the drill
+(p50 11–43 ms: it ships a WAV blob to rtpengine), which is a prompt-start cost,
+not a barge cost.
+
+What no lab number here covers: `StopPlayback` **acked** is not the last
+audible sample. Measuring the audible cut needs an ear on the leg — the
+Phase-3 inline drill.
 
 **Why the last row is not the bus latency.** `at` is stamped when the registry
 commits the event, and in the `StartPlayback` path that happens *before* MSS's
