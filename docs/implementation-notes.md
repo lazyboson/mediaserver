@@ -1418,6 +1418,16 @@ never takes a lock and never waits on the control world.
   utterance as a WAV blob and plays it with `play media`, targeted by
   default at the first from-tag so only the customer hears the agent.
   `MSS_INJECT_TARGET=everyone` widens it.
+- **The inbound dialect carries no speech report (D19, found 2026-08-23).**
+  `media`/`mark`/`clear`/`end_of_interaction` are all a WS consumer can send,
+  and the gRPC `ConsumerToServer` stream is no richer, so
+  `SessionRegistry::report` — the `ConsumerEvent` → `SpeechStarted`/`Partial`/
+  `Final` ingress, and the first hop of barge-in — has **no caller outside
+  unit tests**. `clear` does barge, but by a different road: a direct
+  rtpengine `stop media` from `tap_session`, unevented and untargeted. That is
+  why `lab/barge_drill.sh` triggers on `PlaybackStarted` and measures only
+  hops 2–4 of the chain (MSS publish → bus → translator → `StopPlayback`
+  acked: p95 4.2 ms, see lab.md).
 - **The end of an utterance is inferred, not signalled.** stream-llm-bridge
   streams TTS as a run of `media` events and never sends `mark`, so the
   consumer flushes after `UTTERANCE_IDLE` (700 ms) without inbound audio.
