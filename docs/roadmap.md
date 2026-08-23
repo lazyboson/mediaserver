@@ -255,7 +255,7 @@ on `LEGACY_MEDIA_GATEWAY_BILLING_TOPIC` / `KAFKA_VOICE_AI_AGENT_TOPIC` verified.
 
 Objective: mixing moves to MSS; FreeSWITCH has no media left.
 
-Status (2026-08-23): **code complete and lab-verified; production integration
+Status (2026-08-24): **code complete and lab-verified; production integration
 and the org-gated criteria remain.** Three container RTP peers have been in one
 conference on real sockets, and twenty tone-per-phase assertions decided
 minus-self, the monitor, whisper isolation, the barge flip, mute/unmute and both
@@ -296,9 +296,10 @@ ear left open for hold audio — a prompt into the whole room is
 to one ear, which is the coach shape. Enter/exit sounds are a verb rather than a
 trigger and DTMF control is API-first, both on purpose; the generic conference
 feature list and the ADAPTER parity table against one integrator's 14 conference
-RPCs are architecture.md Appendix B. All four items are verified over in-process
-UDP sockets only. Still owed: the three-peer lab drill (P4-6) that puts a real
-RTP peer in a conference and both recording shapes in MinIO.
+RPCs are architecture.md Appendix B. Items 37-40 are verified over in-process
+UDP sockets; **item 41 then ran the three-peer drill for real** — three container
+RTP peers in one conference, twenty green assertions, both recording shapes in
+MinIO at once. What no conference here has met is a **SIP** peer.
 
 Work:
 - N-way mixer: conferences as MSS sessions of inline legs with a

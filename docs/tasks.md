@@ -111,9 +111,11 @@ the legacy controller's byte for byte. Serves stream/recording/playback verbs on
 one test per mapping row, both surfaces on one port, proven over a real socket
 with a generated the legacy controller client. `StartCallTranscription` returns `UNIMPLEMENTED`
 by design (the ASR endpoint is not in its request message).
-**Blocked before a tenant can be flipped:** a TelCompat session has only the
-channel uuid, so it needs the OpenSIPS→Redis discovery map (M2 item 3) to
-resolve call-id and tags before it can tap.
+**No longer blocked (2026-08-17):** a TelCompat session has only the channel
+uuid, but MSS resolves the rest itself — the caller passes the SIP call-id and
+the caller's from-tag (both already on the channel) and `TapPlane` asks
+rtpengine's `query` for the participants. The OpenSIPS→Redis discovery map is
+now an optimisation, not a prerequisite (see the M2 close-out list below).
 
 ### 2b. (original description, for reference) `TelCompat` façade
 **Where:** `crates/control-api`.
@@ -224,8 +226,8 @@ one connected consumer per attachment (reconnect allowed after it drops),
 the attachment format must be one the encoder serves (since item 8: g711 at
 the tap rate, or L16 at 8k/16k/48k — Opus is item 9),
 and an utterance is capped at one playback datagram — chunked/paced playback
-stays with the WS bridge. **Still to prove: a live tap over gRPC in the lab**
-— every consumer today speaks WS, so this ran only against the fake plane.
+stays with the WS bridge. This was proved on a **live tapped call** in item 10
+(2026-08-22): L16/16k over the gRPC data plane, ASR-verified intelligible.
 
 ### 7. Auth on attachments — ✅ DONE (2026-08-20)
 `crates/control-api/src/auth.rs`: `AuthPolicy`, a shared bearer secret from
@@ -260,14 +262,15 @@ but PCMU 8k by name (frozen dialect). gRPC inject also accepts L16.
 Done-when met: an L16/16k consumer is verified by replay
 (`l16_16k_doubles_the_sample_count_and_preserves_the_tone`, pump test).
 
-### 9. Opus output
-**Where:** `media-core` (+ a dedicated FFI wrapper crate).
-**What:** Opus encode via `audiopus` (Article XI: adopt libopus, never
-reimplement). **The build trade must be decided first:** `audiopus_sys`
-compiles libopus with cmake/gcc, which breaks the hermetic
-pure-Rust build the repo chose twice already (protox over protoc, rskafka
-over rdkafka). Options: accept the toolchain in CI + Dockerfile, or a
-prebuilt static lib, or a pure-Rust decoder-only stopgap.
+### ~~9. Opus output~~ — superseded by 16a and 16d
+**The build trade this item existed to pose has been decided** (16a,
+2026-08-23): the toolchain is accepted, libopus is vendored and bound through
+the `opus-ffi` crate, and building needs cmake/make/g++. **Opus ingest is
+done**; Opus *output* to consumers is tracked in **16d** and is still genuinely
+later, because no consumer has asked for it. The original framing is kept below
+for the reasoning it records, but read 16a/16d for the current state.
+**Where:** `media-core` (+ a dedicated FFI wrapper crate — now `opus-ffi`).
+**What:** Opus encode (Article XI: adopt libopus, never reimplement).
 **Why later:** no consumer asks for Opus yet; L16/16k covers the ASR
 vendors we know about.
 **Done when:** a consumer can request Opus and get it, verified by replay,
@@ -407,8 +410,10 @@ count what it cannot read, but that is replay-proven only: a pod-kill drill
 soak suite (item 19) should re-measure it under load.
 
 ### 12. Barge-in cut-through measurement — 🔶 **MSS+bus half measured (2026-08-23)**
-Item 5 above carries the numbers: **cut-through p50 ~3.2 ms, p95 ~4.2 ms, max
-4.3 ms over 50 iterations** on the live lab, so the Kafka hop makes the budget
+Item 5 above carries the numbers, and they are the ones to quote: a real
+consumer `SpeechReport` to an acked `StopPlayback` at **p50 3.98 / 3.54 ms and
+p95 4.78 / 4.38 ms over two runs of 10 live iterations** (the earlier ~3.2 ms
+figure was the pre-D19 `PlaybackStarted` trigger). The Kafka hop makes the budget
 and the gRPC-for-speech-events fallback stays unbuilt. What remains for the
 Phase-1 exit criterion is not ours to measure: the **integrator's consumer
 half** (the the legacy controller translator merge, still external) plus the two gaps named in
@@ -797,8 +802,9 @@ in the lab, but 960 samples exceeds the hub frame, so a 48 kHz tap cannot fan
 out to consumers yet — that is the remaining piece if anyone ever wants it.
 
 #### 16d. Opus output to consumers — ⬜ still genuinely later
-The original item 9 framing. `opus-rs` ships an encoder too, so this is now
-mostly plumbing, but no consumer has asked and ingest is what WebRTC needs.
+The original item 9 framing. libopus — already vendored and bound through
+`opus-ffi` for ingest (16a) — ships an encoder too, so this is now mostly
+plumbing, but no consumer has asked and ingest is what WebRTC needs.
 
 ### ~~17. Jitter hardening (defect D7)~~ — done 2026-08-22
 **Where:** `crates/media-core` (`jitter.rs`, `pipeline.rs`, new `plc.rs`,
@@ -1095,6 +1101,14 @@ persisted on the attachment, but `RegistryKeeper::rebuild` **refuses** to
 restore a grouped recording on an adopting pod (counted `grouped_not_adopted`)
 rather than split one recording across two pods. Placement — scheduling a
 group's sessions onto one pod — is the real fix and does not exist (D8).
+
+### 22. (number unused)
+
+There is no item 22. The number was skipped when items were being written in
+parallel and is left unused rather than renumbered, so that every reference to
+an item number elsewhere in this file, in commit messages and in
+implementation-notes keeps pointing at the same work.
+
 ### 23. rtpengine kernel-module readiness — ✅ DONE (2026-08-23)
 **Why this exists:** item 18's decision gate cannot be opened without knowing
 whether a tap rides rtpengine's kernel path, and the production deployment runs
@@ -2139,9 +2153,9 @@ participants at once — the room object reads 6500–7600 for 1000+2000+4000 wh
 each participant object reads only its own tone, and the late member's object
 opens with a pad and matches the others' length; the late member's own track and
 the room within 4 frames of each other in a stereo object; the grouped-mixed
-refusal). **The P4-6 conference drill is what will run this live** — the three
-container RTP peers it needs do not exist yet, so nothing here has been through
-a real SIP peer or MinIO.
+refusal). **Item 41 then ran it live** — three container RTP peers in one
+conference, both recording shapes landing in MinIO at once. What has still never
+been through this path is a real **SIP** peer.
 
 **Residuals.** (a) The room object is attached to **one member's** session, so
 it ends when that member leaves even though the conference lives on — D20.
@@ -2314,7 +2328,7 @@ the monitor and the room object both hang off one member's session (D20);
 | ~~D12~~ | ~~**NG cookies repeat across sessions on one pod**: `CookieSequence` restarted its serial at 0 and `TapPlane` binds a new `NgTransport` per session, so every session's first command was `<prefix>-0`. Two sessions inside rtpengine's duplicate-cookie reply-cache window get the *same cached subscribe answer*, and the second tap receives **no media at all** while looking healthy~~ — **fixed 2026-08-22 (item 10)**: the serial is process-wide, unit-pinned and lab-proved before/after | `ng_transport.rs` | closed — was **high**, it silently broke every second tap within a minute |
 | ~~D15~~ | ~~An adopted attachment loses its **negotiated format**: `rebuild` passes `format: None`, so a consumer that attached as L16/16k comes back at the session default.~~ — **fixed 2026-08-23 (item 26)**: `PersistedAttachment.format` (`Option<PersistedFormat>`, `serde(default)`, the wire shape used for the other persisted enums) is written every keeper tick and replayed on adoption; a record without it still decodes and still means the default. Unit-tested (roundtrip, legacy record, an L16/16k gRPC consumer and a default WS consumer re-opened side by side on the adopting pod) and run against the lab's real Redis; **never observed live** — that needs a pod kill with a gRPC L16 consumer attached | `session_store.rs`, `registry_keeper.rs` | closed |
 | ~~D14~~ | ~~**A dead pod's rtpengine subscription is never torn down.**~~ — **fixed 2026-08-23 (item 25)**: `PersistedSession` now carries the tap's `to-tag` (`subscription_tag`, `serde(default)` so older records still decode), the adopter sends NG `unsubscribe` for it **before** re-subscribing (after winning the atomic claim), and a pod that loses its lease destroys the session locally so a partitioned-but-alive owner unsubscribes its own tap instead of double-tapping. `upsert` also stopped rewriting the lease key unconditionally (now `SET NX`) — it had made a lease unloseable, so the partitioned case could never be detected. New counters `mss_registry_orphans_unsubscribed_total`, `mss_registry_orphans_still_subscribed_total`, `mss_registry_surrendered_total`. **Verified in unit tests, against a fake rtpengine socket (the `unsubscribe` bytes) and against the lab's real Redis — not re-measured on a live pod kill**; the residual is that a refused `unsubscribe` still leaks one tap, counted rather than retried | `session_store.rs`, `registry_keeper.rs`, `tap_plane.rs` | closed |
-| ~~D23~~ | ~~**A padded recording-group member lost its pad's worth of audio off the tail.** `Segmenter::close_segment` subtracted the closed frames from `segment_start` (the lead-silence offset) *and* advanced `anchor_ms` by the same frames, so every spill moved a late joiner's timeline forward by the pad twice~~ — **found and fixed 2026-08-23 (item 41)**: the anchor now advances only by `frames - segment_start`. Invisible to every earlier test because an ungrouped recording has `segment_start == 0` and item 29's group drill (5 s stagger, 20 s run) never reached the 30 s spill. Live in the conference drill: `party-c.wav` **55.88 s against 66.16/66.24** before, **72.10 against 71.96/72.02** after, with the 10.66 s pad still at the front. Guarded by `a_padded_member_keeps_its_whole_tail_across_a_spill`, which fails by exactly the lead if the fix is reverted | `recorder.rs` | closed |
+| ~~D23~~ | ~~**A padded recording-group member lost its pad's worth of audio off the tail.** `Segmenter::close_segment` subtracted the closed frames from `segment_start` (the lead-silence offset) *and* advanced `anchor_ms` by the same frames, so every spill moved a late joiner's timeline forward by the pad twice~~ — **found and fixed 2026-08-24 (item 41)**: the anchor now advances only by `frames - segment_start`. Invisible to every earlier test because an ungrouped recording has `segment_start == 0` and item 29's group drill (5 s stagger, 20 s run) never reached the 30 s spill. Live in the conference drill: `party-c.wav` **55.88 s against 66.16/66.24** before, **72.10 against 71.96/72.02** after, with the 10.66 s pad still at the front. Guarded by `a_padded_member_keeps_its_whole_tail_across_a_spill`, which fails by exactly the lead if the fix is reverted | `recorder.rs` | closed |
 | D20 | **A room recording belongs to a member, not to the conference.** The mixed-track `FILE_S3` attachment hangs off one member session, so the object ends when *that* member leaves even though the conference keeps mixing — and its t=0 is its attach moment, not the conference's open, so it aligns with the per-participant objects only if both are attached together. Fix shape: a conference-scoped recording owner (an attachment on the conference rather than on a leg) with the conference's `opened_at` as its anchor | `tap_plane.rs`, `conference.rs` | medium once a tenant records conferences whose members come and go |
 | D21 | **DTMF digits never reach the event bus.** A tapped or inline leg's digits are delivered to consumers (WS `dtmf` frames, gRPC `DtmfFrame`) and counted in `mss_ingest_dtmf_digits_total`, but nothing publishes `Observation::Dtmf`, so `mss.events` carries no digit. Conference control is API-first by design (item 40), and an integrator mapping digits to API calls therefore needs a consumer stream rather than the bus. Fix shape: publish the observation from the capture path, capability-gated like the speech report | `tap_spike.rs`, `tap_plane.rs`, `registry.rs` | medium for anyone wanting an in-call digit menu |
 | D22 | **Member state has no owner, no lease and no read-back.** `member_mute`/`member_deaf`/`member_hold` deliberately outlive the attachment that set them (item 40), so a controller that dies between `on` and `off` leaves a member muted for the life of the conference, and there is no API that reports a room's member state — only the aggregate gauges. Fix shape: expose member state on `DescribeSession` (and consider an optional lease on it, mirroring the session lease) | `conference.rs`, `tap_plane.rs`, `registry.rs` | medium once a tenant drives mute from a UI |
