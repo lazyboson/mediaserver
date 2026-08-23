@@ -5,6 +5,7 @@ pub mod encode;
 pub mod frame;
 pub mod g711;
 pub mod jitter;
+pub mod mixer;
 pub mod opus;
 pub mod pacer;
 pub mod pipeline;
@@ -14,6 +15,10 @@ pub mod rtp;
 
 pub use encode::{ConsumerEncoder, EncodeError};
 pub use frame::{AudioFormat, Encoding, Track};
+pub use mixer::{
+    ContributorId, Gain, ListenerId, MixError, MixMatrix, MixOutput, MixStats, Party, PushOutcome,
+    SpeechGate, MAX_MIX_FRAME_SAMPLES,
+};
 pub use opus::{OpusError, OpusStreamDecoder, MAX_OPUS_PACKET_BYTES};
 pub use pacer::{
     EnqueueOutcome, PacedPacket, PacerConfig, PacerError, PacerStats, PlayoutPacer, UnderrunPolicy,
