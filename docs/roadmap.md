@@ -16,7 +16,7 @@ is boringly stable in production).
 | 1 | Passive fan-out (M3–M4) | `uuid_audio_fork`, `uuid_google_transcribe2` media bugs | 🔶 M3 done, M4 ~95% (code complete; translator merge + barge-in measurement remain) |
 | 2 | Recording | `record_session` bugs, shared-FS recording pipeline | ⬜ |
 | 3 | Interactive media | dummy leg + conference-per-AI-interaction; the legacy media gateway service | ⬜ |
-| 4 | Full media plane | conference mixing, monitor/whisper (`relate nospeak`), MOH | ⬜ |
+| 4 | Full media plane | conference mixing, monitor/whisper (`relate nospeak`), MOH | 🔶 mixer + conference sessions code complete (items 36–37); monitor/whisper, conference recording and the lab drill remain |
 
 The ordered next-up list, with a definition of done per item, open defects
 and what is blocked on other people, lives in [tasks.md](tasks.md).
@@ -234,6 +234,23 @@ on `LEGACY_MEDIA_GATEWAY_BILLING_TOPIC` / `KAFKA_VOICE_AI_AGENT_TOPIC` verified.
 ## Phase 4 — Full media plane
 
 Objective: mixing moves to MSS; FreeSWITCH has no media left.
+
+Status (2026-08-24): **the mixer and conferences of inline legs are code
+complete; nothing has met a SIP peer yet.** `media-core`'s `MixMatrix` is the
+sans-IO engine — N contributors x M listeners, minus-self by default, and all
+three of monitor / whisper / barge are cells of that matrix rather than code
+paths (tasks.md item 36). `mediaserverd`'s `conference.rs` wires it to sockets
+(item 37): `CreateSession{kind=INLINE, group=<name>}` seats a leg in a
+conference, the legs that share a group share one mix driven by one
+capture-world clock, each hears everybody but itself, a prompt played into one
+leg stays private to it, and the conference's full mix is published to every
+member's hub as the `mixed` track so a monitor or recorder attaches with the
+verbs that already exist. Verified over real UDP sockets in-process (three peers
+hearing the other two and never themselves, a leg leaving mid-mix, the last leg
+closing the conference); multi-rate conferences are refused by name rather than
+resampled, and conferences are pod-local. Still owed: monitor/whisper/barge
+attachments, native conference recording, the member-control tail with its
+parity table, and the three-peer lab drill.
 
 Work:
 - N-way mixer: conferences as MSS sessions of inline legs with a

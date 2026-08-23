@@ -15,7 +15,7 @@ Status as of **2026-08-23**.
 | **M3 — fan-out hub** | per-session pub/sub, N consumers, WS-Twilio adapter, pause/resume/send_text parity | ✅ done |
 | **M4 — control plane** | `MediaControl` gRPC, session state machine, Kafka events, Redis registry, tenant-flag pilot | 🔶 **code complete** — pilot gates: translator merge (external), and the consumer half of the barge-in number — **every MSS-owned hop is measured (item 5, 2026-08-23: cut-through p95 4.8 ms from a real consumer `SpeechReport`)**, the D19 ingress gap it found being fixed in item 28. The gRPC lab proof (item 10) and the **live pod-kill drill (item 11, gap 14.41 s)** are both **done 2026-08-22**; the D14 orphan subscription the drill found is **fixed (item 25, 2026-08-23)**, fake- and Redis-verified rather than re-measured live |
 | **M5 — recording (Phase 2)** | per-leg taps → stereo segmenter → S3, identity + callback contract, dual-recording | 🔶 **code complete (2026-08-22)** — a live tapped call recorded end to end to a real MinIO, callbacks read off `mss.events` (2026-08-22, item 10's drill); **recording groups** — N sessions recorded as one recording, one mono object per participant, time-aligned on the group's open instant since item 29 — landed 2026-08-23 (item 21); FS byte-parity **measured against a real FS recording** 2026-08-23 (item 31): container/layout/rms exact, a re-aligned 2 s window agrees 1.0000 at mean diff 0.6/32768; owed: a two-party production-FS comparison and a human listen |
-| M6+ | Phases 3–4 (interactive media, full media plane) | 🔶 **Phase 3 code complete and lab-verified (items 32–35, 2026-08-23)** — an inline leg answers an SDP offer, is spoken to over a continuous inject stream, and barges in **p50 12.2 ms / p95 20.4 ms** measured against a real RTP peer; Phase 4 (mixing) not started |
+| M6+ | Phases 3–4 (interactive media, full media plane) | 🔶 **Phase 3 code complete and lab-verified (items 32–35, 2026-08-23)** — an inline leg answers an SDP offer, is spoken to over a continuous inject stream, and barges in **p50 12.2 ms / p95 20.4 ms** measured against a real RTP peer. **Phase 4 in progress:** the N-way mix matrix (item 36) and **conferences of inline legs** (item 37, 2026-08-24 — one clock per conference, each leg hears everybody but itself, mixed track on the hub) are code complete and verified over in-process sockets; no real SIP peer has been in a conference yet (P4-6) |
 
 ### What landed, concretely
 
@@ -1944,6 +1944,69 @@ leg); AGC; and Opus egress, still absent crate-wide, so a conference of Opus
 legs transcodes on the way out. This is replay-only by construction: media-core
 has no sockets, so mixing quality against real legs cannot be judged until the
 P4-6 drill.
+
+### 37. Conference sessions in mediaserverd (Phase 4) — ✅ DONE (2026-08-24)
+
+`CreateSession{kind=INLINE, group="<conference>"}` now joins a leg into a
+conference: the legs that name one group share **one** `MixMatrix` driven by
+**one** capture-world clock, each hears everybody but itself, and the
+conference's full mix is published to every member's hub as the `mixed` track so
+monitors and recorders attach with the verbs that already exist. New proto
+fields (additive, wire-compatible): `CreateSessionRequest.group = 9` and
+`Session.group = 11`, mirroring the recording group on `Attach` rather than
+inventing a conference noun; a `group` on a TAP is refused by name, since a
+recording group is named on the attachment. `mss_ctl inline <external-id>
+<call-id> <offer-file> [conference-group]` is the lab handle for it.
+
+The design decision this item owed was **threading**, and it is recorded in
+implementation-notes: one *conference-owner thread the legs migrate onto*. Each
+inline leg is still built in the control world exactly as a two-party leg is
+(socket, jitter/decode pipeline, hub, `InlineEgress`), but a grouped one is then
+handed to the conference thread over a bounded queue instead of getting a thread
+of its own. Mixing is frame-synchronous, so a matrix shared between per-leg
+threads would need a lock in the packet path — the two-world rule forbids
+exactly that. Membership is decided in the control world under the conference
+table's lock (so a join cannot race the last leave), the thread never removes
+itself from the table, and the leave that empties a conference hands its
+`JoinHandle` back to `close_session`, which joins it the same way it joins a
+per-session capture thread. Per-session teardown stays one path.
+
+Per tick: each leg's released frame goes to its own hub as `customer` **and**
+into the matrix as its contributor (`TapLeg::release_frame_with`, no copy); each
+member's queued playback/inject audio is cut into exact frames and pushed as
+that member's private injector (`route_only` into its own ear, so a prompt
+played into one leg still reaches only that leg); one `mix()`; then every
+member's minus-self ear goes to its own `PlayoutPacer` and the monitor
+listener's full sum goes to every member's hub as `mixed`. A leg that releases
+nothing is silence and counted; a leg leaving is a command handled at the top of
+a tick, so **a member leaving cannot stall the mix**. One mixer sharp edge found
+here and now documented: `join_listener` resets its column to the defaults, so
+every non-default route (the injectors') must be re-applied after each
+membership change.
+
+**Multi-rate conferences are refused by name**, as the item asked: the joining
+leg's rate, ptime and channels must equal the conference's (its first leg sets
+them), and the error says why. Encoding may differ, because each leg owns its
+own egress encoder. Per-leg resampling is the residual.
+
+Verified in-process over real UDP sockets (5 new tests in `tap_plane.rs`, plus a
+control-api test for the API rule): three fake peers in one group with 1000 /
+2000 / 4000 tones read **6000 / 5000 / 3000** off the wire — the sum of the
+other two, never their own; a hub monitor on one member sees the mixed track at
+**7000** (everyone, self included); closing one leg mid-mix leaves the survivors
+reading exactly each other while the conference stays live, and the last leg out
+closes it; a prompt played into one leg is absent from the other's ear; a 40 ms
+leg is refused from a 20 ms conference. New metrics: `mss_conferences_live`,
+`mss_conference_members_live`, plus joins/leaves/mixed-frames/clipped/absent/
+reanchor/refused counters.
+
+**Not proven and not claimed:** no real SIP peer has ever been in a conference —
+that is P4-6's drill. Conferences are pod-local (a group is one pod's table, and
+an inline leg is not adoptable anyway), have no tenant scope on the group name
+(two tenants picking the same name would share a mix; prefix it until sessions
+carry a tenant), and there is no AGC. Conference recording as one mixed file is
+P4-4; monitor/whisper/barge attachments are P4-3; member mute/deaf/hold verbs
+are P4-5.
 
 ## Open defects and soft spots
 

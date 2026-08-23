@@ -403,11 +403,19 @@ the minus-self default, and whisper/mute/per-pair gain (the reason this is a
 matrix) break it. If conference fan-in ever needs it, gate it on a
 "matrix is default" flag rather than on N.
 
-Not done here: nothing calls it yet (media-core has no sockets, and replay is
-the only altitude available). Multi-rate conferences are out of scope — every
-contributor must arrive at the conference's rate and frame size, so P4-2 owns
-resampling per leg. Opus egress is still absent crate-wide, so a conference of
-Opus legs transcodes to G.711/L16 on the way out.
+Multi-rate conferences are out of scope — every contributor must arrive at the
+conference's rate and frame size. Opus egress is still absent crate-wide, so a
+conference of Opus legs transcodes to G.711/L16 on the way out.
+
+Since item 37 the caller is `mediaserverd`'s `conference.rs`, which drives one
+matrix from one capture thread. One sharp edge that only shows up there and is
+worth repeating: **`join_listener` resets its whole column to the defaults**, so
+a new member's arrival restores unity from every contributor into it —
+including contributors whose row was deliberately narrowed by `route_only`.
+Any non-default routing must therefore be re-applied after every membership
+change, which is exactly what `conference.rs`'s `reroute_injectors` does. The
+mixer test suite could not have caught it: it never re-checks an old route
+after a later join, and a conference test did.
 
 ## crates/opus-ffi — libopus, and the only place unsafe lives
 
@@ -1496,10 +1504,134 @@ the pacer, which is why a ring overflow needs no separate term. A `Mark` ack is
 `drained_samples >= watermark`, and the tick after a `clear()` is silence, so a
 drained mark means the peer really has heard it.
 
+Item 37 split `pump` into the four steps a conference needs to drive
+separately — `take_flush`, `pop_chunk`, `queue_frame`, `send_tick` — and `pump`
+is now their composition, so a plain two-party inline leg behaves exactly as
+before. A conferenced leg never calls `pump`: its pacer is fed one **mixed**
+frame per tick by `queue_frame`, and the ArrayQueue's chunks are pulled out with
+`pop_chunk` and handed to the mix matrix as that leg's private injector instead.
+That moves the drain identity, so `account_mixed_in` / `discard_pending` exist to
+keep it exact in conference mode:
+
+    drained_samples = (samples a flush discarded, queue or partial chunk)
+                    + (samples the mixer consumed from the injector)
+
+`mixed_in_samples: Option<u64>` is what selects between the two identities —
+`None` (never accounted) keeps the tap/two-party formula untouched. A `Mark` on
+a conferenced leg is therefore acked when the marked audio has been *mixed*,
+one frame before it is paced out, and a `Clear` still flushes both the queue and
+the pacer, which now discards mixed audio too (counted in `cleared_samples`).
+
 `egress_ssrc(session, salt)` derives a non-zero SSRC (and the initial sequence
 and timestamp) from the session id and the pod's SDP session id rather than
 adding an RNG dependency; distinctness across sessions and pods is what matters,
 not unpredictability, and a test pins that plus never-zero.
+
+### conference.rs — one clock, one matrix, N legs (item 37, Phase 4, 2026-08-24)
+
+A conference is a set of inline legs that named the same `group` on
+`CreateSession`, and this module is the thread they share.
+`CreateSession{kind=INLINE, group="standup"}` mirrors the recording group on
+`Attach` deliberately: no new proto noun, and the same mental model (N sessions,
+one shared thing). A `group` on a TAP is refused in `control-api` by name — a
+recording group is named on `Attach`, a conference on the session.
+
+**The threading decision, and why.** Before this item each inline session owned
+its own capture thread. A conference cannot: mixing is frame-synchronous, so all
+its legs must be released, mixed and paced on **one** clock, and a matrix shared
+between capture threads would need a lock in the middle of the packet path —
+exactly what the two-world rule forbids. The design chosen is therefore a
+**conference-owner thread the legs migrate onto**: `open_inline_session` builds
+the leg's socket, pipeline, hub and `InlineEgress` in the control world exactly
+as it does for a two-party leg, and then hands the whole bundle
+(`ConferenceMember`) to the conference thread over a bounded `ArrayQueue`
+instead of spawning a thread for it. The alternative — one thread per leg with a
+shared matrix — was rejected for the lock; the third option, migrating *sockets*
+(fd handoff) rather than whole legs, buys nothing here because the pipeline and
+jitter buffer would have to move with them anyway.
+
+**Who decides membership: the control world, under one lock.** `TapPlane`
+holds `conferences: Mutex<HashMap<String, Conference>>` beside the recording
+`groups` table. `Conference` is the control-world half — command queue, stop
+flag, shared counters, the member list and the `JoinHandle`. Because both the
+"is there room / does the format fit" check and the member-list edit happen
+under that lock, a join racing the last leave cannot resurrect a dying mix. The
+thread never removes itself from the table: `unseat` decides, and when it drops
+the last member it sets the stop flag and **returns the `JoinHandle`**, which
+`close_session` joins in `spawn_blocking` the same way it joins a per-session
+capture thread. A conferenced session's `LiveSession.capture` is therefore
+`None` and its `conference` is `Some(name)`; everything else about it — hub,
+egress handle, metrics registration, polite consumer shutdown — is unchanged.
+
+**One tick.** Poll commands, then per member: hub commands, ssrc map, socket
+drain, and a pending `Clear`. Every member's pacer gets a `send_tick` on every
+loop iteration (the pacer self-paces, as it does for a plain inline leg). When
+the release deadline arrives:
+
+1. each leg releases its jitter-buffered frame, which goes to that leg's hub as
+   the `customer` track (unchanged) **and** into the matrix as that leg's
+   contributor — `TapLeg::release_frame_with` takes the sink, so the frame is
+   never copied for the mixer;
+2. each member's queued inject/playback audio is cut into exact frames by
+   `InjectFeed` and pushed as that member's **injector** contributor;
+3. `mix()` once;
+4. each member's minus-self ear goes to its own `InlineEgress::queue_frame`, and
+   the **monitor** listener's frame — the sum of everyone, self included — is
+   published on *every* member's hub as `Track::Mixed`.
+
+A leg that releases nothing pushes nothing and is mixed as silence (the matrix
+counts `absent_frames`); a leg that leaves is a command processed at the top of
+a tick, so **leaving cannot stall the mix** — there is no per-leg wait anywhere
+in the loop.
+
+**Decisions worth not re-litigating:**
+
+- **The mixed track is published on every member session, not one designated
+  one.** A monitor or recorder can then attach to whichever member session it
+  already knows with the verbs that exist (`selector: only=mixed`), and no
+  session becomes load-bearing for the conference's output. It costs one extra
+  `TapEvent` per member per tick, which is the same fan-out cost the hub already
+  pays for the customer track.
+- **The mixed track is the full sum, not the listener's ear.** A recording of a
+  conference should contain everybody; minus-self is an ear, not a record. That
+  is what the matrix's `join_listener`-only monitor is for.
+- **Injected audio is private to the leg it was played into.** Each member gets
+  an injector contributor routed with `route_only` into its own listener, so
+  `StartPlayback` and INJECT frames on a conferenced leg behave as they did
+  before the leg joined a conference — only that participant hears them, and
+  the monitor/recording track does not. Whisper into *another* member's ear is
+  the same mechanism with a different target, which is P4-3's job.
+- **Multi-rate conferences are refused by name.** `Conference::accepts`
+  requires the joining leg's sample rate, ptime and channel count to equal the
+  conference's (set by its first leg) and says so in the error; the encoding may
+  differ, because each leg owns its own encoder on the way out. Per-leg
+  resampling is the residual, and it is a real one: a conference whose first leg
+  is 8 kHz cannot admit a 16 kHz leg today.
+
+Sizes: command queue 64, `MAX_CONFERENCE_MEMBERS` 32 (the matrix starts at 8
+contributor/listener slots and grows on membership change only), one `SpeechGate`
+default. New metrics: `mss_conferences_live`, `mss_conference_members_live`,
+and counters for joins, leaves, mixed frames, clipped samples, absent frames,
+clock re-anchors and matrix-refused frames.
+
+Verified in-process over real UDP sockets (five tests in `tap_plane.rs`): three
+fake peers on one group each hear the sum of the *other two* and never their own
+tone (1000/2000/4000 in, ears of 6000/5000/3000 out, decoded off the wire); a
+monitor on one member's hub sees the mixed track carrying all three (7000); a
+leg closed mid-mix leaves the survivors reading exactly each other and the
+conference still live, and the last leg out closes it (`conferences_live` back to
+0); a prompt played into one leg is in that leg's ear and not the other's; and a
+40 ms-ptime leg is refused from a 20 ms conference by name.
+
+Not done here: cross-pod conferences (a group is one pod's table — a leg
+answered by another pod cannot join it, and an inline leg is not adoptable
+anyway), per-leg resampling, conference recording as one mixed file (P4-4),
+monitor/whisper/barge attachments (P4-3), member mute/deaf/hold verbs (P4-5),
+AGC, and any live drill (P4-6) — no real SIP peer has been in a conference yet.
+A conference group name is also **global to the pod**: there is no tenant scope
+on a session the way `accountId` scopes a recording group, so two tenants
+choosing the same group name would share a mix. Prefixing the name is the
+integrator's job until sessions carry a tenant.
 
 ### tap_plane.rs — the control plane's hands in the media world
 
@@ -1693,6 +1825,15 @@ code. What differs:
   already bounds it at one ptime.
 - The answer is not persisted. See `session_store.rs` on why an inline session
   is not adoptable.
+- **A `group` on an inline session makes it a conference leg (item 37).**
+  `open_inline_session` builds the same socket, pipeline, hub and egress and
+  then, instead of spawning a per-session capture thread, hands the bundle to
+  `conference.rs` through `seat_in_conference`; `LiveSession` remembers the
+  name so `close_session` can `leave_conference` and join the mix thread when
+  it was the last member. A refused join (rate/ptime mismatch, a full
+  conference, a mix that is not draining its command queue) leaves **no**
+  half-open session behind: the error comes back before the session table is
+  touched.
 
 ### main.rs — how the daemon chooses what to be
 
@@ -1963,6 +2104,13 @@ PCM, and write the WAV once capture ends.
   can starve the pacer), `recv_errors`, and `reanchors` when the release
   deadline falls more than one `ptime` behind and re-anchors instead of
   bursting.
+- **`release_frame_with` is the mixer's seam (item 37).** A released frame is
+  handed to an optional `MixedFrameSink` (`&mut dyn FnMut(&[i16])`) alongside
+  the hub publish, so `conference.rs` pushes that leg's contribution into the
+  mix matrix without a copy or a second buffer, and `release_frame` stays the
+  one-line no-sink case every tap uses. `drain` and `MAX_DATAGRAM` are `pub`
+  for the same reason: the conference loop is a second media loop over the same
+  `TapLeg`, not a fork of it.
 - `Playout::Waiting` appends a frame of silence and counts an underrun, so
   both legs stay sample-aligned and the stereo file keeps real time. That
   is why a source slower than the pacer shows up as underruns plus silence

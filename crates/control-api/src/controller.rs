@@ -333,6 +333,7 @@ impl SessionController {
             owner_pod: self.owner.clone(),
             attachments,
             sdp_answer: view.sdp_answer.unwrap_or_default(),
+            group: view.group,
         })
     }
 }
@@ -479,6 +480,12 @@ impl MediaControl for SessionController {
             }
             _ => {}
         }
+        if !message.group.is_empty() && kind != SessionKind::Inline {
+            return Err(Status::invalid_argument(
+                "a session group is the phase-4 conference and mixes inline legs; \
+                 a recording group is named on Attach instead",
+            ));
+        }
         let view = self.commit(|registry| {
             registry.create_session(CreateSession {
                 external_id: message.external_id,
@@ -487,6 +494,7 @@ impl MediaControl for SessionController {
                 from_tags: message.from_tags,
                 rtpengine_node: message.rtpengine_node,
                 sdp_offer,
+                group: message.group,
                 idempotency_key: optional(message.idempotency_key),
             })
         })?;
