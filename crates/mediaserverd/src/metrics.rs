@@ -186,6 +186,11 @@ pub fn render(sources: &MetricsSources) -> String {
         "Seconds of audio recorded, pauses excluded",
         snapshot.recording_seconds,
     );
+    counter(
+        "mss_recording_group_joins_refused_total",
+        "Recording group joins refused for a reused label or a second recording id",
+        snapshot.recording_group_joins_refused,
+    );
 
     let mut gauge = |name: &str, help: &str, value: u64| {
         let _ = writeln!(out, "# HELP {name} {help}");
@@ -232,6 +237,16 @@ pub fn render(sources: &MetricsSources) -> String {
         "mss_recordings_live",
         "Recordings currently accumulating audio",
         snapshot.recordings_live,
+    );
+    gauge(
+        "mss_recording_groups_live",
+        "Recording groups open in this pod",
+        snapshot.recording_groups_live,
+    );
+    gauge(
+        "mss_recording_group_members_live",
+        "Attachments recording as a member of a group",
+        snapshot.recording_group_members_live,
     );
     if let Some(pump) = &sources.pump {
         gauge(
@@ -473,6 +488,9 @@ mod tests {
             "mss_recording_bytes_uploaded_total",
             "mss_recording_seconds_total",
             "mss_recordings_live",
+            "mss_recording_groups_live",
+            "mss_recording_group_members_live",
+            "mss_recording_group_joins_refused_total",
         ] {
             assert!(text.contains(name), "missing {name} in:\n{text}");
         }

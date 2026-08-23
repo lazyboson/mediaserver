@@ -209,6 +209,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             authoritative: false,
             label: label.clone(),
             endpoint: String::new(),
+            group: String::new(),
             metadata: [("streamSid".to_string(), format!("MZ-{label}"))]
                 .into_iter()
                 .collect(),
