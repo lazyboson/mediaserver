@@ -77,8 +77,12 @@ impl MediaPlane for FakePlane {
         &self,
         _session: SessionId,
         playback: PlaybackId,
+        target_tag: Option<String>,
     ) -> Result<(), MediaPlaneError> {
-        self.stopped.lock().unwrap().push(playback.to_string());
+        self.stopped
+            .lock()
+            .unwrap()
+            .push(format!("{playback}/{}", target_tag.unwrap_or_default()));
         Ok(())
     }
 
@@ -300,6 +304,45 @@ async fn a_grpc_consumer_receives_start_frames_dtmf_and_a_stop() {
     match stop.msg {
         Some(server_to_consumer::Msg::Stop(stop)) => {
             assert!(stop.reason.contains("ended"));
+        }
+        other => panic!("expected a stop frame, got {other:?}"),
+    }
+    assert!(inbound.message().await.unwrap().is_none());
+
+    let _ = wire.stop.send(());
+    wire.serving.await.unwrap();
+}
+
+#[tokio::test]
+async fn a_detached_attachment_reaches_the_consumer_as_a_stop_frame_carrying_its_reason() {
+    let wire = listening(AuthPolicy::open()).await;
+    let attachment =
+        session_with_grpc_attachment(&wire.endpoint, vec![proto::Capability::Sink as i32], None)
+            .await;
+
+    let mut client = MediaStreamClient::connect(wire.endpoint.clone())
+        .await
+        .unwrap();
+    let (to_server, outbound) = mpsc::channel(8);
+    to_server.send(hello(&attachment, "")).await.unwrap();
+    let mut inbound = client
+        .subscribe(ReceiverStream::new(outbound))
+        .await
+        .unwrap()
+        .into_inner();
+    inbound.message().await.unwrap().unwrap();
+
+    wire.frames
+        .send(StreamFrame::Stop {
+            reason: "the attachment was detached".to_string(),
+        })
+        .await
+        .unwrap();
+
+    let stop = inbound.message().await.unwrap().unwrap();
+    match stop.msg {
+        Some(server_to_consumer::Msg::Stop(stop)) => {
+            assert_eq!(stop.reason, "the attachment was detached");
         }
         other => panic!("expected a stop frame, got {other:?}"),
     }
