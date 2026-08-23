@@ -617,6 +617,8 @@ impl MediaControl for SessionController {
                     paused: message.paused,
                     selector,
                     format,
+                    metadata: (!message.metadata.is_empty())
+                        .then(|| message.metadata.clone().into_iter().collect()),
                 },
             )
         })?;
@@ -629,6 +631,7 @@ impl MediaControl for SessionController {
                             paused: Some(before.paused),
                             selector: Some(before.selector),
                             format: Some(before.format),
+                            metadata: Some(before.metadata.clone()),
                         },
                     )
                 });

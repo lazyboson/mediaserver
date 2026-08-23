@@ -1595,12 +1595,13 @@ in the loop.
 - **The mixed track is the full sum, not the listener's ear.** A recording of a
   conference should contain everybody; minus-self is an ear, not a record. That
   is what the matrix's `join_listener`-only monitor is for.
-- **Injected audio is private to the leg it was played into.** Each member gets
-  an injector contributor routed with `route_only` into its own listener, so
-  `StartPlayback` and INJECT frames on a conferenced leg behave as they did
-  before the leg joined a conference — only that participant hears them, and
-  the monitor/recording track does not. Whisper into *another* member's ear is
-  the same mechanism with a different target, which is P4-3's job.
+- **Injected audio is private to the leg it was played into, unless a route
+  says otherwise (item 38).** Each member gets an injector contributor whose
+  default route is `route_only` into its own listener, so `StartPlayback` and
+  INJECT frames on a conferenced leg behave as they did before the leg joined —
+  only that participant hears them, and the mixed track does not. Naming
+  another member is the whisper; naming everybody is the barge. See
+  *conference.rs — monitor, whisper and barge* below.
 - **Multi-rate conferences are refused by name.** `Conference::accepts`
   requires the joining leg's sample rate, ptime and channel count to equal the
   conference's (set by its first leg) and says so in the error; the encoding may
@@ -1626,12 +1627,89 @@ conference still live, and the last leg out closes it (`conferences_live` back t
 Not done here: cross-pod conferences (a group is one pod's table — a leg
 answered by another pod cannot join it, and an inline leg is not adoptable
 anyway), per-leg resampling, conference recording as one mixed file (P4-4),
-monitor/whisper/barge attachments (P4-3), member mute/deaf/hold verbs (P4-5),
-AGC, and any live drill (P4-6) — no real SIP peer has been in a conference yet.
+member mute/deaf/hold verbs (P4-5), AGC, and any live drill (P4-6) — no real SIP
+peer has been in a conference yet. Monitor, whisper and barge landed as item 38,
+below.
 A conference group name is also **global to the pod**: there is no tenant scope
 on a session the way `accountId` scopes a recording group, so two tenants
 choosing the same group name would share a mix. Prefixing the name is the
 integrator's job until sessions carry a tenant.
+
+### conference.rs — monitor, whisper and barge (item 38, Phase 4, 2026-08-24)
+
+Three conference features, one mechanism: **an attachment names where its
+injected audio lands, and the matrix does the rest**. No new RPC, no new noun.
+
+`session-core/src/mix.rs` is the single parser and the vocabulary:
+`mix_target` = `own` (or empty — private playback, the item-37 default) |
+`<member external id>` (whisper) | `all` (barge), and `mix_monitor` =
+`include` | `exclude`. `MixRoute::from_metadata` is the only place those strings
+are interpreted, `MixRoute::authorize` requires `INJECT`, and both refusals plus
+`mix_monitor` without `mix_target` are typed errors that reach the API as
+`invalid_argument` (`ControlError::MixRoute`). The literal `all` is reserved, so
+a member whose external id is `all` cannot be whispered to by name.
+
+The verbs:
+
+- **Monitor** needed no code. `Attach{GRPC_STREAM|WS_TWILIO, SINK,
+  selector.only="mixed"}` on any member session is it: the conference's full sum
+  is on every member's hub as `Track::Mixed`, and a consumer that selects that
+  one track hears the whole conference, itself included. A monitor is a record,
+  not an ear, so minus-self does not apply to it.
+- **Whisper** is `mix_target=<member>` on an INJECT attachment. The plane
+  resolves nothing: it hands `ConferenceCommand::Route{session, route}` to the
+  mix thread, which resolves the target **by external id, every time it
+  reroutes**. That is what makes churn safe.
+- **Barge** is the same key flipped to `all`, carried on `UpdateAttachment`,
+  which gained `map<string,string> metadata = 6` — merged into the attachment's
+  metadata (named keys overwritten, the rest left alone). Reusing the RPC that
+  already carries pause/resume was the cheapest additive path, and it makes
+  every future metadata-carried verb free. Re-applying an unchanged route is
+  idempotent (and counted), because every pause on a whisperer re-sends it.
+
+**The mixed track hears whispers by default.** `monitor_audible` defaults to
+true for a whisper and a barge and false for private playback, and
+`mix_monitor` overrides it in both directions. The reasoning is that `mixed` is
+the recording feed as much as the monitor feed, and a recording that omits what
+an agent was told mid-call misrepresents the call; a deployment that treats
+supervisor coaching as off-record sets `mix_monitor=exclude`. Implementation is
+one extra cell: `route_only`/`route_to_all` for the destination, then
+`set_gain(injector, monitor, UNITY|MUTED)`.
+
+`reroute_injectors` is now the whole routing decision and runs after **every**
+join, leave and route change (item 37's sharp edge: `join_listener` resets its
+column). Two behaviors fall out of resolving by name each time: a whisper to
+somebody who is not in the conference is **muted, not broadcast** — including
+its monitor cell, so audio nobody heard never reaches the record — and it
+becomes audible the moment that member joins.
+
+Route ownership lives on the leg, not the attachment: `LiveSession.mix_route`
+remembers which attachment moved the leg's injector off private, and
+`close_attachment` puts it back (`revert_injection`). An attach whose transport
+setup then fails reverts the same way. Two INJECT attachments on one leg share
+one injector — last writer wins, documented, not enforced.
+
+Events: `EventKind::MixRouted{target, monitor_audible}` →
+`MediaEvent.mix_routed` (oneof tag 25; the next free payload tag is 26) on the
+attach that declares a route and on every change, so an integrator can audit who
+whispered to whom and whether it was on the record. `mss_ctl mix <attachment-id>
+<own|all|member-id> [include|exclude]` is the lab handle. New metrics:
+`mss_conference_whispers_live`, `mss_conference_route_changes_total`.
+
+Verified in-process over real UDP sockets (5 new tests in `tap_plane.rs`, plus
+`mix.rs` and registry unit tests): a whisperer injecting 8000 in a three-leg
+conference is read at ~8000 by its target, under 300 by the other two **and by
+the leg it was injected on**, and appears on a `mixed`-only hub subscriber;
+`mix_monitor=exclude` keeps the target's ear and empties the mixed track; the
+flip to `all` lands in all three ears; a fourth leg joining mid-whisper leaves
+the route intact; detaching the whisperer restores private playback.
+
+Residuals: `all` includes the injecting leg's own ear (an injector has no
+minus-self link), so a human barging through their own leg hears themselves —
+use a dedicated silent leg until P4-5 decides on a minus-self variant; a whisper
+sourced from a member's **own RTP** (`mix_source=leg`) is not built and belongs
+with P4-5's mute/deaf/hold row/column verbs; and nothing here has faced a real
+SIP peer (P4-6).
 
 ### tap_plane.rs — the control plane's hands in the media world
 

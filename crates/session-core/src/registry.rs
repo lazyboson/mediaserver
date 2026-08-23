@@ -1,6 +1,7 @@
 use crate::capability::{Capabilities, Transport};
 use crate::event::{ConsumerEvent, EventKind, MediaEvent, Observation};
 use crate::ids::{AttachmentId, PlaybackId, SessionId};
+use crate::mix::MixRoute;
 use media_core::{AudioFormat, Track};
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeMap, VecDeque};
@@ -69,6 +70,8 @@ pub enum ControlError {
     IdempotencyConflict(String),
     #[error("session {session} already holds {limit} attachments")]
     TooManyAttachments { session: SessionId, limit: usize },
+    #[error("{0}")]
+    MixRoute(#[from] crate::mix::MixRouteError),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -137,6 +140,7 @@ pub struct AttachmentUpdate {
     pub paused: Option<bool>,
     pub selector: Option<TrackSelector>,
     pub format: Option<AudioFormat>,
+    pub metadata: Option<BTreeMap<String, String>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -413,6 +417,10 @@ impl SessionRegistry {
         if spec.capabilities.is_empty() {
             return Err(ControlError::NoCapabilityDeclared);
         }
+        let route = MixRoute::from_metadata(&spec.metadata)?;
+        if let Some(route) = &route {
+            route.authorize(spec.capabilities)?;
+        }
         let unsupported = spec.capabilities.missing_from(spec.transport.carries());
         if !unsupported.is_empty() {
             return Err(ControlError::TransportCannotCarry {
@@ -468,6 +476,17 @@ impl SessionRegistry {
                 label: spec.label.clone(),
             },
         );
+        if let Some(route) = &route {
+            self.push_event(
+                spec.session,
+                Some(id),
+                spec.authoritative,
+                EventKind::MixRouted {
+                    target: route.target_name().to_string(),
+                    monitor_audible: route.monitor_audible,
+                },
+            );
+        }
         self.remember(
             &spec.idempotency_key,
             spec.fingerprint(),
@@ -508,6 +527,22 @@ impl SessionRegistry {
             .attachments
             .get_mut(&attachment)
             .ok_or(ControlError::UnknownAttachment(attachment))?;
+        let before = MixRoute::from_metadata(&record.metadata)?;
+        let merged = update.metadata.map(|carried| {
+            let mut merged = record.metadata.clone();
+            merged.extend(carried);
+            merged
+        });
+        let after = match &merged {
+            Some(merged) => MixRoute::from_metadata(merged)?,
+            None => before.clone(),
+        };
+        if let Some(route) = &after {
+            route.authorize(record.capabilities)?;
+        }
+        if let Some(merged) = merged {
+            record.metadata = merged;
+        }
         if let Some(paused) = update.paused {
             record.paused = paused;
         }
@@ -516,6 +551,21 @@ impl SessionRegistry {
         }
         if let Some(format) = update.format {
             record.format = format;
+        }
+        let session = record.session;
+        let authoritative = record.authoritative;
+        if after != before {
+            if let Some(route) = after {
+                self.push_event(
+                    session,
+                    Some(attachment),
+                    authoritative,
+                    EventKind::MixRouted {
+                        target: route.target_name().to_string(),
+                        monitor_audible: route.monitor_audible,
+                    },
+                );
+            }
         }
         self.attachment_view(attachment)
     }
@@ -1243,6 +1293,87 @@ mod tests {
     }
 
     #[test]
+    fn a_mix_target_is_audited_when_it_is_declared_and_every_time_it_moves() {
+        let (mut registry, session) = started();
+        let mut whisperer = bridge(session);
+        whisperer.metadata.insert(
+            crate::mix::MIX_TARGET_METADATA_KEY.to_string(),
+            "agent-7".to_string(),
+        );
+        let id = registry.attach(whisperer).unwrap().id;
+        let declared: Vec<EventKind> = registry
+            .drain_events()
+            .into_iter()
+            .map(|event| event.kind)
+            .collect();
+        assert!(
+            declared.contains(&EventKind::MixRouted {
+                target: "agent-7".to_string(),
+                monitor_audible: true,
+            }),
+            "attaching a whisperer says who it whispers to: {declared:?}"
+        );
+
+        let flipped = registry
+            .update_attachment(
+                id,
+                AttachmentUpdate {
+                    metadata: Some(BTreeMap::from([(
+                        crate::mix::MIX_TARGET_METADATA_KEY.to_string(),
+                        crate::mix::MIX_TARGET_EVERYONE.to_string(),
+                    )])),
+                    ..AttachmentUpdate::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            flipped
+                .metadata
+                .get(crate::mix::MIX_TARGET_METADATA_KEY)
+                .map(String::as_str),
+            Some("all"),
+            "an update merges metadata rather than replacing it"
+        );
+        let events = registry.drain_events();
+        assert_eq!(
+            events.last().map(|event| event.kind.clone()),
+            Some(EventKind::MixRouted {
+                target: "all".to_string(),
+                monitor_audible: true,
+            }),
+            "the barge flip is auditable too"
+        );
+
+        registry
+            .update_attachment(
+                id,
+                AttachmentUpdate {
+                    paused: Some(true),
+                    ..AttachmentUpdate::default()
+                },
+            )
+            .unwrap();
+        assert!(
+            registry.drain_events().is_empty(),
+            "an update that leaves the route alone says nothing about it"
+        );
+    }
+
+    #[test]
+    fn a_sink_only_attachment_may_not_name_a_mix_target() {
+        let (mut registry, session) = started();
+        let mut listener = rtt(session);
+        listener.metadata.insert(
+            crate::mix::MIX_TARGET_METADATA_KEY.to_string(),
+            "agent-7".to_string(),
+        );
+        assert!(matches!(
+            registry.attach(listener),
+            Err(ControlError::MixRoute(_))
+        ));
+    }
+
+    #[test]
     fn pausing_an_attachment_is_an_update_rather_than_a_verb_of_its_own() {
         let (mut registry, session) = started();
         let id = registry.attach(rtt(session)).unwrap().id;
@@ -1266,6 +1397,7 @@ mod tests {
                     paused: Some(false),
                     selector: Some(TrackSelector::Only(Track::Customer)),
                     format: Some(AudioFormat::l16_16k_20ms()),
+                    metadata: None,
                 },
             )
             .unwrap();

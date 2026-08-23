@@ -22,7 +22,9 @@ pub fn status_of(error: ControlError) -> Status {
         ControlError::ExternalIdInUse { .. } => Status::already_exists(error.to_string()),
         ControlError::IdempotencyConflict(_) => Status::aborted(error.to_string()),
         ControlError::TooManyAttachments { .. } => Status::resource_exhausted(error.to_string()),
-        ControlError::NoCapabilityDeclared => Status::invalid_argument(error.to_string()),
+        ControlError::NoCapabilityDeclared | ControlError::MixRoute(_) => {
+            Status::invalid_argument(error.to_string())
+        }
     }
 }
 
@@ -285,6 +287,13 @@ fn payload_wire(kind: EventKind) -> proto::media_event::Payload {
             })
         }
         EventKind::AttachmentUp { label } => Payload::AttachmentUp(proto::AttachmentUp { label }),
+        EventKind::MixRouted {
+            target,
+            monitor_audible,
+        } => Payload::MixRouted(proto::MixRouted {
+            mix_target: target,
+            monitor_audible,
+        }),
         EventKind::AttachmentDown { label, reason } => {
             Payload::AttachmentDown(proto::AttachmentDown { label, reason })
         }

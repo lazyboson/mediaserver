@@ -451,6 +451,7 @@ async fn pausing_and_reselecting_an_attachment_is_one_update_call() {
             }),
             format: None,
             idempotency_key: String::new(),
+            metadata: Default::default(),
         }))
         .await
         .unwrap()
@@ -923,6 +924,7 @@ async fn pausing_an_attachment_reaches_the_media_plane() {
                 selector: None,
                 format: None,
                 idempotency_key: String::new(),
+                metadata: Default::default(),
             }))
             .await
             .unwrap();
@@ -964,6 +966,7 @@ async fn an_update_the_media_plane_refuses_leaves_the_registry_as_it_was() {
             selector: None,
             format: None,
             idempotency_key: String::new(),
+            metadata: Default::default(),
         }))
         .await
         .unwrap_err();

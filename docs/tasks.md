@@ -15,7 +15,7 @@ Status as of **2026-08-23**.
 | **M3 — fan-out hub** | per-session pub/sub, N consumers, WS-Twilio adapter, pause/resume/send_text parity | ✅ done |
 | **M4 — control plane** | `MediaControl` gRPC, session state machine, Kafka events, Redis registry, tenant-flag pilot | 🔶 **code complete** — pilot gates: translator merge (external), and the consumer half of the barge-in number — **every MSS-owned hop is measured (item 5, 2026-08-23: cut-through p95 4.8 ms from a real consumer `SpeechReport`)**, the D19 ingress gap it found being fixed in item 28. The gRPC lab proof (item 10) and the **live pod-kill drill (item 11, gap 14.41 s)** are both **done 2026-08-22**; the D14 orphan subscription the drill found is **fixed (item 25, 2026-08-23)**, fake- and Redis-verified rather than re-measured live |
 | **M5 — recording (Phase 2)** | per-leg taps → stereo segmenter → S3, identity + callback contract, dual-recording | 🔶 **code complete (2026-08-22)** — a live tapped call recorded end to end to a real MinIO, callbacks read off `mss.events` (2026-08-22, item 10's drill); **recording groups** — N sessions recorded as one recording, one mono object per participant, time-aligned on the group's open instant since item 29 — landed 2026-08-23 (item 21); FS byte-parity **measured against a real FS recording** 2026-08-23 (item 31): container/layout/rms exact, a re-aligned 2 s window agrees 1.0000 at mean diff 0.6/32768; owed: a two-party production-FS comparison and a human listen |
-| M6+ | Phases 3–4 (interactive media, full media plane) | 🔶 **Phase 3 code complete and lab-verified (items 32–35, 2026-08-23)** — an inline leg answers an SDP offer, is spoken to over a continuous inject stream, and barges in **p50 12.2 ms / p95 20.4 ms** measured against a real RTP peer. **Phase 4 in progress:** the N-way mix matrix (item 36) and **conferences of inline legs** (item 37, 2026-08-24 — one clock per conference, each leg hears everybody but itself, mixed track on the hub) are code complete and verified over in-process sockets; no real SIP peer has been in a conference yet (P4-6) |
+| M6+ | Phases 3–4 (interactive media, full media plane) | 🔶 **Phase 3 code complete and lab-verified (items 32–35, 2026-08-23)** — an inline leg answers an SDP offer, is spoken to over a continuous inject stream, and barges in **p50 12.2 ms / p95 20.4 ms** measured against a real RTP peer. **Phase 4 in progress:** the N-way mix matrix (item 36) and **conferences of inline legs** (item 37, 2026-08-24 — one clock per conference, each leg hears everybody but itself, mixed track on the hub) and **monitor / whisper / barge as metadata-named matrix cells** (item 38, 2026-08-24 — `only=mixed` is the monitor, `mix_target=<member>|all` on an INJECT attachment is the whisper and the barge flip) are code complete and verified over in-process sockets; no real SIP peer has been in a conference yet (P4-6) |
 
 ### What landed, concretely
 
@@ -2007,6 +2007,78 @@ an inline leg is not adoptable anyway), have no tenant scope on the group name
 carry a tenant), and there is no AGC. Conference recording as one mixed file is
 P4-4; monitor/whisper/barge attachments are P4-3; member mute/deaf/hold verbs
 are P4-5.
+
+### 38. Monitor, whisper and barge (Phase 4) — ✅ DONE (2026-08-24)
+
+Three conference features, **no new RPC**: they are matrix cells named by
+attachment metadata, exactly as item 36 predicted.
+
+**Monitor** is the verb that already existed and now has a name:
+`Attach{transport=GRPC_STREAM|WS_TWILIO, capabilities=SINK,
+selector.only="mixed"}` on **any** member session. The conference's full sum is
+published to every member's hub as `mixed`, so a consumer that selects that one
+track hears the whole conference (itself included — a monitor is a record, not
+an ear) and injects nothing. Verified: a `mixed`-only subscriber on a
+three-tone conference reads **7000** (1000+2000+4000), and the plane accepts a
+`only=mixed` SINK attachment on a conference leg. No code was needed for it.
+
+**Whisper** is `mix_target=<member-external-id>` in the metadata of an
+**INJECT** attachment on a member session: everything that attachment injects
+is routed into that member's ear **only**. The supervisor case is a supervisor
+leg in the conference plus an INJECT attachment on it naming the agent.
+`mix_target` without INJECT is refused by name (`invalid_argument`), and so is
+`mix_target` on a leg that is in no conference.
+
+**Barge** is the same key flipped to `mix_target=all`, carried by
+`UpdateAttachment` — which gained `map<string,string> metadata = 6` (additive;
+merge semantics: named keys are overwritten, the rest untouched). That was the
+cheapest additive path: pause/resume already lives on `UpdateAttachment`, so
+every metadata-carried verb can ride it without a new RPC. `mss_ctl mix
+<attachment-id> <own|all|member-id> [include|exclude]` drives it from the lab.
+
+**Decision — the mixed track hears whispers, and a flag can silence it.**
+Default: a whisper and a barge are audible on `mixed`, private playback
+(`mix_target=own`, the item-37 behavior) is not. The mixed track is the monitor
+**and** the recording feed, and a recording that omits what the agent was told
+mid-call is a recording that lies about the call; audit beats privacy here
+because a whisper is a human speaking into a live conversation. Deployments that
+disagree set `mix_monitor=exclude` (and `include` forces the other direction on
+private playback). Both are documented reserved keys in
+`session-core/src/mix.rs`, parsed in exactly one place.
+
+Events: `MediaEvent.mix_routed` (oneof tag 25, `MixRouted{mix_target,
+monitor_audible}`) is published on the attach that declares a route and on every
+change, so `mss.events` can answer *who whispered to whom, and was it on the
+record*. A pause/resume that leaves the route alone says nothing.
+
+Membership churn was the sharp edge (item 37's warning): `join_listener` resets
+its column, so `conference.rs::reroute_injectors` re-resolves **every** route by
+name after every join and leave. Two consequences fell out of that and are now
+tested: a whisper to a member who has not joined yet is **muted, not
+broadcast**, and it starts being heard the moment that member joins.
+
+New metrics: `mss_conference_whispers_live` (gauge) and
+`mss_conference_route_changes_total`.
+
+Verified in-process over real UDP sockets (5 new tests in `tap_plane.rs`, 3 in
+`session-core`, 6 in `mix.rs`): whisperer injecting 8000 into a three-leg
+conference — target reads **~8000**, the other two and the injecting leg itself
+read **< 300**, and the `mixed` track carries it; `mix_monitor=exclude` keeps
+the target's ear and empties the mixed track; the flip to `all` puts it in all
+three ears; a fourth leg joining mid-whisper does not disturb the route; and
+detaching the whisperer puts the leg's injected audio back to private playback.
+
+**Residuals.** (a) `all` is audible to the injecting leg too (the injector has
+no minus-self link) — a human barging through their own leg hears themselves;
+inject on a dedicated silent leg until P4-5 decides whether to add a
+minus-self variant. (b) The route belongs to the **leg**, not the attachment
+(one injector per leg): two INJECT attachments on one leg share it, last
+writer wins, and detaching the owner reverts it to private. (c) A whisper
+sourced from a member's **own RTP** rather than an injected stream (the
+`mix_source=leg` shape) is not built — that is the same row/column verb family
+as P4-5's mute/deaf/hold and belongs there. (d) No real SIP peer has whispered
+yet: P4-6. (e) The reference deployment's monitor/whisper/barge RPC mapping is
+**not** here on purpose — it goes in P4-5's adapter parity table.
 
 ## Open defects and soft spots
 
