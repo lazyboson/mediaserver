@@ -260,6 +260,33 @@ Requirements for the Rust one: hold ptime-derived pacing within ±1 ms over
 hours, N calls per process, injectable DTMF, and its own pacing-error
 histogram so it can prove it was not the bottleneck.
 
+## The WebRTC codec surface
+
+`lab/opus_call_driver.py` is the only Opus generator this project had until
+2026-08-23, and it is a **deliberately easy** Opus: CBR 24 kbit/s, DTX off,
+inband FEC off, no RED, exactly one 20 ms frame per packet, mono, a
+phase-continuous tone. A real browser defaults to almost none of that. What
+Chrome actually offers is **48 kHz Opus on a dynamic PT (111 here) with
+`minptime=10;useinbandfec=1`**, VBR by default, `usedtx=1` when asked, RFC 2198
+redundancy on **PT 63** (RED), stereo when the track is, and a ptime that can
+be pushed to 120 ms — which means several frames per packet, packets that stop
+arriving during silence, and payloads whose length varies frame to frame.
+
+So "MSS decodes Opus" is two claims, and only the easy one is proven. The
+harder one is what `lab/webrtc_agent_drill.sh`'s `PROFILE` knobs exist for —
+`control` (PCMU, nothing transcodes, run it first), `opus`, `dtx`, `red`,
+`ptime60`, `cbr`, `stereo`, `dsp` (Chrome's own AEC/NS/AGC left on) — one
+variable per run, in that order. Each names one property of the surface above
+so a failure points at a cause instead of at "Opus".
+
+Only `control` has been run (see [lab.md](lab.md)): the lab FreeSWITCH image
+has no `mod_opus`, so FS cannot bridge an Opus call, and the Opus profiles need
+an rtpengine codec-mask arrangement that keeps FS out of the codec decision.
+Until that exists, treat browser Opus as **untested** rather than supported,
+and treat `red` and `ptime60` as the two most likely to find something: RED
+changes the payload's framing, and a 60 ms ptime changes how many frames the
+decoder's `Carry` path has to absorb per packet.
+
 ## The benchmark rig
 
 ### Why WSL2 cannot produce this number

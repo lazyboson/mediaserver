@@ -1497,3 +1497,113 @@ and a 110 s call **tapped and unsubscribed mid-call** also held 50.00/s in both
 ears. So an MSS subscribe/unsubscribe does not damage the tapped call. The long
 run overlapped other agents' lab traffic and it has not reproduced; if it ever
 does, the discriminating experiment is a long call with nothing else on the box.
+
+## webrtc_agent_drill.sh — a real browser as the agent leg, on its own rtpengine node (2026-08-23)
+
+Every drill above anchors both legs of a call in **one** rtpengine, and every
+Opus packet MSS had decoded up to this point came from `lab/opus_call_driver.py`.
+This is rung 2: **two legs, two rtpengine nodes, and a real browser** on the
+agent side, so that "MSS taps each leg where that leg is anchored" and "MSS
+decodes what a browser actually sends" stop being assumptions.
+
+```
+MicroSIP (PCMA)  -> opensips      -> rtpengine RE1 (172.31.99.10) -> FreeSWITCH
+Chrome (WebRTC)  <- opensips-agent <- rtpengine RE2 (172.31.99.11) <- FreeSWITCH
+                              both legs meet in one FS bridge (ext 4001)
+MSS taps each leg at its own node: two sessions, one recording group
+```
+
+It is a **bridge, not a conference** — the lab FreeSWITCH image has no
+`mod_conference` (and no `mod_opus`, and no `mod_loopback`), so `4001` sets
+`absolute_codec_string` and bridges to `sofia/internal/agent@172.31.99.71`,
+which is the agent proxy. Naming the codec on the inbound leg fixes it on the
+outbound leg too, which is what makes a nothing-transcodes control run possible.
+
+```sh
+export DOCKER_API_VERSION=1.43 ELEVENLABS_API_KEY=x DEEPGRAM_API_KEY=x
+docker compose -f lab/docker-compose.microsip.yml \
+               -f lab/docker-compose.webrtc.yml up -d
+./lab/webrtc_agent_drill.sh                      # PROFILE=opus AGENT=headless
+PROFILE=control ./lab/webrtc_agent_drill.sh      # PCMU end to end
+PROFILE=opus AGENT=browser ./lab/webrtc_agent_drill.sh
+./lab/webrtc_record_live.sh                      # you place the call; it taps
+```
+
+The overlay adds five containers: `rtpengine-agent` (RE2, ports 30100-30199),
+`opensips-agent` (ws on 5062 for the browser, UDP 5060 so FS can reach it),
+`webrtc-page` serving `lab/webrtc/` with a vendored JsSIP 3.10.10, a headless
+`chrome-agent` that dials on its own with a wav file for a microphone, and a
+`call-watcher-agent` that reports RE2's view of the call. `AGENT=browser` prints
+a URL instead, for the run you want to hear yourself.
+`AGENT_ADVERTISE_IP` (default `127.0.0.1`) is what RE2 advertises to the
+browser: leave it alone for a browser on this box, set it to the box's LAN
+address for a browser on another machine — and expect a corporate endpoint
+firewall to be the reason the LAN variant goes silent (ESET, here).
+
+### The verified run (stamp 1787492636, PROFILE=control)
+
+Two MSS sessions on two rtpengine nodes, both settled **Pcma / 8 kHz /
+`transcoding: false`** — the control case, nothing transcoding anywhere. The
+browser sent a 440 Hz tone (Goertzel purity **0.707**, i.e. a pure sine) while a
+human spoke into MicroSIP (rms 200-3000, irregular). Across both sessions:
+**zero `jitter_lost`, zero `recv_errors`, zero `unknown_ssrc`**. Seven uploads,
+zero failures. The artifacts, read back with `lab/webrtc/wav_summary.py`:
+
+| object | shape | rms | peak |
+| --- | --- | --- | --- |
+| `acct-webrtc/rec-1787492636.wav` | 2 ch 8 kHz 90.06 s | ch0 3448 / ch1 690 | 11520 / 16128 |
+| `acct-webrtc/grp-1787492636/customer.wav` | 1 ch 8 kHz 90.26 s | 3445 | 11520 |
+| `acct-webrtc/grp-1787492636/agent.agent.wav` | 1 ch 8 kHz 90.32 s | 4609 | 11520 |
+| `acct-webrtc/grp-1787492636/agent.customer.wav` | 1 ch 8 kHz 90.32 s | 689 | 16128 |
+
+The peaks are the check that matters: **11520 and 16128 appear on both nodes**.
+The stereo file is the customer leg tapped at RE1 with both directions in one
+object; the group members are the same two directions arriving through a
+*separate* subscription to RE2 — so the cross-node recording group really did
+assemble one recording out of two rtpengine calls, one object per participant
+track. (The agent member was attached with track `all`, which is why it wrote
+two objects rather than one.)
+
+Two soft spots this run exposed are recorded as defects in
+[tasks.md](tasks.md): the leg labels **inverted** when `from_tags` was left
+unspecified (`-`), because rtpengine's `query` answered with FreeSWITCH's tag
+first (**D17** — speaker attribution is only trustworthy when the caller tag is
+passed explicitly), and the group's member files are **not time-aligned**: each
+anchors on its own first frame, so the three lengths above differ by up to
+0.26 s and a late joiner's file would simply start at its join moment (**D18**).
+The browser leg also **outlived the hung-up call by ~12 s** — the tone ran to
+second 29 against the customer leg's 17 — which is billable media tail after
+hangup and deserves an eye in a pilot.
+
+### Five vendor findings, each of which cost a run
+
+- **FreeSWITCH does not merge two sibling `<context name="default">` blocks.**
+  A lab dialplan dropped in beside the image's own was visible in
+  `xml_locate` and still answered `NO_ROUTE_DESTINATION`. The fix is to merge
+  the extensions **into** the image's `default.xml` — which is why
+  `lab/freeswitch/dialplan-default.xml` is a merged artifact and
+  `dialplan-lab.xml` is kept only as the standalone original.
+- **XML comments cannot contain `--`.** An en-dash-style comment silently
+  broke the whole dialplan parse.
+- **JsSIP registers an RFC 7118 Contact** —
+  `sip:x@y.invalid;transport=ws` — and OpenSIPS 3.4.18's `lookup()` plus
+  `fix_nated_register()` still tries to **DNS-resolve** it (`tm` reports
+  "failure to add branches"). The fix in `opensips-agent.cfg` is to remember
+  `$si:$sp` at REGISTER in a `cfgutils` shared variable (declared with
+  `shvset`) and set `$du` from it at call time.
+- **Chrome refused rtpengine's offer** until `max-bundle` was dropped
+  page-side and `generate-mid` was added to `rtpengine_offer`.
+- **An answer munged to `[opus, telephone-event]` against a no-Opus offer
+  leaves DTMF-only SDP**, and FreeSWITCH answers `INCOMPATIBLE_DESTINATION`.
+  The page now refuses to munge unless the chosen codec is actually present in
+  the offer.
+
+### What this does not prove
+
+The Opus profiles (`opus`, `dtx`, `red`, `ptime60`, `cbr`, `stereo`, `dsp`)
+**have not been run**: this FreeSWITCH image has no `mod_opus`, so FS cannot sit
+in the middle of an Opus call. Running them needs an rtpengine codec-mask
+arrangement that keeps FS out of the codec decision, which is a future item.
+Until then MSS has decoded browser **G.711**, not browser **Opus** — and the
+gap between browser Opus and `opus_call_driver.py` is spelled out in
+[testing.md](testing.md).
