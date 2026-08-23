@@ -1,0 +1,77 @@
+<!--
+  The two-node lab call: a customer leg through OpenSIPS and RE1, an agent leg
+  that FreeSWITCH originates through opensips-agent and RE2 to a registered
+  WebRTC browser. Mounted as dialplan/lab.xml because this image's own
+  dialplan/default.xml declares <context name="default"> inline and does not
+  include dialplan/default/*.xml – a file dropped in that subdirectory is
+  never loaded. Contexts of the same name merge across files, so these
+  extensions land beside the image's 9000/9196 without touching them.
+
+  It bridges rather than conferences because this FreeSWITCH build has no
+  mod_conference (checked, not assumed: `fs_cli -x "show application"` lists
+  bridge and echo, not conference). That turns out to be the better shape:
+  FreeSWITCH dialling a registered agent is what production does, and a bridge
+  keeps each direction one participant's audio instead of a mix, so every leg's
+  tap stays cleanly separated no matter how many parties are involved.
+
+  It also has no mod_opus – G.711, L16, Speex and video only. That mirrors the
+  reference deployment, where WebRTC customer legs are Opus on the endpoint side
+  and rtpengine transcodes them (tasks.md item 16). So the codec here is G.711
+  end to end, and Opus on the browser side is a separate run driven by
+  rtpengine's codec-mask flags, not by anything in this file.
+-->
+<include>
+  <context name="default">
+
+    <!-- 4200: echo. The first thing a new endpoint should dial, browser or
+         softphone: if you cannot hear yourself here, the problem is SIP or RTP
+         reachability and has nothing to do with MSS. -->
+    <extension name="lab_echo">
+      <condition field="destination_number" expression="^4200$">
+        <action application="answer"/>
+        <action application="echo"/>
+      </condition>
+    </extension>
+
+    <!-- 4001: the drill. FreeSWITCH originates the agent leg toward
+         opensips-agent, which looks the browser up in its location table and
+         delivers the INVITE over the websocket it registered on. Two calls,
+         two rtpengine nodes, one bridge.
+
+         absolute_codec_string is inherited by the outbound leg, so naming
+         G.711 here fixes the codec on both legs at once and nothing
+         transcodes anywhere – the control case. -->
+    <extension name="lab_agent_g711">
+      <condition field="destination_number" expression="^4001$">
+        <action application="set" data="absolute_codec_string=PCMA,PCMU"/>
+        <action application="set" data="hangup_after_bridge=true"/>
+        <action application="set" data="continue_on_fail=false"/>
+        <action application="log" data="INFO lab: bridging to the webrtc agent via opensips-agent"/>
+        <action application="bridge" data="sofia/internal/agent@172.31.99.71"/>
+      </condition>
+    </extension>
+
+    <!-- 4002: same, PCMU only, for when a leg's µ-law/A-law choice needs to be
+         removed as a variable. -->
+    <extension name="lab_agent_pcmu">
+      <condition field="destination_number" expression="^4002$">
+        <action application="set" data="absolute_codec_string=PCMU"/>
+        <action application="set" data="hangup_after_bridge=true"/>
+        <action application="set" data="continue_on_fail=false"/>
+        <action application="bridge" data="sofia/internal/agent@172.31.99.71"/>
+      </condition>
+    </extension>
+
+    <!-- 4003: no codec forced, so the profile's own preferences negotiate. The
+         extension to dial once rtpengine is masking Opus toward FreeSWITCH and
+         the question becomes what the browser side actually settled on. -->
+    <extension name="lab_agent_negotiate">
+      <condition field="destination_number" expression="^4003$">
+        <action application="set" data="hangup_after_bridge=true"/>
+        <action application="set" data="continue_on_fail=false"/>
+        <action application="bridge" data="sofia/internal/agent@172.31.99.71"/>
+      </condition>
+    </extension>
+
+  </context>
+</include>

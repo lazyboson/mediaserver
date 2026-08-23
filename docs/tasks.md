@@ -1156,6 +1156,57 @@ probe never repeats, so an rtpengine restarted under a running daemon keeps its
 first-contact report; and `controlstatistics.proxies` and the per-interface
 blocks are read by the shell probe but not modelled in Rust.
 
+### 24. WebRTC agent leg on a second rtpengine node — ✅ DONE (2026-08-23)
+**Why this exists:** every drill before it anchored both legs of a call in one
+rtpengine and fed MSS synthetic Opus. A real deployment anchors the two legs of
+a call in **different** rtpengine nodes — one near the carrier interconnect, one
+near the agents — and the agent side is increasingly a browser. Both halves of
+that were untested.
+
+**What shipped** (`lab/`, no crate changes — the daemon needed none):
+- **`docker-compose.webrtc.yml`**, an overlay on the MicroSIP compose: a second
+  rtpengine (RE2, `172.31.99.11`, ports 30100-30199), `opensips-agent` (ws 5062
+  for the browser, UDP 5060 for FreeSWITCH), a page server for `lab/webrtc/`, a
+  headless Chrome that dials by itself with a wav file for a microphone, and a
+  watcher that reports RE2's view of the call. `AGENT_ADVERTISE_IP` switches
+  between a browser on this box and one on the LAN.
+- **`lab/webrtc/`** — `index.html` + `agent.js` (JsSIP 3.10.10, vendored;
+  SDP munging per profile, guarded so it can never produce a codec the offer
+  did not contain), `make_agent_audio.py` (the microphone fixture: a 440 Hz
+  tone plus optional speech) and `wav_summary.py` (channels, duration, rms,
+  peak, silence runs, Goertzel purity at 440/1000 Hz).
+- **`lab/opensips/opensips-agent.cfg`** — a WebSocket-facing proxy that
+  registers the browser and routes FreeSWITCH's INVITE back over the socket it
+  registered on, with the RFC 7118 `.invalid` Contact problem solved by
+  remembering `$si:$sp` at REGISTER and setting `$du`.
+- **`lab/freeswitch/dialplan-default.xml`** — the image's own default context
+  with the lab extensions **merged in** (4001 G.711 bridge, 4002 PCMU-only),
+  because FreeSWITCH does not merge sibling `<context name="default">` blocks.
+  `dialplan-lab.xml` is kept as the standalone original.
+- **`lab/webrtc_agent_drill.sh`** — one profile per run
+  (`control`/`opus`/`dtx`/`red`/`ptime60`/`cbr`/`stereo`/`dsp`),
+  `AGENT=headless` by default so no human is needed, `AGENT=browser` when you
+  want to hear it. **`lab/webrtc_record_live.sh`** is the manual companion: you
+  place the call, it discovers both call-ids, taps both legs and records them.
+
+**Verified run (stamp 1787492636, `PROFILE=control`).** Two MSS sessions on two
+rtpengine nodes, both settled Pcma/8 kHz/`transcoding: false`; browser tone
+Goertzel purity 0.707 against a human speaking on MicroSIP; **zero
+`jitter_lost`, zero `recv_errors`, zero `unknown_ssrc`**; a stereo recording of
+the customer leg plus a **cross-node recording group** (one object per
+participant track, peaks 11520/16128 matching across the two nodes), seven
+uploads and zero failures to MinIO. Numbers, artifacts and the five vendor
+findings that each cost a run are in [lab.md](lab.md).
+
+**Left open:** the Opus profiles have **not** been run — the lab FreeSWITCH
+image has no `mod_opus`, so FS cannot bridge an Opus call, and the profiles need
+an rtpengine codec-mask arrangement that keeps FS out of the codec decision
+(future item; the surface they cover is described in
+[testing.md](testing.md#the-webrtc-codec-surface)). So MSS has decoded browser
+**G.711**, not browser **Opus**. Two defects came out of the run (D17, D18
+below), and the browser leg **outlived the hung-up call by ~12 s** — billable
+media tail after hangup, worth an eye in a pilot.
+
 ## Open defects and soft spots
 
 | # | Item | Where | Severity |
@@ -1176,6 +1227,8 @@ blocks are read by the shell probe but not modelled in Rust.
 | D14 | **A dead pod's rtpengine subscription is never torn down.** The adopter re-subscribes but nothing cancels the old tap: `PersistedSession` does not carry the subscription's `to-tag`, and only the pod that created it holds one. Measured in the item-11 drill from rtpengine's teardown block: **14,743 packets / 2.5 MB copied to a pod that had been dead for 110 s**, four ports held for the rest of the call — i.e. a pod death permanently doubles that call's cost on the rtpengine host, which is exactly the capacity number still open with the platform team. Fix shape: persist the to-tag, have the adopter `unsubscribe` it before subscribing, and decide what an adopter should do when the previous owner is partitioned rather than dead (`mss_registry_lost_total` is the signal) | `session_store.rs`, `registry_keeper.rs`, `tap_plane.rs` | medium — every pod restart during a call leaks one tap |
 | D16 | **A recording group is one pod's memory.** `TapPlane` holds the group, so every member of a conference recording must attach to the same pod: there is no placement that guarantees it (D8), a member whose session is adopted elsewhere is **refused** rather than restored (`grouped_not_adopted`, so the participant's file simply ends at the pod that died — the D9 shape per participant), and a group name reused on a second pod silently produces a second half-recording under the same prefix. Fix shape: schedule a group's sessions onto one pod, or move the group into shared storage so any pod can serve a member | `tap_plane.rs`, `registry_keeper.rs` | medium once a tenant records conferences across pods |
 | D13 | `StreamStart` (and the Twilio `start` frame's `tracks`) advertises `["customer","agent"]` for `TrackSelector::All`, but a silent `mixed` track is delivered too, at the full frame rate: a consumer must tolerate an unannounced track and pays 50% extra bandwidth for silence. Fixing it means either naming `mixed` in the start frame or not carrying it under `All` — the latter touches the frozen Twilio surface | `stream.rs`, `tap_plane.rs`, `hub.rs` | low for correctness, medium for cost |
+| D17 | **Leg labels invert when the caller's from-tag is not given.** With `from_tags` unspecified (`-`), `TapPlane` labels the two legs in the order rtpengine's `query` returns them, and in the two-node drill that put **FreeSWITCH's** tag first — so `customer` and `agent` were swapped in the recording and in the `tracks` a consumer sees. Speaker attribution is only trustworthy when the caller's from-tag is passed explicitly. Fix shape: refuse to name tracks by direction when no from-tag was supplied (label them `leg_a`/`leg_b`, or resolve the caller from the SIP call-id), rather than guessing an order | `tap_plane.rs` | medium — an ASR or a QA review reads the wrong speaker |
+| D18 | **Recording-group members are not time-aligned.** Each member's file anchors on **its own first frame** (`recorder.rs` takes the offset from the per-member anchor), so a participant that joins late produces a file that starts at its join moment with no leading pad, and two members of the same group differ in length — 90.32 s vs 90.26 s in the drill above, with nothing to say where in the first file the second one begins. Reassembling a conference from the participant objects therefore needs the event timeline as well as the audio. Fix: record the group's open instant and pad each member's first segment with silence from that anchor | `recorder.rs`, `tap_plane.rs` | medium once anyone reassembles a multi-party recording |
 
 ## Waiting on other people (M2 close-out)
 
