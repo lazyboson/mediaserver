@@ -37,6 +37,18 @@ pub enum PlaybackSource {
 #[error("{0}")]
 pub struct MediaPlaneError(pub String);
 
+pub trait InlineEgressSink: Send + Sync + 'static {
+    fn egress_format(&self) -> media_core::AudioFormat;
+
+    fn push_pcm(&self, pcm: Vec<i16>) -> bool;
+
+    fn flush(&self);
+
+    fn pushed_watermark(&self) -> u64;
+
+    fn drained_watermark(&self) -> u64;
+}
+
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct OpenedSession {
     pub sdp_answer: Option<String>,
@@ -109,6 +121,11 @@ pub trait MediaPlane: Send + Sync + 'static {
         playback: PlaybackId,
         target_tag: Option<String>,
     ) -> Result<(), MediaPlaneError>;
+
+    fn inline_egress_sink(&self, session: SessionId) -> Option<Arc<dyn InlineEgressSink>> {
+        let _ = session;
+        None
+    }
 
     async fn open_stream(
         &self,
@@ -204,6 +221,10 @@ impl SessionController {
 
     pub fn authorize_inject(&self, attachment: AttachmentId) -> Result<(), Status> {
         self.lock().authorize_inject(attachment).map_err(status_of)
+    }
+
+    pub fn inline_egress_sink(&self, session: SessionId) -> Option<Arc<dyn InlineEgressSink>> {
+        self.media.as_ref()?.inline_egress_sink(session)
     }
 
     pub fn record_report(

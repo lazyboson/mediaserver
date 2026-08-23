@@ -20,7 +20,8 @@ use crate::tap_spike::{
     MAX_SSRC_TRACKS,
 };
 use control_api::{
-    MediaPlane, MediaPlaneError, ObservationSink, OpenedSession, PlaybackSource, StreamFrame,
+    InlineEgressSink, MediaPlane, MediaPlaneError, ObservationSink, OpenedSession, PlaybackSource,
+    StreamFrame,
 };
 use media_core::pipeline::PipelineConfig;
 use media_core::{AudioFormat, ConsumerEncoder, Encoding, Track};
@@ -29,8 +30,8 @@ use rtpengine_ng::{
     SubscriptionAnswer, SubscriptionOffer,
 };
 use session_core::{
-    AttachmentId, AttachmentView, Observation, SessionId, SessionKind, SessionView, TrackSelector,
-    Transport,
+    AttachmentId, AttachmentView, Capabilities, Observation, SessionId, SessionKind, SessionView,
+    TrackSelector, Transport,
 };
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr, UdpSocket};
@@ -544,6 +545,11 @@ impl TapPlane {
                 .iter()
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect(),
+            egress: if view.capabilities.contains(Capabilities::INJECT) {
+                self.inline_egress(view.session)
+            } else {
+                None
+            },
         };
 
         let (text, inbound) = mpsc::channel(TEXT_QUEUE_DEPTH);
@@ -1462,6 +1468,11 @@ impl TapPlane {
 
 #[control_api::async_trait]
 impl MediaPlane for TapPlane {
+    fn inline_egress_sink(&self, session: SessionId) -> Option<Arc<dyn InlineEgressSink>> {
+        self.inline_egress(session)
+            .map(|handle| Arc::new(handle) as Arc<dyn InlineEgressSink>)
+    }
+
     async fn open_session(&self, view: SessionView) -> Result<OpenedSession, MediaPlaneError> {
         match view.kind {
             SessionKind::Tap => self.open_tap_session(view).await,

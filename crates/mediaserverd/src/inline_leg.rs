@@ -16,6 +16,8 @@ const MAX_CHUNKS_PER_TICK: usize = 4;
 #[derive(Default)]
 pub struct InlineEgressShared {
     pub chunks_queued: AtomicU64,
+    pub pushed_samples: AtomicU64,
+    pub drained_samples: AtomicU64,
     pub chunks_refused: AtomicU64,
     pub clears: AtomicU64,
     pub cleared_samples: AtomicU64,
@@ -30,6 +32,8 @@ pub struct InlineEgressShared {
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct InlineEgressTotals {
     pub chunks_queued: u64,
+    pub pushed_samples: u64,
+    pub drained_samples: u64,
     pub chunks_refused: u64,
     pub clears: u64,
     pub cleared_samples: u64,
@@ -45,6 +49,8 @@ impl InlineEgressTotals {
     pub fn add_shared(&mut self, shared: &InlineEgressShared) {
         let read = |value: &AtomicU64| value.load(Ordering::Relaxed);
         self.chunks_queued += read(&shared.chunks_queued);
+        self.pushed_samples += read(&shared.pushed_samples);
+        self.drained_samples += read(&shared.drained_samples);
         self.chunks_refused += read(&shared.chunks_refused);
         self.clears += read(&shared.clears);
         self.cleared_samples += read(&shared.cleared_samples);
@@ -59,16 +65,25 @@ impl InlineEgressTotals {
 
 #[derive(Clone)]
 pub struct InlineEgressHandle {
+    format: AudioFormat,
     queue: Arc<ArrayQueue<Vec<i16>>>,
     flush: Arc<AtomicBool>,
     shared: Arc<InlineEgressShared>,
 }
 
 impl InlineEgressHandle {
+    pub fn format(&self) -> AudioFormat {
+        self.format
+    }
+
     pub fn push(&self, pcm: Vec<i16>) -> bool {
+        let samples = pcm.len() as u64;
         match self.queue.push(pcm) {
             Ok(()) => {
                 self.shared.chunks_queued.fetch_add(1, Ordering::Relaxed);
+                self.shared
+                    .pushed_samples
+                    .fetch_add(samples, Ordering::Relaxed);
                 true
             }
             Err(_) => {
@@ -82,12 +97,42 @@ impl InlineEgressHandle {
         self.flush.store(true, Ordering::Relaxed);
     }
 
+    pub fn watermark(&self) -> u64 {
+        self.shared.pushed_samples.load(Ordering::Relaxed)
+    }
+
+    pub fn drained_samples(&self) -> u64 {
+        self.shared.drained_samples.load(Ordering::Relaxed)
+    }
+
     pub fn free_chunks(&self) -> usize {
         self.queue.capacity().saturating_sub(self.queue.len())
     }
 
     pub fn shared(&self) -> Arc<InlineEgressShared> {
         Arc::clone(&self.shared)
+    }
+}
+
+impl control_api::InlineEgressSink for InlineEgressHandle {
+    fn egress_format(&self) -> AudioFormat {
+        self.format
+    }
+
+    fn push_pcm(&self, pcm: Vec<i16>) -> bool {
+        self.push(pcm)
+    }
+
+    fn flush(&self) {
+        self.clear()
+    }
+
+    fn pushed_watermark(&self) -> u64 {
+        self.watermark()
+    }
+
+    fn drained_watermark(&self) -> u64 {
+        self.drained_samples()
     }
 }
 
@@ -100,6 +145,7 @@ pub struct InlineEgress {
     flush: Arc<AtomicBool>,
     shared: Arc<InlineEgressShared>,
     epoch: Instant,
+    discarded_from_queue: u64,
 }
 
 impl InlineEgress {
@@ -125,6 +171,7 @@ impl InlineEgress {
         let flush = Arc::new(AtomicBool::new(false));
         let shared = Arc::new(InlineEgressShared::default());
         let handle = InlineEgressHandle {
+            format,
             queue: Arc::clone(&queue),
             flush: Arc::clone(&flush),
             shared: Arc::clone(&shared),
@@ -139,6 +186,7 @@ impl InlineEgress {
                 flush,
                 shared,
                 epoch,
+                discarded_from_queue: 0,
             },
             handle,
         ))
@@ -149,6 +197,7 @@ impl InlineEgress {
             let mut cleared = 0u64;
             while let Some(pending) = self.queue.pop() {
                 cleared += pending.len() as u64;
+                self.discarded_from_queue += pending.len() as u64;
             }
             cleared += self.pacer.clear() as u64;
             self.shared.clears.fetch_add(1, Ordering::Relaxed);
@@ -189,6 +238,11 @@ impl InlineEgress {
     }
 
     fn publish(&self, stats: PacerStats) {
+        let drained =
+            self.discarded_from_queue + stats.pushed_samples - self.pacer.queued_samples() as u64;
+        self.shared
+            .drained_samples
+            .store(drained, Ordering::Relaxed);
         self.shared
             .silence_frames
             .store(stats.silence_frames, Ordering::Relaxed);

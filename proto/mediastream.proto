@@ -29,6 +29,11 @@ message ServerToConsumer {
     DtmfFrame dtmf = 3;
     TextFrame text = 4;
     StreamStop stop = 5;
+    // Sent back only for an INLINE session, where an inject stream feeds the
+    // leg's egress queue directly: it says the audio queued before the
+    // consumer's Mark of this name has drained out of that queue. A TAP
+    // session's Mark starts a playback instead and is never acked here.
+    Mark mark = 6;
   }
 }
 

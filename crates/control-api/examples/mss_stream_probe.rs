@@ -277,6 +277,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         texts += 1;
                         println!("probe: text {}", text.json);
                     }
+                    Some(server_to_consumer::Msg::Mark(mark)) => {
+                        println!("probe: the inline egress drained past mark {}", mark.name);
+                    }
                     Some(server_to_consumer::Msg::Stop(stop)) => {
                         ended = format!("the server stopped the stream: {}", stop.reason);
                         break;

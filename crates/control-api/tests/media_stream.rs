@@ -2,10 +2,12 @@ use control_api::proto::media_control_client::MediaControlClient;
 use control_api::proto::media_stream_client::MediaStreamClient;
 use control_api::proto::{self, consumer_to_server, server_to_consumer};
 use control_api::{
-    serve_authenticated_until, AuthPolicy, MediaPlane, MediaPlaneError, OpenedSession,
-    PlaybackSource, SessionController, StreamFrame,
+    serve_authenticated_until, AuthPolicy, InlineEgressSink, MediaPlane, MediaPlaneError,
+    OpenedSession, PlaybackSource, SessionController, StreamFrame,
 };
+use media_core::AudioFormat;
 use session_core::{AttachmentId, PlaybackId, SessionId};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
@@ -13,16 +15,70 @@ use tokio_stream::wrappers::ReceiverStream;
 use tonic::Request;
 
 const SCHEME_SEPARATOR: &str = "\x2f\x2f";
+const INLINE_OFFER: &str = "v=0\r\n";
+
+#[derive(Default)]
+struct FakeEgress {
+    pcm: Mutex<Vec<i16>>,
+    clears: AtomicU64,
+    pushed: AtomicU64,
+    drained: AtomicU64,
+    format: Mutex<Option<AudioFormat>>,
+}
+
+impl FakeEgress {
+    fn queued(&self) -> Vec<i16> {
+        self.pcm.lock().unwrap().clone()
+    }
+
+    fn drain_everything(&self) {
+        self.drained
+            .store(self.pushed.load(Ordering::Relaxed), Ordering::Relaxed);
+    }
+}
+
+impl InlineEgressSink for FakeEgress {
+    fn egress_format(&self) -> AudioFormat {
+        self.format
+            .lock()
+            .unwrap()
+            .unwrap_or_else(AudioFormat::pcmu_8k_20ms)
+    }
+
+    fn push_pcm(&self, pcm: Vec<i16>) -> bool {
+        self.pushed.fetch_add(pcm.len() as u64, Ordering::Relaxed);
+        self.pcm.lock().unwrap().extend(pcm);
+        true
+    }
+
+    fn flush(&self) {
+        self.pcm.lock().unwrap().clear();
+        self.clears.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn pushed_watermark(&self) -> u64 {
+        self.pushed.load(Ordering::Relaxed)
+    }
+
+    fn drained_watermark(&self) -> u64 {
+        self.drained.load(Ordering::Relaxed)
+    }
+}
 
 #[derive(Default)]
 struct FakePlane {
     stream: Mutex<Option<mpsc::Receiver<StreamFrame>>>,
     playbacks: Mutex<Vec<Vec<u8>>>,
     stopped: Mutex<Vec<String>>,
+    egress: Arc<FakeEgress>,
 }
 
 #[control_api::async_trait]
 impl MediaPlane for FakePlane {
+    fn inline_egress_sink(&self, _session: SessionId) -> Option<Arc<dyn InlineEgressSink>> {
+        Some(Arc::clone(&self.egress) as Arc<dyn InlineEgressSink>)
+    }
+
     async fn open_session(
         &self,
         _session: session_core::SessionView,
@@ -138,18 +194,35 @@ async fn session_with_grpc_attachment(
     capabilities: Vec<i32>,
     bearer: Option<&str>,
 ) -> String {
+    grpc_attachment_on(endpoint, capabilities, bearer, proto::SessionKind::Tap).await
+}
+
+async fn inline_grpc_attachment(endpoint: &str, capabilities: Vec<i32>) -> String {
+    grpc_attachment_on(endpoint, capabilities, None, proto::SessionKind::Inline).await
+}
+
+async fn grpc_attachment_on(
+    endpoint: &str,
+    capabilities: Vec<i32>,
+    bearer: Option<&str>,
+    kind: proto::SessionKind,
+) -> String {
     let mut client = MediaControlClient::connect(endpoint.to_string())
         .await
         .unwrap();
     let mut create = Request::new(proto::CreateSessionRequest {
         external_id: "req-stream".to_string(),
-        kind: proto::SessionKind::Tap as i32,
+        kind: kind as i32,
         call_id: "call-stream".to_string(),
         from_tags: vec!["from-a".to_string()],
         rtpengine_node: "rtpengine-1".to_string(),
         mix: false,
         idempotency_key: String::new(),
-        sdp_offer: String::new(),
+        sdp_offer: if kind == proto::SessionKind::Inline {
+            INLINE_OFFER.to_string()
+        } else {
+            String::new()
+        },
     });
     if let Some(token) = bearer {
         create
@@ -682,6 +755,195 @@ async fn a_speech_report_without_the_events_capability_is_a_protocol_violation()
     };
     assert_eq!(denied.code(), tonic::Code::PermissionDenied);
     assert!(denied.message().contains("EVENTS"));
+
+    let _ = wire.stop.send(());
+    wire.serving.await.unwrap();
+}
+
+#[tokio::test]
+async fn an_inline_inject_stream_feeds_the_egress_queue_instead_of_a_playback() {
+    let wire = listening(AuthPolicy::open()).await;
+    let attachment = inline_grpc_attachment(
+        &wire.endpoint,
+        vec![
+            proto::Capability::Sink as i32,
+            proto::Capability::Inject as i32,
+        ],
+    )
+    .await;
+
+    let mut client = MediaStreamClient::connect(wire.endpoint.clone())
+        .await
+        .unwrap();
+    let (to_server, outbound) = mpsc::channel(8);
+    to_server.send(hello(&attachment, "")).await.unwrap();
+    let mut inbound = client
+        .subscribe(ReceiverStream::new(outbound))
+        .await
+        .unwrap()
+        .into_inner();
+    inbound.message().await.unwrap().unwrap();
+
+    for _ in 0..3 {
+        to_server.send(inject(vec![0xFF; 160])).await.unwrap();
+    }
+    let egress = Arc::clone(&wire.plane.egress);
+    assert!(
+        poll_until(Duration::from_secs(5), || egress.queued().len() == 480).await,
+        "three injected frames should be 480 samples of egress, saw {}",
+        egress.queued().len()
+    );
+    assert_eq!(
+        egress.queued()[0],
+        media_core::g711::ulaw_to_linear(0xFF),
+        "the consumer's declared encoding is decoded to pcm before it is queued"
+    );
+    assert!(
+        wire.plane.playbacks.lock().unwrap().is_empty(),
+        "an inline leg is fed continuously, never through a playback"
+    );
+
+    to_server.send(clear()).await.unwrap();
+    let egress = Arc::clone(&wire.plane.egress);
+    assert!(
+        poll_until(Duration::from_secs(5), || egress
+            .clears
+            .load(Ordering::Relaxed)
+            == 1)
+        .await,
+        "clear should flush the inline egress queue"
+    );
+    assert!(egress.queued().is_empty());
+    assert!(
+        wire.plane.stopped.lock().unwrap().is_empty(),
+        "an inline clear flushes the egress rather than stopping a playback"
+    );
+
+    let _ = wire.stop.send(());
+    wire.serving.await.unwrap();
+}
+
+#[tokio::test]
+async fn an_inline_mark_is_acked_once_the_egress_queue_drains_past_it() {
+    let wire = listening(AuthPolicy::open()).await;
+    let attachment = inline_grpc_attachment(
+        &wire.endpoint,
+        vec![
+            proto::Capability::Sink as i32,
+            proto::Capability::Inject as i32,
+        ],
+    )
+    .await;
+
+    let mut client = MediaStreamClient::connect(wire.endpoint.clone())
+        .await
+        .unwrap();
+    let (to_server, outbound) = mpsc::channel(8);
+    to_server.send(hello(&attachment, "")).await.unwrap();
+    let mut inbound = client
+        .subscribe(ReceiverStream::new(outbound))
+        .await
+        .unwrap()
+        .into_inner();
+    inbound.message().await.unwrap().unwrap();
+
+    to_server.send(inject(vec![0x00; 320])).await.unwrap();
+    to_server.send(mark("prompt-done")).await.unwrap();
+
+    let undrained = tokio::time::timeout(Duration::from_millis(300), inbound.message()).await;
+    assert!(
+        undrained.is_err(),
+        "a mark is not acked while its audio is still queued"
+    );
+
+    wire.plane.egress.drain_everything();
+    let acked = tokio::time::timeout(Duration::from_secs(5), inbound.message())
+        .await
+        .expect("the drained mark should be acked")
+        .unwrap()
+        .unwrap();
+    match acked.msg {
+        Some(server_to_consumer::Msg::Mark(mark)) => assert_eq!(mark.name, "prompt-done"),
+        other => panic!("expected a mark ack, got {other:?}"),
+    }
+
+    let _ = wire.stop.send(());
+    wire.serving.await.unwrap();
+}
+
+#[tokio::test]
+async fn an_inline_inject_at_the_wrong_rate_is_refused_by_name_rather_than_resampled() {
+    let wire = listening(AuthPolicy::open()).await;
+    let attachment = inline_grpc_attachment(
+        &wire.endpoint,
+        vec![
+            proto::Capability::Sink as i32,
+            proto::Capability::Inject as i32,
+        ],
+    )
+    .await;
+    *wire.plane.egress.format.lock().unwrap() = Some(AudioFormat::l16_16k_20ms());
+
+    let mut client = MediaStreamClient::connect(wire.endpoint.clone())
+        .await
+        .unwrap();
+    let (to_server, outbound) = mpsc::channel(8);
+    to_server.send(hello(&attachment, "")).await.unwrap();
+    let mut inbound = client
+        .subscribe(ReceiverStream::new(outbound))
+        .await
+        .unwrap()
+        .into_inner();
+    inbound.message().await.unwrap().unwrap();
+
+    to_server.send(inject(vec![0xFF; 160])).await.unwrap();
+    let refused = loop {
+        match inbound.message().await {
+            Ok(Some(_)) => continue,
+            Ok(None) => panic!("the stream ended without the refusal"),
+            Err(status) => break status,
+        }
+    };
+    assert_eq!(refused.code(), tonic::Code::FailedPrecondition);
+    assert!(refused.message().contains("16000"), "{}", refused.message());
+    assert!(wire.plane.egress.queued().is_empty());
+
+    let _ = wire.stop.send(());
+    wire.serving.await.unwrap();
+}
+
+#[tokio::test]
+async fn an_unprivileged_inline_inject_is_refused_before_it_reaches_the_egress() {
+    let wire = listening(AuthPolicy::open()).await;
+    let attachment =
+        inline_grpc_attachment(&wire.endpoint, vec![proto::Capability::Sink as i32]).await;
+
+    let mut client = MediaStreamClient::connect(wire.endpoint.clone())
+        .await
+        .unwrap();
+    let (to_server, outbound) = mpsc::channel(8);
+    to_server.send(hello(&attachment, "")).await.unwrap();
+    let mut inbound = client
+        .subscribe(ReceiverStream::new(outbound))
+        .await
+        .unwrap()
+        .into_inner();
+    inbound.message().await.unwrap().unwrap();
+
+    to_server.send(inject(vec![0xFF; 160])).await.unwrap();
+    let denied = loop {
+        match inbound.message().await {
+            Ok(Some(_)) => continue,
+            Ok(None) => panic!("the stream ended without the denial"),
+            Err(status) => break status,
+        }
+    };
+    assert_eq!(denied.code(), tonic::Code::PermissionDenied);
+    assert!(denied.message().contains("INJECT"));
+    assert!(
+        wire.plane.egress.queued().is_empty(),
+        "nothing unprivileged reaches the inline leg"
+    );
 
     let _ = wire.stop.send(());
     wire.serving.await.unwrap();
