@@ -162,6 +162,16 @@ pub fn render(sources: &MetricsSources) -> String {
         snapshot.inline.cleared_samples,
     );
     counter(
+        "mss_inline_egress_pushed_samples_total",
+        "PCM samples the control world queued for an inline leg to speak",
+        snapshot.inline.pushed_samples,
+    );
+    counter(
+        "mss_inline_egress_drained_samples_total",
+        "Queued samples that have left the inline egress, whether paced out, dropped or flushed",
+        snapshot.inline.drained_samples,
+    );
+    counter(
         "mss_inline_egress_encode_errors_total",
         "Inline egress frames that could not be encoded or serialized",
         snapshot.inline.encode_errors,
