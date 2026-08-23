@@ -300,6 +300,9 @@ fn payload_wire(kind: EventKind) -> proto::media_event::Payload {
             mix_target: target,
             monitor_audible,
         }),
+        EventKind::MemberControlled { mute, deaf, hold } => {
+            Payload::MemberControlled(proto::MemberControlled { mute, deaf, hold })
+        }
         EventKind::AttachmentDown { label, reason } => {
             Payload::AttachmentDown(proto::AttachmentDown { label, reason })
         }

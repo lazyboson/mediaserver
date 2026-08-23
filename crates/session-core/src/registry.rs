@@ -1,7 +1,7 @@
 use crate::capability::{Capabilities, Transport};
 use crate::event::{ConsumerEvent, EventKind, MediaEvent, Observation};
 use crate::ids::{AttachmentId, PlaybackId, SessionId};
-use crate::mix::MixRoute;
+use crate::mix::{MemberControl, MixRoute};
 use media_core::{AudioFormat, Track};
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeMap, VecDeque};
@@ -421,6 +421,7 @@ impl SessionRegistry {
         if let Some(route) = &route {
             route.authorize(spec.capabilities)?;
         }
+        let control = MemberControl::from_metadata(&spec.metadata)?;
         let unsupported = spec.capabilities.missing_from(spec.transport.carries());
         if !unsupported.is_empty() {
             return Err(ControlError::TransportCannotCarry {
@@ -487,6 +488,14 @@ impl SessionRegistry {
                 },
             );
         }
+        if let Some(control) = &control {
+            self.push_event(
+                spec.session,
+                Some(id),
+                spec.authoritative,
+                member_controlled(control),
+            );
+        }
         self.remember(
             &spec.idempotency_key,
             spec.fingerprint(),
@@ -528,6 +537,7 @@ impl SessionRegistry {
             .get_mut(&attachment)
             .ok_or(ControlError::UnknownAttachment(attachment))?;
         let before = MixRoute::from_metadata(&record.metadata)?;
+        let controlled_before = MemberControl::from_metadata(&record.metadata)?;
         let merged = update.metadata.map(|carried| {
             let mut merged = record.metadata.clone();
             merged.extend(carried);
@@ -536,6 +546,10 @@ impl SessionRegistry {
         let after = match &merged {
             Some(merged) => MixRoute::from_metadata(merged)?,
             None => before.clone(),
+        };
+        let controlled_after = match &merged {
+            Some(merged) => MemberControl::from_metadata(merged)?,
+            None => controlled_before,
         };
         if let Some(route) = &after {
             route.authorize(record.capabilities)?;
@@ -564,6 +578,16 @@ impl SessionRegistry {
                         target: route.target_name().to_string(),
                         monitor_audible: route.monitor_audible,
                     },
+                );
+            }
+        }
+        if controlled_after != controlled_before {
+            if let Some(control) = &controlled_after {
+                self.push_event(
+                    session,
+                    Some(attachment),
+                    authoritative,
+                    member_controlled(control),
                 );
             }
         }
@@ -876,6 +900,14 @@ impl SessionRegistry {
         let id = self.next_id;
         self.next_id += 1;
         id
+    }
+}
+
+fn member_controlled(control: &MemberControl) -> EventKind {
+    EventKind::MemberControlled {
+        mute: control.muted(),
+        deaf: control.deafened(),
+        hold: control.held(),
     }
 }
 
@@ -1296,6 +1328,83 @@ mod tests {
         assert_eq!(event.external_id, "req-1");
         assert_eq!(event.attachment, Some(id));
         assert_eq!(event.seq, 1);
+    }
+
+    #[test]
+    fn muting_a_member_is_audited_the_same_way_a_whisper_is() {
+        let (mut registry, session) = started();
+        let id = registry.attach(rtt(session)).unwrap().id;
+        registry.drain_events();
+
+        registry
+            .update_attachment(
+                id,
+                AttachmentUpdate {
+                    metadata: Some(BTreeMap::from([(
+                        crate::mix::MEMBER_MUTE_METADATA_KEY.to_string(),
+                        crate::mix::MEMBER_FLAG_ON.to_string(),
+                    )])),
+                    ..AttachmentUpdate::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            registry.drain_events().pop().map(|event| event.kind),
+            Some(EventKind::MemberControlled {
+                mute: true,
+                deaf: false,
+                hold: false,
+            }),
+            "a member verb needs no capability and no new rpc, only an audit trail"
+        );
+
+        registry
+            .update_attachment(
+                id,
+                AttachmentUpdate {
+                    metadata: Some(BTreeMap::from([(
+                        crate::mix::MEMBER_HOLD_METADATA_KEY.to_string(),
+                        crate::mix::MEMBER_FLAG_ON.to_string(),
+                    )])),
+                    ..AttachmentUpdate::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            registry.drain_events().pop().map(|event| event.kind),
+            Some(EventKind::MemberControlled {
+                mute: true,
+                deaf: false,
+                hold: true,
+            }),
+            "the merged metadata is the member's declared state, not just the last verb"
+        );
+
+        registry
+            .update_attachment(
+                id,
+                AttachmentUpdate {
+                    paused: Some(true),
+                    ..AttachmentUpdate::default()
+                },
+            )
+            .unwrap();
+        assert!(
+            registry.drain_events().is_empty(),
+            "an update that touches no member verb says nothing about them"
+        );
+
+        let refused = registry.update_attachment(
+            id,
+            AttachmentUpdate {
+                metadata: Some(BTreeMap::from([(
+                    crate::mix::MEMBER_DEAF_METADATA_KEY.to_string(),
+                    "later".to_string(),
+                )])),
+                ..AttachmentUpdate::default()
+            },
+        );
+        assert!(matches!(refused, Err(ControlError::MixRoute(_))));
     }
 
     #[test]
