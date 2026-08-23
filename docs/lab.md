@@ -158,6 +158,48 @@ ffmpeg-decodable blob) or an inline leg (continuous stream), with nothing
 in between. An AI agent can speak into a tapped call today, one utterance
 at a time; streaming TTS with barge-in still needs Phase 3.
 
+## How precisely can a playback be stopped? (2026-08-23)
+
+`lab/ng_stop_media_probe.py` answers the question defect D2 raised: MSS used to
+stop *every* playback on a call, because it sent `stop media` with `all: all`.
+The probe builds its own two-leg call over NG, both legs transmit mu-law
+silence and count non-silent payloads, and it plays a 2 s 440 Hz blob with
+`repeat-times: 30` so a player is still running when the stop arrives.
+
+```sh
+docker run --rm --network mss-microsip_lab --ip 172.31.99.20 \
+    -v "$PWD/lab:/lab" -w /lab -e SELF_IP=172.31.99.20 \
+    -e CALL_ID=stop-media-probe-5 -e CALLER_RTP_PORT=40050 \
+    -e CALLEE_RTP_PORT=40052 python:3-slim python ng_stop_media_probe.py
+```
+
+Findings against rtpengine 14.1.1.8, reproduced in three runs (packet counts
+are non-silent payloads received in a 1.5 s window, one packet being the tail
+already in flight when the stop landed):
+
+| Experiment | Result |
+| --- | --- |
+| a player on each participant, then `stop media {from-tag: tagA}` | **only tagA stops** — tagA 75 → 1, tagB 75 → 75 |
+| two `play media` at the **same** from-tag | both accepted, but one `stop media {from-tag}` clears the participant (1 packet in a 3 s window) |
+| a player started `all: all`, stopped with one from-tag | that participant stops, the **other keeps hearing it** — 1 vs 75 |
+| `play media {from-tag: tagA}` | corroborates the injection probe: only tagA hears it (76 vs 0) |
+
+So a targeted stop is exactly as precise as rtpengine gets: per participant.
+MSS therefore aims `stop media` at the from-tag the playback was started with
+and keeps `all: all` only for playbacks that were for everyone. What no NG
+command can express is *which* playback to stop: two playbacks aimed at one
+participant are one player as far as rtpengine is concerned.
+
+**A trap this probe fell into first, worth remembering for any NG script:**
+cookies must be unique per *run*, not just per command. The first version
+restarted its serial at 1, so the second run's `offer`/`answer`/`play media`
+were answered from rtpengine's duplicate-cookie reply cache — every command
+came back "accepted" against a call that did not exist, and the run measured
+pure silence while looking healthy. That is defect D12 in a script instead of
+in mediaserverd: the cookie prefix now carries the pid and a timestamp. Any
+lab run whose "while playing" control reads zero should be treated as invalid
+rather than as a finding.
+
 ## The whole loop, closed in the lab
 
 `lab/mock_bridge.py` stands in for stream-llm-bridge: a stdlib-only

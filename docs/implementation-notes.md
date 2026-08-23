@@ -607,6 +607,13 @@ accepted by the same calls.
   fingerprint is `IdempotencyConflict` rather than silently handing back the
   wrong resource. Fingerprints deliberately exclude the key itself.
 
+- **A playback remembers who it was played to (2026-08-23, item 27, defect
+  D2).** `PlaybackRecord` keeps the `target_tag` from its `PlaybackSpec`, and
+  `stop_playback` returns it as `StoppedPlayback { session, target_tag }` so
+  the shell can aim rtpengine's `stop media` at the same participant instead
+  of stopping every player on the call. The registry is the only place that
+  knows this, because the media plane sees a `PlaybackId` and nothing else.
+
 ### Bounds, because nothing here may grow without one
 
 - `max_attachments` per session (default 16) → `TooManyAttachments`.
@@ -734,7 +741,15 @@ never silent), then asks the media plane for frames through the new
 
 - **Frame vocabulary is native** (`customer`/`agent`/`mixed`), not the
   Twilio `inbound`/`outbound` — this is the native surface, the WS adapter
-  is the compatibility one.
+  is the compatibility one. Under `TrackSelector::All` the tracks
+  advertised in `StreamStart` are customer and agent, and since item 27 that
+  is exactly what arrives — `mixed` is delivered only to a consumer that
+  named it (defect D13).
+- **`StreamFrame::Stop { reason }` is how the media plane says goodbye**
+  (2026-08-23, item 27): it becomes a `StreamStop` carrying the reason and
+  the server ends the stream. Before it existed, a detached attachment
+  reached the consumer as nothing more than a closed channel, which is
+  indistinguishable from a crash.
 - **Inject is authorized at the first frame**, not at flush:
   `authorize_inject` maps `CapabilityDenied` to `PERMISSION_DENIED` and the
   stream ends — the proto calls unprivileged inject a protocol violation,
@@ -1229,6 +1244,35 @@ into something that actually taps calls.
   an error naming transcoding as the fix. Two legs of one call have never
   disagreed in the lab, and if they ever do, transcoding is the right answer
   rather than a per-leg pipeline.
+- **Detach and hangup end a consumer politely (2026-08-23, item 27, defect
+  D3).** `close_attachment` and `close_session` both go through
+  `TapPlane::end_attachment`, which ends the hub subscription and *waits*
+  (up to `POLITE_CLOSE`, 2 s) for the consumer to finish on its own instead
+  of aborting its task: the WS consumer drains its queue and sends the
+  Twilio `stop` frame, the gRPC pump drains and then a
+  `StreamFrame::Stop { reason }` goes down the stream as `StreamStop`. The
+  reason names why ("the attachment was detached" / "the call ended"), which
+  is the difference a consumer can act on. A consumer that will not finish in
+  time is still aborted, with a warning; a gRPC consumer too far behind for
+  one more frame gets the channel close instead of the `Stop`. The cost of
+  the fix is that `Detach` can now wait up to 2 s on an unresponsive
+  consumer — the same shape as D11's upload wait, and worth watching in a
+  pilot.
+- **Pause reaches consumer transports (2026-08-23, item 27, defect D10).**
+  `update_attachment` sets the subscription's pause flag for `Ws` and
+  `Grpc` attachments as well as calling `RecorderHandle::set_paused` for
+  recordings. A gRPC attachment holds its pause state (`LiveAttachment::Grpc
+  { paused }`) even before a consumer subscribes, so `open_stream` applies it
+  to the new subscription — a stream that opens while paused stays silent
+  until it is resumed.
+- **`stop_playback` is aimed (2026-08-23, item 27, defect D2).** The
+  `MediaPlane::stop_playback` signature gained the playback's `target_tag`,
+  which `SessionRegistry::stop_playback` now returns (`StoppedPlayback`)
+  from the `PlaybackRecord` it wrote at start. `target_of` maps it to
+  `PlayTarget::HeardBy(tag)`, or `HeardByEveryone` (`all: all`) when the
+  playback was for everyone — which the lab probe showed is exactly what an
+  `all: all` playback needs, since a targeted stop only removes one
+  participant from it.
 - **`LiveSession` now carries the format the tap actually settled on**, and
   `session_format()` is what the attachment paths consult. This matters
   because `config.format` stopped being the truth the moment transcoding
@@ -1364,11 +1408,32 @@ never takes a lock and never waits on the control world.
 - `TrackSelection` filters at the hub, so a Customer-only consumer costs
   nothing on the Agent leg. The single-track default and
   `MSS_CONSUMER_TRACKS=both` behavior carried over unchanged.
+- **Two shapes of "everything" (2026-08-23, item 27, defect D13).**
+  `TrackSelection::All` means every track *including* `Mixed`;
+  `TrackSelection::Speakers` means customer and agent only. Consumers are
+  attached as `Speakers` for `TrackSelector::All` so that what arrives
+  matches the `tracks` their start frame advertised, while the recorder is
+  attached as `All` because injected bot speech belongs in the recording.
+  A consumer that wants the injected track asks for it by name
+  (`TrackSelector::Only(Mixed)`), which is advertised as `["mixed"]`.
+  The frozen Twilio start frame was not touched.
+- **Pause lives on the subscription (2026-08-23, item 27, defect D10).**
+  `Subscription::control()` hands the control world a
+  `SubscriptionControl` — a clone of the shared state — with
+  `set_paused` and `end_of_stream`. `publish` checks the flag per frame:
+  a paused consumer's frame is skipped and counted in
+  `suppressed_while_paused` (exported as
+  `mss_consumer_suppressed_while_paused_total`), so pause costs nothing
+  downstream and resume starts at the live edge instead of replaying a
+  backlog. `publish` also skips a closed subscription rather than filling
+  a ring nobody will read.
 - `Subscription::next()` is async and cancel-safe (pop-then-wait against a
   `Notify`; a permit stored by a racing publish is consumed on the next
-  poll). Hub drop or detach closes the subscription: `next()` drains what
-  is queued, then returns `None`, which is what tells the WS consumer to
-  send `stop`.
+  poll). Hub drop, detach, or `SubscriptionControl::end_of_stream` closes
+  the subscription: `next()` drains what is queued, then returns `None`,
+  which is what tells the WS consumer to send `stop`. `end_of_stream` is
+  how the control world asks a consumer to finish politely without the
+  session ending (defect D3).
 - Attach is command-queue-bounded; a full queue refuses the attach rather
   than blocking anyone. `crossbeam-queue` is the one new dependency
   (Article XI: adopted lock-free structure, not hand-rolled).

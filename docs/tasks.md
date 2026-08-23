@@ -1296,17 +1296,79 @@ carries an attachment, since it had asserted its field on an empty list. **Not**
 observed on a live call: it would take a live pod kill with a gRPC L16
 consumer attached, which is the D14 close-out drill's shape.
 
+### 27. Consumer-facing defect batch: D2, D3, D10, D13 — ✅ DONE (2026-08-23)
+
+Four defects that all live on the seam between the hub and a consumer.
+
+**D13 — an unannounced silent track.** The hub's `TrackSelection::All` meant
+literally every track, so a consumer that asked for `All` was fed the `mixed`
+track (the injected-playback track, silence whenever nothing is playing) at the
+full frame rate, while its `StreamStart` / Twilio `start` frame advertised only
+`["customer","agent"]`: an unannounced track and 50% extra bandwidth for
+silence. The selection now has two shapes — `All` (every track, **including**
+`mixed`) and `Speakers` (customer and agent only). Consumers map
+`TrackSelector::All` to `Speakers`, so they receive exactly the tracks they were
+told about; the **recorder keeps `All`**, because bot speech played into the
+call belongs in the recording. Nothing about the frozen Twilio start frame or
+`StreamStart.tracks` changed — the delivery was brought in line with the
+advertisement, not the other way round.
+
+**D10 — pause was a note in the registry.** A paused `WS_TWILIO` /
+`GRPC_STREAM` attachment kept receiving media; only the recorder honoured
+pause. A subscription now carries a pause flag the control world flips
+(`SubscriptionControl::set_paused`) and the hub checks per frame: a paused
+consumer is skipped and the skips are counted
+(`mss_consumer_suppressed_while_paused_total`). Resume delivers from where the
+tap now is — no backlog is replayed. A gRPC attachment paused before its
+consumer subscribes stays paused when the stream opens. Recorder pause is
+untouched (it still segments).
+
+**D3 — detach aborted the consumer task.** `close_attachment` (and
+`close_session`) called `JoinHandle::abort()`, so a websocket consumer's stream
+just stopped mid-frame with no Twilio `stop` message, and a gRPC consumer got a
+dropped channel. Both paths now go through `TapPlane::end_attachment`, which
+ends the *subscription* (`SubscriptionControl::end_of_stream`) and lets the
+consumer finish on its own: the WS task drains its queue and sends the `stop`
+frame it always had code for, the gRPC pump drains and a new
+`StreamFrame::Stop { reason }` becomes a `StreamStop` carrying why the stream
+ended ("the attachment was detached" / "the call ended"). A consumer that will
+not finish within `POLITE_CLOSE` (2 s) is still aborted, counted as a warning
+in the log. This also means a normal hangup now ends every consumer stream
+politely, not just an explicit `Detach`.
+
+**D2 — `stop_playback` stopped every playback on the call.** It sent NG
+`stop media` with `all: all` regardless of what the playback was aimed at. The
+registry now remembers each playback's `target_tag` (`PlaybackRecord`), returns
+it from `stop_playback` (`StoppedPlayback`), and the media plane passes it to
+rtpengine as `from-tag` — or `all: all` when the playback was for everyone.
+
+**Verified against what.** Unit/replay tests: the hub (a `Speakers` consumer
+never sees `mixed` while an `All` consumer does; a paused consumer is fed
+nothing and resumes at the current tap position with the suppressions counted;
+an ended stream drains then finishes), `tap_plane` (detaching a WS consumer
+lets its task run to completion instead of being aborted, detaching a gRPC
+consumer ends its stream with a `Stop` frame carrying the reason, pausing
+through `update_attachment` stops hub delivery), `stream.rs` over the wire (a
+`Stop` frame reaches a real gRPC consumer as `StreamStop` with its reason), the
+registry (a stopped playback reports the participant it was played to), and the
+controller end-to-end against a recording fake (two playbacks, one aimed at
+`from-b` and one at everyone, are stopped with `Some("from-b")` and `None`
+respectively). D2's rtpengine half was measured on the live lab node with the
+new `lab/ng_stop_media_probe.py` — see lab.md; the numbers are in the D2 row
+below. No live MSS call was driven for D3/D10/D13: the lab's `mss-control`
+image predates this commit.
+
 ## Open defects and soft spots
 
 | # | Item | Where | Severity |
 | --- | --- | --- | --- |
 | ~~D1~~ | ~~A **mid-call SSRC change** (re-INVITE, transfer, codec renegotiation) does not re-resolve leg identity~~ — **fixed 2026-08-22 (item 14)**: the leg re-enters resolution on a confirmed SSRC change and a control-world task re-queries rtpengine and pushes a fresh map through a bounded queue. Replay-verified only, not yet on a live call. Residual: a transfer that replaces a *from-tag* still needs a re-subscribe, not a re-resolve | `tap_spike.rs`, `tap_plane.rs` | closed |
-| D2 | `stop_playback` stops **all** playback on the call: rtpengine's `stop media` targets a participant, not a playback id | `tap_plane.rs` | low until multiple concurrent playbacks exist |
-| D3 | `close_attachment` **aborts** the consumer task instead of closing the websocket politely (no `stop` frame) | `tap_plane.rs` | low, but consumers see a truncated stream |
+| ~~D2~~ | ~~`stop_playback` stops **all** playback on the call~~ — **fixed 2026-08-23 (item 27)**: the registry remembers each playback's `target_tag` and `stop_playback` sends NG `stop media` with that `from-tag` (`all: all` only when the playback itself was for everyone). Measured on the lab node with `lab/ng_stop_media_probe.py`, three consistent runs: with a player on each participant, `stop media {from-tag: tagA}` left tagA at **1 packet** (a tail) and tagB still at **75 packets per 1.5 s**; an `all: all` player stopped with one from-tag keeps playing to the *other* participant (1 vs 75), which is why "no target" still maps to `all: all`. **Residual, now measured rather than assumed:** a second `play media` at the *same* from-tag is accepted, and one `stop media` for that from-tag clears the participant entirely (1 packet in a 3 s window) — rtpengine has no playback identifier, so two playbacks aimed at one participant cannot be stopped independently. MSS is now as precise as the protocol allows | `tap_plane.rs`, `registry.rs` | closed (residual documented) |
+| ~~D3~~ | ~~`close_attachment` **aborts** the consumer task instead of closing the websocket politely (no `stop` frame)~~ — **fixed 2026-08-23 (item 27)**: `TapPlane::end_attachment` ends the hub subscription and lets the consumer finish, so a WS consumer sends its Twilio `stop` frame and a gRPC consumer gets a `StreamStop` naming the reason ("the attachment was detached" / "the call ended"); a consumer that will not finish inside `POLITE_CLOSE` (2 s) is still aborted, with a warning. `close_session` takes the same path, so an ordinary hangup is polite too. Replay-verified (the task runs to completion instead of being aborted; the `Stop` frame reaches a real gRPC consumer over the wire); not observed against a live consumer | `tap_plane.rs` | closed |
 | ~~D4~~ | ~~`WS_TWILIO` and `GRPC_STREAM` attachments are served; `FILE_S3` (phase 2) and `RTP_INLINE` (phase 3) are refused by name~~ — **`FILE_S3` now served (2026-08-22, item 15)**: the recorder is a hub consumer with the frozen identity, pause-segmenting and `object_store` upload. `RTP_INLINE` is still refused by name and stays Phase 3 | `tap_plane.rs` | partly closed — inline is phase 3 |
 | D9 | A recording lives in the recording pod's memory until the call ends: a pod death loses the buffered audio even though the *session* is adopted elsewhere, and no upload is resumed. Also caps a recording at `MAX_RECORDING` (2 h) | `recorder.rs` | medium once a tenant records for real |
 | D11 | `StopRecording`/`Detach` **blocks until the upload finishes** (bounded 60 s/90 s), because `observe` needs a live session and a backgrounded upload would lose `UploadCompleted` on every hangup. A pilot may find the latency unacceptable; the fix is a session-independent event path | `tap_plane.rs`, `recorder.rs` | medium — watch it in the pilot |
-| D10 | Pause is honoured by the recorder only. A paused `WS_TWILIO`/`GRPC_STREAM` attachment keeps receiving media (registry state only) — now logged explicitly instead of being invisible, but `StreamPause` still does not stop feeding an ASR | `tap_plane.rs` | medium for cost, low for correctness |
+| ~~D10~~ | ~~Pause is honoured by the recorder only; a paused `WS_TWILIO`/`GRPC_STREAM` attachment keeps receiving media~~ — **fixed 2026-08-23 (item 27)**: the hub checks a per-subscription pause flag before every frame, so `StreamPause` really stops feeding an ASR; skipped frames are counted (`mss_consumer_suppressed_while_paused_total`) and resume starts at the current tap position rather than replaying a backlog. A gRPC attachment paused before its consumer subscribes stays paused when the stream opens. Recorder pause behaviour is unchanged. Replay-verified through `update_attachment`; not observed live | `tap_plane.rs`, `hub.rs` | closed |
 | ~~D5~~ | ~~Event delivery is **at-most-once**; a broker outage drops events~~ — **fixed 2026-08-22 (item 13)**: bounded retry backlog, order preserved, drop-oldest counted. Now **at-least-once**, so the translator must dedupe by `(external_id, seq)`; a backlog past its 8192 cap or a pod death still loses events | `event_pump.rs` | closed |
 | D6 | `play media` `from-tag` semantics are **unmeasured** — architecture §6's claim was retracted after the instrument turned out to be broken (see lab.md correction) | docs + lab | low, but §6 must not be trusted until re-probed |
 | ~~D7~~ | ~~Jitter buffer: fixed target depth, no adaptive sizing, no timestamp-aware gap handling, silence instead of real PLC~~ — **fixed 2026-08-22 (item 17)**: adaptive depth from the RFC 3550 estimate, timestamp-aware silence gaps, comfort noise accounted, G.711 Appendix I-shaped PLC, restart on SSRC change. Replay-verified across the impairment matrix, and since item 19 also **on a real link** in the soak — 1%/5% injected loss reported as 1.06%/5.01% with `frames_concealed` equal to `jitter_lost` to the packet, reorder and ±35 ms jitter costing zero loss and zero late drops. Still open: never impaired with `tc netem` on the **tap link** (this box's kernel has none), so burst loss, reorder-beyond-depth and dedupe stay replay-only, and the concealment has never been judged perceptually | `jitter.rs`, `pipeline.rs`, `plc.rs` | closed |
@@ -1315,7 +1377,7 @@ consumer attached, which is the D14 close-out drill's shape.
 | ~~D15~~ | ~~An adopted attachment loses its **negotiated format**: `rebuild` passes `format: None`, so a consumer that attached as L16/16k comes back at the session default.~~ — **fixed 2026-08-23 (item 26)**: `PersistedAttachment.format` (`Option<PersistedFormat>`, `serde(default)`, the wire shape used for the other persisted enums) is written every keeper tick and replayed on adoption; a record without it still decodes and still means the default. Unit-tested (roundtrip, legacy record, an L16/16k gRPC consumer and a default WS consumer re-opened side by side on the adopting pod) and run against the lab's real Redis; **never observed live** — that needs a pod kill with a gRPC L16 consumer attached | `session_store.rs`, `registry_keeper.rs` | closed |
 | ~~D14~~ | ~~**A dead pod's rtpengine subscription is never torn down.**~~ — **fixed 2026-08-23 (item 25)**: `PersistedSession` now carries the tap's `to-tag` (`subscription_tag`, `serde(default)` so older records still decode), the adopter sends NG `unsubscribe` for it **before** re-subscribing (after winning the atomic claim), and a pod that loses its lease destroys the session locally so a partitioned-but-alive owner unsubscribes its own tap instead of double-tapping. `upsert` also stopped rewriting the lease key unconditionally (now `SET NX`) — it had made a lease unloseable, so the partitioned case could never be detected. New counters `mss_registry_orphans_unsubscribed_total`, `mss_registry_orphans_still_subscribed_total`, `mss_registry_surrendered_total`. **Verified in unit tests, against a fake rtpengine socket (the `unsubscribe` bytes) and against the lab's real Redis — not re-measured on a live pod kill**; the residual is that a refused `unsubscribe` still leaks one tap, counted rather than retried | `session_store.rs`, `registry_keeper.rs`, `tap_plane.rs` | closed |
 | D16 | **A recording group is one pod's memory.** `TapPlane` holds the group, so every member of a conference recording must attach to the same pod: there is no placement that guarantees it (D8), a member whose session is adopted elsewhere is **refused** rather than restored (`grouped_not_adopted`, so the participant's file simply ends at the pod that died — the D9 shape per participant), and a group name reused on a second pod silently produces a second half-recording under the same prefix. Fix shape: schedule a group's sessions onto one pod, or move the group into shared storage so any pod can serve a member | `tap_plane.rs`, `registry_keeper.rs` | medium once a tenant records conferences across pods |
-| D13 | `StreamStart` (and the Twilio `start` frame's `tracks`) advertises `["customer","agent"]` for `TrackSelector::All`, but a silent `mixed` track is delivered too, at the full frame rate: a consumer must tolerate an unannounced track and pays 50% extra bandwidth for silence. Fixing it means either naming `mixed` in the start frame or not carrying it under `All` — the latter touches the frozen Twilio surface | `stream.rs`, `tap_plane.rs`, `hub.rs` | low for correctness, medium for cost |
+| ~~D13~~ | ~~`StreamStart` (and the Twilio `start` frame's `tracks`) advertises `["customer","agent"]` for `TrackSelector::All`, but a silent `mixed` track is delivered too~~ — **fixed 2026-08-23 (item 27)**: the hub selection split into `All` (every track, including `mixed`) and `Speakers` (customer + agent). Consumers get `Speakers`, so delivery matches the advertisement exactly; the **recorder keeps `All`** because injected bot speech belongs in the recording. The frozen Twilio start frame and `StreamStart.tracks` were not touched — the delivery was brought in line with them. A consumer that wants the injected track can still ask for it by name (`TrackSelector::Only(Mixed)`). Replay-verified | `hub.rs`, `tap_plane.rs` | closed |
 | D17 | **Leg labels invert when the caller's from-tag is not given.** With `from_tags` unspecified (`-`), `TapPlane` labels the two legs in the order rtpengine's `query` returns them, and in the two-node drill that put **FreeSWITCH's** tag first — so `customer` and `agent` were swapped in the recording and in the `tracks` a consumer sees. Speaker attribution is only trustworthy when the caller's from-tag is passed explicitly. Fix shape: refuse to name tracks by direction when no from-tag was supplied (label them `leg_a`/`leg_b`, or resolve the caller from the SIP call-id), rather than guessing an order | `tap_plane.rs` | medium — an ASR or a QA review reads the wrong speaker |
 | D18 | **Recording-group members are not time-aligned.** Each member's file anchors on **its own first frame** (`recorder.rs` takes the offset from the per-member anchor), so a participant that joins late produces a file that starts at its join moment with no leading pad, and two members of the same group differ in length — 90.32 s vs 90.26 s in the drill above, with nothing to say where in the first file the second one begins. Reassembling a conference from the participant objects therefore needs the event timeline as well as the audio. Fix: record the group's open instant and pad each member's first segment with silence from that anchor | `recorder.rs`, `tap_plane.rs` | medium once anyone reassembles a multi-party recording |
 | D19 | **A consumer cannot tell MSS that the caller started speaking.** `Registry::report` (`ConsumerEvent` → `SpeechStarted`/`Partial`/`Final`/`EndOfUtterance`) is the documented ingress for speech events and the head of the barge-in chain, but **no transport calls it**: the `WS_TWILIO` inbound dialect carries only `media`/`mark`/`clear`/`end_of_interaction`, the gRPC `ConsumerToServer` stream carries only `hello`/`inject`/`mark`/`clear`, and `SendToAttachment` runs the other way (server → consumer text). So `SpeechStarted`/`Partial`/`Final` never reach `mss.events` from a real consumer, and the only barge a consumer can trigger is the WS `clear`, which bypasses the bus entirely (a direct rtpengine `stop media`, unevented and untargeted — the D2 shape). Found while measuring item 5. Fix shape: carry a speech report on both consumer transports (a `ConsumerToServer.report` message and a Twilio-dialect inbound event) into `Registry::report`, keeping the frozen serializations additive | `consumer_ws.rs`, `stream.rs`, `session-core/registry.rs` | **high** — the barge-in chain has no first hop |

@@ -1,5 +1,8 @@
 use crate::consumer_ws::{self, ConsumerConfig};
-use crate::hub::{Hub, HubClient, Subscription, SubscriptionMetrics, TapEvent, TrackSelection};
+use crate::hub::{
+    Hub, HubClient, Subscription, SubscriptionControl, SubscriptionMetrics, TapEvent,
+    TrackSelection,
+};
 use crate::ng_transport::{NgTransport, NgTransportConfig};
 use crate::recorder::{
     self, Layout, RecorderCounters, RecorderHandle, RecorderSpec, RecordingFormat,
@@ -45,6 +48,7 @@ const MAX_REQUERIED_SSRCS: usize = 16;
 const ACCOUNT_METADATA_KEY: &str = "accountId";
 const STREAM_SID_METADATA_KEY: &str = "streamSid";
 const DEFAULT_ACCOUNT_ID: &str = "mss";
+const POLITE_CLOSE: Duration = Duration::from_secs(2);
 
 pub struct TapPlaneConfig {
     pub default_node: Option<SocketAddr>,
@@ -74,6 +78,7 @@ enum LiveAttachment {
     Ws {
         session: SessionId,
         text: mpsc::Sender<String>,
+        media: SubscriptionControl,
         task:
             tokio::task::JoinHandle<Result<consumer_ws::ConsumerStats, consumer_ws::ConsumerError>>,
     },
@@ -81,6 +86,7 @@ enum LiveAttachment {
         session: SessionId,
         selection: TrackSelection,
         format: AudioFormat,
+        paused: bool,
         live: Option<GrpcLive>,
     },
     Recording {
@@ -129,6 +135,7 @@ impl LiveAttachment {
 
 struct GrpcLive {
     frames: mpsc::Sender<StreamFrame>,
+    media: SubscriptionControl,
     pump: tokio::task::JoinHandle<()>,
 }
 
@@ -191,6 +198,7 @@ pub struct IngestSnapshot {
     pub consumers_live: u64,
     pub consumer_dropped_oldest: u64,
     pub consumer_delivered: u64,
+    pub consumer_suppressed_while_paused: u64,
     pub consumer_queue_depth: u64,
     pub consumer_queue_depth_max: u64,
     pub recordings_live: u64,
@@ -213,6 +221,7 @@ struct MetricsInner {
     retired: LegTotals,
     retired_consumer_dropped: u64,
     retired_consumer_delivered: u64,
+    retired_consumer_suppressed: u64,
     ssrc_requeries: u64,
     legs: HashMap<SessionId, Vec<Arc<SharedLegStats>>>,
     consumers: HashMap<AttachmentId, SubscriptionMetrics>,
@@ -258,6 +267,7 @@ impl TapPlaneMetrics {
         if let Some(replaced) = inner.consumers.insert(attachment, metrics) {
             inner.retired_consumer_dropped += replaced.dropped_oldest();
             inner.retired_consumer_delivered += replaced.delivered();
+            inner.retired_consumer_suppressed += replaced.suppressed_while_paused();
         }
     }
 
@@ -266,6 +276,7 @@ impl TapPlaneMetrics {
         if let Some(removed) = inner.consumers.remove(&attachment) {
             inner.retired_consumer_dropped += removed.dropped_oldest();
             inner.retired_consumer_delivered += removed.delivered();
+            inner.retired_consumer_suppressed += removed.suppressed_while_paused();
         }
     }
 
@@ -279,6 +290,7 @@ impl TapPlaneMetrics {
             consumers_live: inner.consumers.len() as u64,
             consumer_dropped_oldest: inner.retired_consumer_dropped,
             consumer_delivered: inner.retired_consumer_delivered,
+            consumer_suppressed_while_paused: inner.retired_consumer_suppressed,
             ssrc_requeries: inner.ssrc_requeries,
             recordings_live: read(&recorder.live),
             recordings_started: read(&recorder.started),
@@ -306,6 +318,7 @@ impl TapPlaneMetrics {
         for consumer in inner.consumers.values() {
             snapshot.consumer_dropped_oldest += consumer.dropped_oldest();
             snapshot.consumer_delivered += consumer.delivered();
+            snapshot.consumer_suppressed_while_paused += consumer.suppressed_while_paused();
             let depth = consumer.queue_depth() as u64;
             snapshot.consumer_queue_depth += depth;
             snapshot.consumer_queue_depth_max = snapshot.consumer_queue_depth_max.max(depth);
@@ -446,11 +459,13 @@ impl TapPlane {
 
         let (_, call_id, hub, external_id, _) = self.session_handles(view.session)?;
         let subscription = hub
-            .attach(CONSUMER_QUEUE_FRAMES, selection_of(view.selector))
+            .attach(CONSUMER_QUEUE_FRAMES, consumer_selection_of(view.selector))
             .ok_or_else(|| {
                 MediaPlaneError("the hub would not take another consumer".to_string())
             })?;
         let subscription_metrics = subscription.metrics();
+        let media = subscription.control();
+        media.set_paused(view.paused);
 
         let stream_sid = view
             .metadata
@@ -498,6 +513,7 @@ impl TapPlane {
             LiveAttachment::Ws {
                 session: view.session,
                 text,
+                media,
                 task,
             },
         );
@@ -524,8 +540,9 @@ impl TapPlane {
             view.id,
             LiveAttachment::Grpc {
                 session: view.session,
-                selection: selection_of(view.selector),
+                selection: consumer_selection_of(view.selector),
                 format: view.format,
+                paused: view.paused,
                 live: None,
             },
         );
@@ -553,7 +570,7 @@ impl TapPlane {
             ));
         }
         let (_, _, hub, external_id, _) = self.session_handles(view.session)?;
-        let selection = selection_of(view.selector);
+        let selection = recording_selection_of(view.selector);
         let grouped = if view.group.is_empty() {
             None
         } else {
@@ -813,6 +830,79 @@ impl TapPlane {
             live.external_id.clone(),
             live.to_tag.clone(),
         ))
+    }
+
+    async fn end_attachment(&self, attachment: AttachmentId, held: LiveAttachment, reason: &str) {
+        match held {
+            LiveAttachment::Ws {
+                session,
+                media,
+                task,
+                ..
+            } => {
+                media.end_of_stream();
+                let mut task = task;
+                match tokio::time::timeout(POLITE_CLOSE, &mut task).await {
+                    Ok(Ok(Ok(stats))) => info!(
+                        %attachment,
+                        %session,
+                        %reason,
+                        media_sent = stats.media_sent,
+                        "the consumer websocket was closed after its stop frame"
+                    ),
+                    Ok(Ok(Err(error))) => warn!(
+                        %attachment, %session, %error,
+                        "the consumer websocket ended with an error instead of a stop frame"
+                    ),
+                    Ok(Err(_)) => warn!(
+                        %attachment, %session,
+                        "the consumer task ended before it could send its stop frame"
+                    ),
+                    Err(_) => {
+                        task.abort();
+                        warn!(
+                            %attachment, %session,
+                            "the consumer did not take its stop frame within {POLITE_CLOSE:?}; \
+                             its socket was dropped"
+                        );
+                    }
+                }
+            }
+            LiveAttachment::Grpc { session, live, .. } => {
+                if let Some(GrpcLive {
+                    frames,
+                    media,
+                    mut pump,
+                }) = live
+                {
+                    media.end_of_stream();
+                    if tokio::time::timeout(POLITE_CLOSE, &mut pump).await.is_err() {
+                        pump.abort();
+                        warn!(
+                            %attachment, %session,
+                            "the frame pump did not drain within {POLITE_CLOSE:?}"
+                        );
+                    }
+                    if frames
+                        .try_send(StreamFrame::Stop {
+                            reason: reason.to_string(),
+                        })
+                        .is_err()
+                    {
+                        warn!(
+                            %attachment, %session,
+                            "the grpc consumer is too far behind for a stop frame; \
+                             its stream is closed instead"
+                        );
+                    }
+                }
+                info!(%attachment, %session, %reason, "grpc consumer detached");
+            }
+            recording @ LiveAttachment::Recording { .. } => {
+                self.finish_recording(attachment, recording).await;
+            }
+        }
+        self.metrics.retire_consumer(attachment);
     }
 }
 
@@ -1091,18 +1181,8 @@ impl MediaPlane for TapPlane {
         };
 
         for (attachment, held) in self.take_attachments_of(session)? {
-            match held {
-                LiveAttachment::Ws { task, .. } => task.abort(),
-                LiveAttachment::Grpc { live, .. } => {
-                    if let Some(live) = live {
-                        live.pump.abort();
-                    }
-                }
-                recording @ LiveAttachment::Recording { .. } => {
-                    self.finish_recording(attachment, recording).await;
-                }
-            }
-            self.metrics.retire_consumer(attachment);
+            self.end_attachment(attachment, held, "the call ended")
+                .await;
         }
 
         live.stop.store(true, Ordering::Relaxed);
@@ -1152,23 +1232,37 @@ impl MediaPlane for TapPlane {
     }
 
     async fn update_attachment(&self, view: AttachmentView) -> Result<(), MediaPlaneError> {
-        let paused = {
-            let held = self
+        enum Applied {
+            Recorder(bool),
+            Consumer,
+        }
+        let applied = {
+            let mut held = self
                 .attachments
                 .lock()
                 .map_err(|_| MediaPlaneError("the attachment table is poisoned".to_string()))?;
-            match held.get(&view.id) {
+            match held.get_mut(&view.id) {
                 Some(LiveAttachment::Recording {
                     handle: Some(handle),
                     ..
-                }) => Some(handle.set_paused(view.paused)),
+                }) => Applied::Recorder(handle.set_paused(view.paused)),
                 Some(LiveAttachment::Recording { handle: None, .. }) => {
                     return Err(MediaPlaneError(format!(
                         "{} is a recording that has already been closed",
                         view.id
                     )))
                 }
-                Some(_) => None,
+                Some(LiveAttachment::Ws { media, .. }) => {
+                    media.set_paused(view.paused);
+                    Applied::Consumer
+                }
+                Some(LiveAttachment::Grpc { paused, live, .. }) => {
+                    *paused = view.paused;
+                    if let Some(live) = live {
+                        live.media.set_paused(view.paused);
+                    }
+                    Applied::Consumer
+                }
                 None => {
                     return Err(MediaPlaneError(format!(
                         "{} is not connected here",
@@ -1177,19 +1271,18 @@ impl MediaPlane for TapPlane {
                 }
             }
         };
-        match paused {
-            Some(true) => Ok(()),
-            Some(false) => Err(MediaPlaneError(format!(
+        match applied {
+            Applied::Recorder(true) => Ok(()),
+            Applied::Recorder(false) => Err(MediaPlaneError(format!(
                 "{} is not taking commands any more",
                 view.id
             ))),
-            None => {
+            Applied::Consumer => {
                 info!(
                     attachment = %view.id,
                     paused = view.paused,
                     transport = %view.transport,
-                    "pause is control-plane state for this transport; \
-                     its media keeps flowing"
+                    "the hub stops feeding this consumer while it is paused"
                 );
                 Ok(())
             }
@@ -1208,23 +1301,10 @@ impl MediaPlane for TapPlane {
                 .map_err(|_| MediaPlaneError("the attachment table is poisoned".to_string()))?;
             held.remove(&attachment)
         };
-        match live {
-            Some(LiveAttachment::Ws { session, task, .. }) => {
-                task.abort();
-                info!(%attachment, %session, "consumer detached");
-            }
-            Some(LiveAttachment::Grpc { session, live, .. }) => {
-                if let Some(live) = live {
-                    live.pump.abort();
-                }
-                info!(%attachment, %session, "grpc consumer detached");
-            }
-            Some(recording @ LiveAttachment::Recording { .. }) => {
-                self.finish_recording(attachment, recording).await;
-            }
-            None => {}
+        if let Some(held) = live {
+            self.end_attachment(attachment, held, "the attachment was detached")
+                .await;
         }
-        self.metrics.retire_consumer(attachment);
         Ok(())
     }
 
@@ -1280,7 +1360,7 @@ impl MediaPlane for TapPlane {
         session: SessionId,
         attachment: AttachmentId,
     ) -> Result<mpsc::Receiver<StreamFrame>, MediaPlaneError> {
-        let (selection, target_format) = {
+        let (selection, target_format, paused) = {
             let held = self
                 .attachments
                 .lock()
@@ -1290,6 +1370,7 @@ impl MediaPlane for TapPlane {
                     session: held_session,
                     selection,
                     format,
+                    paused,
                     live,
                 }) => {
                     if *held_session != session {
@@ -1302,7 +1383,7 @@ impl MediaPlane for TapPlane {
                             "{attachment} already has a connected consumer"
                         )));
                     }
-                    (*selection, *format)
+                    (*selection, *format, *paused)
                 }
                 Some(LiveAttachment::Ws { .. }) => {
                     return Err(MediaPlaneError(format!(
@@ -1329,6 +1410,8 @@ impl MediaPlane for TapPlane {
                 MediaPlaneError("the hub would not take another consumer".to_string())
             })?;
         let subscription_metrics = subscription.metrics();
+        let media = subscription.control();
+        media.set_paused(paused);
         let (frames, receiver) = mpsc::channel(GRPC_FRAME_QUEUE);
         let pump = tokio::spawn(pump_frames(
             subscription,
@@ -1343,7 +1426,11 @@ impl MediaPlane for TapPlane {
             .map_err(|_| MediaPlaneError("the attachment table is poisoned".to_string()))?;
         match held.get_mut(&attachment) {
             Some(LiveAttachment::Grpc { live, .. }) => {
-                *live = Some(GrpcLive { frames, pump });
+                *live = Some(GrpcLive {
+                    frames,
+                    media,
+                    pump,
+                });
             }
             _ => {
                 pump.abort();
@@ -1403,10 +1490,11 @@ impl MediaPlane for TapPlane {
         &self,
         session: SessionId,
         _playback: session_core::PlaybackId,
+        target_tag: Option<String>,
     ) -> Result<(), MediaPlaneError> {
         let (transport, call_id, _, _, _) = self.session_handles(session)?;
         transport
-            .stop_media(&call_id, &PlayTarget::HeardByEveryone)
+            .stop_media(&call_id, &target_of(target_tag))
             .await
             .map_err(|error| MediaPlaneError(format!("stop media: {error}")))?;
         Ok(())
@@ -1603,7 +1691,14 @@ fn target_of(target_tag: Option<String>) -> PlayTarget {
     }
 }
 
-fn selection_of(selector: TrackSelector) -> TrackSelection {
+fn consumer_selection_of(selector: TrackSelector) -> TrackSelection {
+    match selector {
+        TrackSelector::All => TrackSelection::Speakers,
+        TrackSelector::Only(track) => TrackSelection::Only(track),
+    }
+}
+
+fn recording_selection_of(selector: TrackSelector) -> TrackSelection {
     match selector {
         TrackSelector::All => TrackSelection::All,
         TrackSelector::Only(track) => TrackSelection::Only(track),
@@ -2576,12 +2671,147 @@ mod tests {
             .is_ok());
     }
 
+    #[tokio::test]
+    async fn detaching_a_websocket_consumer_lets_it_finish_instead_of_being_aborted() {
+        let plane = plane();
+        let (mut hub, client) = crate::hub::Hub::new();
+        let mut subscription = client.attach(8, TrackSelection::Speakers).unwrap();
+        hub.poll_commands();
+        let media = subscription.control();
+        let (text, _inbound) = mpsc::channel(TEXT_QUEUE_DEPTH);
+        let finished = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&finished);
+        let task = tokio::spawn(async move {
+            let mut seen = 0u64;
+            while subscription.next().await.is_some() {
+                seen += 1;
+            }
+            flag.store(true, Ordering::Relaxed);
+            Ok(consumer_ws::ConsumerStats {
+                media_sent: seen,
+                ..consumer_ws::ConsumerStats::default()
+            })
+        });
+
+        hub.publish(TapEvent::media(Track::Customer, 0, &[0i16; 160]));
+        plane
+            .end_attachment(
+                AttachmentId::from_raw(2),
+                LiveAttachment::Ws {
+                    session: SessionId::from_raw(1),
+                    text,
+                    media,
+                    task,
+                },
+                "the attachment was detached",
+            )
+            .await;
+
+        assert!(
+            finished.load(Ordering::Relaxed),
+            "the consumer was aborted rather than being allowed to close"
+        );
+        assert_eq!(hub.published(), 1);
+    }
+
+    #[tokio::test]
+    async fn detaching_a_grpc_consumer_ends_its_stream_with_a_stop_frame() {
+        let plane = plane();
+        let (mut hub, client) = crate::hub::Hub::new();
+        let subscription = client.attach(8, TrackSelection::Speakers).unwrap();
+        hub.poll_commands();
+        let media = subscription.control();
+        let (frames, mut receiver) = mpsc::channel(GRPC_FRAME_QUEUE);
+        let pump = tokio::spawn(pump_frames(
+            subscription,
+            frames.clone(),
+            AudioFormat::pcmu_8k_20ms(),
+            AudioFormat::pcmu_8k_20ms(),
+        ));
+
+        hub.publish(TapEvent::media(Track::Customer, 0, &[0i16; 160]));
+        plane
+            .end_attachment(
+                AttachmentId::from_raw(2),
+                LiveAttachment::Grpc {
+                    session: SessionId::from_raw(1),
+                    selection: TrackSelection::Speakers,
+                    format: AudioFormat::pcmu_8k_20ms(),
+                    paused: false,
+                    live: Some(GrpcLive {
+                        frames,
+                        media,
+                        pump,
+                    }),
+                },
+                "the attachment was detached",
+            )
+            .await;
+
+        let mut seen = Vec::new();
+        while let Some(frame) = receiver.recv().await {
+            seen.push(frame);
+        }
+        match seen.last() {
+            Some(StreamFrame::Stop { reason }) => assert_eq!(reason, "the attachment was detached"),
+            other => panic!("expected a stop frame last, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn pausing_a_consumer_attachment_stops_the_hub_feeding_it() {
+        let plane = plane();
+        let (mut hub, client) = crate::hub::Hub::new();
+        let mut subscription = client.attach(8, TrackSelection::Speakers).unwrap();
+        hub.poll_commands();
+        let media = subscription.control();
+        let (text, _inbound) = mpsc::channel(TEXT_QUEUE_DEPTH);
+        let task = tokio::spawn(async { Ok(consumer_ws::ConsumerStats::default()) });
+        plane.attachments.lock().unwrap().insert(
+            AttachmentId::from_raw(2),
+            LiveAttachment::Ws {
+                session: SessionId::from_raw(1),
+                text,
+                media,
+                task,
+            },
+        );
+
+        let mut view = attachment(Transport::WsTwilio, "ws-endpoint");
+        view.paused = true;
+        plane.update_attachment(view.clone()).await.unwrap();
+        hub.publish(TapEvent::media(Track::Customer, 0, &[0i16; 160]));
+        hub.publish(TapEvent::media(Track::Customer, 20, &[0i16; 160]));
+
+        view.paused = false;
+        plane.update_attachment(view).await.unwrap();
+        hub.publish(TapEvent::media(Track::Customer, 40, &[0i16; 160]));
+
+        let mut stamps = Vec::new();
+        while let Some(TapEvent::Media { timestamp_ms, .. }) = subscription.try_next() {
+            stamps.push(timestamp_ms);
+        }
+        assert_eq!(stamps, vec![40]);
+        assert_eq!(subscription.suppressed_while_paused(), 2);
+    }
+
     #[test]
     fn a_selector_becomes_the_hub_selection_and_the_track_list_it_implies() {
-        assert_eq!(selection_of(TrackSelector::All), TrackSelection::All);
         assert_eq!(
-            selection_of(TrackSelector::Only(Track::Agent)),
+            consumer_selection_of(TrackSelector::All),
+            TrackSelection::Speakers
+        );
+        assert_eq!(
+            recording_selection_of(TrackSelector::All),
+            TrackSelection::All
+        );
+        assert_eq!(
+            consumer_selection_of(TrackSelector::Only(Track::Agent)),
             TrackSelection::Only(Track::Agent)
+        );
+        assert_eq!(
+            recording_selection_of(TrackSelector::Only(Track::Mixed)),
+            TrackSelection::Only(Track::Mixed)
         );
         assert_eq!(tracks_of(TrackSelector::All), vec!["inbound", "outbound"]);
         assert_eq!(

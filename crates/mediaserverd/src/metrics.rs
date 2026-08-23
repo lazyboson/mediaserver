@@ -142,6 +142,11 @@ pub fn render(sources: &MetricsSources) -> String {
         snapshot.consumer_delivered,
     );
     counter(
+        "mss_consumer_suppressed_while_paused_total",
+        "Frames not delivered to a consumer because its attachment was paused",
+        snapshot.consumer_suppressed_while_paused,
+    );
+    counter(
         "mss_recordings_started_total",
         "Recordings opened on this pod",
         snapshot.recordings_started,
