@@ -29,9 +29,23 @@ pub enum SdpError {
     CodecNotOffered(Encoding),
     #[error("opus must be signalled at 48000 Hz per RFC 7587; the offer said {0}")]
     OpusClockRate(u32),
+    #[error("an inline leg speaks pcmu or pcma; the offer carries {0:?}")]
+    NoInlineCodecOffered(Vec<String>),
+    #[error("an inline answer needs one audio stream; the offer carries {0}")]
+    InlineStreamCount(usize),
+    #[error("the offer's media port is zero; an inline leg needs a peer to send to")]
+    NoPeerPort,
+    #[error("the offer carries no connection address an inline leg could send to")]
+    NoPeerAddress,
+    #[error("ptime {0} ms is outside what an inline leg paces")]
+    UnusablePtime(u32),
 }
 
 pub const TELEPHONE_EVENT: &str = "telephone-event";
+pub const TELEPHONE_EVENT_FMTP: &str = "0-15";
+pub const INLINE_SESSION_NAME: &str = "mss-inline";
+pub const INLINE_CODECS: [Encoding; 2] = [Encoding::Pcmu, Encoding::Pcma];
+pub const MAX_INLINE_PTIME_MS: u32 = 120;
 pub const OPUS: &str = "opus";
 pub const OPUS_CLOCK_RATE_HZ: u32 = 48000;
 pub const OPUS_RTPMAP_CHANNELS: u8 = 2;
@@ -158,6 +172,54 @@ impl OfferedStream {
             }
         }
         Err(SdpError::CodecNotOffered(encoding))
+    }
+
+    pub fn offered_codec_names(&self) -> Vec<String> {
+        self.payload_types
+            .iter()
+            .map(|payload_type| self.codec_name_of(*payload_type))
+            .collect()
+    }
+
+    fn codec_name_of(&self, payload_type: u8) -> String {
+        if let Some(rtpmap) = self
+            .rtpmaps
+            .iter()
+            .find(|map| map.payload_type == payload_type)
+        {
+            return rtpmap.encoding_name.clone();
+        }
+        match Encoding::from_static_payload_type(payload_type) {
+            Some(encoding) => encoding.rtpmap_name().to_string(),
+            None => format!("payload type {payload_type}"),
+        }
+    }
+
+    pub fn negotiate_inline(&self) -> Result<NegotiatedCodec, SdpError> {
+        for payload_type in &self.payload_types {
+            let Some(encoding) = Encoding::from_static_payload_type(*payload_type) else {
+                continue;
+            };
+            if !INLINE_CODECS.contains(&encoding) {
+                continue;
+            }
+            let clock_rate_hz = self
+                .rtpmaps
+                .iter()
+                .find(|map| map.payload_type == *payload_type)
+                .map(|map| map.clock_rate_hz)
+                .or_else(|| encoding.static_clock_rate_hz())
+                .unwrap_or_default();
+            if clock_rate_hz == 0 {
+                return Err(SdpError::UnusableFormat);
+            }
+            return Ok(NegotiatedCodec {
+                payload_type: *payload_type,
+                encoding,
+                clock_rate_hz,
+            });
+        }
+        Err(SdpError::NoInlineCodecOffered(self.offered_codec_names()))
     }
 
     pub fn offered_format(&self, ptime_fallback_ms: u32) -> Result<AudioFormat, SdpError> {
@@ -361,9 +423,314 @@ impl SubscriptionAnswer<'_> {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InlineOffer {
+    pub peer_address: String,
+    pub peer_port: u16,
+    pub codec: NegotiatedCodec,
+    pub ptime_ms: u32,
+    pub telephone_event: Option<RtpMap>,
+}
+
+impl InlineOffer {
+    pub fn parse(sdp: &str, ptime_fallback_ms: u32) -> Result<InlineOffer, SdpError> {
+        let offer = SubscriptionOffer::parse(sdp)?;
+        InlineOffer::from_offer(&offer, ptime_fallback_ms)
+    }
+
+    pub fn from_offer(
+        offer: &SubscriptionOffer,
+        ptime_fallback_ms: u32,
+    ) -> Result<InlineOffer, SdpError> {
+        if offer.streams.len() != 1 {
+            return Err(SdpError::InlineStreamCount(offer.streams.len()));
+        }
+        let stream = &offer.streams[0];
+        if stream.port == 0 {
+            return Err(SdpError::NoPeerPort);
+        }
+        let peer_address = offer
+            .stream_address(0)
+            .filter(|address| !address.is_empty())
+            .ok_or(SdpError::NoPeerAddress)?
+            .to_string();
+        let codec = stream.negotiate_inline()?;
+        let ptime_ms = stream.ptime_ms.unwrap_or(ptime_fallback_ms);
+        if ptime_ms == 0
+            || ptime_ms > MAX_INLINE_PTIME_MS
+            || codec.samples_per_packet(ptime_ms).unwrap_or_default() == 0
+        {
+            return Err(SdpError::UnusablePtime(ptime_ms));
+        }
+        Ok(InlineOffer {
+            peer_address,
+            peer_port: stream.port,
+            codec,
+            ptime_ms,
+            telephone_event: stream.telephone_event().cloned(),
+        })
+    }
+
+    pub fn format(&self) -> AudioFormat {
+        AudioFormat {
+            encoding: self.codec.encoding,
+            sample_rate_hz: self.codec.clock_rate_hz,
+            channels: 1,
+            ptime_ms: self.ptime_ms,
+        }
+    }
+
+    pub fn answer<'a>(
+        &'a self,
+        session_id: u64,
+        local_address: &'a str,
+        receive_port: u16,
+    ) -> InlineAnswer<'a> {
+        InlineAnswer {
+            session_id,
+            local_address,
+            receive_port,
+            answer_with: self.codec,
+            ptime_ms: self.ptime_ms,
+            telephone_event: self.telephone_event.as_ref(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct InlineAnswer<'a> {
+    pub session_id: u64,
+    pub local_address: &'a str,
+    pub receive_port: u16,
+    pub answer_with: NegotiatedCodec,
+    pub ptime_ms: u32,
+    pub telephone_event: Option<&'a RtpMap>,
+}
+
+impl InlineAnswer<'_> {
+    pub fn to_sdp(&self) -> Result<String, SdpError> {
+        if self.receive_port == 0 {
+            return Err(SdpError::NoPeerPort);
+        }
+        if self.ptime_ms == 0 || self.ptime_ms > MAX_INLINE_PTIME_MS {
+            return Err(SdpError::UnusablePtime(self.ptime_ms));
+        }
+        if !INLINE_CODECS.contains(&self.answer_with.encoding) {
+            return Err(SdpError::NoInlineCodecOffered(vec![self
+                .answer_with
+                .encoding
+                .rtpmap_name()
+                .to_string()]));
+        }
+        let mut sdp = String::with_capacity(256);
+        sdp.push_str("v=0\r\n");
+        sdp.push_str(&format!(
+            "o=- {id} {id} IN IP4 {addr}\r\n",
+            id = self.session_id,
+            addr = self.local_address
+        ));
+        sdp.push_str(&format!("s={INLINE_SESSION_NAME}\r\n"));
+        sdp.push_str(&format!("c=IN IP4 {}\r\n", self.local_address));
+        sdp.push_str("t=0 0\r\n");
+        match self.telephone_event {
+            Some(event) => sdp.push_str(&format!(
+                "m=audio {} RTP/AVP {} {}\r\n",
+                self.receive_port, self.answer_with.payload_type, event.payload_type
+            )),
+            None => sdp.push_str(&format!(
+                "m=audio {} RTP/AVP {}\r\n",
+                self.receive_port, self.answer_with.payload_type
+            )),
+        }
+        sdp.push_str(&self.answer_with.rtpmap_line());
+        if let Some(event) = self.telephone_event {
+            sdp.push_str(&format!(
+                "a=rtpmap:{} {}/{}\r\n",
+                event.payload_type, event.encoding_name, event.clock_rate_hz
+            ));
+            sdp.push_str(&format!(
+                "a=fmtp:{} {TELEPHONE_EVENT_FMTP}\r\n",
+                event.payload_type
+            ));
+        }
+        sdp.push_str(&format!("a=ptime:{}\r\n", self.ptime_ms));
+        sdp.push_str("a=sendrecv\r\n");
+        Ok(sdp)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const INLINE_SIP_OFFER: &str = "v=0\r\n\
+o=peer 42 42 IN IP4 10.9.0.4\r\n\
+s=-\r\n\
+c=IN IP4 10.9.0.4\r\n\
+t=0 0\r\n\
+m=audio 41000 RTP/AVP 0 101\r\n\
+a=rtpmap:0 PCMU/8000\r\n\
+a=rtpmap:101 telephone-event/8000\r\n\
+a=fmtp:101 0-16\r\n\
+a=ptime:20\r\n\
+a=sendrecv\r\n";
+
+    fn inline_offer_of(media: &str) -> Result<InlineOffer, SdpError> {
+        InlineOffer::parse(
+            &format!(
+                "v=0\r\no=peer 1 1 IN IP4 10.9.0.4\r\ns=-\r\nc=IN IP4 10.9.0.4\r\nt=0 0\r\n{media}"
+            ),
+            20,
+        )
+    }
+
+    #[test]
+    fn an_inline_offer_yields_the_peer_the_codec_and_the_dtmf_payload_type() {
+        let offer = InlineOffer::parse(INLINE_SIP_OFFER, 20).expect("a plain sip offer parses");
+        assert_eq!(offer.peer_address, "10.9.0.4");
+        assert_eq!(offer.peer_port, 41000);
+        assert_eq!(offer.codec.encoding, Encoding::Pcmu);
+        assert_eq!(offer.codec.payload_type, 0);
+        assert_eq!(offer.codec.clock_rate_hz, 8000);
+        assert_eq!(offer.ptime_ms, 20);
+        assert_eq!(
+            offer
+                .telephone_event
+                .as_ref()
+                .map(|event| event.payload_type),
+            Some(101)
+        );
+        assert_eq!(offer.format(), AudioFormat::pcmu_8k_20ms());
+    }
+
+    #[test]
+    fn the_inline_answer_offers_our_port_the_chosen_codec_and_two_way_media() {
+        let offer = InlineOffer::parse(INLINE_SIP_OFFER, 20).expect("offer");
+        let answer = offer
+            .answer(7, "172.31.98.20", 34002)
+            .to_sdp()
+            .expect("an answer");
+        assert_eq!(
+            answer,
+            "v=0\r\n\
+o=- 7 7 IN IP4 172.31.98.20\r\n\
+s=mss-inline\r\n\
+c=IN IP4 172.31.98.20\r\n\
+t=0 0\r\n\
+m=audio 34002 RTP/AVP 0 101\r\n\
+a=rtpmap:0 PCMU/8000\r\n\
+a=rtpmap:101 telephone-event/8000\r\n\
+a=fmtp:101 0-15\r\n\
+a=ptime:20\r\n\
+a=sendrecv\r\n"
+        );
+    }
+
+    #[test]
+    fn our_own_answer_parses_back_to_what_we_put_in_it() {
+        let offer = InlineOffer::parse(INLINE_SIP_OFFER, 20).expect("offer");
+        let answer = offer
+            .answer(7, "172.31.98.20", 34002)
+            .to_sdp()
+            .expect("answer");
+        let reparsed = InlineOffer::parse(&answer, 20).expect("the answer is valid sdp");
+        assert_eq!(reparsed.peer_address, "172.31.98.20");
+        assert_eq!(reparsed.peer_port, 34002);
+        assert_eq!(reparsed.codec.encoding, Encoding::Pcmu);
+        assert_eq!(reparsed.ptime_ms, 20);
+    }
+
+    #[test]
+    fn an_offer_that_prefers_pcma_is_answered_with_pcma_in_offer_order() {
+        let offer = inline_offer_of(
+            "m=audio 41000 RTP/AVP 8 0\r\na=rtpmap:8 PCMA/8000\r\na=rtpmap:0 PCMU/8000\r\n",
+        )
+        .expect("offer");
+        assert_eq!(offer.codec.encoding, Encoding::Pcma);
+        assert_eq!(offer.codec.payload_type, 8);
+        assert!(offer.telephone_event.is_none());
+        let answer = offer.answer(1, "127.0.0.1", 5000).to_sdp().expect("answer");
+        assert!(answer.contains("m=audio 5000 RTP/AVP 8\r\n"), "{answer}");
+        assert!(!answer.contains("telephone-event"), "{answer}");
+    }
+
+    #[test]
+    fn an_offer_this_leg_cannot_speak_is_refused_by_codec_name() {
+        let refused = inline_offer_of(
+            "m=audio 41000 RTP/AVP 111 9 101\r\n\
+a=rtpmap:111 opus/48000/2\r\n\
+a=rtpmap:9 G722/8000\r\n\
+a=rtpmap:101 telephone-event/8000\r\n",
+        )
+        .expect_err("an inline leg has no opus or g722 encoder");
+        assert_eq!(
+            refused,
+            SdpError::NoInlineCodecOffered(vec![
+                "opus".to_string(),
+                "G722".to_string(),
+                "telephone-event".to_string()
+            ])
+        );
+    }
+
+    #[test]
+    fn an_offer_without_an_rtpmap_still_names_what_it_offered() {
+        let refused = inline_offer_of("m=audio 41000 RTP/AVP 9\r\n")
+            .expect_err("payload type 9 is not a codec this leg speaks");
+        assert_eq!(
+            refused,
+            SdpError::NoInlineCodecOffered(vec!["payload type 9".to_string()])
+        );
+    }
+
+    #[test]
+    fn an_inline_leg_answers_one_stream_only() {
+        let refused = inline_offer_of(
+            "m=audio 41000 RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\n\
+m=audio 41002 RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\n",
+        )
+        .expect_err("two streams are a conference, not an inline leg");
+        assert_eq!(refused, SdpError::InlineStreamCount(2));
+    }
+
+    #[test]
+    fn an_offer_with_no_peer_to_send_to_is_refused() {
+        assert_eq!(
+            inline_offer_of("m=audio 0 RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\n")
+                .expect_err("port zero is held media"),
+            SdpError::NoPeerPort
+        );
+        assert_eq!(
+            InlineOffer::parse(
+                "v=0\r\no=peer 1 1 IN IP4 10.9.0.4\r\ns=-\r\nt=0 0\r\n\
+m=audio 41000 RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\n",
+                20
+            )
+            .expect_err("no c= line means no address"),
+            SdpError::NoPeerAddress
+        );
+    }
+
+    #[test]
+    fn an_offer_with_no_ptime_takes_the_configured_one_and_an_absurd_ptime_is_refused() {
+        let quiet = inline_offer_of("m=audio 41000 RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\n")
+            .expect("an offer may leave ptime out");
+        assert_eq!(quiet.ptime_ms, 20);
+        assert_eq!(
+            inline_offer_of("m=audio 41000 RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\na=ptime:500\r\n")
+                .expect_err("500 ms is not a paceable frame"),
+            SdpError::UnusablePtime(500)
+        );
+    }
+
+    #[test]
+    fn a_stream_level_connection_address_wins_over_the_session_one() {
+        let offer = inline_offer_of(
+            "m=audio 41000 RTP/AVP 0\r\nc=IN IP4 10.9.0.9\r\na=rtpmap:0 PCMU/8000\r\n",
+        )
+        .expect("offer");
+        assert_eq!(offer.peer_address, "10.9.0.9");
+    }
 
     pub(super) const TWO_LEG_OFFER: &str = "v=0\r\n\
 o=- 8000 8000 IN IP4 10.0.0.5\r\n\

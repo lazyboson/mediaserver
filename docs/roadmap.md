@@ -191,10 +191,24 @@ tag-replacing transfer triggers a re-subscribe.
 Objective: things that talk back go through MSS inline legs; the
 dummy-leg-conference construct and the legacy media gateway die.
 
+Status (2026-08-23): the leg itself is built and replay-verified, nothing has
+met a SIP peer yet. `CreateSession{kind=INLINE, sdp_offer}` binds a UDP socket
+on the pod's media address, answers with MSS-owned SDP (PCMU/PCMA +
+telephone-event; anything else refused by name), returns the answer in
+`Session.sdp_answer`, feeds the peer's audio into the same jitter → decode →
+hub pipeline the taps use as the `customer` track, and paces queued PCM back
+out through the sans-IO `PlayoutPacer` (tasks.md items 32 and 33).
+`StopPlayback` flushes the egress queue, which is the barge seam. Owed:
+full duplex from consumers (INJECT streaming), the measured cut-through, and a
+live drill with a real RTP peer.
+
 Work:
 - Inline RTP endpoint mode: answer OpenSIPS B2B INVITEs
   (`X-Conversation-ID` / `X-ccId` correlation, `ua_session_reply` via MI)
   with MSS-owned SDP; per-pod addressable RTP (hostNetwork/port range).
+  **The SDP answer and the media path exist; the SIP/B2B side is the
+  integrator's, and an inline leg is deliberately not adoptable across pods —
+  unlike a tap, its socket dies with its pod, so recovery is call control's.**
 - Full-duplex sessions: caller audio to bot, streaming TTS from bot to
   caller through the playout pacer; barge-in cut-through in MSS.
 - Pre-agent AI calls routed by OpenSIPS straight to MSS — FreeSWITCH

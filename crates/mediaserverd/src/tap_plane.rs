@@ -3,6 +3,10 @@ use crate::hub::{
     Hub, HubClient, Subscription, SubscriptionControl, SubscriptionMetrics, TapEvent,
     TrackSelection,
 };
+use crate::inline_leg::{
+    egress_ssrc, InlineEgress, InlineEgressHandle, InlineEgressShared, InlineEgressTotals,
+    EGRESS_CHUNK_MS,
+};
 use crate::ng_transport::{NgTransport, NgTransportConfig};
 use crate::recorder::{
     self, Layout, RecorderCounters, RecorderHandle, RecorderSpec, RecordingFormat,
@@ -12,13 +16,16 @@ use crate::registry_keeper::TapSubscriptions;
 use crate::rtpengine_capability::NodeCapabilityLog;
 use crate::session_store::PersistedRecording;
 use crate::tap_spike::{
-    capture, SharedLegStats, SsrcTrackPublisher, SsrcTracks, TapLeg, MAX_SSRC_TRACKS,
+    capture, capture_with_egress, SharedLegStats, SsrcTrackPublisher, SsrcTracks, TapLeg,
+    MAX_SSRC_TRACKS,
 };
-use control_api::{MediaPlane, MediaPlaneError, ObservationSink, PlaybackSource, StreamFrame};
+use control_api::{
+    MediaPlane, MediaPlaneError, ObservationSink, OpenedSession, PlaybackSource, StreamFrame,
+};
 use media_core::pipeline::PipelineConfig;
 use media_core::{AudioFormat, ConsumerEncoder, Encoding, Track};
 use rtpengine_ng::{
-    NegotiatedCodec, PlayMedia, PlaySource, PlayTarget, SdpError, SubscribeRequest,
+    InlineOffer, NegotiatedCodec, PlayMedia, PlaySource, PlayTarget, SdpError, SubscribeRequest,
     SubscriptionAnswer, SubscriptionOffer,
 };
 use session_core::{
@@ -63,13 +70,22 @@ pub struct TapPlaneConfig {
     pub capabilities: Arc<NodeCapabilityLog>,
 }
 
+struct SessionHandles {
+    transport: Option<Arc<NgTransport>>,
+    call_id: String,
+    hub: HubClient,
+    external_id: String,
+}
+
 struct LiveSession {
-    transport: Arc<NgTransport>,
+    kind: SessionKind,
+    transport: Option<Arc<NgTransport>>,
     external_id: String,
     call_id: String,
     to_tag: String,
     format: AudioFormat,
     hub: HubClient,
+    egress: Option<InlineEgressHandle>,
     stop: Arc<AtomicBool>,
     capture: Option<std::thread::JoinHandle<()>>,
     speakers: Option<tokio::task::JoinHandle<()>>,
@@ -223,6 +239,8 @@ pub struct IngestSnapshot {
     pub recording_groups_live: u64,
     pub recording_group_members_live: u64,
     pub recording_group_joins_refused: u64,
+    pub inline_legs_live: u64,
+    pub inline: InlineEgressTotals,
 }
 
 #[derive(Default)]
@@ -233,6 +251,8 @@ struct MetricsInner {
     retired_consumer_suppressed: u64,
     ssrc_requeries: u64,
     legs: HashMap<SessionId, Vec<Arc<SharedLegStats>>>,
+    inline: HashMap<SessionId, Arc<InlineEgressShared>>,
+    retired_inline: InlineEgressTotals,
     consumers: HashMap<AttachmentId, SubscriptionMetrics>,
     recorder: Arc<RecorderCounters>,
 }
@@ -258,8 +278,15 @@ impl TapPlaneMetrics {
         self.lock().legs.insert(session, legs);
     }
 
+    fn register_inline(&self, session: SessionId, egress: Arc<InlineEgressShared>) {
+        self.lock().inline.insert(session, egress);
+    }
+
     fn retire_session(&self, session: SessionId) {
         let mut inner = self.lock();
+        if let Some(egress) = inner.inline.remove(&session) {
+            inner.retired_inline.add_shared(&egress);
+        }
         if let Some(legs) = inner.legs.remove(&session) {
             for leg in legs {
                 inner.retired.add_shared(&leg);
@@ -320,8 +347,13 @@ impl TapPlaneMetrics {
             recording_groups_live: read(&recorder.groups_live),
             recording_group_members_live: read(&recorder.group_members_live),
             recording_group_joins_refused: read(&recorder.group_joins_refused),
+            inline_legs_live: inner.inline.len() as u64,
+            inline: inner.retired_inline,
             ..IngestSnapshot::default()
         };
+        for egress in inner.inline.values() {
+            snapshot.inline.add_shared(egress);
+        }
         for legs in inner.legs.values() {
             for leg in legs {
                 snapshot.totals.add_shared(leg);
@@ -472,7 +504,12 @@ impl TapPlane {
             ));
         }
 
-        let (_, call_id, hub, external_id, _) = self.session_handles(view.session)?;
+        let SessionHandles {
+            call_id,
+            hub,
+            external_id,
+            ..
+        } = self.session_handles(view.session)?;
         let subscription = hub
             .attach(CONSUMER_QUEUE_FRAMES, consumer_selection_of(view.selector))
             .ok_or_else(|| {
@@ -584,7 +621,9 @@ impl TapPlane {
                     .to_string(),
             ));
         }
-        let (_, _, hub, external_id, _) = self.session_handles(view.session)?;
+        let SessionHandles {
+            hub, external_id, ..
+        } = self.session_handles(view.session)?;
         let selection = recording_selection_of(view.selector);
         let grouped = if view.group.is_empty() {
             None
@@ -843,118 +882,7 @@ impl TapPlane {
         Some(())
     }
 
-    fn session_format(&self, session: SessionId) -> Result<AudioFormat, MediaPlaneError> {
-        let held = self
-            .sessions
-            .lock()
-            .map_err(|_| MediaPlaneError("the session table is poisoned".to_string()))?;
-        held.get(&session)
-            .map(|live| live.format)
-            .ok_or_else(|| MediaPlaneError(format!("{session} is not tapped here")))
-    }
-
-    fn session_handles(
-        &self,
-        session: SessionId,
-    ) -> Result<(Arc<NgTransport>, String, HubClient, String, String), MediaPlaneError> {
-        let held = self
-            .sessions
-            .lock()
-            .map_err(|_| MediaPlaneError("the session table is poisoned".to_string()))?;
-        let live = held
-            .get(&session)
-            .ok_or_else(|| MediaPlaneError(format!("{session} is not tapped here")))?;
-        Ok((
-            Arc::clone(&live.transport),
-            live.call_id.clone(),
-            live.hub.clone(),
-            live.external_id.clone(),
-            live.to_tag.clone(),
-        ))
-    }
-
-    async fn end_attachment(&self, attachment: AttachmentId, held: LiveAttachment, reason: &str) {
-        match held {
-            LiveAttachment::Ws {
-                session,
-                media,
-                task,
-                ..
-            } => {
-                media.end_of_stream();
-                let mut task = task;
-                match tokio::time::timeout(POLITE_CLOSE, &mut task).await {
-                    Ok(Ok(Ok(stats))) => info!(
-                        %attachment,
-                        %session,
-                        %reason,
-                        media_sent = stats.media_sent,
-                        "the consumer websocket was closed after its stop frame"
-                    ),
-                    Ok(Ok(Err(error))) => warn!(
-                        %attachment, %session, %error,
-                        "the consumer websocket ended with an error instead of a stop frame"
-                    ),
-                    Ok(Err(_)) => warn!(
-                        %attachment, %session,
-                        "the consumer task ended before it could send its stop frame"
-                    ),
-                    Err(_) => {
-                        task.abort();
-                        warn!(
-                            %attachment, %session,
-                            "the consumer did not take its stop frame within {POLITE_CLOSE:?}; \
-                             its socket was dropped"
-                        );
-                    }
-                }
-            }
-            LiveAttachment::Grpc { session, live, .. } => {
-                if let Some(GrpcLive {
-                    frames,
-                    media,
-                    mut pump,
-                }) = live
-                {
-                    media.end_of_stream();
-                    if tokio::time::timeout(POLITE_CLOSE, &mut pump).await.is_err() {
-                        pump.abort();
-                        warn!(
-                            %attachment, %session,
-                            "the frame pump did not drain within {POLITE_CLOSE:?}"
-                        );
-                    }
-                    if frames
-                        .try_send(StreamFrame::Stop {
-                            reason: reason.to_string(),
-                        })
-                        .is_err()
-                    {
-                        warn!(
-                            %attachment, %session,
-                            "the grpc consumer is too far behind for a stop frame; \
-                             its stream is closed instead"
-                        );
-                    }
-                }
-                info!(%attachment, %session, %reason, "grpc consumer detached");
-            }
-            recording @ LiveAttachment::Recording { .. } => {
-                self.finish_recording(attachment, recording).await;
-            }
-        }
-        self.metrics.retire_consumer(attachment);
-    }
-}
-
-#[control_api::async_trait]
-impl MediaPlane for TapPlane {
-    async fn open_session(&self, view: SessionView) -> Result<(), MediaPlaneError> {
-        if view.kind != SessionKind::Tap {
-            return Err(MediaPlaneError(
-                "only tap sessions are implemented; inline legs are phase 3".to_string(),
-            ));
-        }
+    async fn open_tap_session(&self, view: SessionView) -> Result<OpenedSession, MediaPlaneError> {
         if view.call_id.is_empty() {
             return Err(MediaPlaneError("a tap needs the call-id".to_string()));
         }
@@ -1192,12 +1120,14 @@ impl MediaPlane for TapPlane {
         held.insert(
             view.id,
             LiveSession {
-                transport,
+                kind: SessionKind::Tap,
+                transport: Some(transport),
                 external_id: view.external_id.clone(),
                 call_id: view.call_id.clone(),
                 to_tag,
                 format,
                 hub: hub_client,
+                egress: None,
                 stop,
                 capture: Some(capture_thread),
                 speakers,
@@ -1205,7 +1135,343 @@ impl MediaPlane for TapPlane {
         );
         drop(held);
         self.metrics.register_session(view.id, shared_stats);
+        Ok(OpenedSession::default())
+    }
+
+    fn open_inline_session(&self, view: SessionView) -> Result<OpenedSession, MediaPlaneError> {
+        let offer_sdp = view.sdp_offer.as_deref().ok_or_else(|| {
+            MediaPlaneError(
+                "an inline session needs the peer's sdp offer; a tap is what listens to a \
+                 call MSS is not in"
+                    .to_string(),
+            )
+        })?;
+        let offer = InlineOffer::parse(offer_sdp, self.config.format.ptime_ms)
+            .map_err(|error| MediaPlaneError(format!("inline offer: {error}")))?;
+        let peer_address: IpAddr = offer.peer_address.parse().map_err(|_| {
+            MediaPlaneError(format!(
+                "inline offer: {} is not an address this leg can send rtp to",
+                offer.peer_address
+            ))
+        })?;
+        let peer = SocketAddr::new(peer_address, offer.peer_port);
+        let format = offer.format();
+
+        let socket = UdpSocket::bind(SocketAddr::new(self.config.local_media_address, 0))
+            .map_err(|error| MediaPlaneError(format!("media socket: {error}")))?;
+        socket
+            .set_nonblocking(true)
+            .map_err(|error| MediaPlaneError(format!("media socket: {error}")))?;
+        let receive_port = socket
+            .local_addr()
+            .map_err(|error| MediaPlaneError(format!("media socket: {error}")))?
+            .port();
+        let egress_socket = socket
+            .try_clone()
+            .map_err(|error| MediaPlaneError(format!("egress socket: {error}")))?;
+
+        let local_address = self.config.local_media_address.to_string();
+        let answer_sdp = offer
+            .answer(self.config.sdp_session_id, &local_address, receive_port)
+            .to_sdp()
+            .map_err(|error| MediaPlaneError(format!("inline answer: {error}")))?;
+
+        let epoch = Instant::now();
+        let (mut egress, egress_handle) = InlineEgress::bind(
+            egress_socket,
+            peer,
+            format,
+            offer.codec.payload_type,
+            egress_ssrc(view.id.raw(), self.config.sdp_session_id),
+            epoch,
+        )
+        .map_err(|error| MediaPlaneError(format!("inline egress: {error}")))?;
+
+        let shared = Arc::new(SharedLegStats::default());
+        let leg = TapLeg::with_pipeline_config(
+            Track::Customer,
+            socket,
+            PipelineConfig {
+                audio_payload_type: offer.codec.payload_type,
+                clock_rate_hz: offer.codec.clock_rate_hz,
+                decode: format,
+                target_depth_packets: TARGET_DEPTH_PACKETS,
+                telephone_event_payload_type: offer
+                    .telephone_event
+                    .as_ref()
+                    .map(|event| event.payload_type),
+            },
+            RETAIN_NO_LOCAL_AUDIO,
+        )
+        .map_err(|error| MediaPlaneError(format!("inline leg: {error}")))?
+        .with_shared_stats(Arc::clone(&shared), STALL_AFTER, epoch);
+
+        let (mut hub, hub_client) = Hub::new();
+        let stop = Arc::new(AtomicBool::new(false));
+        let capture_stop = Arc::clone(&stop);
+        let session = view.id;
+        let mut legs = vec![leg];
+        let capture_thread = std::thread::Builder::new()
+            .name(format!("mss-inline-{}", view.id.raw()))
+            .spawn(move || {
+                let summary = capture_with_egress(
+                    &mut legs,
+                    Some(&mut hub),
+                    Some(&mut egress),
+                    format,
+                    MAX_SESSION_DURATION,
+                    &capture_stop,
+                );
+                for leg in legs.iter() {
+                    let stats = leg.stats();
+                    info!(
+                        %session,
+                        track = ?leg.track(),
+                        datagrams = stats.datagrams,
+                        frames_played = stats.pipeline.frames_played,
+                        frames_concealed = stats.pipeline.frames_concealed,
+                        underruns = stats.underruns,
+                        telephone_event_packets = stats.pipeline.telephone_events,
+                        dtmf_digits = stats.pipeline.dtmf_digits,
+                        jitter_lost = stats.jitter.lost,
+                        jitter_late_drops = stats.jitter.late_drops,
+                        recv_errors = stats.recv_errors,
+                        "inline leg ingest finished"
+                    );
+                }
+                let paced = egress.stats();
+                info!(
+                    %session,
+                    peer = %egress.peer(),
+                    releases = summary.releases,
+                    reanchors = summary.reanchors,
+                    elapsed_ms = summary.elapsed.as_millis() as u64,
+                    published = hub.published(),
+                    packets_emitted = paced.packets_emitted,
+                    silence_frames = paced.silence_frames,
+                    partial_frames = paced.partial_frames,
+                    marker_packets = paced.marker_packets,
+                    late_ticks = paced.late_ticks,
+                    dropped_samples = paced.dropped_samples,
+                    flushed_samples = paced.flushed_samples,
+                    encode_errors = paced.encode_errors,
+                    "inline leg egress finished"
+                );
+            })
+            .map_err(|error| MediaPlaneError(format!("capture thread: {error}")))?;
+
+        info!(
+            session = %view.id,
+            external_id = %view.external_id,
+            call_id = %view.call_id,
+            %peer,
+            receive_port,
+            encoding = ?format.encoding,
+            sample_rate_hz = format.sample_rate_hz,
+            ptime_ms = format.ptime_ms,
+            payload_type = offer.codec.payload_type,
+            telephone_event = ?offer.telephone_event.as_ref().map(|event| event.payload_type),
+            "answered an inline leg; MSS is the rtp endpoint for this session"
+        );
+
+        let mut held = self
+            .sessions
+            .lock()
+            .map_err(|_| MediaPlaneError("the session table is poisoned".to_string()))?;
+        held.insert(
+            view.id,
+            LiveSession {
+                kind: SessionKind::Inline,
+                transport: None,
+                external_id: view.external_id.clone(),
+                call_id: view.call_id.clone(),
+                to_tag: String::new(),
+                format,
+                hub: hub_client,
+                egress: Some(egress_handle.clone()),
+                stop,
+                capture: Some(capture_thread),
+                speakers: None,
+            },
+        );
+        drop(held);
+        self.metrics.register_session(view.id, vec![shared]);
+        self.metrics
+            .register_inline(view.id, egress_handle.shared());
+        Ok(OpenedSession::answered(answer_sdp))
+    }
+
+    pub fn inline_egress(&self, session: SessionId) -> Option<InlineEgressHandle> {
+        self.sessions
+            .lock()
+            .ok()?
+            .get(&session)
+            .and_then(|live| live.egress.clone())
+    }
+
+    fn play_into_inline_leg(
+        &self,
+        session: SessionId,
+        source: PlaybackSource,
+    ) -> Result<(), MediaPlaneError> {
+        let format = self.session_format(session)?;
+        let egress = self
+            .inline_egress(session)
+            .ok_or_else(|| MediaPlaneError(format!("{session} has no inline egress")))?;
+        let wav = match source {
+            PlaybackSource::Blob(bytes) => bytes,
+            PlaybackSource::File(path) => std::fs::read(&path)
+                .map_err(|error| MediaPlaneError(format!("playback file {path}: {error}")))?,
+            PlaybackSource::Stream => {
+                return Err(MediaPlaneError(
+                    "a streaming playback into an inline leg is an inject-capable \
+                     attachment, not a playback"
+                        .to_string(),
+                ))
+            }
+        };
+        let pcm = inline_playback_pcm(&wav, format)?;
+        let chunk_samples =
+            (format.sample_rate_hz as usize * EGRESS_CHUNK_MS as usize / 1000).max(1);
+        let chunks = pcm.len().div_ceil(chunk_samples);
+        let free = egress.free_chunks();
+        if chunks > free {
+            return Err(MediaPlaneError(format!(
+                "this playback is {} ms of audio and the inline egress queue has room for \
+                 {} ms; stream long-form audio through an inject attachment instead",
+                pcm.len() as u64 * 1000 / format.sample_rate_hz.max(1) as u64,
+                free as u32 * EGRESS_CHUNK_MS
+            )));
+        }
+        for chunk in pcm.chunks(chunk_samples) {
+            if !egress.push(chunk.to_vec()) {
+                return Err(MediaPlaneError(
+                    "the inline egress queue filled while this playback was being queued"
+                        .to_string(),
+                ));
+            }
+        }
+        info!(
+            %session,
+            samples = pcm.len(),
+            chunks,
+            "queued a playback into the inline leg's egress"
+        );
         Ok(())
+    }
+
+    fn session_format(&self, session: SessionId) -> Result<AudioFormat, MediaPlaneError> {
+        let held = self
+            .sessions
+            .lock()
+            .map_err(|_| MediaPlaneError("the session table is poisoned".to_string()))?;
+        held.get(&session)
+            .map(|live| live.format)
+            .ok_or_else(|| MediaPlaneError(format!("{session} is not tapped here")))
+    }
+
+    fn session_handles(&self, session: SessionId) -> Result<SessionHandles, MediaPlaneError> {
+        let held = self
+            .sessions
+            .lock()
+            .map_err(|_| MediaPlaneError("the session table is poisoned".to_string()))?;
+        let live = held
+            .get(&session)
+            .ok_or_else(|| MediaPlaneError(format!("{session} is not tapped here")))?;
+        Ok(SessionHandles {
+            transport: live.transport.clone(),
+            call_id: live.call_id.clone(),
+            hub: live.hub.clone(),
+            external_id: live.external_id.clone(),
+        })
+    }
+
+    async fn end_attachment(&self, attachment: AttachmentId, held: LiveAttachment, reason: &str) {
+        match held {
+            LiveAttachment::Ws {
+                session,
+                media,
+                task,
+                ..
+            } => {
+                media.end_of_stream();
+                let mut task = task;
+                match tokio::time::timeout(POLITE_CLOSE, &mut task).await {
+                    Ok(Ok(Ok(stats))) => info!(
+                        %attachment,
+                        %session,
+                        %reason,
+                        media_sent = stats.media_sent,
+                        "the consumer websocket was closed after its stop frame"
+                    ),
+                    Ok(Ok(Err(error))) => warn!(
+                        %attachment, %session, %error,
+                        "the consumer websocket ended with an error instead of a stop frame"
+                    ),
+                    Ok(Err(_)) => warn!(
+                        %attachment, %session,
+                        "the consumer task ended before it could send its stop frame"
+                    ),
+                    Err(_) => {
+                        task.abort();
+                        warn!(
+                            %attachment, %session,
+                            "the consumer did not take its stop frame within {POLITE_CLOSE:?}; \
+                             its socket was dropped"
+                        );
+                    }
+                }
+            }
+            LiveAttachment::Grpc { session, live, .. } => {
+                if let Some(GrpcLive {
+                    frames,
+                    media,
+                    mut pump,
+                }) = live
+                {
+                    media.end_of_stream();
+                    if tokio::time::timeout(POLITE_CLOSE, &mut pump).await.is_err() {
+                        pump.abort();
+                        warn!(
+                            %attachment, %session,
+                            "the frame pump did not drain within {POLITE_CLOSE:?}"
+                        );
+                    }
+                    if frames
+                        .try_send(StreamFrame::Stop {
+                            reason: reason.to_string(),
+                        })
+                        .is_err()
+                    {
+                        warn!(
+                            %attachment, %session,
+                            "the grpc consumer is too far behind for a stop frame; \
+                             its stream is closed instead"
+                        );
+                    }
+                }
+                info!(%attachment, %session, %reason, "grpc consumer detached");
+            }
+            recording @ LiveAttachment::Recording { .. } => {
+                self.finish_recording(attachment, recording).await;
+            }
+        }
+        self.metrics.retire_consumer(attachment);
+    }
+}
+
+#[control_api::async_trait]
+impl MediaPlane for TapPlane {
+    async fn open_session(&self, view: SessionView) -> Result<OpenedSession, MediaPlaneError> {
+        match view.kind {
+            SessionKind::Tap => self.open_tap_session(view).await,
+            SessionKind::Inline => self.open_inline_session(view),
+            SessionKind::Mix => Err(MediaPlaneError(
+                "a mixed session is the phase-4 conference; join inline legs into a group \
+                 instead"
+                    .to_string(),
+            )),
+        }
     }
 
     async fn close_session(&self, session: SessionId) -> Result<(), MediaPlaneError> {
@@ -1230,16 +1496,14 @@ impl MediaPlane for TapPlane {
         if let Some(speakers) = live.speakers.take() {
             speakers.abort();
         }
-        if let Err(error) = live
-            .transport
-            .unsubscribe(&live.call_id, &live.to_tag)
-            .await
-        {
-            warn!(
-                %session,
-                %error,
-                "unsubscribe failed; rtpengine keeps the subscription until it times out"
-            );
+        if let Some(transport) = live.transport.as_ref() {
+            if let Err(error) = transport.unsubscribe(&live.call_id, &live.to_tag).await {
+                warn!(
+                    %session,
+                    %error,
+                    "unsubscribe failed; rtpengine keeps the subscription until it times out"
+                );
+            }
         }
         if let Some(thread) = live.capture.take() {
             let joined = tokio::task::spawn_blocking(move || thread.join()).await;
@@ -1248,7 +1512,7 @@ impl MediaPlane for TapPlane {
             }
         }
         self.metrics.retire_session(session);
-        info!(%session, call_id = %live.call_id, "tap closed");
+        info!(%session, kind = ?live.kind, call_id = %live.call_id, "session closed");
         Ok(())
     }
 
@@ -1444,7 +1708,7 @@ impl MediaPlane for TapPlane {
             }
         };
 
-        let (_, _, hub, _, _) = self.session_handles(session)?;
+        let SessionHandles { hub, .. } = self.session_handles(session)?;
         let subscription = hub
             .attach(CONSUMER_QUEUE_FRAMES, selection)
             .ok_or_else(|| {
@@ -1495,25 +1759,21 @@ impl MediaPlane for TapPlane {
         target_tag: Option<String>,
         block_egress: bool,
     ) -> Result<(), MediaPlaneError> {
-        let source = match source {
-            PlaybackSource::File(path) => PlaySource::File(path),
-            PlaybackSource::Blob(bytes) => {
-                if bytes.len() > MAX_PLAYBACK_BLOB_BYTES {
-                    return Err(MediaPlaneError(format!(
-                        "a {} byte blob exceeds what one NG datagram carries; \
-                         chunked playback is not implemented",
-                        bytes.len()
-                    )));
-                }
-                PlaySource::Blob(bytes)
-            }
-            PlaybackSource::Stream => {
-                return Err(MediaPlaneError(
-                    "streaming playback needs the phase-3 inline leg".to_string(),
-                ))
-            }
-        };
-        let (transport, call_id, _, _, _) = self.session_handles(session)?;
+        if matches!(source, PlaybackSource::Stream) {
+            return Err(MediaPlaneError(
+                "a streaming playback is an inject-capable attachment on an inline leg, \
+                 not a playback"
+                    .to_string(),
+            ));
+        }
+        let SessionHandles {
+            transport, call_id, ..
+        } = self.session_handles(session)?;
+        if transport.is_none() {
+            return self.play_into_inline_leg(session, source);
+        }
+        let source = ng_play_source(source)?;
+        let transport = require_subscription(session, transport)?;
         transport
             .play_media(&PlayMedia {
                 call_id,
@@ -1533,7 +1793,20 @@ impl MediaPlane for TapPlane {
         _playback: session_core::PlaybackId,
         target_tag: Option<String>,
     ) -> Result<(), MediaPlaneError> {
-        let (transport, call_id, _, _, _) = self.session_handles(session)?;
+        let SessionHandles {
+            transport, call_id, ..
+        } = self.session_handles(session)?;
+        let Some(transport) = transport else {
+            let egress = self.inline_egress(session).ok_or_else(|| {
+                MediaPlaneError(format!("{session} has no inline egress to stop"))
+            })?;
+            egress.clear();
+            info!(
+                %session,
+                "flushed an inline leg's egress queue; the next paced frame is silence"
+            );
+            return Ok(());
+        };
         transport
             .stop_media(&call_id, &target_of(target_tag))
             .await
@@ -1641,6 +1914,61 @@ async fn pump_frames(
             return;
         }
     }
+}
+
+fn inline_playback_pcm(wav: &[u8], format: AudioFormat) -> Result<Vec<i16>, MediaPlaneError> {
+    let mut reader = hound::WavReader::new(std::io::Cursor::new(wav))
+        .map_err(|error| MediaPlaneError(format!("playback audio is not a wav: {error}")))?;
+    let spec = reader.spec();
+    if spec.channels != 1 || spec.bits_per_sample != 16 {
+        return Err(MediaPlaneError(format!(
+            "an inline playback must be 16-bit mono; this wav is {}-bit with {} channels",
+            spec.bits_per_sample, spec.channels
+        )));
+    }
+    if spec.sample_rate != format.sample_rate_hz {
+        return Err(MediaPlaneError(format!(
+            "this playback is {} Hz and the leg negotiated {} Hz; resample before queueing it",
+            spec.sample_rate, format.sample_rate_hz
+        )));
+    }
+    reader
+        .samples::<i16>()
+        .collect::<Result<Vec<i16>, _>>()
+        .map_err(|error| MediaPlaneError(format!("playback audio: {error}")))
+}
+
+fn ng_play_source(source: PlaybackSource) -> Result<PlaySource, MediaPlaneError> {
+    match source {
+        PlaybackSource::File(path) => Ok(PlaySource::File(path)),
+        PlaybackSource::Blob(bytes) => {
+            if bytes.len() > MAX_PLAYBACK_BLOB_BYTES {
+                return Err(MediaPlaneError(format!(
+                    "a {} byte blob exceeds what one NG datagram carries; \
+                     chunked playback is not implemented",
+                    bytes.len()
+                )));
+            }
+            Ok(PlaySource::Blob(bytes))
+        }
+        PlaybackSource::Stream => Err(MediaPlaneError(
+            "a streaming playback is an inject-capable attachment on an inline leg, \
+             not a playback"
+                .to_string(),
+        )),
+    }
+}
+
+fn require_subscription(
+    session: SessionId,
+    transport: Option<Arc<NgTransport>>,
+) -> Result<Arc<NgTransport>, MediaPlaneError> {
+    transport.ok_or_else(|| {
+        MediaPlaneError(format!(
+            "{session} is an inline leg, not a tap: it has no rtpengine subscription to play \
+             media into, and audio reaches its peer through the egress queue"
+        ))
+    })
 }
 
 fn transcoded_tap_codec(
@@ -2001,8 +2329,17 @@ mod tests {
             call_id: "call-abc".to_string(),
             from_tags: vec!["from-a".to_string()],
             rtpengine_node: node.to_string(),
+            sdp_offer: None,
+            sdp_answer: None,
             attachments: Vec::new(),
             authoritative: None,
+        }
+    }
+
+    fn inline_session(offer: &str) -> SessionView {
+        SessionView {
+            sdp_offer: Some(offer.to_string()),
+            ..session(SessionKind::Inline, "")
         }
     }
 
@@ -2106,14 +2443,267 @@ mod tests {
         assert!(error.to_string().contains("ip:port"));
     }
 
+    fn inline_offer_sdp(peer_port: u16) -> String {
+        format!(
+            "v=0\r\no=peer 1 1 IN IP4 127.0.0.1\r\ns=-\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\n\
+m=audio {peer_port} RTP/AVP 0 101\r\na=rtpmap:0 PCMU/8000\r\n\
+a=rtpmap:101 telephone-event/8000\r\na=ptime:20\r\n"
+        )
+    }
+
+    fn tone_datagram(sequence: u16, sample: i16) -> Vec<u8> {
+        let payload: Vec<u8> = (0..160)
+            .map(|_| media_core::g711::linear_to_ulaw(sample))
+            .collect();
+        let packet = media_core::rtp::RtpPacket {
+            marker: sequence == 0,
+            payload_type: 0,
+            sequence,
+            timestamp: u32::from(sequence) * 160,
+            ssrc: 0x0bad_cafe,
+            payload: &payload,
+        };
+        let mut datagram = vec![0u8; 12 + payload.len()];
+        let written = packet.serialize(&mut datagram).expect("an rtp datagram");
+        datagram.truncate(written);
+        datagram
+    }
+
     #[tokio::test]
-    async fn an_inline_session_is_refused_because_phase_3_has_not_landed() {
+    async fn an_inline_leg_hears_its_peer_and_paces_queued_audio_back_to_it() {
+        let peer = UdpSocket::bind("127.0.0.1:0").expect("a fake peer socket");
+        peer.set_nonblocking(true).expect("nonblocking peer");
+        let peer_port = peer.local_addr().expect("peer address").port();
+        let plane = plane();
+        let session = SessionId::from_raw(1);
+
+        let opened = plane
+            .open_session(inline_session(&inline_offer_sdp(peer_port)))
+            .await
+            .expect("an inline leg answers a pcmu offer");
+        let answer = opened
+            .sdp_answer
+            .expect("an inline session answers with sdp");
+        let answered = InlineOffer::parse(&answer, 20).expect("our own answer is valid sdp");
+        assert_eq!(answered.codec.payload_type, 0);
+        assert_eq!(
+            answered.telephone_event.map(|event| event.payload_type),
+            Some(101)
+        );
+        let ours = SocketAddr::new(IpAddr::from([127, 0, 0, 1]), answered.peer_port);
+
+        let SessionHandles { transport, hub, .. } = plane
+            .session_handles(session)
+            .expect("the inline session is live here");
+        assert!(
+            transport.is_none(),
+            "an inline leg holds no rtpengine subscription"
+        );
+        let mut subscription = hub
+            .attach(64, TrackSelection::All)
+            .expect("the hub takes a consumer");
+
+        for sequence in 0..8u16 {
+            peer.send_to(&tone_datagram(sequence, 4_000), ours)
+                .expect("the peer can reach the inline leg");
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        let mut heard = 0;
+        let mut loudest = 0i16;
+        while let Some(event) = subscription.try_next() {
+            if let TapEvent::Media {
+                track,
+                len,
+                samples,
+                ..
+            } = event
+            {
+                assert_ne!(track, Track::Agent, "an inline leg has one leg, not two");
+                if track == Track::Customer && len > 0 {
+                    heard += 1;
+                    loudest = loudest.max(samples[..len].iter().copied().max().unwrap_or(0));
+                }
+            }
+        }
+        assert!(heard >= 4, "the hub saw {heard} frames from the peer");
+        assert!(
+            loudest > 3_000,
+            "the peer's tone reached the hub: {loudest}"
+        );
+
+        let pcm: Vec<i16> = (0..1_600)
+            .map(|index| ((index % 40) * 200) as i16)
+            .collect();
+        let wav =
+            crate::tap_spike::wav_blob(AudioFormat::pcmu_8k_20ms(), &pcm).expect("a playback wav");
+        plane
+            .start_playback(
+                session,
+                session_core::PlaybackId::from_raw(3),
+                PlaybackSource::Blob(wav),
+                None,
+                false,
+            )
+            .await
+            .expect("a wav queues into the inline egress");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        let mut datagrams = 0;
+        let mut sequences = Vec::new();
+        let mut payload_types = Vec::new();
+        let mut buf = [0u8; 2048];
+        while let Ok((len, from)) = peer.recv_from(&mut buf) {
+            assert_eq!(
+                from, ours,
+                "the inline leg sends from the port it answered on"
+            );
+            let packet = media_core::rtp::RtpPacket::parse(&buf[..len])
+                .expect("the peer receives parsable rtp");
+            datagrams += 1;
+            sequences.push(packet.sequence);
+            payload_types.push(packet.payload_type);
+            assert_eq!(packet.payload.len(), 160);
+        }
+        assert!(datagrams >= 8, "the peer heard {datagrams} paced datagrams");
+        assert!(
+            payload_types.iter().all(|payload_type| *payload_type == 0),
+            "every egress packet is pcmu: {payload_types:?}"
+        );
+        for pair in sequences.windows(2) {
+            assert_eq!(
+                pair[1],
+                pair[0].wrapping_add(1),
+                "the egress sequence never skips: {sequences:?}"
+            );
+        }
+
+        plane
+            .close_session(session)
+            .await
+            .expect("the inline leg closes");
+    }
+
+    #[tokio::test]
+    async fn an_offer_this_leg_cannot_speak_is_refused_before_a_socket_is_bound() {
         let plane = plane();
         let error = plane
-            .open_session(session(SessionKind::Inline, "127.0.0.1:22222"))
+            .open_session(inline_session(
+                "v=0\r\no=peer 1 1 IN IP4 127.0.0.1\r\ns=-\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\n\
+m=audio 41000 RTP/AVP 111\r\na=rtpmap:111 opus/48000/2\r\n",
+            ))
             .await
             .unwrap_err();
-        assert!(error.to_string().contains("phase 3"));
+        assert!(error.to_string().contains("opus"), "{error}");
+        assert_eq!(plane.live_sessions(), 0);
+    }
+
+    #[tokio::test]
+    async fn stopping_playback_on_an_inline_leg_flushes_its_egress_instead_of_calling_rtpengine() {
+        let peer = UdpSocket::bind("127.0.0.1:0").expect("a fake peer socket");
+        let plane = plane();
+        let session = SessionId::from_raw(1);
+        plane
+            .open_session(inline_session(&inline_offer_sdp(
+                peer.local_addr().expect("peer address").port(),
+            )))
+            .await
+            .expect("an inline leg");
+
+        let egress = plane.inline_egress(session).expect("an egress handle");
+        assert!(egress.push(vec![1_000i16; 8_000]));
+        plane
+            .stop_playback(session, session_core::PlaybackId::from_raw(3), None)
+            .await
+            .expect("stopping playback on an inline leg is a flush");
+        tokio::time::sleep(Duration::from_millis(60)).await;
+
+        let mut totals = crate::inline_leg::InlineEgressTotals::default();
+        totals.add_shared(&egress.shared());
+        assert_eq!(totals.clears, 1);
+        assert!(totals.cleared_samples > 0);
+        plane.close_session(session).await.expect("close");
+    }
+
+    #[tokio::test]
+    async fn a_playback_longer_than_the_egress_queue_is_refused_rather_than_truncated() {
+        let peer = UdpSocket::bind("127.0.0.1:0").expect("a fake peer socket");
+        let plane = plane();
+        let session = SessionId::from_raw(1);
+        plane
+            .open_session(inline_session(&inline_offer_sdp(
+                peer.local_addr().expect("peer address").port(),
+            )))
+            .await
+            .expect("an inline leg");
+
+        let wav = crate::tap_spike::wav_blob(AudioFormat::pcmu_8k_20ms(), &vec![0i16; 8_000 * 30])
+            .expect("a long wav");
+        let error = plane
+            .start_playback(
+                session,
+                session_core::PlaybackId::from_raw(3),
+                PlaybackSource::Blob(wav),
+                None,
+                false,
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("inject attachment"), "{error}");
+        plane.close_session(session).await.expect("close");
+    }
+
+    #[tokio::test]
+    async fn a_playback_at_the_wrong_sample_rate_is_refused_by_name() {
+        let peer = UdpSocket::bind("127.0.0.1:0").expect("a fake peer socket");
+        let plane = plane();
+        let session = SessionId::from_raw(1);
+        plane
+            .open_session(inline_session(&inline_offer_sdp(
+                peer.local_addr().expect("peer address").port(),
+            )))
+            .await
+            .expect("an inline leg");
+
+        let wide = AudioFormat {
+            encoding: Encoding::L16,
+            sample_rate_hz: 16_000,
+            channels: 1,
+            ptime_ms: 20,
+        };
+        let wav = crate::tap_spike::wav_blob(wide, &vec![0i16; 1_600]).expect("a 16k wav");
+        let error = plane
+            .start_playback(
+                session,
+                session_core::PlaybackId::from_raw(3),
+                PlaybackSource::Blob(wav),
+                None,
+                false,
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("resample"), "{error}");
+        plane.close_session(session).await.expect("close");
+    }
+
+    #[tokio::test]
+    async fn an_inline_session_without_an_offer_is_refused_by_name() {
+        let plane = plane();
+        let error = plane
+            .open_session(session(SessionKind::Inline, ""))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("sdp offer"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn a_mixed_session_names_the_conference_phase_rather_than_half_opening() {
+        let plane = plane();
+        let error = plane
+            .open_session(session(SessionKind::Mix, ""))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("phase-4"), "{error}");
     }
 
     #[tokio::test]
@@ -2698,20 +3288,12 @@ mod tests {
         assert!(error.to_string().contains("not connected here"));
     }
 
-    #[tokio::test]
-    async fn a_blob_too_large_for_one_datagram_is_refused_rather_than_truncated() {
-        let plane = plane();
-        let error = plane
-            .start_playback(
-                SessionId::from_raw(1),
-                PlaybackId::from_raw(3),
-                PlaybackSource::Blob(vec![0u8; MAX_PLAYBACK_BLOB_BYTES + 1]),
-                None,
-                false,
-            )
-            .await
+    #[test]
+    fn a_blob_too_large_for_one_datagram_is_refused_rather_than_truncated() {
+        let error = ng_play_source(PlaybackSource::Blob(vec![0u8; MAX_PLAYBACK_BLOB_BYTES + 1]))
             .unwrap_err();
         assert!(error.to_string().contains("chunked playback"));
+        assert!(ng_play_source(PlaybackSource::Blob(vec![0u8; 16])).is_ok());
     }
 
     #[tokio::test]

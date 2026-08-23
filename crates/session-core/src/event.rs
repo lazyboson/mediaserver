@@ -1,4 +1,5 @@
 use crate::ids::{AttachmentId, PlaybackId, SessionId};
+use crate::registry::SessionKind;
 use media_core::Track;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -133,6 +134,7 @@ impl EventKind {
 pub struct MediaEvent {
     pub session: SessionId,
     pub external_id: String,
+    pub session_kind: SessionKind,
     pub attachment: Option<AttachmentId>,
     pub seq: u64,
     pub legacy_eligible: bool,
@@ -216,6 +218,7 @@ mod tests {
         let event = MediaEvent {
             session: SessionId::from_raw(1),
             external_id: "req-1".to_string(),
+            session_kind: SessionKind::Tap,
             attachment: Some(AttachmentId::from_raw(2)),
             seq: 7,
             legacy_eligible: false,

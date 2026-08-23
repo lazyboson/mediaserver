@@ -1658,6 +1658,83 @@ not wired to anything yet; P3-2 (inline session + SDP answer + UDP socket pair)
 is what puts it on the wire, and only then can the cadence be judged against a
 real far end.
 
+### 33. Inline sessions in mediaserverd — the leg on the wire (Phase 3) — ✅ DONE (2026-08-23)
+
+`SessionKind::INLINE` stops being refused. `CreateSession{kind=INLINE,
+sdp_offer=...}` now binds a UDP socket on `MSS_TAP_LOCAL_IP`, answers the offer
+as an RTP endpoint and returns the answer in the new `Session.sdp_answer` field.
+The peer's audio enters the **existing** capture pipeline (jitter → decode →
+hub) as the session's `customer` track, so every consumer, recorder and
+recording group already built for taps works on an inline leg unchanged; audio
+leaves through item 32's `PlayoutPacer`, driven from the capture thread's own
+clock.
+
+Decisions, recorded so P3-3/P3-4 do not re-litigate them:
+
+- **The SDP lives in `rtpengine-ng/src/sdp.rs`**, next to the subscription
+  offer/answer, as `InlineOffer`/`InlineAnswer`. That module was already a
+  plain sans-IO SDP implementation depending only on `media-core`; a second
+  parser in `media-core` would have duplicated the line splitting, the rtpmap
+  table and the codec-negotiation types, and `media-core` must not depend on
+  `rtpengine-ng` (dependency direction). The crate name is now narrower than
+  its sdp module — if a third dialect appears, split the module into its own
+  crate rather than duplicating it.
+- **PCMU or PCMA, in the offer's own order, plus telephone-event.** Anything
+  else is refused **by name** (`SdpError::NoInlineCodecOffered` lists what was
+  offered, from the rtpmaps, so an opus/G722 offer says so). The reason is
+  honest: `ConsumerEncoder` has no Opus *encoder*, so an Opus inline leg could
+  hear but not speak. The answer echoes the offered telephone-event payload
+  type with `fmtp 0-15`, one `m=audio`, `a=sendrecv`, and the offer's ptime
+  (falling back to the configured one, refusing anything over 120 ms).
+- **The egress queue is the buffer; the pacer ring is the prebuffer.** The
+  control world pushes `Vec<i16>` chunks into a bounded `ArrayQueue` (64 chunks
+  ≈ 6.4 s at the 100 ms chunking `StartPlayback` uses) exactly as the hub's
+  inject path already does; the media thread pops at most 4 chunks per tick and
+  only while the pacer holds less than two frames. A full queue **refuses** the
+  chunk (counted) rather than blocking the control world, and a playback longer
+  than the free queue is refused whole rather than truncated.
+- **`StartPlayback` on an inline leg is a local mix-in, not an NG command.**
+  rtpengine `play media` needs a subscription and an inline leg has none, so a
+  wav blob/file is decoded in the control world (16-bit mono at the negotiated
+  rate; anything else is refused naming the mismatch) and queued. **`StopPlayback`
+  on an inline leg flushes the egress queue** — that is the barge seam, and the
+  tick after it is silence by construction (item 32), so P3-4's job is to
+  measure it, not to build it. Streaming playback still refuses by name: it is
+  an INJECT attachment (P3-3).
+- **An inline session is not adoptable, and the registry says so.** A tap is
+  re-creatable from another pod because MSS asks rtpengine for the copy; an
+  inline leg *is* the RTP destination the peer is sending to, and that socket
+  died with the pod. `PersistedSession::is_rebuildable()` is now false for
+  kind INLINE, the keeper releases such an orphan with a counter
+  (`mss_registry_inline_not_adopted_total`) and a log line saying recovery is
+  call control's job. The SDP is deliberately **not** persisted — persisting it
+  would only invite a dishonest rebuild.
+- **Every event now carries the session kind** (`MediaEvent.session_kind`,
+  wire field 7), rather than a new `SessionCreated` event. A bus consumer can
+  tell a tap's events from an inline leg's without asking the API, and no
+  existing event sequence shifted.
+- `CreateSession` validation is symmetric: INLINE without an offer is
+  `INVALID_ARGUMENT`, and a TAP *with* an offer is too (a tap has no SDP).
+
+Tested: 10 SDP offer/answer replay tests (answer bytes asserted exactly, our own
+answer re-parsed, offer-order PCMA, opus/G722/bare-PT refusals by name, two
+m-lines, port 0, no `c=`, absurd ptime, stream-level `c=` winning); 6 egress
+tests (paced RTP the fake peer parses with pt/seq/ts checked, clear-then-silence,
+queue-full refusal, unreachable peer counted not stalled, ssrc derivation, an
+Opus wire format refused); and an **over-the-wire test with a fake peer socket**:
+the peer sends 8 G.711 packets and the hub delivers them as `customer` frames
+(tone amplitude asserted), then a queued wav comes back as ≥8 paced datagrams
+from the port MSS answered on, all PT 0, sequence never skipping. Plus
+`stop_playback` flushing, the long-playback and wrong-rate refusals, the keeper's
+inline-orphan release, the API's answer round-trip through `DescribeSession`, and
+the registry's offer/answer bookkeeping. `mss_ctl inline <id> <call-id>
+<offer-file>` prints the answer for the P3-5 drill.
+
+**Not verified live.** No SIP peer has ever answered this leg: everything above
+is replay or a fake socket in-process. P3-5's `inline_call_drill.sh` is what
+puts a real RTP peer (and a real tone) on it, and only then can the cadence,
+the DTMF path and the 20 ms budget be judged.
+
 ## Open defects and soft spots
 
 | # | Item | Where | Severity |
@@ -1665,7 +1742,7 @@ real far end.
 | ~~D1~~ | ~~A **mid-call SSRC change** (re-INVITE, transfer, codec renegotiation) does not re-resolve leg identity~~ — **fixed 2026-08-22 (item 14)**: the leg re-enters resolution on a confirmed SSRC change and a control-world task re-queries rtpengine and pushes a fresh map through a bounded queue. Replay-verified only, not yet on a live call. Residual: a transfer that replaces a *from-tag* still needs a re-subscribe, not a re-resolve | `tap_spike.rs`, `tap_plane.rs` | closed |
 | ~~D2~~ | ~~`stop_playback` stops **all** playback on the call~~ — **fixed 2026-08-23 (item 27)**: the registry remembers each playback's `target_tag` and `stop_playback` sends NG `stop media` with that `from-tag` (`all: all` only when the playback itself was for everyone). Measured on the lab node with `lab/ng_stop_media_probe.py`, three consistent runs: with a player on each participant, `stop media {from-tag: tagA}` left tagA at **1 packet** (a tail) and tagB still at **75 packets per 1.5 s**; an `all: all` player stopped with one from-tag keeps playing to the *other* participant (1 vs 75), which is why "no target" still maps to `all: all`. **Residual, now measured rather than assumed:** a second `play media` at the *same* from-tag is accepted, and one `stop media` for that from-tag clears the participant entirely (1 packet in a 3 s window) — rtpengine has no playback identifier, so two playbacks aimed at one participant cannot be stopped independently. MSS is now as precise as the protocol allows | `tap_plane.rs`, `registry.rs` | closed (residual documented) |
 | ~~D3~~ | ~~`close_attachment` **aborts** the consumer task instead of closing the websocket politely (no `stop` frame)~~ — **fixed 2026-08-23 (item 27)**: `TapPlane::end_attachment` ends the hub subscription and lets the consumer finish, so a WS consumer sends its Twilio `stop` frame and a gRPC consumer gets a `StreamStop` naming the reason ("the attachment was detached" / "the call ended"); a consumer that will not finish inside `POLITE_CLOSE` (2 s) is still aborted, with a warning. `close_session` takes the same path, so an ordinary hangup is polite too. Replay-verified (the task runs to completion instead of being aborted; the `Stop` frame reaches a real gRPC consumer over the wire); not observed against a live consumer | `tap_plane.rs` | closed |
-| ~~D4~~ | ~~`WS_TWILIO` and `GRPC_STREAM` attachments are served; `FILE_S3` (phase 2) and `RTP_INLINE` (phase 3) are refused by name~~ — **`FILE_S3` now served (2026-08-22, item 15)**: the recorder is a hub consumer with the frozen identity, pause-segmenting and `object_store` upload. `RTP_INLINE` is still refused by name and stays Phase 3 | `tap_plane.rs` | partly closed — inline is phase 3 |
+| ~~D4~~ | ~~`WS_TWILIO` and `GRPC_STREAM` attachments are served; `FILE_S3` (phase 2) and `RTP_INLINE` (phase 3) are refused by name~~ — **`FILE_S3` now served (2026-08-22, item 15)**: the recorder is a hub consumer with the frozen identity, pause-segmenting and `object_store` upload. `RTP_INLINE` is still refused by name as an **attachment transport**, and item 33 (2026-08-23) did not change that: an inline leg is a session *kind*, and a consumer reaches one over `GRPC_STREAM`/`WS_TWILIO` like any other — the INJECT direction is P3-3. `RTP_INLINE` may end up never being needed | `tap_plane.rs` | partly closed — the transport stays unused |
 | 🔶 D9 | ~~A recording lives in the recording pod's memory until the call ends: a pod death loses the buffered audio and no upload is resumed~~ — **partly closed 2026-08-23 (item 30)**: closed segments now spill to `MSS_RECORDING_SPILL_DIR` every `MSS_RECORDING_SPILL_SECONDS` (default 30) and on pause, the final upload stitches spill + memory tail into the one frozen key, this pod's leftovers are salvaged on its next start (never over an object that already exists), and an adopter recovers what it can read while padding and counting the rest (`mss_recording_frames_lost_on_adopt_total`). **Residual, by construction:** the spill dir is per-pod local disk, so a **cross-pod** adopter still cannot read the dead pod's segments — worst-case loss falls from the whole call to the spill interval *on the same pod*, and stays the whole prefix across pods until the spill lives somewhere every pod can read (same fix as D16). No retention policy on the spill dir. Replay/fake-verified only; no live pod-kill drill with a recorder attached. `MAX_RECORDING` (2 h) is unchanged | `recorder.rs`, `recording_spill.rs`, `registry_keeper.rs` | medium — cross-pod half open |
 | D11 | `StopRecording`/`Detach` **blocks until the upload finishes** (bounded 60 s/90 s), because `observe` needs a live session and a backgrounded upload would lose `UploadCompleted` on every hangup. A pilot may find the latency unacceptable; the fix is a session-independent event path | `tap_plane.rs`, `recorder.rs` | medium — watch it in the pilot |
 | ~~D10~~ | ~~Pause is honoured by the recorder only; a paused `WS_TWILIO`/`GRPC_STREAM` attachment keeps receiving media~~ — **fixed 2026-08-23 (item 27)**: the hub checks a per-subscription pause flag before every frame, so `StreamPause` really stops feeding an ASR; skipped frames are counted (`mss_consumer_suppressed_while_paused_total`) and resume starts at the current tap position rather than replaying a backlog. A gRPC attachment paused before its consumer subscribes stays paused when the stream opens. Recorder pause behaviour is unchanged. Replay-verified through `update_attachment`; not observed live | `tap_plane.rs`, `hub.rs` | closed |
@@ -1724,11 +1801,14 @@ residual). D1 (item 14) is fixed for a mid-call SSRC change on
 the same from-tag; a transfer that replaces a tag still lands on elimination,
 so a recording of one is only as right as that.
 
-**Phase 3 — Interactive media** needs the inline RTP leg (`SessionKind::INLINE`
-is already accepted by the API), streaming TTS playback, and barge-in
-cut-through in MSS. Its egress brain landed with item 32: a sans-IO
-`PlayoutPacer` in media-core that turns queued PCM into one paced RTP packet
-per ptime. The socket, the SDP answer and the consumer plumbing are next.
+**Phase 3 — Interactive media** has its leg on the wire: item 32 built the
+sans-IO `PlayoutPacer`, and item 33 made `CreateSession{INLINE, sdp_offer}` bind
+a socket, answer the offer (PCMU/PCMA + telephone-event) and pump both
+directions — the peer into the tap hub as the `customer` track, queued PCM back
+out one paced packet per ptime, with `StopPlayback` as the barge flush. What is
+left is full duplex to consumers (an INJECT attachment streaming into that
+queue, P3-3), the cut-through measurement (P3-4) and a live drill against a real
+RTP peer (P3-5) — nothing here has met a SIP endpoint yet.
 
 **Phase 4 — Full media plane** is the N-way mixer, monitor/whisper as
 attachments and playbacks rather than conference tricks. Do not start before
