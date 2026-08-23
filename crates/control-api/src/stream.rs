@@ -129,16 +129,13 @@ async fn serve_stream(
         _ => InjectState::new(view.format.encoding, view.format.sample_rate_hz),
     };
 
+    let mut mark_poll = tokio::time::interval(MARK_POLL_INTERVAL);
+    mark_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
     loop {
         let marks_pending = !inject.marks.is_empty();
         tokio::select! {
-            _ = async {
-                if marks_pending {
-                    tokio::time::sleep(MARK_POLL_INTERVAL).await
-                } else {
-                    std::future::pending::<()>().await
-                }
-            } => {
+            _ = mark_poll.tick(), if marks_pending => {
                 for name in inject.drained_marks() {
                     if send_message(&sender, mark_message(name)).await.is_err() {
                         return;

@@ -201,8 +201,14 @@ out through the sans-IO `PlayoutPacer` (tasks.md items 32 and 33).
 `StopPlayback` flushes the egress queue, which is the barge seam. Item 34 made
 it **full duplex**: an INJECT attachment on either transport (gRPC
 `MediaStream`, WS-Twilio) streams into that queue continuously, `Clear` flushes
-it, and `Mark` is acked once the marked audio has drained out of it. Owed: the
-measured cut-through, and a live drill with a real RTP peer.
+it, and `Mark` is acked once the marked audio has drained out of it. Item 35
+put a **real RTP peer** on the other end (`lab/inline_call_drill.sh`, no SIP and
+no human) and measured what was owed: the peer hears the injected tone, the hub
+still taps the peer at the same time, egress paces at 50.19 pkt/s with unbroken
+sequence numbers, `Mark` acks 404 ms after a 400 ms lead, and **barge-in
+cut-through is p50 12.2 ms / p95 20.4 ms / max 21.0 ms over 20 iterations** —
+one ptime, as the pacer's flush promised. Owed now: a SIP/B2B leg, codecs other
+than PCMU/8 kHz, and the integrator's own consumer half of barge-in.
 
 Work:
 - Inline RTP endpoint mode: answer OpenSIPS B2B INVITEs
