@@ -14,7 +14,7 @@ Status as of **2026-08-23**.
 | **M2 — Phase-0 spike** | real NG subscribe against lab rtpengine, both legs jitter-buffered to WAV, per-tap cost | ✅ **code done**; 3 org-side items open (below) |
 | **M3 — fan-out hub** | per-session pub/sub, N consumers, WS-Twilio adapter, pause/resume/send_text parity | ✅ done |
 | **M4 — control plane** | `MediaControl` gRPC, session state machine, Kafka events, Redis registry, tenant-flag pilot | 🔶 **code complete** — pilot gates: translator merge (external), and the consumer half of the barge-in number — **every MSS-owned hop is measured (item 5, 2026-08-23: cut-through p95 4.8 ms from a real consumer `SpeechReport`)**, the D19 ingress gap it found being fixed in item 28. The gRPC lab proof (item 10) and the **live pod-kill drill (item 11, gap 14.41 s)** are both **done 2026-08-22**; the D14 orphan subscription the drill found is **fixed (item 25, 2026-08-23)**, fake- and Redis-verified rather than re-measured live |
-| **M5 — recording (Phase 2)** | per-leg taps → stereo segmenter → S3, identity + callback contract, dual-recording | 🔶 **code complete (2026-08-22)** — a live tapped call recorded end to end to a real MinIO, callbacks read off `mss.events` (2026-08-22, item 10's drill); **recording groups** — N sessions recorded as one recording, one mono object per participant — landed 2026-08-23 (item 21); owed: FS byte-parity sign-off (harness exists) |
+| **M5 — recording (Phase 2)** | per-leg taps → stereo segmenter → S3, identity + callback contract, dual-recording | 🔶 **code complete (2026-08-22)** — a live tapped call recorded end to end to a real MinIO, callbacks read off `mss.events` (2026-08-22, item 10's drill); **recording groups** — N sessions recorded as one recording, one mono object per participant, time-aligned on the group's open instant since item 29 — landed 2026-08-23 (item 21); owed: FS byte-parity sign-off (harness exists) |
 | M6+ | Phases 3–4 (interactive media, full media plane) | ⬜ not started |
 
 ### What landed, concretely
@@ -1037,10 +1037,11 @@ one path segment (no `/`, whitespace, control characters, `.`/`..`) because it
 lands in an object key. **An empty group is byte-identical to before** — same
 single object under the frozen `${accountID}/${recordingID}.${format}` — pinned
 by `an_ungrouped_recording_still_writes_the_frozen_two_leg_identity`.
-**Per-participant files are the design, not a shortcut:** aligning N sessions'
-clocks into one N-channel WAV is a real problem with no cheap answer, and it
-would make one slow member's buffer the whole conference's; separate files hand
-that to the consumer, which can align on the `RecordingStarted` events.
+**Per-participant files are the design, not a shortcut:** interleaving N
+sessions into one N-channel WAV would make one slow member's buffer the whole
+conference's. Separate files keep the members independent, and since item 29
+they are time-aligned anyway — every member anchors on the instant the group
+opened, so a consumer can lay the objects side by side.
 **Recommend `TRACK_CUSTOMER` per member** — a participant's own voice is leg
 index 0 — so each file is one speaker.
 **Three refusals, by name and counted** (`mss_recording_group_joins_refused_total`):
@@ -1409,6 +1410,52 @@ runs of 10 iterations against the live stack, 10/10 each, no event missed, the
 consumer taking 378 tapped audio frames on the same stream while it measured.
 Numbers in item 5 and lab.md.
 
+### 29. Recording-group members were not time-aligned (defect D18) — ✅ DONE (2026-08-23)
+
+Every member's segmenter anchored on **its own first frame**, so a participant
+that joined a conference recording ten seconds late produced a file whose
+sample 0 was ten seconds later than the first member's. Two objects under one
+recording prefix, different lengths, and nothing in the audio to say where the
+second one begins: reassembly needed the `RecordingStarted` event timeline.
+
+**What shipped.** The group owns t=0. `RecordingGroup` stamps `opened_at:
+Instant` when its first member joins, `join_group` hands that instant to every
+later member, `RecorderSpec.group_anchor: Option<Instant>` carries it into the
+recorder task, and when that member's **first media frame** arrives the task
+converts `now - anchor` into leading silence through the new sans-IO seam
+`Segmenter::lead_with_silence(Duration)`. All members share t=0, and members
+that stop together are the same length to within one frame.
+
+**Three decisions.** *Measured at the first frame, not at the attach*, so the
+member's own subscribe round-trip is inside the pad (and the same latency on
+every member cancels out of their relative alignment). *Padded once per
+recording, never per segment*: the pad is written into `segment_start` under a
+`stats.lead_silence_frames` guard and `pause` now takes
+`frames().max(segment_start)`, so pause/resume (pause = segment + defer) can
+neither erase nor re-add it. *The pad counts against `MAX_RECORDING`* — a
+member joining an hour into the 2 h cap gets an hour of its own audio, not two.
+An ungrouped recording passes `group_anchor: None` and is byte-identical to
+before.
+
+**Verified against what.** Four new tests: the late member's file opens with
+silence to the anchor and its own audio lands after it; two members that end
+together render the same length (one padded 1 s, one not); a paused late member
+pads its lead once and a second `lead_with_silence` is refused; and one
+end-to-end recorder test (spawn → hub frames → real WAV bytes out of a fake
+sink) proving a 400 ms anchor becomes 400 ms of leading zeros in the uploaded
+object. `join_group` also asserts every member gets the same instant.
+**Live:** `lab/group_recording_drill.sh` grew `JOIN_STAGGER_SECONDS` (default
+5) and was run against the live lab — bob joined 5 s late, the pod logged
+`lead_silence_ms=5016`, and the object read back off MinIO opens with **40128
+zero samples = 5016 ms**. Lengths: alice 25.030 s vs bob 25.116 s, an **86 ms**
+difference where the stagger was 5 s. The residual 86 ms is the *tail*: `Detach`
+waits for the upload (D11) and the drill detaches the members one after the
+other. Numbers in lab.md.
+
+**Residual.** Head alignment is exact; equal length still assumes the members
+stop together, and D11 (blocking detach) and D16 (a group is one pod's memory,
+so the anchor is one pod's monotonic clock) are unchanged.
+
 ## Open defects and soft spots
 
 | # | Item | Where | Severity |
@@ -1430,7 +1477,7 @@ Numbers in item 5 and lab.md.
 | D16 | **A recording group is one pod's memory.** `TapPlane` holds the group, so every member of a conference recording must attach to the same pod: there is no placement that guarantees it (D8), a member whose session is adopted elsewhere is **refused** rather than restored (`grouped_not_adopted`, so the participant's file simply ends at the pod that died — the D9 shape per participant), and a group name reused on a second pod silently produces a second half-recording under the same prefix. Fix shape: schedule a group's sessions onto one pod, or move the group into shared storage so any pod can serve a member | `tap_plane.rs`, `registry_keeper.rs` | medium once a tenant records conferences across pods |
 | ~~D13~~ | ~~`StreamStart` (and the Twilio `start` frame's `tracks`) advertises `["customer","agent"]` for `TrackSelector::All`, but a silent `mixed` track is delivered too~~ — **fixed 2026-08-23 (item 27)**: the hub selection split into `All` (every track, including `mixed`) and `Speakers` (customer + agent). Consumers get `Speakers`, so delivery matches the advertisement exactly; the **recorder keeps `All`** because injected bot speech belongs in the recording. The frozen Twilio start frame and `StreamStart.tracks` were not touched — the delivery was brought in line with them. A consumer that wants the injected track can still ask for it by name (`TrackSelector::Only(Mixed)`). Replay-verified | `hub.rs`, `tap_plane.rs` | closed |
 | D17 | **Leg labels invert when the caller's from-tag is not given.** With `from_tags` unspecified (`-`), `TapPlane` labels the two legs in the order rtpengine's `query` returns them, and in the two-node drill that put **FreeSWITCH's** tag first — so `customer` and `agent` were swapped in the recording and in the `tracks` a consumer sees. Speaker attribution is only trustworthy when the caller's from-tag is passed explicitly. Fix shape: refuse to name tracks by direction when no from-tag was supplied (label them `leg_a`/`leg_b`, or resolve the caller from the SIP call-id), rather than guessing an order | `tap_plane.rs` | medium — an ASR or a QA review reads the wrong speaker |
-| D18 | **Recording-group members are not time-aligned.** Each member's file anchors on **its own first frame** (`recorder.rs` takes the offset from the per-member anchor), so a participant that joins late produces a file that starts at its join moment with no leading pad, and two members of the same group differ in length — 90.32 s vs 90.26 s in the drill above, with nothing to say where in the first file the second one begins. Reassembling a conference from the participant objects therefore needs the event timeline as well as the audio. Fix: record the group's open instant and pad each member's first segment with silence from that anchor | `recorder.rs`, `tap_plane.rs` | medium once anyone reassembles a multi-party recording |
+| ~~D18~~ | ~~**Recording-group members are not time-aligned.** Each member's file anchored on **its own first frame**, so a late joiner's file started at its join moment and two members of one group differed in length (90.32 s vs 90.26 s in the two-node drill), leaving reassembly to the event timeline~~ — **fixed 2026-08-23 (item 29)**: a recording group stamps `opened_at` when its first member joins and every later member's segmenter pads its first segment with silence from that anchor to its own first frame (`Segmenter::lead_with_silence`, reported as `lead_silence_frames`), padded once per recording so pause/resume cannot double-count it. Replay-verified (late joiner padded, two members equal length, the pause interaction, and a WAV read back out of a fake sink) **and live**: the drill's staggered re-run had bob join 5 s late and his object came back opening with 5016 ms of zeros, 25.116 s against alice's 25.030 s. **Residual:** equal length still assumes the members stop together — the 86 ms here is D11's blocking detach, and D16 keeps the anchor inside one pod's clock | `recorder.rs`, `tap_plane.rs` | closed (residual documented) |
 | ~~D19~~ | ~~A consumer cannot tell MSS that the caller started speaking: `Registry::report` had no caller outside tests~~ — **fixed 2026-08-23 (item 28)**: `ConsumerToServer.SpeechReport` on the gRPC `MediaStream` stream (kind `STARTED`/`PARTIAL`/`FINAL`/`END_OF_UTTERANCE`/`END_OF_INTERACTION`, track, text, confidence, the consumer's own `observed_at`) reaches `Registry::report`, gated on `CAPABILITY_EVENTS` — an attachment without it gets `PERMISSION_DENIED` and the stream ends, the same protocol-violation shape as an unprivileged `inject`. Proven on a live tapped call: `lab/barge_drill.sh` now triggers on a real `SpeechReport` and measures cut-through p50 3.54–3.98 ms (item 5). **Residual, accepted:** the `WS_TWILIO` dialect cannot report speech — its bytes are frozen (Article VII) and it carries no such message, so a WS consumer's only barge stays the `clear` message's direct rtpengine `stop media` (unevented; the D2 shape). Interactive voice-AI on WS should attach over gRPC instead | `stream.rs`, `convert.rs`, `session-core/registry.rs` | closed |
 
 ## Waiting on other people (M2 close-out)
