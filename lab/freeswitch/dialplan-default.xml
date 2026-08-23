@@ -1,0 +1,119 @@
+<include>
+  <context name="default">
+
+    <!-- 9196: pure FreeSWITCH echo, module not involved. If you cannot hear
+         yourself here, the problem is SIP/RTP reachability, not mod_audio_fork.
+         Always try this before 9000/9001. -->
+    <extension name="rtp_reachability_check">
+      <condition field="destination_number" expression="^9196$">
+        <action application="answer"/>
+        <action application="echo"/>
+      </condition>
+    </extension>
+
+    <!-- mod_audio_fork injects playback by REPLACING outbound frames, so the
+         channel must be writing frames for WRITE_REPLACE to fire at all. A
+         parked call writes nothing and the caller would hear silence no matter
+         what the server sends; the endless silence stream is what gives the
+         module frames to overwrite. -->
+
+    <!-- 9000: answers and holds so you can drive the fork by hand from fs_cli. -->
+    <extension name="audio_fork_manual">
+      <condition field="destination_number" expression="^9000$">
+        <action application="answer"/>
+        <action application="log" data="INFO audio_fork rig: uuid_audio_fork ${uuid} start $${audio_fork_url} mono"/>
+        <action application="playback" data="silence_stream://-1"/>
+      </condition>
+    </extension>
+
+    <!-- 9001: starts the fork itself, so a call is the only step. -->
+    <extension name="audio_fork_auto">
+      <condition field="destination_number" expression="^9001$">
+        <action application="answer"/>
+        <action application="set" data="fork_start=${uuid_audio_fork(${uuid} start $${audio_fork_url} mono)}"/>
+        <action application="log" data="INFO audio_fork rig: start -> ${fork_start}"/>
+        <action application="playback" data="silence_stream://-1"/>
+      </condition>
+    </extension>
+
+    <!-- 9002: like 9001 but forks as base64 {"event":"media"} text frames at
+         16k (audio_fork_output=media) for Twilio-Media-Streams-style back-ends
+         such as stream-llm-bridge. -->
+    <extension name="audio_fork_media_json">
+      <condition field="destination_number" expression="^9002$">
+        <action application="answer"/>
+        <action application="set" data="audio_fork_output=media"/>
+        <action application="set" data="fork_start=${uuid_audio_fork(${uuid} start $${audio_fork_url} mono 16k)}"/>
+        <action application="log" data="INFO audio_fork rig: media-json start -> ${fork_start}"/>
+        <action application="playback" data="silence_stream://-1"/>
+      </condition>
+    </extension>
+
+    <extension name="extension_to_extension">
+      <condition field="destination_number" expression="^(10[01][0-9])$">
+        <action application="bridge" data="user/$1@$${domain}"/>
+      </condition>
+    </extension>
+
+
+    <!-- Everything below is the two node lab call (lab/dialplan-lab.xml is the
+         source of truth for the prose). It lives INSIDE this context on
+         purpose: FreeSWITCH does not merge two sibling contexts of the same
+         name, it uses the first and silently ignores the rest, which costs a
+         call NO_ROUTE_DESTINATION with the extension plainly present in
+         `xml_locate dialplan`. -->
+
+
+    <!-- 4200: echo. The first thing a new endpoint should dial, browser or
+         softphone: if you cannot hear yourself here, the problem is SIP or RTP
+         reachability and has nothing to do with MSS. -->
+    <extension name="lab_echo">
+      <condition field="destination_number" expression="^4200$">
+        <action application="answer"/>
+        <action application="echo"/>
+      </condition>
+    </extension>
+
+    <!-- 4001: the drill. FreeSWITCH originates the agent leg toward
+         opensips-agent, which looks the browser up in its location table and
+         delivers the INVITE over the websocket it registered on. Two calls,
+         two rtpengine nodes, one bridge.
+
+         absolute_codec_string is inherited by the outbound leg, so naming
+         G.711 here fixes the codec on both legs at once and nothing
+         transcodes anywhere – the control case. -->
+    <extension name="lab_agent_g711">
+      <condition field="destination_number" expression="^4001$">
+        <action application="set" data="absolute_codec_string=PCMA,PCMU"/>
+        <action application="set" data="hangup_after_bridge=true"/>
+        <action application="set" data="continue_on_fail=false"/>
+        <action application="log" data="INFO lab: bridging to the webrtc agent via opensips-agent"/>
+        <action application="bridge" data="sofia/internal/agent@172.31.99.71"/>
+      </condition>
+    </extension>
+
+    <!-- 4002: same, PCMU only, for when a leg's µ-law/A-law choice needs to be
+         removed as a variable. -->
+    <extension name="lab_agent_pcmu">
+      <condition field="destination_number" expression="^4002$">
+        <action application="set" data="absolute_codec_string=PCMU"/>
+        <action application="set" data="hangup_after_bridge=true"/>
+        <action application="set" data="continue_on_fail=false"/>
+        <action application="bridge" data="sofia/internal/agent@172.31.99.71"/>
+      </condition>
+    </extension>
+
+    <!-- 4003: no codec forced, so the profile's own preferences negotiate. The
+         extension to dial once rtpengine is masking Opus toward FreeSWITCH and
+         the question becomes what the browser side actually settled on. -->
+    <extension name="lab_agent_negotiate">
+      <condition field="destination_number" expression="^4003$">
+        <action application="set" data="hangup_after_bridge=true"/>
+        <action application="set" data="continue_on_fail=false"/>
+        <action application="bridge" data="sofia/internal/agent@172.31.99.71"/>
+      </condition>
+    </extension>
+
+  
+  </context>
+</include>

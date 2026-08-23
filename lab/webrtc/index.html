@@ -1,0 +1,120 @@
+<!doctype html>
+<!--
+  The lab's WebRTC agent phone: SIP over WebSocket to opensips-agent, media to
+  the agent-side rtpengine. It exists to put a *real browser* on one leg of a
+  lab call, because everything Opus this project has tapped so far came from
+  lab/opus_call_driver.py, which sends the friendliest Opus that exists: CBR,
+  VBR off, DTX off, one 20 ms frame per packet, no RED. A browser sends none of
+  that by default, and the difference is exactly where production surprises
+  live. Every knob below turns one of those differences on.
+
+  Serve it over http://127.0.0.1:<port> or localhost. NOT a LAN address:
+  getUserMedia needs a secure context, localhost qualifies, 192.168.x.x does
+  not, and Chrome refuses the microphone with no useful error. ws:// is fine
+  from an http:// page (it is only blocked from https://), so the lab needs no
+  TLS certificates anywhere.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>MSS lab — WebRTC agent leg</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font: 14px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; margin: 0; padding: 1.5rem; }
+  h1 { font-size: 1rem; margin: 0 0 1rem; }
+  fieldset { border: 1px solid currentColor; margin: 0 0 1rem; padding: .75rem 1rem; }
+  legend { padding: 0 .4rem; font-weight: bold; }
+  label { display: inline-block; margin-right: 1.25rem; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(15rem, 1fr)); gap: .35rem 1rem; }
+  button { font: inherit; padding: .4rem 1rem; margin-right: .5rem; }
+  pre { margin: 0; white-space: pre-wrap; word-break: break-word; max-height: 18rem; overflow: auto; }
+  #state { font-weight: bold; }
+  table { border-collapse: collapse; }
+  td { padding: .1rem .75rem .1rem 0; vertical-align: top; }
+  td:first-child { opacity: .7; }
+</style>
+</head>
+<body>
+
+<h1>MSS lab — WebRTC agent leg · <span id="state">idle</span></h1>
+
+<fieldset>
+  <legend>call</legend>
+  <div class="grid">
+    <label>ws <input id="ws" size="30"></label>
+    <label>target <input id="target" size="18"></label>
+    <label>from <input id="from" size="18"></label>
+  </div>
+  <div class="grid">
+    <label>send
+      <select id="source">
+        <option value="tone">test tone (no microphone)</option>
+        <option value="mic">microphone</option>
+        <option value="silence">digital silence</option>
+      </select>
+    </label>
+    <label>tone Hz <input id="tone" size="6"></label>
+  </div>
+  <p>
+    <button id="arm">arm audio</button>
+    <button id="dial">dial</button>
+    <button id="hangup" disabled>hang up</button>
+    <button id="mute" disabled>mute</button>
+    <button id="register">register</button>
+  </p>
+  <p><small>Both endpoints on one machine share one microphone, so a test tone
+  is how the agent leg gets an identity of its own. Click <b>arm audio</b> once:
+  a browser will not start an AudioContext without a gesture, and an
+  auto-answered call has no gesture of its own.</small></p>
+</fieldset>
+
+<fieldset>
+  <legend>codec — what the browser offers</legend>
+  <div class="grid">
+    <label>codec
+      <select id="codec">
+        <option value="opus">opus (what WebRTC really uses)</option>
+        <option value="pcmu">pcmu (control: nothing transcodes)</option>
+        <option value="pcma">pcma</option>
+        <option value="asis">as-is (Chrome's full offer)</option>
+      </select>
+    </label>
+    <label><input type="checkbox" id="red"> RED (RFC 2198, PT 63)</label>
+    <label><input type="checkbox" id="dtx"> DTX (usedtx=1)</label>
+    <label><input type="checkbox" id="fec" checked> inband FEC</label>
+    <label><input type="checkbox" id="cbr"> CBR (cbr=1)</label>
+    <label><input type="checkbox" id="stereo"> stereo</label>
+    <label>ptime
+      <select id="ptime">
+        <option value="">default (20 ms)</option>
+        <option value="40">40 ms</option>
+        <option value="60">60 ms</option>
+        <option value="120">120 ms</option>
+      </select>
+    </label>
+    <label>bitrate <input id="bitrate" size="7" placeholder="e.g. 24000"></label>
+    <label><input type="checkbox" id="dsp"> browser AEC/NS/AGC</label>
+  </div>
+</fieldset>
+
+<fieldset>
+  <legend>negotiated — read this, do not assume it</legend>
+  <table>
+    <tr><td>offered</td><td id="offered">—</td></tr>
+    <tr><td>answered</td><td id="answered">—</td></tr>
+    <tr><td>sending</td><td id="sending">—</td></tr>
+    <tr><td>receiving</td><td id="receiving">—</td></tr>
+  </table>
+</fieldset>
+
+<fieldset>
+  <legend>log</legend>
+  <pre id="log"></pre>
+</fieldset>
+
+<audio id="remote" autoplay></audio>
+
+<script src="vendor/jssip.min.js"></script>
+<script src="agent.js"></script>
+</body>
+</html>
