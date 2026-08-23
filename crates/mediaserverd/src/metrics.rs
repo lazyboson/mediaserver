@@ -207,6 +207,16 @@ pub fn render(sources: &MetricsSources) -> String {
         snapshot.conference.route_changes,
     );
     counter(
+        "mss_conference_member_controls_total",
+        "Times a member was muted, deafened, put on hold or released",
+        snapshot.conference.member_controls,
+    );
+    counter(
+        "mss_conference_prompt_frames_total",
+        "Frames a prompt played into the whole room contributed to the mix",
+        snapshot.conference.prompt_frames,
+    );
+    counter(
         "mss_conference_frames_refused_total",
         "Frames the mix matrix refused, by frame size or a stale membership handle",
         snapshot.conference.frames_refused,
@@ -367,6 +377,21 @@ pub fn render(sources: &MetricsSources) -> String {
         "mss_conference_whispers_live",
         "Conference legs whose injected audio is routed somewhere other than their own ear",
         snapshot.conference_whispers_live,
+    );
+    gauge(
+        "mss_conference_muted_members",
+        "Conference members whose own audio reaches nobody, hold included",
+        snapshot.conference_members_muted,
+    );
+    gauge(
+        "mss_conference_deaf_members",
+        "Conference members the room is silent to, hold included",
+        snapshot.conference_members_deaf,
+    );
+    gauge(
+        "mss_conference_held_members",
+        "Conference members on hold: neither heard nor hearing the room",
+        snapshot.conference_members_held,
     );
     gauge(
         "mss_consumers_live",

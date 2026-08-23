@@ -215,6 +215,9 @@ message StartPlaybackRequest {
   }
   // Empty means everyone in the session hears it; a from-tag targets one
   // participant, which is the whisper shape (lab-measured on 14.1.1.8).
+  // On an inline leg there is no from-tag: empty or "own" is that leg's own
+  // ear, and "all" plays the prompt into the conference the leg is seated in,
+  // where every member and the mixed track hear it.
   string target_tag = 5;
   uint32 repeat_times = 6;
   bool block_egress = 7;
@@ -288,6 +291,7 @@ message MediaEvent {
     EndOfInteraction end_of_interaction = 23;
     RecordingPaused recording_paused = 24;
     MixRouted mix_routed = 25;
+    MemberControlled member_controlled = 26;
   }
 }
 
@@ -331,6 +335,10 @@ message AttachmentUp { string label = 1; }
 // says whether the conference's mixed track — the monitor and recording feed —
 // carries it, so an integrator can audit who whispered to whom.
 message MixRouted { string mix_target = 1; bool monitor_audible = 2; }
+// A conference member's own routing verbs: mute silences their contributor row,
+// deaf silences the room into their ear, hold is both. Member state outlives
+// the attachment that carried the verb.
+message MemberControlled { bool mute = 1; bool deaf = 2; bool hold = 3; }
 message AttachmentDown { string label = 1; string reason = 2; }
 message SessionEnded { string reason = 1; }
 message EndOfInteraction { string reason = 1; }

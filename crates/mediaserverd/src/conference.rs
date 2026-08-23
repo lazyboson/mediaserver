@@ -3,9 +3,9 @@ use crate::inline_leg::InlineEgress;
 use crate::tap_spike::{TapLeg, MAX_DATAGRAM};
 use crossbeam_queue::ArrayQueue;
 use media_core::{
-    AudioFormat, ContributorId, Gain, ListenerId, MixMatrix, Party, SpeechGate, Track,
+    AudioFormat, ContributorId, Gain, ListenerId, MixError, MixMatrix, Party, SpeechGate, Track,
 };
-use session_core::mix::{MixRoute, MixTarget};
+use session_core::mix::{MemberControl, MixRoute, MixTarget};
 use session_core::SessionId;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -14,6 +14,7 @@ use std::time::{Duration, Instant};
 use tracing::{info, warn};
 
 pub const COMMAND_CAPACITY: usize = 64;
+pub const PROMPT_CAPACITY: usize = 64;
 pub const MAX_CONFERENCE_MEMBERS: usize = 32;
 const INITIAL_SLOTS: usize = 8;
 
@@ -30,6 +31,11 @@ pub struct ConferenceTotals {
     pub frames_refused: u64,
     pub route_changes: u64,
     pub whispers_live: u64,
+    pub member_controls: u64,
+    pub members_muted: u64,
+    pub members_deaf: u64,
+    pub members_held: u64,
+    pub prompt_frames: u64,
 }
 
 #[derive(Default)]
@@ -45,6 +51,11 @@ pub struct ConferenceShared {
     pub frames_refused: AtomicU64,
     pub route_changes: AtomicU64,
     pub whispers_live: AtomicU64,
+    pub member_controls: AtomicU64,
+    pub members_muted: AtomicU64,
+    pub members_deaf: AtomicU64,
+    pub members_held: AtomicU64,
+    pub prompt_frames: AtomicU64,
 }
 
 impl ConferenceTotals {
@@ -61,6 +72,11 @@ impl ConferenceTotals {
         self.frames_refused += read(&shared.frames_refused);
         self.route_changes += read(&shared.route_changes);
         self.whispers_live += read(&shared.whispers_live);
+        self.member_controls += read(&shared.member_controls);
+        self.members_muted += read(&shared.members_muted);
+        self.members_deaf += read(&shared.members_deaf);
+        self.members_held += read(&shared.members_held);
+        self.prompt_frames += read(&shared.prompt_frames);
     }
 }
 
@@ -75,12 +91,21 @@ pub struct ConferenceMember {
 pub enum ConferenceCommand {
     Join(Box<ConferenceMember>),
     Leave(SessionId),
-    Route { session: SessionId, route: MixRoute },
+    Route {
+        session: SessionId,
+        route: MixRoute,
+    },
+    Control {
+        session: SessionId,
+        control: MemberControl,
+    },
 }
 
 pub struct Conference {
     format: AudioFormat,
     commands: Arc<ArrayQueue<ConferenceCommand>>,
+    prompts: Arc<ArrayQueue<Vec<i16>>>,
+    prompt_flush: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
     shared: Arc<ConferenceShared>,
     thread: Option<JoinHandle<()>>,
@@ -93,6 +118,8 @@ impl Conference {
             .samples_per_packet()
             .ok_or(ConferenceError::Format(format))? as usize;
         let commands = Arc::new(ArrayQueue::new(COMMAND_CAPACITY));
+        let prompts = Arc::new(ArrayQueue::new(PROMPT_CAPACITY));
+        let prompt_flush = Arc::new(AtomicBool::new(false));
         let stop = Arc::new(AtomicBool::new(false));
         let shared = Arc::new(ConferenceShared::default());
         let mixed = Mixed {
@@ -100,6 +127,8 @@ impl Conference {
             format,
             frame_samples,
             commands: Arc::clone(&commands),
+            prompts: Arc::clone(&prompts),
+            prompt_flush: Arc::clone(&prompt_flush),
             shared: Arc::clone(&shared),
             stop: Arc::clone(&stop),
         };
@@ -110,6 +139,8 @@ impl Conference {
         Ok(Conference {
             format,
             commands,
+            prompts,
+            prompt_flush,
             stop,
             shared,
             thread: Some(thread),
@@ -159,6 +190,33 @@ impl Conference {
             .map_err(|_| ConferenceError::Busy)
     }
 
+    pub fn control(
+        &mut self,
+        session: SessionId,
+        control: MemberControl,
+    ) -> Result<(), ConferenceError> {
+        if !self.members.contains(&session) {
+            return Err(ConferenceError::NotSeated(session));
+        }
+        self.commands
+            .push(ConferenceCommand::Control { session, control })
+            .map_err(|_| ConferenceError::Busy)
+    }
+
+    pub fn free_prompt_chunks(&self) -> usize {
+        self.prompts.capacity() - self.prompts.len()
+    }
+
+    pub fn prompt(&self, chunk: Vec<i16>) -> Result<(), ConferenceError> {
+        self.prompts
+            .push(chunk)
+            .map_err(|_| ConferenceError::PromptQueue)
+    }
+
+    pub fn flush_prompts(&self) {
+        self.prompt_flush.store(true, Ordering::Relaxed);
+    }
+
     pub fn unseat(&mut self, session: SessionId) -> Option<JoinHandle<()>> {
         self.members.retain(|held| *held != session);
         if self
@@ -198,6 +256,11 @@ pub enum ConferenceError {
     Full(usize),
     #[error("the conference is not taking commands fast enough to seat another leg")]
     Busy,
+    #[error(
+        "the conference prompt queue is full; the room is still playing what was \
+         queued before"
+    )]
+    PromptQueue,
     #[error("{0} is not seated in this conference")]
     NotSeated(SessionId),
     #[error("conference thread: {0}")]
@@ -209,6 +272,8 @@ struct Mixed {
     format: AudioFormat,
     frame_samples: usize,
     commands: Arc<ArrayQueue<ConferenceCommand>>,
+    prompts: Arc<ArrayQueue<Vec<i16>>>,
+    prompt_flush: Arc<AtomicBool>,
     shared: Arc<ConferenceShared>,
     stop: Arc<AtomicBool>,
 }
@@ -222,37 +287,53 @@ struct Seated {
     egress: InlineEgress,
     party: Party,
     injector: ContributorId,
-    inject: InjectFeed,
+    inject: ChunkFeed,
     route: MixRoute,
+    mute: bool,
+    deaf: bool,
+    hold: bool,
 }
 
-struct InjectFeed {
+impl Seated {
+    fn silenced(&self) -> bool {
+        self.mute || self.hold
+    }
+
+    fn deafened(&self) -> bool {
+        self.deaf || self.hold
+    }
+}
+
+struct ChunkFeed {
     frame: Vec<i16>,
     pending: Option<Vec<i16>>,
     at: usize,
 }
 
-impl InjectFeed {
-    fn with_frame(frame_samples: usize) -> InjectFeed {
-        InjectFeed {
+impl ChunkFeed {
+    fn with_frame(frame_samples: usize) -> ChunkFeed {
+        ChunkFeed {
             frame: vec![0; frame_samples],
             pending: None,
             at: 0,
         }
     }
 
-    fn discard(&mut self, egress: &mut InlineEgress) {
-        if let Some(pending) = self.pending.take() {
-            egress.discard_pending(pending.len().saturating_sub(self.at) as u64);
-        }
+    fn discard(&mut self) -> u64 {
+        let unplayed = self
+            .pending
+            .take()
+            .map(|pending| pending.len().saturating_sub(self.at) as u64)
+            .unwrap_or(0);
         self.at = 0;
+        unplayed
     }
 
-    fn take_frame(&mut self, egress: &mut InlineEgress) -> Option<&[i16]> {
+    fn fill(&mut self, pop: &mut dyn FnMut() -> Option<Vec<i16>>) -> u64 {
         let mut filled = 0;
         while filled < self.frame.len() {
             if self.pending.is_none() {
-                self.pending = egress.pop_chunk();
+                self.pending = pop();
                 self.at = 0;
             }
             let Some(chunk) = self.pending.as_ref() else {
@@ -267,14 +348,14 @@ impl InjectFeed {
                 self.at = 0;
             }
         }
-        if filled == 0 {
-            return None;
-        }
         for sample in self.frame[filled..].iter_mut() {
             *sample = 0;
         }
-        egress.account_mixed_in(filled as u64);
-        Some(&self.frame)
+        filled as u64
+    }
+
+    fn frame(&self) -> &[i16] {
+        &self.frame
     }
 }
 
@@ -293,6 +374,9 @@ impl Mixed {
             }
         };
         let monitor = matrix.join_listener();
+        let prompt = matrix.join_contributor();
+        let mut prompt_feed = ChunkFeed::with_frame(self.frame_samples);
+        let mut prompt_frames = 0u64;
         let ptime = Duration::from_millis(self.format.ptime_ms.max(1) as u64);
         let poll = ptime / 4;
         let mut buf = [0u8; MAX_DATAGRAM];
@@ -328,10 +412,13 @@ impl Mixed {
                             egress: member.egress,
                             party,
                             injector,
-                            inject: InjectFeed::with_frame(self.frame_samples),
+                            inject: ChunkFeed::with_frame(self.frame_samples),
                             route: MixRoute::private(),
+                            mute: false,
+                            deaf: false,
+                            hold: false,
                         });
-                        reroute_injectors(&mut matrix, &seated, monitor, &self.name);
+                        apply_matrix(&mut matrix, &seated, prompt, monitor, &self.name);
                         self.shared.joins.fetch_add(1, Ordering::Relaxed);
                         self.shared
                             .members_live
@@ -348,7 +435,7 @@ impl Mixed {
                             let leaving = seated.remove(at);
                             let _ = matrix.leave_party(leaving.party);
                             let _ = matrix.leave_contributor(leaving.injector);
-                            reroute_injectors(&mut matrix, &seated, monitor, &self.name);
+                            apply_matrix(&mut matrix, &seated, prompt, monitor, &self.name);
                             report_leg(&self.name, &leaving);
                             self.shared.leaves.fetch_add(1, Ordering::Relaxed);
                             self.shared
@@ -368,7 +455,7 @@ impl Mixed {
                             let target = route.target_name().to_string();
                             let monitor_audible = route.monitor_audible;
                             member.route = route;
-                            reroute_injectors(&mut matrix, &seated, monitor, &self.name);
+                            apply_matrix(&mut matrix, &seated, prompt, monitor, &self.name);
                             self.shared.route_changes.fetch_add(1, Ordering::Relaxed);
                             info!(
                                 conference = %self.name,
@@ -385,6 +472,37 @@ impl Mixed {
                             );
                         }
                     }
+                    ConferenceCommand::Control { session, control } => {
+                        if let Some(member) = seated.iter_mut().find(|held| held.session == session)
+                        {
+                            if let Some(mute) = control.mute {
+                                member.mute = mute;
+                            }
+                            if let Some(deaf) = control.deaf {
+                                member.deaf = deaf;
+                            }
+                            if let Some(hold) = control.hold {
+                                member.hold = hold;
+                            }
+                            let (mute, deaf, hold) = (member.mute, member.deaf, member.hold);
+                            apply_matrix(&mut matrix, &seated, prompt, monitor, &self.name);
+                            self.shared.member_controls.fetch_add(1, Ordering::Relaxed);
+                            info!(
+                                conference = %self.name,
+                                %session,
+                                mute,
+                                deaf,
+                                hold,
+                                "this member is heard, hears, or is on hold on new terms"
+                            );
+                        } else {
+                            warn!(
+                                conference = %self.name,
+                                %session,
+                                "a member control arrived for a leg that is no longer seated"
+                            );
+                        }
+                    }
                 }
             }
             self.shared.whispers_live.store(
@@ -394,14 +512,29 @@ impl Mixed {
                     .count() as u64,
                 Ordering::Relaxed,
             );
+            let count = |wanted: fn(&&Seated) -> bool| seated.iter().filter(wanted).count() as u64;
+            self.shared
+                .members_muted
+                .store(count(|held| held.silenced()), Ordering::Relaxed);
+            self.shared
+                .members_deaf
+                .store(count(|held| held.deafened()), Ordering::Relaxed);
+            self.shared
+                .members_held
+                .store(count(|held| held.hold), Ordering::Relaxed);
 
             for member in seated.iter_mut() {
                 member.hub.poll_commands();
                 member.leg.poll_ssrc_tracks();
                 member.leg.drain(&mut buf, Some(&mut member.hub));
                 if member.egress.take_flush() {
-                    member.inject.discard(&mut member.egress);
+                    let unplayed = member.inject.discard();
+                    member.egress.discard_pending(unplayed);
                 }
+            }
+            if self.prompt_flush.swap(false, Ordering::Relaxed) {
+                prompt_feed.discard();
+                while self.prompts.pop().is_some() {}
             }
 
             let now = Instant::now();
@@ -425,12 +558,29 @@ impl Mixed {
                             .release_frame_with(Some(&mut member.hub), Some(&mut into_mix));
                     }
                     refused += rejected;
-                    if let Some(injected) = member.inject.take_frame(&mut member.egress) {
-                        if matrix.push(member.injector, injected).is_err() {
+                    let filled = {
+                        let egress = &mut member.egress;
+                        let mut pop = || egress.pop_chunk();
+                        member.inject.fill(&mut pop)
+                    };
+                    if filled > 0 {
+                        member.egress.account_mixed_in(filled);
+                        if matrix.push(member.injector, member.inject.frame()).is_err() {
                             refused += 1;
                         }
                     }
                     member.leg.publish_shared(now);
+                }
+                let prompted = {
+                    let prompts = &self.prompts;
+                    let mut pop = || prompts.pop();
+                    prompt_feed.fill(&mut pop)
+                };
+                if prompted > 0 {
+                    prompt_frames += 1;
+                    if matrix.push(prompt, prompt_feed.frame()).is_err() {
+                        refused += 1;
+                    }
                 }
 
                 let output = matrix.mix();
@@ -465,6 +615,9 @@ impl Mixed {
                 self.shared.mixed_frames.store(frames, Ordering::Relaxed);
                 self.shared.reanchors.store(reanchors, Ordering::Relaxed);
                 self.shared.frames_refused.store(refused, Ordering::Relaxed);
+                self.shared
+                    .prompt_frames
+                    .store(prompt_frames, Ordering::Relaxed);
                 continue;
             }
 
@@ -487,6 +640,7 @@ impl Mixed {
             absent_frames = stats.absent_frames,
             replaced_frames = stats.replaced_frames,
             frames_refused = refused,
+            prompt_frames,
             reanchors,
             "the last leg left this conference; the mix stopped"
         );
@@ -494,12 +648,21 @@ impl Mixed {
     }
 }
 
-fn reroute_injectors(
+fn apply_matrix(
     matrix: &mut MixMatrix,
     seated: &[Seated],
+    prompt: ContributorId,
     monitor: ListenerId,
     conference: &str,
 ) {
+    let mut addressed: Vec<(ContributorId, ListenerId)> = Vec::with_capacity(seated.len() * 2 + 1);
+    if let Err(error) = matrix.route_to_all(prompt) {
+        warn!(
+            conference = %conference,
+            %error,
+            "the room prompt source has no route into the mix"
+        );
+    }
     for member in seated.iter() {
         let ear = match &member.route.target {
             MixTarget::Own => Some(member.party.listener),
@@ -509,39 +672,107 @@ fn reroute_injectors(
                 .find(|held| held.external_id == *named)
                 .map(|held| held.party.listener),
         };
-        let routed = match (&member.route.target, ear) {
-            (MixTarget::Everyone, _) => matrix.route_to_all(member.injector),
-            (_, Some(ear)) => matrix.route_only(member.injector, ear),
-            (MixTarget::Member(named), None) => {
-                warn!(
-                    conference = %conference,
-                    session = %member.session,
-                    target = %named,
-                    "nobody by that name is in this conference, so the whisper is \
-                     inaudible until they join"
-                );
-                matrix.mute_contributor(member.injector)
-            }
-            (MixTarget::Own, None) => matrix.mute_contributor(member.injector),
-        };
-        let audible = member.route.monitor_audible
-            && !matches!((&member.route.target, ear), (MixTarget::Member(_), None));
-        let routed = routed.and_then(|_| {
-            matrix.set_gain(
-                member.injector,
-                monitor,
-                if audible { Gain::UNITY } else { Gain::MUTED },
-            )
-        });
-        if let Err(error) = routed {
+        let missing = matches!(&member.route.target, MixTarget::Member(_)) && ear.is_none();
+        if missing {
             warn!(
                 conference = %conference,
                 session = %member.session,
                 target = %member.route.target_name(),
-                %error,
-                "this leg's injected audio has no route into the mix"
+                "nobody by that name is in this conference, so the whisper is \
+                 inaudible until they join"
             );
         }
+        let from_own_leg = member.route.is_own_leg();
+        let heard = if member.silenced() {
+            matrix.mute_contributor(member.party.contributor)
+        } else if from_own_leg {
+            route_source(
+                matrix,
+                member.party.contributor,
+                &member.route.target,
+                ear,
+                &mut addressed,
+            )
+        } else {
+            matrix.route_to_all(member.party.contributor)
+        };
+        let injected = if from_own_leg || member.route.is_private() {
+            addressed.push((member.injector, member.party.listener));
+            matrix.route_only(member.injector, member.party.listener)
+        } else {
+            route_source(
+                matrix,
+                member.injector,
+                &member.route.target,
+                ear,
+                &mut addressed,
+            )
+        };
+        let routed_source = if from_own_leg {
+            member.party.contributor
+        } else {
+            member.injector
+        };
+        let monitored = if member.silenced() && from_own_leg {
+            Ok(())
+        } else {
+            matrix.set_gain(
+                routed_source,
+                monitor,
+                if member.route.monitor_audible && !missing {
+                    Gain::UNITY
+                } else {
+                    Gain::MUTED
+                },
+            )
+        };
+        if let Err(error) = heard.and(injected).and(monitored) {
+            warn!(
+                conference = %conference,
+                session = %member.session,
+                target = %member.route.target_name(),
+                source = %member.route.source_name(),
+                %error,
+                "this leg's audio has no route into the mix"
+            );
+        }
+    }
+    for member in seated.iter().filter(|held| held.deafened()) {
+        let ear = member.party.listener;
+        for source in seated
+            .iter()
+            .flat_map(|held| [held.party.contributor, held.injector])
+            .chain(std::iter::once(prompt))
+        {
+            if addressed.contains(&(source, ear)) {
+                continue;
+            }
+            if let Err(error) = matrix.set_gain(source, ear, Gain::MUTED) {
+                warn!(
+                    conference = %conference,
+                    session = %member.session,
+                    %error,
+                    "a deafened member's ear could not be closed to a contributor"
+                );
+            }
+        }
+    }
+}
+
+fn route_source(
+    matrix: &mut MixMatrix,
+    contributor: ContributorId,
+    target: &MixTarget,
+    ear: Option<ListenerId>,
+    addressed: &mut Vec<(ContributorId, ListenerId)>,
+) -> Result<(), MixError> {
+    match (target, ear) {
+        (MixTarget::Everyone, _) => matrix.route_to_all(contributor),
+        (_, Some(ear)) => {
+            addressed.push((contributor, ear));
+            matrix.route_only(contributor, ear)
+        }
+        (_, None) => matrix.mute_contributor(contributor),
     }
 }
 

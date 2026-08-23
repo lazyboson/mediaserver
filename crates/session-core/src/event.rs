@@ -109,6 +109,11 @@ pub enum EventKind {
         target: String,
         monitor_audible: bool,
     },
+    MemberControlled {
+        mute: bool,
+        deaf: bool,
+        hold: bool,
+    },
     AttachmentDown {
         label: String,
         reason: String,

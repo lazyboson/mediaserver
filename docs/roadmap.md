@@ -16,7 +16,7 @@ is boringly stable in production).
 | 1 | Passive fan-out (M3–M4) | `uuid_audio_fork`, `uuid_google_transcribe2` media bugs | 🔶 M3 done, M4 ~95% (code complete; translator merge + barge-in measurement remain) |
 | 2 | Recording | `record_session` bugs, shared-FS recording pipeline | ⬜ |
 | 3 | Interactive media | dummy leg + conference-per-AI-interaction; mediagateway service | ⬜ |
-| 4 | Full media plane | conference mixing, monitor/whisper (`relate nospeak`), MOH | 🔶 mixer + conference sessions code complete (items 36–37); monitor/whisper, conference recording and the lab drill remain |
+| 4 | Full media plane | conference mixing, monitor/whisper (`relate nospeak`), MOH | 🔶 mixer, conference sessions, monitor/whisper/barge, conference recording and the member-control tail all code complete (items 36–40); the three-peer lab drill remains |
 
 The ordered next-up list, with a definition of done per item, open defects
 and what is blocked on other people, lives in [tasks.md](tasks.md).
@@ -261,10 +261,20 @@ recording** landed on top of that (item 39) with no new noun either: a
 mono object, a recording **group** over the member sessions with
 `only=customer` records one object per participant time-aligned on the group
 anchor, both shapes may run on one conference at once, and `RecordingStarted`
-now names which shape an object is. All three items are verified over
-in-process UDP sockets only. Still owed: the member-control tail with its
-parity table (P4-5) and the three-peer lab drill (P4-6) that puts a real RTP
-peer in a conference and both recording shapes in MinIO.
+now names which shape an object is.
+
+The **conference feature tail** closed the same way (item 40): `member_mute`,
+`member_deaf` and `member_hold` are member-state metadata verbs — mute zeroes a
+contributor row (off every ear and off the record), deaf silences the room into
+one ear while audio addressed at that member still lands, hold is both with the
+ear left open for hold audio — a prompt into the whole room is
+`StartPlayback{target_tag="all"}`, and `mix_source=leg` routes a member's own RTP
+to one ear, which is the coach shape. Enter/exit sounds are a verb rather than a
+trigger and DTMF control is API-first, both on purpose; the generic conference
+feature list and the ADAPTER parity table against one integrator's 14 conference
+RPCs are architecture.md Appendix B. All four items are verified over in-process
+UDP sockets only. Still owed: the three-peer lab drill (P4-6) that puts a real
+RTP peer in a conference and both recording shapes in MinIO.
 
 Work:
 - N-way mixer: conferences as MSS sessions of inline legs with a
@@ -272,8 +282,10 @@ Work:
 - Monitor = a hub subscriber (no SIP leg at all); whisper = injection
   routed only into the agent's mix; barge = matrix flip — replacing
   conference `relate … nospeak`.
-- Conference feature tail: enter/exit sounds, member mute/deaf/hold,
-  conference recording, DTMF controls (parity list from cigol's 14
+- Conference feature tail: member mute/deaf/hold, prompts into the room,
+  conference recording (items 39–40 — done; enter/exit sounds and DTMF
+  menus are deliberately integrator policy, see architecture.md
+  Appendix B for the parity table against one integrator's 14
   conference RPCs).
 - Fallback path if hand-rolled mixing disappoints: embed GStreamer
   (`gstreamer-rs`, `audiomixer`) behind the same session API
