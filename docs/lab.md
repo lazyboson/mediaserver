@@ -1607,3 +1607,93 @@ arrangement that keeps FS out of the codec decision, which is a future item.
 Until then MSS has decoded browser **G.711**, not browser **Opus** — and the
 gap between browser Opus and `opus_call_driver.py` is spelled out in
 [testing.md](testing.md).
+
+## barge_drill.sh — the half of barge-in cut-through that MSS owns (2026-08-23)
+
+Barge-in is four hops, and only three of them are MSS's:
+
+1. a consumer (ASR, voice-AI) decides the caller started talking and **tells
+   MSS**;
+2. MSS publishes that as a `MediaEvent` on Kafka `mss.events`;
+3. somebody's translator consumes the event and decides to cut the prompt;
+4. that translator calls `StopPlayback` on `MediaControl`, and MSS stops the
+   media.
+
+`lab/barge_drill.sh` + `lab/barge_translator.py` measure hops 2–4 against the
+live lab. **Hop 1 has no wire today** (see the D19 row in
+[tasks.md](tasks.md)): `session-core`'s `Registry::report` — the
+`ConsumerEvent` → `SpeechStarted`/`Partial`/`Final` path that feeds the pump —
+is reachable only from unit tests. Neither the `WS_TWILIO` inbound dialect nor
+the gRPC `ConsumerToServer` stream carries a speech report, and the Twilio
+`clear` message takes a different road entirely: it becomes a direct
+rtpengine `stop media` from `tap_session.rs`, never an event. So the drill's
+**trigger event is `PlaybackStarted`, not `SpeechStarted`**. For the bus half
+that costs nothing in fidelity — every `MediaEvent` goes through the same
+`event_pump`, the same topic and the same per-`external_id` partition key
+whatever payload it carries — but the consumer's own detection latency and
+whatever hop 1 will eventually cost are out of frame.
+
+The drill runs **beside** the live compose lab and adds one container: a
+fabricated call (`lab/call_driver.py`, no SIP) at 172.31.99.123, tapped by the
+lab's own `mss-control` pod, so events travel the real pump into the real
+Redpanda (`mss.events`, published to the host at 127.0.0.1:19092). The mock
+translator runs on the WSL host: a `kafka-python-ng` consumer parked at the
+end of the topic plus a warm gRPC channel to 127.0.0.1:50551. It plays **both**
+integrator roles on purpose — it starts the prompt *and* barges it — so every
+interval in the headline is measured on one clock, with no container/host skew
+in it. Skew was measured anyway (`PlaybackStopped` is stamped inside the
+`StopPlayback` call, so its `at` must fall inside this process's send/ack
+window): **median −0.12 ms**, i.e. negligible.
+
+### Numbers (two runs of 25 iterations, 2026-08-23)
+
+| interval | run A p50 / p95 / max | run B p50 / p95 / max |
+| --- | --- | --- |
+| **cut-through**: `StartPlayback` acked → `StopPlayback` acked | **3.31 / 4.19 / 4.27 ms** | **3.15 / 3.64 / 3.90 ms** |
+| event on the bus after the `StartPlayback` ack | 1.50 / 1.84 / 1.84 ms | 1.41 / 1.61 / 1.68 ms |
+| translator decides: event in hand → `StopPlayback` acked | 1.86 / 2.35 / 2.57 ms | 1.78 / 2.03 / 2.36 ms |
+| publish → consume, measured on `PlaybackStopped` | 1.09 / 1.33 / 1.38 ms | 1.02 / 1.16 / 1.56 ms |
+| MSS's own event `at` → consumed | 11.01 / 11.95 / 38.88 ms | 10.67 / 11.25 / 12.50 ms |
+
+Per-iteration rows are kept in `lab/out/barge-drill-<stamp>.jsonl`.
+
+**The Kafka hop is not the problem.** The whole MSS+bus half fits inside a
+single 20 ms frame with an order of magnitude to spare — p95 4.2 ms — so
+architecture §9 risk 9's fallback (a gRPC stream *for speech events only*) is not
+needed on these numbers.
+
+**Why the last row is not the bus latency.** `at` is stamped when the registry
+commits the event, and in the `StartPlayback` path that happens *before* MSS's
+rtpengine `play media` round trip inside the same RPC (that RPC's own p50 was
+10.84 ms). So `at` is a **commit** timestamp, not a publish timestamp, and the
+11 ms is mostly rtpengine. The honest publish→consume number is the
+`PlaybackStopped` row: **~1 ms**. Run A's 38.88 ms outlier tracks a 38.9 ms
+`play media` round trip in the same iteration, not a broker stall.
+
+### Setup notes
+
+- The host `python3` (WSL, 3.10) has no `ensurepip`, so there is no venv:
+  `pip install --user grpcio grpcio-tools kafka-python-ng`. The drill
+  generates the `MediaControl` stubs into `lab/out/pb` itself.
+- A playback blob is capped at 60 000 bytes (`MAX_PLAYBACK_BLOB_BYTES`, one NG
+  datagram) — about 3.7 s of 8 kHz s16. A 6 s tone is refused with *"exceeds
+  what one NG datagram carries; chunked playback is not implemented"*, so the
+  drill's prompt is 3 s of 440 Hz; `TONE_SECONDS` must stay under the cap.
+- One `COOKIE_PREFIX` per call driver, as always (the D12 shape).
+
+### What this does not prove
+
+- **Hop 1 does not exist** (D19), so no consumer-detection latency is in these
+  numbers, and the *shape* of the eventual speech-report hop could add its own
+  cost.
+- **The integrator's half is theirs.** Hop 3 here is a 40-line Python mock with
+  the topic to itself; a real translator (the reference deployment's, awaiting
+  review in its own repo) has other traffic, other consumers in its group, and
+  a downstream call-control hop after `StopPlayback`.
+- **`StopPlayback` acked is not the last audible sample.** The ack means
+  rtpengine accepted `stop media`; how quickly the caller stops hearing the
+  prompt is a media-path number that needs an ear on the leg, and that
+  measurement belongs to the Phase-3 inline drill.
+- An idle box, one session, one playback at a time, a single-broker Redpanda
+  and no competing load. Under the soak suite these numbers should be
+  re-taken.

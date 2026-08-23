@@ -13,7 +13,7 @@ Status as of **2026-08-23**.
 | **M1 — scaffold** | workspace, sans-IO cores (RTP, G.711, DTMF, jitter), NG bencode, consumer dialects, two-world daemon skeleton, watchdog | ✅ done (2026-08-13) |
 | **M2 — Phase-0 spike** | real NG subscribe against lab rtpengine, both legs jitter-buffered to WAV, per-tap cost | ✅ **code done**; 3 org-side items open (below) |
 | **M3 — fan-out hub** | per-session pub/sub, N consumers, WS-Twilio adapter, pause/resume/send_text parity | ✅ done |
-| **M4 — control plane** | `MediaControl` gRPC, session state machine, Kafka events, Redis registry, tenant-flag pilot | 🔶 **code complete** — pilot gates: translator merge (external), barge-in number (item 5). The gRPC lab proof (item 10) and the **live pod-kill drill (item 11, gap 14.41 s)** are both **done 2026-08-22**; the D14 orphan subscription the drill found is **fixed (item 25, 2026-08-23)**, fake- and Redis-verified rather than re-measured live |
+| **M4 — control plane** | `MediaControl` gRPC, session state machine, Kafka events, Redis registry, tenant-flag pilot | 🔶 **code complete** — pilot gates: translator merge (external), and the consumer half of the barge-in number — **the MSS+bus half is measured (item 5, 2026-08-23: cut-through p95 4.2 ms)** and found the D19 missing speech-report ingress. The gRPC lab proof (item 10) and the **live pod-kill drill (item 11, gap 14.41 s)** are both **done 2026-08-22**; the D14 orphan subscription the drill found is **fixed (item 25, 2026-08-23)**, fake- and Redis-verified rather than re-measured live |
 | **M5 — recording (Phase 2)** | per-leg taps → stereo segmenter → S3, identity + callback contract, dual-recording | 🔶 **code complete (2026-08-22)** — a live tapped call recorded end to end to a real MinIO, callbacks read off `mss.events` (2026-08-22, item 10's drill); **recording groups** — N sessions recorded as one recording, one mono object per participant — landed 2026-08-23 (item 21); owed: FS byte-parity sign-off (harness exists) |
 | M6+ | Phases 3–4 (interactive media, full media plane) | ⬜ not started |
 
@@ -177,15 +177,26 @@ Constitution wants them first-class with alerts, and Phase-1 pilot needs
 them for the FS-CPU-reduction claim.
 **Done when:** `/metrics` serves them and the drop counters have alert rules.
 
-### 5. Barge-in cut-through measurement
-**Where:** lab.
-**What:** measure `partial_speech_result` → `StopPlayback` end to end
-(consumer → MSS → Kafka → translator → the legacy controller → FS `break`), since MSS is a
-single writer per session and therefore on that critical path (§5.5).
-**Why now:** it is a **Phase-1 exit criterion**, and if the Kafka hop is too
-slow the fallback (a gRPC stream for speech events only) is a design change,
-not a tuning knob — better known early.
-**Done when:** a number exists, compared against the barge-in budget.
+### 5. Barge-in cut-through measurement — 🔶 **MSS+bus half measured (2026-08-23)**
+**Where:** lab — `lab/barge_drill.sh`, `lab/barge_translator.py`.
+**What was measured:** the hops MSS owns, against the live lab stack — MSS
+publishes a `MediaEvent` → Kafka `mss.events` → a mock translator consumes it
+→ it calls `StopPlayback` → MSS acks. Two runs of 25 iterations:
+**cut-through p50 3.31 / 3.15 ms, p95 4.19 / 3.64 ms, max 4.27 / 3.90 ms**;
+publish→consume alone ~1 ms; the translator's own decide-and-call 1.8–2.6 ms;
+container/host clock skew −0.12 ms. The whole MSS+bus half therefore fits
+inside one 20 ms frame with an order of magnitude to spare, so **architecture
+§9 risk 9's fallback (a gRPC stream for speech events only) is not needed**
+on these numbers. Method, the per-interval table and the caveats are in
+[lab.md](lab.md#barge_drillsh--the-half-of-barge-in-cut-through-that-mss-owns-2026-08-23).
+**What is still owed, and by whom:** the **integrator's consumer half is
+theirs to add** — hop 3 here is a Python mock with the topic to itself, and
+the reference deployment's translator (awaiting review in its own repo) is one
+such consumer with its own traffic and a call-control hop after `StopPlayback`.
+Two gaps of our own: the trigger had to be `PlaybackStarted` because the
+consumer→MSS speech report has **no wire** (D19), and `StopPlayback` acked is
+not the last audible sample — the media-path cut needs an ear on the leg
+(Phase-3 inline drill).
 
 ### 6. gRPC `MediaStream` data plane — ✅ DONE (2026-08-20)
 `crates/control-api/src/stream.rs` implements `MediaStream::Subscribe` over a
@@ -385,11 +396,14 @@ dead pod's memory is still lost, and the adopter starts a new segment; this
 drill attached no recorder. And the gap is a lab number on an idle box; the
 soak suite (item 19) should re-measure it under load.
 
-### 12. Barge-in cut-through measurement
-Item 5 above, unchanged — still gated on the the legacy controller translator merge
-(external). It is a **Phase-1 exit criterion**; if the Kafka hop misses the
-budget, the fallback (a gRPC stream for speech events only) is a design
-change better known early.
+### 12. Barge-in cut-through measurement — 🔶 **MSS+bus half measured (2026-08-23)**
+Item 5 above carries the numbers: **cut-through p50 ~3.2 ms, p95 ~4.2 ms, max
+4.3 ms over 50 iterations** on the live lab, so the Kafka hop makes the budget
+and the gRPC-for-speech-events fallback stays unbuilt. What remains for the
+Phase-1 exit criterion is not ours to measure: the **integrator's consumer
+half** (the the legacy controller translator merge, still external) plus the two gaps named in
+item 5 — the missing consumer→MSS speech-report wire (D19) and the audible
+cut inside rtpengine.
 
 ### 13. Event delivery durability (defect D5) — ✅ DONE (2026-08-22)
 **Where:** `crates/mediaserverd/src/event_pump.rs`.
@@ -1304,6 +1318,7 @@ consumer attached, which is the D14 close-out drill's shape.
 | D13 | `StreamStart` (and the Twilio `start` frame's `tracks`) advertises `["customer","agent"]` for `TrackSelector::All`, but a silent `mixed` track is delivered too, at the full frame rate: a consumer must tolerate an unannounced track and pays 50% extra bandwidth for silence. Fixing it means either naming `mixed` in the start frame or not carrying it under `All` — the latter touches the frozen Twilio surface | `stream.rs`, `tap_plane.rs`, `hub.rs` | low for correctness, medium for cost |
 | D17 | **Leg labels invert when the caller's from-tag is not given.** With `from_tags` unspecified (`-`), `TapPlane` labels the two legs in the order rtpengine's `query` returns them, and in the two-node drill that put **FreeSWITCH's** tag first — so `customer` and `agent` were swapped in the recording and in the `tracks` a consumer sees. Speaker attribution is only trustworthy when the caller's from-tag is passed explicitly. Fix shape: refuse to name tracks by direction when no from-tag was supplied (label them `leg_a`/`leg_b`, or resolve the caller from the SIP call-id), rather than guessing an order | `tap_plane.rs` | medium — an ASR or a QA review reads the wrong speaker |
 | D18 | **Recording-group members are not time-aligned.** Each member's file anchors on **its own first frame** (`recorder.rs` takes the offset from the per-member anchor), so a participant that joins late produces a file that starts at its join moment with no leading pad, and two members of the same group differ in length — 90.32 s vs 90.26 s in the drill above, with nothing to say where in the first file the second one begins. Reassembling a conference from the participant objects therefore needs the event timeline as well as the audio. Fix: record the group's open instant and pad each member's first segment with silence from that anchor | `recorder.rs`, `tap_plane.rs` | medium once anyone reassembles a multi-party recording |
+| D19 | **A consumer cannot tell MSS that the caller started speaking.** `Registry::report` (`ConsumerEvent` → `SpeechStarted`/`Partial`/`Final`/`EndOfUtterance`) is the documented ingress for speech events and the head of the barge-in chain, but **no transport calls it**: the `WS_TWILIO` inbound dialect carries only `media`/`mark`/`clear`/`end_of_interaction`, the gRPC `ConsumerToServer` stream carries only `hello`/`inject`/`mark`/`clear`, and `SendToAttachment` runs the other way (server → consumer text). So `SpeechStarted`/`Partial`/`Final` never reach `mss.events` from a real consumer, and the only barge a consumer can trigger is the WS `clear`, which bypasses the bus entirely (a direct rtpengine `stop media`, unevented and untargeted — the D2 shape). Found while measuring item 5. Fix shape: carry a speech report on both consumer transports (a `ConsumerToServer.report` message and a Twilio-dialect inbound event) into `Registry::report`, keeping the frozen serializations additive | `consumer_ws.rs`, `stream.rs`, `session-core/registry.rs` | **high** — the barge-in chain has no first hop |
 
 ## Waiting on other people (M2 close-out)
 
