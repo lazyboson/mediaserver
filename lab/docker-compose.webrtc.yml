@@ -1,0 +1,164 @@
+name: mss-microsip
+
+# The agent side of the lab: a second rtpengine, a second OpenSIPS that speaks
+# WebSocket, a page server for the browser phone, and a headless Chrome that
+# can place the call with no human in the room.
+#
+# It is an overlay on docker-compose.microsip.yml, not a replacement, because
+# the customer leg it needs already exists there. Bring both up together:
+#
+#   DOCKER_API_VERSION=1.43 docker compose \
+#     -f lab/docker-compose.microsip.yml -f lab/docker-compose.webrtc.yml \
+#     up -d rtpengine rtpengine-agent opensips opensips-agent freeswitch \
+#           redis redpanda minio minio-init mss-control webrtc-page \
+#           call-watcher-agent
+#
+# or just run lab/webrtc_agent_drill.sh, which does that and everything after.
+#
+# Why a second rtpengine at all: production anchors the customer leg at the
+# carrier interconnect and the agent leg on the agent side (architecture.md
+# section 2), on two different nodes. One session in MSS carries one node, so
+# such a call is two sessions -- and that is a claim the single-rtpengine lab
+# could not test. Addresses stay static for the same reason they do in the base
+# file: rtpengine has to advertise one it can be reached at.
+
+services:
+
+  # RE2. Same image and flags as RE1 with two differences: its own address, and
+  # its own port range, so the two nodes cannot be confused for each other in a
+  # packet capture or in a published-port collision.
+  rtpengine-agent:
+    image: jambonz/rtpengine
+    command:
+      - rtpengine
+      - --table=-1
+      - --recording-dir=/tmp
+      - --interface=internal/172.31.99.11
+      # What RE2 tells the browser to send media to. 127.0.0.1 is right only
+      # while the browser runs on this host; a browser on another machine on
+      # the LAN needs this host's LAN address, or it signals perfectly and
+      # carries no audio.
+      - --interface=external/172.31.99.11!${AGENT_ADVERTISE_IP:-127.0.0.1}
+      - --port-min=30100
+      - --port-max=30199
+    ports:
+      - "30100-30199:30100-30199/udp"
+    networks:
+      lab:
+        ipv4_address: 172.31.99.11
+
+  # The agent proxy. ws on 5062 for the browser, udp on 5060 so FreeSWITCH can
+  # send it in-dialog requests, and every media command aimed at RE2.
+  opensips-agent:
+    image: opensips/opensips:3.4
+    depends_on: [rtpengine-agent]
+    entrypoint: ["/bin/sh", "-c"]
+    # One line on purpose: a YAML folded scalar keeps more-indented lines
+    # literally, so a "readable" multi-line version arrives at sh -c as several
+    # broken commands instead of one.
+    command:
+      - sed -e "s/__ADVERTISED_IP__/${AGENT_ADVERTISED_IP:-${ADVERTISED_IP:-127.0.0.1}}/" -e "s/__RTPE_OFFER_DIR__/${AGENT_RTPE_OFFER_DIR:-external internal}/" -e "s/__RTPE_ANSWER_DIR__/${AGENT_RTPE_ANSWER_DIR:-internal external}/" -e "s/__RTPE_CODEC_FLAGS__/${AGENT_RTPE_CODEC_FLAGS:-}/" /etc/opensips/opensips-agent.cfg.tmpl > /tmp/opensips-agent.cfg && exec /usr/sbin/opensips -F -f /tmp/opensips-agent.cfg
+    volumes:
+      - ./opensips/opensips-agent.cfg:/etc/opensips/opensips-agent.cfg.tmpl:ro
+    ports:
+      - "5062:5062/tcp"
+    networks:
+      lab:
+        ipv4_address: 172.31.99.71
+
+  # The browser phone, served over http. nginx logs every request to stdout,
+  # which is how the page's end-of-call summary gets collected: it fetches
+  # /lab-report?... and the 404 line in `docker logs` is the artifact.
+  webrtc-page:
+    image: nginx:alpine
+    volumes:
+      - ./webrtc:/usr/share/nginx/html:ro
+    ports:
+      - "8081:80"
+    networks:
+      lab:
+        ipv4_address: 172.31.99.12
+
+  # Machine-driven agent: Chrome with a wav file for a microphone. Gated behind
+  # a profile so `up` never starts it -- the drill starts it when it wants a
+  # call placed, and a human using the real browser on 127.0.0.1:8081 is
+  # unaffected.
+  #
+  # Two flags carry the whole trick. --use-file-for-fake-audio-capture makes the
+  # microphone deterministic, and --unsafely-treat-insecure-origin-as-secure is
+  # what lets getUserMedia run at all from a container-internal http origin
+  # (localhost would be a secure context; 172.31.99.12 is not).
+  chrome-agent:
+    profiles: ["headless"]
+    image: zenika/alpine-chrome:latest
+    depends_on: [webrtc-page, opensips-agent]
+    volumes:
+      - ./out:/out:ro
+    entrypoint: ["chromium-browser"]
+    command:
+      - --headless=new
+      - --no-sandbox
+      - --disable-gpu
+      - --disable-dev-shm-usage
+      - --user-data-dir=/tmp/chrome-agent
+      - --autoplay-policy=no-user-gesture-required
+      - --use-fake-device-for-media-stream
+      - --use-fake-ui-for-media-stream
+      - --use-file-for-fake-audio-capture=/out/${AGENT_MIC_WAV:-agent_mic.wav}%noloop
+      - --unsafely-treat-insecure-origin-as-secure=http://172.31.99.12
+      - --allow-running-insecure-content
+      - "http://172.31.99.12/?ws=ws%3A%2F%2F172.31.99.71%3A5062&autodial=1&target=${AGENT_DIAL:-4048}&seconds=${AGENT_CALL_SECONDS:-45}&codec=${AGENT_CODEC:-opus}&red=${AGENT_RED:-0}&dtx=${AGENT_DTX:-0}&fec=${AGENT_FEC:-1}&cbr=${AGENT_CBR:-0}&stereo=${AGENT_STEREO:-0}&ptime=${AGENT_PTIME:-}&bitrate=${AGENT_BITRATE:-}&dsp=${AGENT_DSP:-0}"
+    networks:
+      lab:
+        ipv4_address: 172.31.99.13
+
+  # The agent leg's call-id is generated by the browser, so it cannot be known
+  # in advance the way host_test_caller.py's is. Same stand-in as the customer
+  # side, pointed at RE2 and writing its own env file.
+  call-watcher-agent:
+    image: python:3-slim
+    depends_on: [rtpengine-agent]
+    volumes:
+      - ./call_watcher.py:/call_watcher.py:ro
+      - shared:/shared
+    command: ["python3", "/call_watcher.py"]
+    environment:
+      NG_NODE: 172.31.99.11
+      CALL_ENV_FILE: /shared/call-agent.env
+      CALLEE_MEDIA_IP: 172.31.99.80
+    networks:
+      lab:
+        ipv4_address: 172.31.99.91
+
+  # Additions to services the base file owns.
+
+  freeswitch:
+    volumes:
+      # This replaces the image's dialplan/default.xml with the same file plus
+      # the lab extensions, because FreeSWITCH does not merge two contexts of
+      # the same name: it routes out of the first one it parsed and ignores the
+      # rest, so a second file declaring <context name="default"> loads into the
+      # XML tree, shows up in `xml_locate dialplan`, and still never matches a
+      # call. dialplan-lab.xml keeps the prose; dialplan-default.xml is the
+      # merged artefact that FreeSWITCH actually reads.
+      - ./freeswitch/dialplan-default.xml:/etc/freeswitch/dialplan/default.xml:ro
+
+  # MSS_TAP_TRANSCODE=off is not a preference here, it is a requirement, and the
+  # reason is in tap_plane.rs: with transcoding off the tap format is settled
+  # per session from what rtpengine actually offers (`offered_tap_format`),
+  # while with it on every session gets the one format MSS_TAP_FORMAT names.
+  # This call is deliberately mixed -- PCMA on the customer leg, Opus on the
+  # agent leg -- so a single daemon-wide format cannot describe it, and asking
+  # rtpengine to transcode is the one thing measurement has already ruled out
+  # (item 23: its transcoder produces 3.8 pkt/s against 50 native).
+  mss-control:
+    environment:
+      MSS_TAP_TRANSCODE: ${MSS_TAP_TRANSCODE:-off}
+      MSS_OPUS_DECODE_RATE_HZ: ${MSS_OPUS_DECODE_RATE_HZ:-16000}
+
+networks:
+  lab:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.31.99.0/24
