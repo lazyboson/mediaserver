@@ -327,9 +327,11 @@ Decisions worth knowing before extending it:
   `encode_errors`, still advances sequence and timestamp (the far end reads one
   lost packet, which is what happened) and returns `None`.
 
-Not done here: nothing calls it yet. The wiring — UDP socket pair, SDP answer,
-where the pushed PCM comes from and how the media thread's wakeup maps onto
-`tick` — is P3-2, and Opus egress is still absent everywhere in the crate.
+Not done here: nothing called it yet at this commit. **Item 33 wired it**
+(`inline_leg.rs` below — UDP socket pair, SDP answer, and `InlineEgress::pump`
+driving `tick` from the capture loop), item 34 fed it from a consumer's inject
+stream, and item 37 drives one per conference member. Opus egress is still absent
+everywhere in the crate.
 
 ### mixer.rs — the N-way mix matrix (Phase 4 core, landed 2026-08-23)
 
@@ -413,7 +415,8 @@ worth repeating: **`join_listener` resets its whole column to the defaults**, so
 a new member's arrival restores unity from every contributor into it —
 including contributors whose row was deliberately narrowed by `route_only`.
 Any non-default routing must therefore be re-applied after every membership
-change, which is exactly what `conference.rs`'s `reroute_injectors` does. The
+change, which is exactly what `conference.rs`'s `apply_matrix` does (named
+`reroute_injectors` when item 37 introduced it). The
 mixer test suite could not have caught it: it never re-checks an old route
 after a later join, and a conference test did.
 
@@ -499,11 +502,13 @@ rate and channel count to `opus-ffi`, so the pipeline has one call and
 of five rates and which one a tap should use is a negotiation question, not a
 decoder question.
 
-**Not wired into `StreamPipeline` yet, on purpose.** The pipeline derives its
-audio payload type from `Encoding::static_payload_type`, and Opus has no static
-type — it is always dynamically negotiated (typically 111). That plumbing
-belongs with the SDP work (tasks 16b), so this stage stops at a validated
-decoder rather than half-wiring the packet path.
+**Wired into `StreamPipeline` since 2026-08-23** (tasks 16b-2; see the
+pipeline.rs section above — `PipelineConfig` carries the negotiated payload type
+and `Decoder::Opus`). It was deliberately left unwired at *this* commit because
+the pipeline derived its audio payload type from
+`Encoding::static_payload_type`, and Opus has no static type — it is always
+dynamically negotiated (typically 111), so the plumbing belonged with the SDP
+work rather than being half-wired here.
 
 ### frame.rs — the codec table, now readable in both directions
 
@@ -746,8 +751,10 @@ below testable without a lab (Constitution, Article III).
 
 The four nouns are `SessionKind` (Tap/Inline/Mix), `AttachSpec`,
 `PlaybackSpec` and `MediaEvent`. Phase 3/4 add no operations — an inline leg
-is `SessionKind::Inline` and a conference is `SessionKind::Mix`, both already
-accepted by the same calls.
+is `SessionKind::Inline` and **a conference is inline legs sharing a `group`**
+(item 37), so both ride the same calls. `SessionKind::Mix` was the original guess
+and is **unused** — it is refused by name in the controller; see the tap_plane
+section on why a conference needed no new session kind.
 
 ### The invariants it enforces, and where they come from
 
@@ -1251,9 +1258,7 @@ Gaps: leases are renewed per session per tick with one round trip each (fine
 at hundreds, revisit at thousands); the discovery map (call-id → node + tags)
 is a separate, still-unbuilt concern; `SessionStore` is a `mediaserverd`
 module rather than a crate, so the integration test re-includes it by path;
-and `rebuild` still drops the attachment's negotiated `format` (it passes
-`format: None`), so a consumer that asked for L16/16k is rebuilt at the
-session default (D15). D14's fix has **not** been re-measured on a live pod
+and D14's fix has **not** been re-measured on a live pod
 kill — the drill needs a live SIP call and a rebuilt pod image, so what is
 proven today is the seam and the ordering (unit tests, a fake rtpengine
 socket, and the store paths against the lab's real Redis), not another
@@ -1452,9 +1457,12 @@ the same session over one socket. `SessionController` implements `MediaControl`
 for `Arc<Self>` so both services can hold it.
 
 Gap: session creation passes an empty `call_id`/`from_tags`, because telsvc
-callers only know the channel uuid — the OpenSIPS→Redis discovery map (M2, open)
-is what resolves those, and until it exists a TelCompat-created session cannot
-actually tap.
+callers only know the channel uuid. **Resolved since 2026-08-17** (see
+"Resolving a call's participants without the discovery map" above): the caller
+passes the SIP call-id and the caller's from-tag as session metadata
+(`sipCallId` / `callerFromTag`, both already on the FreeSWITCH channel) and
+`TapPlane` asks rtpengine's `query` for the rest, so a TelCompat-created session
+taps without the OpenSIPS→Redis discovery map.
 
 ### inline_leg.rs — the egress pump (item 33, Phase 3, 2026-08-23)
 
@@ -1632,9 +1640,9 @@ conference still live, and the last leg out closes it (`conferences_live` back t
 Not done here: cross-pod conferences (a group is one pod's table — a leg
 answered by another pod cannot join it, and an inline leg is not adoptable
 anyway), per-leg resampling, conference recording as one mixed file (P4-4),
-member mute/deaf/hold verbs (P4-5), AGC, and any live drill (P4-6) — no real SIP
-peer has been in a conference yet. Monitor, whisper and barge landed as item 38,
-below.
+AGC, and a **SIP** peer — none has been in a conference yet. Monitor, whisper and
+barge landed as item 38, conference recording as item 39, the member-control
+verbs as item 40 and the live three-peer drill as item 41, all below.
 A conference group name is also **global to the pod**: there is no tenant scope
 on a session the way `accountId` scopes a recording group, so two tenants
 choosing the same group name would share a mix. Prefixing the name is the
@@ -1682,7 +1690,8 @@ one extra cell: `route_only`/`route_to_all` for the destination, then
 `set_gain(injector, monitor, UNITY|MUTED)`.
 
 `reroute_injectors` is now the whole routing decision and runs after **every**
-join, leave and route change (item 37's sharp edge: `join_listener` resets its
+join, leave and route change (item 40 renamed it `apply_matrix` and added the
+member-control passes; it is still the only writer of non-default cells) (item 37's sharp edge: `join_listener` resets its
 column). Two behaviors fall out of resolving by name each time: a whisper to
 somebody who is not in the conference is **muted, not broadcast** — including
 its monitor cell, so audio nobody heard never reaches the record — and it
@@ -1695,7 +1704,8 @@ setup then fails reverts the same way. Two INJECT attachments on one leg share
 one injector — last writer wins, documented, not enforced.
 
 Events: `EventKind::MixRouted{target, monitor_audible}` →
-`MediaEvent.mix_routed` (oneof tag 25; the next free payload tag is 26) on the
+`MediaEvent.mix_routed` (oneof tag 25; item 40 then took 26, so the next free
+payload tag is 27) on the
 attach that declares a route and on every change, so an integrator can audit who
 whispered to whom and whether it was on the record. `mss_ctl mix <attachment-id>
 <own|all|member-id> [include|exclude]` is the lab handle. New metrics:
@@ -2037,11 +2047,13 @@ into something that actually taps calls.
   the whole loop rests on rtpengine's `query` reporting the *current* SSRC for
   a tag after a change, which is measured at subscribe time but **not yet
   measured mid-call**. Probe it before claiming transfer support.
-- **Known gaps:** no Redis registry, so a tap lives and dies with its pod;
-  `stop_playback` stops everything on the call rather than one playback,
-  because rtpengine's `stop media` targets a participant, not a playback id;
-  `close_attachment` aborts the consumer task rather than closing the
-  websocket politely.
+- **Known gaps at the time — all three since closed**, kept because the middle
+  one's reasoning still binds: the Redis registry landed 2026-08-17 (a tap now
+  outlives its pod by adoption); `stop_playback` targets the playback's own
+  participant since item 27 (D2) — but rtpengine's `stop media` still targets a
+  participant and **not** a playback id, so two playbacks aimed at one
+  participant cannot be stopped independently, which is D2's measured residual;
+  and `close_attachment` closes politely since item 27 (D3).
 
 #### Inline sessions (item 33, 2026-08-23)
 
@@ -2176,7 +2188,7 @@ never takes a lock and never waits on the control world.
   `MediaStream` adapter and exported hub metrics landed 2026-08-20 —
   `SubscriptionMetrics` is the cloneable handle over a subscription's
   queue depth and drop/delivery counters that the metrics endpoint reads.
-  Opus output remains open (tasks item 9).
+  Opus output remains open (tasks item 16d, which superseded item 9).
 - **The hub is what architecture.md §5 calls an Attachment set**, and the
   spike already prefigures two of its rules: capability is structural (the
   voice-AI consumer is constructed with a command channel, listeners with
@@ -2303,9 +2315,12 @@ cookie, per-request `oneshot`, timeout, retry, and node health counters.
   re-subscribe orchestration, and `#[allow(dead_code)]` on the module
   until the control plane calls the subscribe verbs — same pattern as
   `supervisor.rs`.
-- **M2 remaining:** real lab validation against rtpengine.
-  **M4:** node registry keyed by call→node discovery, re-subscribe on pod
-  loss.
+- **Both since done.** Real lab validation against rtpengine landed with the
+  Phase-0 spike and every drill since. Re-subscribe on pod loss lives in
+  `registry_keeper.rs` and was proved on a live `kill -9` (tasks item 11), with
+  the orphaned subscription it exposed fixed in item 25. A node registry keyed
+  by call→node discovery is still absent and no longer needed: MSS resolves a
+  call's participants itself (see the section above).
 
 ### rtpengine_capability.rs — the first-contact capability log (2026-08-23, item 23)
 Answers, in the daemon's own log, "what is this rtpengine and can my taps use
@@ -2864,8 +2879,10 @@ this addition only because of a specific feature selection, so do not
   sink → require the session → hub-subscribe (all tracks, or one if the
   selector names one) → spawn the recorder → register it as a consumer for
   metrics → raise `RecordingStarted`. `update_attachment` forwards pause to
-  the recorder and, for WS/gRPC, logs that pause is still control-plane state
-  only (their media keeps flowing — an unchanged, and now explicit, gap).
+  the recorder and, for WS/gRPC, sets the hub subscription's pause flag
+  (`SubscriptionControl::set_paused`) so their media really stops — that was
+  control-plane state only until item 27 closed D10, and skipped frames are now
+  counted.
   `close_attachment` **awaits** the recorder's finish so the callbacks land
   before the caller's `Detach` returns, and `close_session` now sweeps *all*
   of a session's attachments (previously it left WS tasks and map entries
