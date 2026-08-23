@@ -1353,6 +1353,33 @@ recording group acct-conf/conf-drill is already recording rec-1787429250 and
   a different group
 ```
 
+### The staggered re-run that proved the group time anchor (P2-1, 2026-08-23)
+
+The drill grew `JOIN_STAGGER_SECONDS` (default 5): alice attaches, the drill
+waits, **then** bob attaches, so the second member joins a group that is
+already open — which is what D18 was about. With P2-1, bob's file is padded
+back to the group's open instant instead of starting at its join moment.
+
+Run 2026-08-23 16:03 UTC, `JOIN_STAGGER_SECONDS=5 RECORD_SECONDS=20`:
+
+```
+pod log: this recording group member joined late; lead_silence_ms=10    (alice)
+pod log: this recording group member joined late; lead_silence_ms=5016  (bob)
+
+acct-conf/rec-1787500885/alice.wav  400524 B  200240 frames  25.030 s
+acct-conf/rec-1787500885/bob.wav    401900 B  200928 frames  25.116 s
+```
+
+Read back off MinIO and measured sample by sample: **bob.wav opens with 40128
+zero samples = 5016 ms of silence**, exactly its pad, and alice.wav opens with
+50 ms. Both files therefore start at the same wall instant, and they differ in
+length by **86 ms** rather than by the 5 s stagger — the residual is the tail,
+not the head: `Detach` waits for the upload (D11) and the drill detaches
+alice first, so bob records through alice's ~47 ms upload.
+
+`mss_recording_group_joins_refused_total` is still 2 (the reused label and the
+second recording id), so the anchor changed no refusal.
+
 **The drill found a bug in the instrument first (worth keeping).**
 `call_driver.py` could not fabricate **two** calls at once: both containers
 number their NG cookies from `lab-1`, so rtpengine's duplicate-cookie reply
@@ -1610,9 +1637,11 @@ Two soft spots this run exposed are recorded as defects in
 [tasks.md](tasks.md): the leg labels **inverted** when `from_tags` was left
 unspecified (`-`), because rtpengine's `query` answered with FreeSWITCH's tag
 first (**D17** — speaker attribution is only trustworthy when the caller tag is
-passed explicitly), and the group's member files are **not time-aligned**: each
-anchors on its own first frame, so the three lengths above differ by up to
-0.26 s and a late joiner's file would simply start at its join moment (**D18**).
+passed explicitly), and the group's member files were **not time-aligned**: each
+anchored on its own first frame, so the three lengths above differ by up to
+0.26 s and a late joiner's file simply started at its join moment (**D18**,
+fixed 2026-08-23 by the group time anchor — see the staggered re-run above;
+these numbers are from before that fix).
 The browser leg also **outlived the hung-up call by ~12 s** — the tone ran to
 second 29 against the customer leg's 17 — which is billable media tail after
 hangup and deserves an eye in a pilot.

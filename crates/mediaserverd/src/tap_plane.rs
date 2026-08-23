@@ -112,6 +112,7 @@ impl std::fmt::Display for GroupKey {
 struct RecordingGroup {
     recording_id: String,
     format: RecordingFormat,
+    opened_at: Instant,
     members: HashMap<AttachmentId, Vec<String>>,
 }
 
@@ -580,12 +581,12 @@ impl TapPlane {
                 account_id: identity.account_id.clone(),
                 group: view.group.clone(),
             };
-            self.join_group(&key, view.id, &identity, &targets)?;
-            Some((key, targets))
+            let anchor = self.join_group(&key, view.id, &identity, &targets)?;
+            Some((key, targets, anchor))
         };
         let rate = self.config.format.sample_rate_hz;
         let (member_of, spec) = match grouped {
-            Some((key, targets)) => (
+            Some((key, targets, anchor)) => (
                 Some(key),
                 RecorderSpec {
                     session: view.session,
@@ -594,6 +595,7 @@ impl TapPlane {
                     targets,
                     sample_rate_hz: rate,
                     max_duration: recorder::MAX_RECORDING,
+                    group_anchor: Some(anchor),
                 },
             ),
             None => (
@@ -674,7 +676,7 @@ impl TapPlane {
         attachment: AttachmentId,
         identity: &RecordingIdentity,
         targets: &[RecordingTarget],
-    ) -> Result<(), MediaPlaneError> {
+    ) -> Result<Instant, MediaPlaneError> {
         let counters = &self.config.recording.counters;
         let mut held = self
             .groups
@@ -705,6 +707,7 @@ impl TapPlane {
                 held.entry(key.clone()).or_insert(RecordingGroup {
                     recording_id: identity.recording_id.clone(),
                     format: identity.format,
+                    opened_at: Instant::now(),
                     members: HashMap::new(),
                 })
             }
@@ -723,7 +726,7 @@ impl TapPlane {
             targets.iter().map(|target| target.key.clone()).collect(),
         );
         counters.group_members_live.fetch_add(1, Ordering::Relaxed);
-        Ok(())
+        Ok(group.opened_at)
     }
 
     fn leave_group(&self, key: &GroupKey, attachment: AttachmentId) {
@@ -2201,12 +2204,16 @@ mod tests {
         let alice = participant_targets(&identity, "alice", TrackSelector::All);
         let bob = participant_targets(&identity, "bob", TrackSelector::All);
 
-        plane
+        let opened = plane
             .join_group(&key, AttachmentId::from_raw(2), &identity, &alice)
             .expect("the first member opens the group");
-        plane
+        let joined_late = plane
             .join_group(&key, AttachmentId::from_raw(3), &identity, &bob)
             .expect("a second participant is the whole point");
+        assert_eq!(
+            opened, joined_late,
+            "every member of a group anchors on the instant the group opened"
+        );
         let error = plane
             .join_group(&key, AttachmentId::from_raw(4), &identity, &alice)
             .unwrap_err();

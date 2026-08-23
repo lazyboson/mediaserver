@@ -7,7 +7,7 @@ use session_core::{Observation, SessionId};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
@@ -196,6 +196,7 @@ pub struct SegmenterStats {
     pub frames_out_of_order: u64,
     pub frames_beyond_cap: u64,
     pub segments: u64,
+    pub lead_silence_frames: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -236,6 +237,23 @@ impl Segmenter {
         }
     }
 
+    pub fn lead_with_silence(&mut self, lead: Duration) -> bool {
+        if self.stats.frames_written > 0 || self.stats.lead_silence_frames > 0 {
+            return false;
+        }
+        let frames = lead
+            .as_millis()
+            .saturating_mul(self.sample_rate_hz as u128)
+            .saturating_div(1000)
+            .min(self.max_frames as u128) as usize;
+        if frames == 0 {
+            return false;
+        }
+        self.stats.lead_silence_frames = frames as u64;
+        self.segment_start = frames;
+        true
+    }
+
     pub fn accept(&mut self, track: Track, timestamp_ms: u64, samples: &[i16]) {
         if samples.is_empty() {
             return;
@@ -268,7 +286,7 @@ impl Segmenter {
             return false;
         }
         self.paused = true;
-        self.segment_start = self.frames();
+        self.segment_start = self.frames().max(self.segment_start);
         self.anchor_ms = None;
         true
     }
@@ -555,6 +573,7 @@ pub struct RecorderSpec {
     pub targets: Vec<RecordingTarget>,
     pub sample_rate_hz: u32,
     pub max_duration: Duration,
+    pub group_anchor: Option<Instant>,
 }
 
 impl RecorderSpec {
@@ -574,6 +593,7 @@ impl RecorderSpec {
             }],
             sample_rate_hz,
             max_duration: MAX_RECORDING,
+            group_anchor: None,
         }
     }
 }
@@ -651,12 +671,13 @@ async fn run(
     counters.live.fetch_add(1, Ordering::Relaxed);
     let recording_id = spec.recording_id.clone();
     let mut segmenter = Segmenter::new(spec.sample_rate_hz, spec.max_duration);
+    let mut group_anchor = spec.group_anchor;
 
     loop {
         tokio::select! {
             biased;
             event = subscription.next() => match event {
-                Some(event) => absorb(&mut segmenter, event),
+                Some(event) => absorb(&mut segmenter, event, &mut group_anchor),
                 None => break,
             },
             command = commands.recv() => match command {
@@ -692,7 +713,7 @@ async fn run(
         }
     }
     while let Some(event) = subscription.try_next() {
-        absorb(&mut segmenter, event);
+        absorb(&mut segmenter, event, &mut group_anchor);
     }
 
     let stats = segmenter.stats();
@@ -756,6 +777,7 @@ async fn run(
             frames,
             channels,
             segments = stats.segments,
+            lead_silence_frames = stats.lead_silence_frames,
             bytes = size,
             "recording closed; uploading"
         );
@@ -870,7 +892,7 @@ fn write_spill(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     std::fs::write(path, bytes)
 }
 
-fn absorb(segmenter: &mut Segmenter, event: TapEvent) {
+fn absorb(segmenter: &mut Segmenter, event: TapEvent, group_anchor: &mut Option<Instant>) {
     if let TapEvent::Media {
         track,
         timestamp_ms,
@@ -878,6 +900,15 @@ fn absorb(segmenter: &mut Segmenter, event: TapEvent) {
         samples,
     } = event
     {
+        if let Some(anchor) = group_anchor.take() {
+            let lead = Instant::now().saturating_duration_since(anchor);
+            if segmenter.lead_with_silence(lead) {
+                info!(
+                    lead_silence_ms = lead.as_millis() as u64,
+                    "this recording group member joined late; its file opens with silence"
+                );
+            }
+        }
         segmenter.accept(track, timestamp_ms, &samples[..len]);
     }
 }
@@ -1225,6 +1256,18 @@ mod tests {
                 .collect(),
             sample_rate_hz: RATE,
             max_duration: MAX_RECORDING,
+            group_anchor: None,
+        }
+    }
+
+    fn group_spec_anchored(labels: &[(&str, Layout)], lead: Duration) -> RecorderSpec {
+        RecorderSpec {
+            group_anchor: Some(
+                std::time::Instant::now()
+                    .checked_sub(lead)
+                    .expect("this machine's clock has no room for a lead"),
+            ),
+            ..group_spec(labels)
         }
     }
 
@@ -1482,6 +1525,125 @@ mod tests {
                 other => panic!("{other:?}"),
             }
         }
+    }
+
+    #[test]
+    fn a_late_group_member_opens_its_file_with_silence_back_to_the_group_anchor() {
+        let mut late = segmenter();
+        assert!(late.lead_with_silence(Duration::from_millis(1000)));
+        assert_eq!(late.stats().lead_silence_frames, RATE as u64);
+        for at in 0..10u64 {
+            late.accept(Track::Customer, at * 20, &tone(700));
+        }
+
+        assert_eq!(late.frames(), RATE as usize + FRAME * 10);
+        assert_eq!(late.duration_ms(), 1200);
+        let rendered = late.render(Layout::Mono(Track::Customer));
+        assert_eq!(rendered.samples.len(), RATE as usize + FRAME * 10);
+        assert!(
+            rendered.samples[..RATE as usize]
+                .iter()
+                .all(|sample| *sample == 0),
+            "the lead is not silent"
+        );
+        assert!(
+            rendered.samples[RATE as usize..]
+                .iter()
+                .all(|sample| *sample == 700),
+            "the member's own audio did not land after the lead"
+        );
+    }
+
+    #[test]
+    fn two_members_of_one_group_that_end_together_render_the_same_length() {
+        let mut early = segmenter();
+        for at in 0..100u64 {
+            early.accept(Track::Customer, at * 20, &tone(100));
+        }
+        let mut late = segmenter();
+        assert!(late.lead_with_silence(Duration::from_millis(1000)));
+        for at in 0..50u64 {
+            late.accept(Track::Customer, at * 20, &tone(-100));
+        }
+
+        assert_eq!(early.frames(), late.frames());
+        assert_eq!(early.duration_ms(), 2000);
+        assert_eq!(late.duration_ms(), 2000);
+        assert_eq!(
+            early.render(Layout::Stereo).samples.len(),
+            late.render(Layout::Stereo).samples.len()
+        );
+    }
+
+    #[test]
+    fn a_paused_late_member_pads_its_lead_once_and_never_again() {
+        let mut late = segmenter();
+        assert!(late.lead_with_silence(Duration::from_millis(500)));
+        for at in 0..10u64 {
+            late.accept(Track::Customer, at * 20, &tone(21));
+        }
+        assert!(late.pause());
+        for at in 10..40u64 {
+            late.accept(Track::Customer, at * 20, &tone(21));
+        }
+        assert!(late.resume());
+        for at in 0..10u64 {
+            late.accept(Track::Customer, at * 20, &tone(22));
+        }
+
+        let lead = RATE as usize / 2;
+        assert_eq!(late.frames(), lead + FRAME * 20);
+        assert_eq!(late.stats().lead_silence_frames, lead as u64);
+        assert_eq!(late.stats().segments, 2);
+        assert!(
+            !late.lead_with_silence(Duration::from_millis(500)),
+            "a lead is padded once per recording, not once per segment"
+        );
+        assert_eq!(late.frames(), lead + FRAME * 20);
+        let rendered = late.render(Layout::Mono(Track::Customer));
+        assert!(rendered.samples[..lead].iter().all(|sample| *sample == 0));
+        assert_eq!(rendered.samples[lead + FRAME * 10], 22);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_group_member_that_attaches_late_uploads_a_file_anchored_on_the_group() {
+        let (mut hub, client) = Hub::new();
+        let subscription = client.attach(64, TrackSelection::All).unwrap();
+        hub.poll_commands();
+        let sink = Arc::new(MemorySink::accepting());
+        let support = support(Arc::clone(&sink) as Arc<dyn RecordingSink>, None);
+
+        let handle = spawn(
+            group_spec_anchored(
+                &[("bob.customer", Layout::Mono(Track::Customer))],
+                Duration::from_millis(400),
+            ),
+            subscription,
+            support,
+            None,
+        );
+        for at in 0..5u64 {
+            hub.publish(TapEvent::media(Track::Customer, at * 20, &tone(500)));
+        }
+        let outcome = handle.finish().await.expect("the recorder had no outcome");
+        drop(hub);
+
+        let lead = outcome.stats.lead_silence_frames as usize;
+        assert!(
+            lead >= RATE as usize * 4 / 10,
+            "the member padded {lead} frames for a 400 ms lead"
+        );
+        assert_eq!(outcome.frames, lead + FRAME * 5);
+        let samples: Vec<i16> = hound::WavReader::new(std::io::Cursor::new(
+            sink.body("acct-42/rec-99/bob.customer.wav"),
+        ))
+        .unwrap()
+        .into_samples::<i16>()
+        .map(|held| held.unwrap())
+        .collect();
+        assert_eq!(samples.len(), lead + FRAME * 5);
+        assert!(samples[..lead].iter().all(|sample| *sample == 0));
+        assert!(samples[lead..].iter().all(|sample| *sample == 500));
     }
 
     #[test]

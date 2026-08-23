@@ -187,6 +187,7 @@ async fn a_recording_group_lands_one_object_per_participant_in_a_real_bucket() {
                 targets,
                 sample_rate_hz: RATE,
                 max_duration: recorder::MAX_RECORDING,
+                group_anchor: None,
             },
             subscription,
             support.clone(),
