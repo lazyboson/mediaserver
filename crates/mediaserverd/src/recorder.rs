@@ -134,16 +134,59 @@ impl RecordingIdentity {
             self.format.extension()
         )
     }
+
+    pub fn participant_key(&self, participant: &str) -> String {
+        format!(
+            "{}/{}/{}.{}",
+            self.account_id,
+            self.recording_id,
+            participant,
+            self.format.extension()
+        )
+    }
 }
 
 fn is_relative_segment(segment: &str) -> bool {
     segment == "." || segment == ".."
 }
 
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum LabelError {
+    #[error("a recording group member needs a label to name its own file")]
+    Empty,
+    #[error("{0} cannot name one file: a participant label carries no separator, whitespace or control character")]
+    NotOneSegment(String),
+    #[error("{0} is a relative path segment")]
+    Traversal(String),
+}
+
+pub fn participant_label(label: &str) -> Result<&str, LabelError> {
+    if label.is_empty() {
+        return Err(LabelError::Empty);
+    }
+    if label.contains('/')
+        || label
+            .chars()
+            .any(|character| character.is_whitespace() || character.is_control())
+    {
+        return Err(LabelError::NotOneSegment(label.to_string()));
+    }
+    if is_relative_segment(label) {
+        return Err(LabelError::Traversal(label.to_string()));
+    }
+    Ok(label)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Layout {
     Stereo,
     Mono(Track),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecordingTarget {
+    pub key: String,
+    pub layout: Layout,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -164,7 +207,6 @@ pub struct RecordedAudio {
 pub struct Segmenter {
     sample_rate_hz: u32,
     max_frames: usize,
-    layout: Layout,
     customer: Vec<i16>,
     agent: Vec<i16>,
     mixed: Vec<i16>,
@@ -175,13 +217,12 @@ pub struct Segmenter {
 }
 
 impl Segmenter {
-    pub fn new(sample_rate_hz: u32, max_duration: Duration, layout: Layout) -> Segmenter {
+    pub fn new(sample_rate_hz: u32, max_duration: Duration) -> Segmenter {
         let seconds = max_duration.as_secs().max(1);
         let max_frames = (sample_rate_hz.max(1) as u64).saturating_mul(seconds) as usize;
         Segmenter {
             sample_rate_hz: sample_rate_hz.max(1),
             max_frames,
-            layout,
             customer: Vec::new(),
             agent: Vec::new(),
             mixed: Vec::new(),
@@ -213,15 +254,12 @@ impl Segmenter {
             self.stats.frames_beyond_cap += 1;
             return;
         }
-        let sum = track == Track::Mixed;
-        let target = match (self.layout, track) {
-            (Layout::Stereo, Track::Customer) => &mut self.customer,
-            (Layout::Stereo, Track::Agent) => &mut self.agent,
-            (Layout::Stereo, Track::Mixed) => &mut self.mixed,
-            (Layout::Mono(only), heard) if only == heard => &mut self.customer,
-            (Layout::Mono(_), _) => return,
+        let target = match track {
+            Track::Customer => &mut self.customer,
+            Track::Agent => &mut self.agent,
+            Track::Mixed => &mut self.mixed,
         };
-        place(target, position, samples, sum);
+        place(target, position, samples, track == Track::Mixed);
         self.stats.frames_written += 1;
     }
 
@@ -259,12 +297,16 @@ impl Segmenter {
         self.stats
     }
 
-    pub fn finish(&self) -> RecordedAudio {
+    pub fn render(&self, layout: Layout) -> RecordedAudio {
         let frames = self.frames();
-        match self.layout {
-            Layout::Mono(_) => RecordedAudio {
+        match layout {
+            Layout::Mono(only) => RecordedAudio {
                 channels: 1,
-                samples: self.customer.clone(),
+                samples: match only {
+                    Track::Customer => self.customer.clone(),
+                    Track::Agent => self.agent.clone(),
+                    Track::Mixed => self.mixed.clone(),
+                },
             },
             Layout::Stereo => {
                 let mut samples = Vec::with_capacity(frames * 2);
@@ -454,6 +496,9 @@ pub struct RecorderCounters {
     pub seconds_recorded: AtomicU64,
     pub truncated: AtomicU64,
     pub live: AtomicU64,
+    pub groups_live: AtomicU64,
+    pub group_members_live: AtomicU64,
+    pub group_joins_refused: AtomicU64,
 }
 
 #[derive(Clone, Default)]
@@ -505,10 +550,32 @@ impl RecordingSupport {
 
 pub struct RecorderSpec {
     pub session: SessionId,
-    pub identity: RecordingIdentity,
-    pub layout: Layout,
+    pub recording_id: String,
+    pub format: RecordingFormat,
+    pub targets: Vec<RecordingTarget>,
     pub sample_rate_hz: u32,
     pub max_duration: Duration,
+}
+
+impl RecorderSpec {
+    pub fn one_object(
+        session: SessionId,
+        identity: &RecordingIdentity,
+        layout: Layout,
+        sample_rate_hz: u32,
+    ) -> RecorderSpec {
+        RecorderSpec {
+            session,
+            recording_id: identity.recording_id.clone(),
+            format: identity.format,
+            targets: vec![RecordingTarget {
+                key: identity.object_key(),
+                layout,
+            }],
+            sample_rate_hz,
+            max_duration: MAX_RECORDING,
+        }
+    }
 }
 
 enum RecorderCommand {
@@ -522,7 +589,7 @@ pub struct RecordingOutcome {
     pub duration_ms: u64,
     pub frames: usize,
     pub bytes: usize,
-    pub uri: Option<String>,
+    pub uris: Vec<String>,
     pub stats: SegmenterStats,
 }
 
@@ -582,9 +649,8 @@ async fn run(
 ) -> RecordingOutcome {
     let counters = Arc::clone(&support.counters);
     counters.live.fetch_add(1, Ordering::Relaxed);
-    let recording_id = spec.identity.recording_id.clone();
-    let key = spec.identity.object_key();
-    let mut segmenter = Segmenter::new(spec.sample_rate_hz, spec.max_duration, spec.layout);
+    let recording_id = spec.recording_id.clone();
+    let mut segmenter = Segmenter::new(spec.sample_rate_hz, spec.max_duration);
 
     loop {
         tokio::select! {
@@ -655,69 +721,67 @@ async fn run(
         },
     );
 
-    let audio = segmenter.finish();
     let rate = spec.sample_rate_hz;
-    let built = tokio::task::spawn_blocking(move || {
-        wav_bytes(rate, audio.channels, &audio.samples).map(|bytes| (bytes, audio.channels))
-    })
-    .await;
-    let (bytes, channels) = match built.unwrap_or_else(|error| {
-        Err(RecorderError::Encoding(format!(
-            "the wav writer thread died: {error}"
-        )))
-    }) {
-        Ok(built) => built,
-        Err(error) => {
-            counters.upload_failures.fetch_add(1, Ordering::Relaxed);
-            warn!(%recording_id, %error, "this recording could not be encoded as wav");
-            return RecordingOutcome {
-                duration_ms,
-                frames,
-                bytes: 0,
-                uri: None,
-                stats,
-            };
-        }
-    };
-    let size = bytes.len();
-    info!(
-        %recording_id,
-        %key,
-        duration_ms,
-        frames,
-        channels,
-        segments = stats.segments,
-        bytes = size,
-        "recording closed; uploading"
-    );
-
-    let uri = upload(
-        &support,
-        &key,
-        spec.identity.format.content_type(),
-        bytes,
-        &recording_id,
-    )
-    .await;
-    if let Some(uri) = &uri {
-        counters.uploaded.fetch_add(1, Ordering::Relaxed);
-        counters
-            .bytes_uploaded
-            .fetch_add(size as u64, Ordering::Relaxed);
-        observe(
-            &observer,
-            spec.session,
-            Observation::UploadCompleted {
-                recording_id: recording_id.clone(),
-                uri: uri.clone(),
-            },
+    let content_type = spec.format.content_type();
+    let mut uris = Vec::with_capacity(spec.targets.len());
+    let mut total = 0usize;
+    for target in &spec.targets {
+        let audio = segmenter.render(target.layout);
+        let channels = audio.channels;
+        let built =
+            tokio::task::spawn_blocking(move || wav_bytes(rate, audio.channels, &audio.samples))
+                .await;
+        let bytes = match built.unwrap_or_else(|error| {
+            Err(RecorderError::Encoding(format!(
+                "the wav writer thread died: {error}"
+            )))
+        }) {
+            Ok(built) => built,
+            Err(error) => {
+                counters.upload_failures.fetch_add(1, Ordering::Relaxed);
+                warn!(
+                    %recording_id,
+                    key = %target.key,
+                    %error,
+                    "this recording could not be encoded as wav"
+                );
+                continue;
+            }
+        };
+        let size = bytes.len();
+        info!(
+            %recording_id,
+            key = %target.key,
+            duration_ms,
+            frames,
+            channels,
+            segments = stats.segments,
+            bytes = size,
+            "recording closed; uploading"
         );
+        let uri = upload(&support, &target.key, content_type, bytes, &recording_id).await;
+        if let Some(uri) = uri {
+            counters.uploaded.fetch_add(1, Ordering::Relaxed);
+            counters
+                .bytes_uploaded
+                .fetch_add(size as u64, Ordering::Relaxed);
+            total += size;
+            observe(
+                &observer,
+                spec.session,
+                Observation::UploadCompleted {
+                    recording_id: recording_id.clone(),
+                    uri: uri.clone(),
+                },
+            );
+            uris.push(uri);
+        }
     }
     RecordingOutcome {
         duration_ms,
         frames,
-        bytes: size,
-        uri,
+        bytes: total,
+        uris,
         stats,
     }
 }
@@ -868,6 +932,25 @@ mod tests {
         fn last(&self) -> Option<(String, Vec<u8>)> {
             self.puts.lock().unwrap().last().cloned()
         }
+
+        fn keys(&self) -> Vec<String> {
+            self.puts
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(key, _)| key.clone())
+                .collect()
+        }
+
+        fn body(&self, key: &str) -> Vec<u8> {
+            self.puts
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|(held, _)| held == key)
+                .map(|(_, body)| body.clone())
+                .unwrap_or_else(|| panic!("{key} was never uploaded"))
+        }
     }
 
     #[control_api::async_trait]
@@ -917,8 +1000,8 @@ mod tests {
         vec![value; FRAME]
     }
 
-    fn segmenter(layout: Layout) -> Segmenter {
-        Segmenter::new(RATE, MAX_RECORDING, layout)
+    fn segmenter() -> Segmenter {
+        Segmenter::new(RATE, MAX_RECORDING)
     }
 
     #[test]
@@ -987,13 +1070,13 @@ mod tests {
 
     #[test]
     fn stereo_puts_the_customer_left_and_the_agent_right() {
-        let mut held = segmenter(Layout::Stereo);
+        let mut held = segmenter();
         held.accept(Track::Customer, 0, &tone(100));
         held.accept(Track::Agent, 0, &tone(-100));
         held.accept(Track::Customer, 20, &tone(200));
         held.accept(Track::Agent, 20, &tone(-200));
 
-        let audio = held.finish();
+        let audio = held.render(Layout::Stereo);
         assert_eq!(audio.channels, 2);
         assert_eq!(audio.samples.len(), FRAME * 2 * 2);
         assert_eq!(&audio.samples[..2], &[100, -100]);
@@ -1007,11 +1090,11 @@ mod tests {
 
     #[test]
     fn a_leg_that_falls_silent_is_zero_filled_so_the_other_stays_wall_aligned() {
-        let mut held = segmenter(Layout::Stereo);
+        let mut held = segmenter();
         held.accept(Track::Customer, 0, &tone(100));
         held.accept(Track::Customer, 200, &tone(300));
 
-        let audio = held.finish();
+        let audio = held.render(Layout::Stereo);
         let frames = audio.samples.len() / 2;
         assert_eq!(frames, FRAME * 11);
         assert_eq!(audio.samples[0], 100);
@@ -1023,7 +1106,7 @@ mod tests {
 
     #[test]
     fn a_paused_interval_is_absent_from_the_audio_but_the_duration_still_adds_up() {
-        let mut held = segmenter(Layout::Stereo);
+        let mut held = segmenter();
         held.accept(Track::Customer, 0, &tone(11));
         held.accept(Track::Customer, 20, &tone(22));
         assert!(held.pause());
@@ -1036,7 +1119,7 @@ mod tests {
         held.accept(Track::Customer, 1040, &tone(33));
         held.accept(Track::Customer, 1060, &tone(44));
 
-        let audio = held.finish();
+        let audio = held.render(Layout::Stereo);
         let left: Vec<i16> = audio.samples.iter().step_by(2).copied().collect();
         assert_eq!(left.len(), FRAME * 4, "the paused second is still in there");
         assert_eq!(
@@ -1051,13 +1134,13 @@ mod tests {
 
     #[test]
     fn injected_bot_speech_is_summed_into_the_agent_channel() {
-        let mut held = segmenter(Layout::Stereo);
+        let mut held = segmenter();
         held.accept(Track::Agent, 0, &tone(1000));
         held.accept(Track::Mixed, 0, &tone(2000));
         held.accept(Track::Mixed, 20, &tone(i16::MAX));
         held.accept(Track::Agent, 20, &tone(1000));
 
-        let audio = held.finish();
+        let audio = held.render(Layout::Stereo);
         assert_eq!(audio.samples[1], 3000);
         assert_eq!(
             audio.samples[FRAME * 2 + 1],
@@ -1068,19 +1151,22 @@ mod tests {
 
     #[test]
     fn a_mono_recording_keeps_only_the_track_it_asked_for() {
-        let mut held = segmenter(Layout::Mono(Track::Customer));
+        let mut held = segmenter();
         held.accept(Track::Customer, 0, &tone(7));
         held.accept(Track::Agent, 0, &tone(9));
 
-        let audio = held.finish();
+        let audio = held.render(Layout::Mono(Track::Customer));
         assert_eq!(audio.channels, 1);
         assert_eq!(audio.samples.len(), FRAME);
         assert!(audio.samples.iter().all(|sample| *sample == 7));
+
+        let other = held.render(Layout::Mono(Track::Agent));
+        assert!(other.samples.iter().all(|sample| *sample == 9));
     }
 
     #[test]
     fn a_recording_stops_growing_at_its_cap_and_says_so() {
-        let mut held = Segmenter::new(RATE, Duration::from_secs(1), Layout::Stereo);
+        let mut held = Segmenter::new(RATE, Duration::from_secs(1));
         for at in 0..60 {
             held.accept(Track::Customer, at * 20, &tone(5));
         }
@@ -1121,10 +1207,22 @@ mod tests {
     }
 
     fn spec() -> RecorderSpec {
+        RecorderSpec::one_object(SessionId::from_raw(1), &identity(), Layout::Stereo, RATE)
+    }
+
+    fn group_spec(labels: &[(&str, Layout)]) -> RecorderSpec {
+        let identity = identity();
         RecorderSpec {
             session: SessionId::from_raw(1),
-            identity: identity(),
-            layout: Layout::Stereo,
+            recording_id: identity.recording_id.clone(),
+            format: identity.format,
+            targets: labels
+                .iter()
+                .map(|(participant, layout)| RecordingTarget {
+                    key: identity.participant_key(participant),
+                    layout: *layout,
+                })
+                .collect(),
             sample_rate_hz: RATE,
             max_duration: MAX_RECORDING,
         }
@@ -1164,7 +1262,8 @@ mod tests {
 
         assert_eq!(outcome.duration_ms, 200);
         assert_eq!(outcome.stats.segments, 2);
-        let uri = outcome.uri.clone().expect("nothing was uploaded");
+        let uri = outcome.uris.first().cloned().expect("nothing was uploaded");
+        assert_eq!(outcome.uris.len(), 1);
         assert!(uri.ends_with("acct-42/rec-99.wav"), "{uri}");
 
         let events = seen.seen();
@@ -1226,7 +1325,7 @@ mod tests {
 
         let outcome = handle.finish().await.expect("the recorder had no outcome");
         assert_eq!(outcome.duration_ms, 60);
-        assert!(outcome.uri.is_some());
+        assert_eq!(outcome.uris.len(), 1);
         assert!(matches!(
             seen.seen().first(),
             Some(Observation::RecordingStopped { .. })
@@ -1258,7 +1357,7 @@ mod tests {
         let outcome = handle.finish().await.expect("the recorder had no outcome");
         drop(hub);
 
-        assert!(outcome.uri.is_none());
+        assert!(outcome.uris.is_empty());
         assert_eq!(
             seen.seen(),
             vec![Observation::RecordingStopped {
@@ -1271,6 +1370,118 @@ mod tests {
         let spilled = directory.join("acct-42/rec-99.wav");
         assert!(spilled.is_file(), "{} is missing", spilled.display());
         let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn a_group_member_gets_its_own_object_under_the_recordings_own_prefix() {
+        let identity = identity();
+        assert_eq!(identity.object_key(), "acct-42/rec-99.wav");
+        assert_eq!(
+            identity.participant_key("alice"),
+            "acct-42/rec-99/alice.wav"
+        );
+        assert_eq!(
+            identity.participant_key("alice.customer"),
+            "acct-42/rec-99/alice.customer.wav"
+        );
+    }
+
+    #[test]
+    fn a_participant_label_that_could_escape_its_prefix_is_refused_by_name() {
+        assert_eq!(participant_label("alice"), Ok("alice"));
+        assert_eq!(participant_label("agent-7_b.left"), Ok("agent-7_b.left"));
+        assert_eq!(participant_label(""), Err(LabelError::Empty));
+        assert_eq!(
+            participant_label("a/b"),
+            Err(LabelError::NotOneSegment("a/b".to_string()))
+        );
+        assert_eq!(
+            participant_label("two words"),
+            Err(LabelError::NotOneSegment("two words".to_string()))
+        );
+        assert_eq!(
+            participant_label(".."),
+            Err(LabelError::Traversal("..".to_string()))
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_member_that_records_both_tracks_uploads_one_mono_object_per_track() {
+        let (mut hub, client) = Hub::new();
+        let subscription = client.attach(64, TrackSelection::All).unwrap();
+        hub.poll_commands();
+        let sink = Arc::new(MemorySink::accepting());
+        let seen = Arc::new(Collected::default());
+        let strong: Arc<dyn ObservationSink> = seen.clone();
+        let observer = Arc::downgrade(&strong);
+        let support = support(Arc::clone(&sink) as Arc<dyn RecordingSink>, None);
+
+        let handle = spawn(
+            group_spec(&[
+                ("alice.customer", Layout::Mono(Track::Customer)),
+                ("alice.agent", Layout::Mono(Track::Agent)),
+            ]),
+            subscription,
+            support,
+            Some(observer),
+        );
+        for at in 0..3u64 {
+            hub.publish(TapEvent::media(Track::Customer, at * 20, &tone(300)));
+            hub.publish(TapEvent::media(Track::Agent, at * 20, &tone(-300)));
+        }
+        let outcome = handle.finish().await.expect("the recorder had no outcome");
+        drop(hub);
+
+        assert_eq!(outcome.duration_ms, 60);
+        assert_eq!(outcome.uris.len(), 2);
+        assert_eq!(
+            sink.keys(),
+            vec![
+                "acct-42/rec-99/alice.customer.wav".to_string(),
+                "acct-42/rec-99/alice.agent.wav".to_string(),
+            ]
+        );
+
+        for (key, expected) in [
+            ("acct-42/rec-99/alice.customer.wav", 300i16),
+            ("acct-42/rec-99/alice.agent.wav", -300),
+        ] {
+            let reader = hound::WavReader::new(std::io::Cursor::new(sink.body(key))).unwrap();
+            assert_eq!(reader.spec().channels, 1, "{key} is not mono");
+            let samples: Vec<i16> = reader
+                .into_samples::<i16>()
+                .map(|held| held.unwrap())
+                .collect();
+            assert_eq!(samples.len(), FRAME * 3);
+            assert!(
+                samples.iter().all(|sample| *sample == expected),
+                "{key} carries the other participant's audio"
+            );
+        }
+
+        let events = seen.seen();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|held| matches!(held, Observation::RecordingStopped { .. }))
+                .count(),
+            1,
+            "a member reports one stop however many files it writes"
+        );
+        let uploads: Vec<&Observation> = events
+            .iter()
+            .filter(|held| matches!(held, Observation::UploadCompleted { .. }))
+            .collect();
+        assert_eq!(uploads.len(), 2);
+        for upload in uploads {
+            match upload {
+                Observation::UploadCompleted { recording_id, uri } => {
+                    assert_eq!(recording_id, "rec-99");
+                    assert!(uri.contains("/rec-99/alice."), "{uri}");
+                }
+                other => panic!("{other:?}"),
+            }
+        }
     }
 
     #[test]

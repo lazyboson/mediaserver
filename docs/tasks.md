@@ -14,7 +14,7 @@ Status as of **2026-08-22**.
 | **M2 — Phase-0 spike** | real NG subscribe against lab rtpengine, both legs jitter-buffered to WAV, per-tap cost | ✅ **code done**; 3 org-side items open (below) |
 | **M3 — fan-out hub** | per-session pub/sub, N consumers, WS-Twilio adapter, pause/resume/send_text parity | ✅ done |
 | **M4 — control plane** | `MediaControl` gRPC, session state machine, Kafka events, Redis registry, tenant-flag pilot | 🔶 **code complete** — pilot gates: translator merge (external), barge-in number (item 5). The gRPC lab proof (item 10) and the **live pod-kill drill (item 11, gap 14.41 s)** are both **done 2026-08-22**; the drill left D14 open (orphan subscription after a pod death) |
-| **M5 — recording (Phase 2)** | per-leg taps → stereo segmenter → S3, identity + callback contract, dual-recording | 🔶 **code complete (2026-08-22)** — a live tapped call recorded end to end to a real MinIO, callbacks read off `mss.events` (2026-08-22, item 10's drill); owed: FS byte-parity sign-off (harness exists) |
+| **M5 — recording (Phase 2)** | per-leg taps → stereo segmenter → S3, identity + callback contract, dual-recording | 🔶 **code complete (2026-08-22)** — a live tapped call recorded end to end to a real MinIO, callbacks read off `mss.events` (2026-08-22, item 10's drill); **recording groups** — N sessions recorded as one recording, one mono object per participant — landed 2026-08-23 (item 21); owed: FS byte-parity sign-off (harness exists) |
 | M6+ | Phases 3–4 (interactive media, full media plane) | ⬜ not started |
 
 ### What landed, concretely
@@ -59,6 +59,10 @@ Status as of **2026-08-22**.
   there is also `soak.py` — N concurrent calls for hours through a walk of
   impairment profiles, asserting on `/metrics` every minute and failing loudly —
   with `netem.sh` for the tap-link impairment on a kernel that has netem.
+  Since item 21 there is `group_recording_drill.sh` — two fabricated calls, two
+  sessions, one recording group, one object per participant in MinIO — and
+  `call_driver.py` takes a `COOKIE_PREFIX` so two drivers can fabricate two
+  calls at once without colliding in rtpengine's reply cache.
 
 ## Next up — ordered
 
@@ -978,6 +982,72 @@ scrape still carries the tail of a call dialed under the previous profile (the
 reorder row's 97 lost packets are loss5 bleed) — read the frozen interior, not
 the boundary. And the concealment has still never been judged perceptually.
 
+### 21. Recording groups — multi-party conference recording — ✅ DONE (2026-08-23)
+**The problem it solves:** a FreeSWITCH conference is N SIP dialogs = N
+rtpengine calls = **N MSS sessions** (a session is one call-id and at most
+`MAX_TAPPED_LEGS` = 2 legs), and the recorder was stereo customer-left /
+agent-right. There was no way to record N participants as one logical
+recording.
+**What shipped:** `AttachRequest.group` (proto field 11, **additive**) plumbed
+through `control-api` → `session-core` → `tap_plane`. A `FILE_S3` attach with a
+non-empty group joins a per-pod recording group keyed `(accountID, group)`, and
+each member writes **its own mono object**:
+`${accountID}/${recordingID}/${label}.${format}`, with `.customer`/`.agent`
+suffixes when a member selects both tracks. The participant label is the attach
+`label`, falling back to the session's `external_id`, and it is validated as
+one path segment (no `/`, whitespace, control characters, `.`/`..`) because it
+lands in an object key. **An empty group is byte-identical to before** — same
+single object under the frozen `${accountID}/${recordingID}.${format}` — pinned
+by `an_ungrouped_recording_still_writes_the_frozen_two_leg_identity`.
+**Per-participant files are the design, not a shortcut:** aligning N sessions'
+clocks into one N-channel WAV is a real problem with no cheap answer, and it
+would make one slow member's buffer the whole conference's; separate files hand
+that to the consumer, which can align on the `RecordingStarted` events.
+**Recommend `TRACK_CUSTOMER` per member** — a participant's own voice is leg
+index 0 — so each file is one speaker.
+**Three refusals, by name and counted** (`mss_recording_group_joins_refused_total`):
+a second member reusing a participant label (it would overwrite the first
+member's object), a member naming a **different** `recordingID` inside a group
+that already has one, and a non-empty group on any transport but `FILE_S3`.
+Pause stays per member. The group opens with its first member and dies with its
+last (`mss_recording_groups_live`, `mss_recording_group_members_live`).
+**The recorder grew targets:** `RecorderSpec.targets` is a list of
+`RecordingTarget { key, layout }` and `Segmenter` renders per target instead of
+filtering at `accept`, so a two-track member writes two mono files from **one**
+buffered call — one `RecordingStopped`, one `UploadCompleted` per object, with
+`path`/`uri` disambiguating the participant while `recording_id` stays the
+group's. `mss_recording_uploads_total` and `_bytes_uploaded_total` therefore
+count **objects** now.
+**Verified against a real MinIO** (`crates/mediaserverd/tests/minio_upload.rs`,
+`MSS_TEST_S3_ENDPOINT`-gated): three members in one group produced four objects
+— `alice.wav`, `bob.wav`, `carol.customer.wav`, `carol.agent.wav` — each mono
+8 kHz carrying **only its own participant's tone**, with the pause applied to
+`bob` alone (25 frames in his file against alice's 50, and alice saw no pause
+callback), and the frozen two-leg key **absent** from the bucket. Confirmed
+independently with `mc`: 16 KiB / 7.9 KiB / 7.9 KiB / 7.9 KiB,
+`Content-Type: audio/wav`.
+**Verified on two live rtpengine calls** (the stretch, done — `lab/group_recording_drill.sh`,
+recipe in [lab.md](lab.md)): two fabricated calls through the lab rtpengine
+14.1.1.8, two sessions on one pod of its own, one group, `mss_sessions_live 2`
+/ `mss_recordings_live 2` / `mss_recording_groups_live 1` /
+`mss_recording_group_members_live 2`, both live refusals fired with their exact
+messages, and detaching both members uploaded
+`acct-conf/rec-<id>/alice.wav` (47.34 s, rms 9960) and `bob.wav` (47.40 s, rms
+9971) — mono 8 kHz, each **exactly equal to the `duration_ms` reported**, group
+and member gauges back to 0 afterwards.
+**A lab instrument bug found and fixed on the way:** `lab/call_driver.py` could
+not fabricate **two** calls at once. Both drivers started their NG cookies at
+`lab-1`, so rtpengine's duplicate-cookie reply cache handed the second driver
+the *first* call's answer — both "calls" claimed ports 30028/30042. It is the
+D12 shape on the driver side. `COOKIE_PREFIX` (default `lab`, so every existing
+drill is unchanged) fixes it; with distinct prefixes the two calls get distinct
+ports.
+**Left open, filed as D16:** a group lives in one pod's memory. The group is
+persisted on the attachment, but `RegistryKeeper::rebuild` **refuses** to
+restore a grouped recording on an adopting pod (counted `grouped_not_adopted`)
+rather than split one recording across two pods. Placement — scheduling a
+group's sessions onto one pod — is the real fix and does not exist (D8).
+
 ## Open defects and soft spots
 
 | # | Item | Where | Severity |
@@ -996,6 +1066,7 @@ the boundary. And the concealment has still never been judged perceptually.
 | ~~D12~~ | ~~**NG cookies repeat across sessions on one pod**: `CookieSequence` restarted its serial at 0 and `TapPlane` binds a new `NgTransport` per session, so every session's first command was `<prefix>-0`. Two sessions inside rtpengine's duplicate-cookie reply-cache window get the *same cached subscribe answer*, and the second tap receives **no media at all** while looking healthy~~ — **fixed 2026-08-22 (item 10)**: the serial is process-wide, unit-pinned and lab-proved before/after | `ng_transport.rs` | closed — was **high**, it silently broke every second tap within a minute |
 | D15 | An adopted attachment loses its **negotiated format**: `PersistedAttachment` has no format field and `rebuild` passes `format: None`, so a consumer that attached as L16/16k comes back at the session default (g711 at the tap rate). Found by reading the adoption path during item 11, **not** observed — that drill's consumer was WS/PCMU, where the default is the only legal answer. A gRPC consumer would notice | `session_store.rs`, `registry_keeper.rs` | low today, medium once ASR consumers ask for L16/16k |
 | D14 | **A dead pod's rtpengine subscription is never torn down.** The adopter re-subscribes but nothing cancels the old tap: `PersistedSession` does not carry the subscription's `to-tag`, and only the pod that created it holds one. Measured in the item-11 drill from rtpengine's teardown block: **14,743 packets / 2.5 MB copied to a pod that had been dead for 110 s**, four ports held for the rest of the call — i.e. a pod death permanently doubles that call's cost on the rtpengine host, which is exactly the capacity number still open with the platform team. Fix shape: persist the to-tag, have the adopter `unsubscribe` it before subscribing, and decide what an adopter should do when the previous owner is partitioned rather than dead (`mss_registry_lost_total` is the signal) | `session_store.rs`, `registry_keeper.rs`, `tap_plane.rs` | medium — every pod restart during a call leaks one tap |
+| D16 | **A recording group is one pod's memory.** `TapPlane` holds the group, so every member of a conference recording must attach to the same pod: there is no placement that guarantees it (D8), a member whose session is adopted elsewhere is **refused** rather than restored (`grouped_not_adopted`, so the participant's file simply ends at the pod that died — the D9 shape per participant), and a group name reused on a second pod silently produces a second half-recording under the same prefix. Fix shape: schedule a group's sessions onto one pod, or move the group into shared storage so any pod can serve a member | `tap_plane.rs`, `registry_keeper.rs` | medium once a tenant records conferences across pods |
 | D13 | `StreamStart` (and the Twilio `start` frame's `tracks`) advertises `["customer","agent"]` for `TrackSelector::All`, but a silent `mixed` track is delivered too, at the full frame rate: a consumer must tolerate an unannounced track and pays 50% extra bandwidth for silence. Fixing it means either naming `mixed` in the start frame or not carrying it under `All` — the latter touches the frozen Twilio surface | `stream.rs`, `tap_plane.rs`, `hub.rs` | low for correctness, medium for cost |
 
 ## Waiting on other people (M2 close-out)
