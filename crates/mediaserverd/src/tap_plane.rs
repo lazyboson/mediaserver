@@ -30,7 +30,7 @@ use rtpengine_ng::{
     InlineOffer, NegotiatedCodec, PlayMedia, PlaySource, PlayTarget, SdpError, SubscribeRequest,
     SubscriptionAnswer, SubscriptionOffer,
 };
-use session_core::mix::MixRoute;
+use session_core::mix::{MemberControl, MixRoute, MIX_TARGET_EVERYONE, MIX_TARGET_OWN};
 use session_core::{
     AttachmentId, AttachmentView, Capabilities, Observation, SessionId, SessionKind, SessionView,
     TrackSelector, Transport,
@@ -249,6 +249,9 @@ pub struct IngestSnapshot {
     pub conferences_live: u64,
     pub conference_members_live: u64,
     pub conference_whispers_live: u64,
+    pub conference_members_muted: u64,
+    pub conference_members_deaf: u64,
+    pub conference_members_held: u64,
     pub conference: ConferenceTotals,
 }
 
@@ -382,6 +385,9 @@ impl TapPlaneMetrics {
             snapshot.conference.add_shared(conference);
             snapshot.conference_members_live += conference.members_live.load(Ordering::Relaxed);
             snapshot.conference_whispers_live += conference.whispers_live.load(Ordering::Relaxed);
+            snapshot.conference_members_muted += conference.members_muted.load(Ordering::Relaxed);
+            snapshot.conference_members_deaf += conference.members_deaf.load(Ordering::Relaxed);
+            snapshot.conference_members_held += conference.members_held.load(Ordering::Relaxed);
         }
         for legs in inner.legs.values() {
             for leg in legs {
@@ -1530,6 +1536,95 @@ impl TapPlane {
         Ok(())
     }
 
+    fn control_member(
+        &self,
+        session: SessionId,
+        control: MemberControl,
+    ) -> Result<(), MediaPlaneError> {
+        let name = self.conference_of(session)?;
+        {
+            let mut held = self
+                .conferences
+                .lock()
+                .map_err(|_| MediaPlaneError("the conference table is poisoned".to_string()))?;
+            let conference = held.get_mut(&name).ok_or_else(|| {
+                MediaPlaneError(format!("conference {name} is not running on this pod"))
+            })?;
+            conference
+                .control(session, control)
+                .map_err(|error| MediaPlaneError(format!("conference {name}: {error}")))?;
+        }
+        info!(
+            %session,
+            conference = %name,
+            mute = ?control.mute,
+            deaf = ?control.deaf,
+            hold = ?control.hold,
+            "a member control verb arrived for this conference leg"
+        );
+        Ok(())
+    }
+
+    fn play_into_room(
+        &self,
+        session: SessionId,
+        source: PlaybackSource,
+    ) -> Result<(), MediaPlaneError> {
+        let name = self.conference_of(session)?;
+        let format = self.session_format(session)?;
+        let pcm = inline_playback_pcm(&playback_wav(source)?, format)?;
+        let chunk_samples =
+            (format.sample_rate_hz as usize * EGRESS_CHUNK_MS as usize / 1000).max(1);
+        let chunks = pcm.len().div_ceil(chunk_samples);
+        let mut held = self
+            .conferences
+            .lock()
+            .map_err(|_| MediaPlaneError("the conference table is poisoned".to_string()))?;
+        let conference = held.get_mut(&name).ok_or_else(|| {
+            MediaPlaneError(format!("conference {name} is not running on this pod"))
+        })?;
+        let free = conference.free_prompt_chunks();
+        if chunks > free {
+            return Err(MediaPlaneError(format!(
+                "this prompt is {} ms of audio and conference {name} has room for {} ms; \
+                 a long-form prompt belongs on an inject attachment routed mix_target=all",
+                pcm.len() as u64 * 1000 / format.sample_rate_hz.max(1) as u64,
+                free as u32 * EGRESS_CHUNK_MS
+            )));
+        }
+        for chunk in pcm.chunks(chunk_samples) {
+            conference
+                .prompt(chunk.to_vec())
+                .map_err(|error| MediaPlaneError(format!("conference {name}: {error}")))?;
+        }
+        info!(
+            %session,
+            conference = %name,
+            samples = pcm.len(),
+            chunks,
+            "queued a prompt into the whole room"
+        );
+        Ok(())
+    }
+
+    fn flush_room_prompts(&self, session: SessionId) -> Result<(), MediaPlaneError> {
+        let name = self.conference_of(session)?;
+        let held = self
+            .conferences
+            .lock()
+            .map_err(|_| MediaPlaneError("the conference table is poisoned".to_string()))?;
+        let conference = held.get(&name).ok_or_else(|| {
+            MediaPlaneError(format!("conference {name} is not running on this pod"))
+        })?;
+        conference.flush_prompts();
+        info!(
+            %session,
+            conference = %name,
+            "flushed the room's prompt queue; the next mixed frame carries no prompt"
+        );
+        Ok(())
+    }
+
     fn revert_injection(&self, attachment: AttachmentId) {
         let owner = match self.sessions.lock() {
             Ok(mut held) => held
@@ -1584,19 +1679,7 @@ impl TapPlane {
         let egress = self
             .inline_egress(session)
             .ok_or_else(|| MediaPlaneError(format!("{session} has no inline egress")))?;
-        let wav = match source {
-            PlaybackSource::Blob(bytes) => bytes,
-            PlaybackSource::File(path) => std::fs::read(&path)
-                .map_err(|error| MediaPlaneError(format!("playback file {path}: {error}")))?,
-            PlaybackSource::Stream => {
-                return Err(MediaPlaneError(
-                    "a streaming playback into an inline leg is an inject-capable \
-                     attachment, not a playback"
-                        .to_string(),
-                ))
-            }
-        };
-        let pcm = inline_playback_pcm(&wav, format)?;
+        let pcm = inline_playback_pcm(&playback_wav(source)?, format)?;
         let chunk_samples =
             (format.sample_rate_hz as usize * EGRESS_CHUNK_MS as usize / 1000).max(1);
         let chunks = pcm.len().div_ceil(chunk_samples);
@@ -1812,6 +1895,11 @@ impl MediaPlane for TapPlane {
             }
             None => false,
         };
+        if let Some(control) = MemberControl::from_metadata(&view.metadata)
+            .map_err(|error| MediaPlaneError(error.to_string()))?
+        {
+            self.control_member(view.session, control)?;
+        }
         let attachment = view.id;
         let opened = match view.transport {
             Transport::WsTwilio => self.open_ws_attachment(view),
@@ -1875,6 +1963,11 @@ impl MediaPlane for TapPlane {
                 .authorize(view.capabilities)
                 .map_err(|error| MediaPlaneError(error.to_string()))?;
             self.route_injection(view.session, view.id, route)?;
+        }
+        if let Some(control) = MemberControl::from_metadata(&view.metadata)
+            .map_err(|error| MediaPlaneError(error.to_string()))?
+        {
+            self.control_member(view.session, control)?;
         }
         match applied {
             Applied::Recorder(true) => Ok(()),
@@ -2071,7 +2164,10 @@ impl MediaPlane for TapPlane {
             transport, call_id, ..
         } = self.session_handles(session)?;
         if transport.is_none() {
-            return self.play_into_inline_leg(session, source);
+            return match playback_reach(target_tag.as_deref())? {
+                PlaybackReach::Room => self.play_into_room(session, source),
+                PlaybackReach::Ear => self.play_into_inline_leg(session, source),
+            };
         }
         let source = ng_play_source(source)?;
         let transport = require_subscription(session, transport)?;
@@ -2098,6 +2194,9 @@ impl MediaPlane for TapPlane {
             transport, call_id, ..
         } = self.session_handles(session)?;
         let Some(transport) = transport else {
+            if matches!(playback_reach(target_tag.as_deref())?, PlaybackReach::Room) {
+                return self.flush_room_prompts(session);
+            }
             let egress = self.inline_egress(session).ok_or_else(|| {
                 MediaPlaneError(format!("{session} has no inline egress to stop"))
             })?;
@@ -2214,6 +2313,37 @@ async fn pump_frames(
         if frames.send(frame).await.is_err() {
             return;
         }
+    }
+}
+
+enum PlaybackReach {
+    Ear,
+    Room,
+}
+
+fn playback_reach(target_tag: Option<&str>) -> Result<PlaybackReach, MediaPlaneError> {
+    match target_tag.map(str::trim) {
+        None | Some("") => Ok(PlaybackReach::Ear),
+        Some(MIX_TARGET_OWN) => Ok(PlaybackReach::Ear),
+        Some(MIX_TARGET_EVERYONE) => Ok(PlaybackReach::Room),
+        Some(other) => Err(MediaPlaneError(format!(
+            "an inline leg has no sip from-tag to target, so {other:?} names nobody; \
+             \"own\" or an empty target is this leg's own ear and \"all\" is the \
+             conference it is seated in"
+        ))),
+    }
+}
+
+fn playback_wav(source: PlaybackSource) -> Result<Vec<u8>, MediaPlaneError> {
+    match source {
+        PlaybackSource::Blob(bytes) => Ok(bytes),
+        PlaybackSource::File(path) => std::fs::read(&path)
+            .map_err(|error| MediaPlaneError(format!("playback file {path}: {error}"))),
+        PlaybackSource::Stream => Err(MediaPlaneError(
+            "a streaming playback into an inline leg is an inject-capable attachment, \
+             not a playback"
+                .to_string(),
+        )),
     }
 }
 
@@ -2578,7 +2708,9 @@ mod tests {
     use super::*;
     use media_core::AudioFormat;
     use session_core::mix::{
-        MIX_MONITOR_EXCLUDE, MIX_MONITOR_METADATA_KEY, MIX_TARGET_EVERYONE, MIX_TARGET_METADATA_KEY,
+        MEMBER_DEAF_METADATA_KEY, MEMBER_FLAG_OFF, MEMBER_FLAG_ON, MEMBER_HOLD_METADATA_KEY,
+        MEMBER_MUTE_METADATA_KEY, MIX_MONITOR_EXCLUDE, MIX_MONITOR_METADATA_KEY, MIX_SOURCE_LEG,
+        MIX_SOURCE_METADATA_KEY, MIX_TARGET_EVERYONE, MIX_TARGET_METADATA_KEY,
     };
     use session_core::{Capabilities, PlaybackId};
     use std::collections::BTreeMap;
@@ -3777,6 +3909,431 @@ m=audio {peer_port} RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\na=ptime:{ptime_ms}\r\n"
         plane.close_session(alice.session).await.expect("alice out");
         plane.close_session(bob.session).await.expect("bob out");
         assert_eq!(plane.metrics().snapshot().conferences_live, 0);
+    }
+
+    fn member_attachment(session: SessionId, id: u64, metadata: &[(&str, &str)]) -> AttachmentView {
+        let mut view = injecting_attachment(session, id, metadata);
+        view.capabilities = Capabilities::SINK;
+        view
+    }
+
+    async fn everybody_speaks(alice: &mut FakePeer, bob: &mut FakePeer, carol: &mut FakePeer) {
+        for peer in [&*alice, &*bob, &*carol] {
+            peer.loudest_ear();
+        }
+        for _ in 0..10 {
+            alice.speak(1_000, 4);
+            bob.speak(2_000, 4);
+            carol.speak(4_000, 4);
+            tokio::time::sleep(Duration::from_millis(80)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    fn about(level: i16, ear: i16) -> bool {
+        let slack = (level / 10).max(200);
+        (level - slack..=level + slack).contains(&ear)
+    }
+
+    #[tokio::test]
+    async fn a_muted_member_is_heard_by_nobody_and_leaves_the_recording_feed_too() {
+        let plane = plane();
+        let mut alice = seat_peer(&plane, 1, "muting").await;
+        let mut bob = seat_peer(&plane, 2, "muting").await;
+        let mut carol = seat_peer(&plane, 3, "muting").await;
+        let SessionHandles { hub, .. } = plane
+            .session_handles(alice.session)
+            .expect("the conference leg is live here");
+        let mut monitor = hub
+            .attach(512, TrackSelection::Only(Track::Mixed))
+            .expect("the hub takes a monitor that wants the mix only");
+
+        plane
+            .open_attachment(member_attachment(
+                bob.session,
+                7,
+                &[(MEMBER_MUTE_METADATA_KEY, MEMBER_FLAG_ON)],
+            ))
+            .await
+            .expect("a member verb rides on an attachment of that member's own session");
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        assert_eq!(
+            plane.metrics().snapshot().conference_members_muted,
+            1,
+            "one member is muted"
+        );
+
+        let _ = loudest_mixed(&mut monitor);
+        everybody_speaks(&mut alice, &mut bob, &mut carol).await;
+        let alice_ear = alice.loudest_ear();
+        let bob_ear = bob.loudest_ear();
+        let carol_ear = carol.loudest_ear();
+        let mixed = loudest_mixed(&mut monitor);
+        assert!(
+            about(4_000, alice_ear),
+            "alice hears carol alone, because bob is muted: {alice_ear}"
+        );
+        assert!(
+            about(1_000, carol_ear),
+            "carol hears alice alone: {carol_ear}"
+        );
+        assert!(
+            about(5_000, bob_ear),
+            "a muted member still hears the room: {bob_ear}"
+        );
+        assert!(
+            about(5_000, mixed),
+            "and the mixed track, which is the recording feed, has lost him too: {mixed}"
+        );
+
+        plane
+            .update_attachment(member_attachment(
+                bob.session,
+                7,
+                &[(MEMBER_MUTE_METADATA_KEY, MEMBER_FLAG_OFF)],
+            ))
+            .await
+            .expect("off gives the member their voice back");
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        assert_eq!(plane.metrics().snapshot().conference_members_muted, 0);
+        let _ = loudest_mixed(&mut monitor);
+        everybody_speaks(&mut alice, &mut bob, &mut carol).await;
+        let alice_ear = alice.loudest_ear();
+        let mixed = loudest_mixed(&mut monitor);
+        assert!(
+            about(6_000, alice_ear),
+            "alice hears bob and carol again: {alice_ear}"
+        );
+        assert!(
+            about(7_000, mixed),
+            "the whole room is on the record: {mixed}"
+        );
+
+        for peer in [&alice, &bob, &carol] {
+            plane
+                .close_session(peer.session)
+                .await
+                .expect("a conference leg closes");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_deaf_member_still_speaks_into_a_room_it_cannot_hear() {
+        let plane = plane();
+        let mut alice = seat_peer(&plane, 1, "deafness").await;
+        let mut bob = seat_peer(&plane, 2, "deafness").await;
+        let mut carol = seat_peer(&plane, 3, "deafness").await;
+        let SessionHandles { hub, .. } = plane
+            .session_handles(alice.session)
+            .expect("the conference leg is live here");
+        let mut monitor = hub
+            .attach(512, TrackSelection::Only(Track::Mixed))
+            .expect("the hub takes a monitor that wants the mix only");
+
+        plane
+            .open_attachment(member_attachment(
+                carol.session,
+                7,
+                &[(MEMBER_DEAF_METADATA_KEY, MEMBER_FLAG_ON)],
+            ))
+            .await
+            .expect("deaf is a member verb like mute");
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        assert_eq!(plane.metrics().snapshot().conference_members_deaf, 1);
+        assert_eq!(
+            plane.metrics().snapshot().conference_members_muted,
+            0,
+            "deaf closes an ear, it does not close a mouth"
+        );
+
+        let _ = loudest_mixed(&mut monitor);
+        everybody_speaks(&mut alice, &mut bob, &mut carol).await;
+        let alice_ear = alice.loudest_ear();
+        let carol_ear = carol.loudest_ear();
+        let mixed = loudest_mixed(&mut monitor);
+        assert!(
+            carol_ear < SILENT,
+            "a deafened member's ear is silent: {carol_ear}"
+        );
+        assert!(
+            about(6_000, alice_ear),
+            "and she is still heard by everybody else: {alice_ear}"
+        );
+        assert!(
+            about(7_000, mixed),
+            "the recording feed is unchanged by who is listening: {mixed}"
+        );
+
+        for peer in [&alice, &bob, &carol] {
+            plane
+                .close_session(peer.session)
+                .await
+                .expect("a conference leg closes");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_member_on_hold_hears_its_hold_audio_alone_and_the_room_loses_it() {
+        let plane = plane();
+        let mut alice = seat_peer(&plane, 1, "holding").await;
+        let mut bob = seat_peer(&plane, 2, "holding").await;
+        let mut carol = seat_peer(&plane, 3, "holding").await;
+        let SessionHandles { hub, .. } = plane
+            .session_handles(alice.session)
+            .expect("the conference leg is live here");
+        let mut monitor = hub
+            .attach(512, TrackSelection::Only(Track::Mixed))
+            .expect("the hub takes a monitor that wants the mix only");
+
+        plane
+            .open_attachment(member_attachment(
+                bob.session,
+                7,
+                &[(MEMBER_HOLD_METADATA_KEY, MEMBER_FLAG_ON)],
+            ))
+            .await
+            .expect("hold is mute and deaf in one verb");
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        let snapshot = plane.metrics().snapshot();
+        assert_eq!(snapshot.conference_members_held, 1);
+        assert_eq!(snapshot.conference_members_muted, 1, "hold implies mute");
+        assert_eq!(snapshot.conference_members_deaf, 1, "hold implies deaf");
+
+        let hold_audio =
+            crate::tap_spike::wav_blob(AudioFormat::pcmu_8k_20ms(), &[3_000i16; 16_000])
+                .expect("two seconds of hold audio");
+        plane
+            .start_playback(
+                bob.session,
+                PlaybackId::from_raw(9),
+                PlaybackSource::Blob(hold_audio),
+                None,
+                false,
+            )
+            .await
+            .expect("hold audio is an ordinary playback into the held member's own ear");
+
+        let _ = loudest_mixed(&mut monitor);
+        everybody_speaks(&mut alice, &mut bob, &mut carol).await;
+        let alice_ear = alice.loudest_ear();
+        let bob_ear = bob.loudest_ear();
+        let mixed = loudest_mixed(&mut monitor);
+        assert!(
+            about(3_000, bob_ear),
+            "the held member hears his hold audio and nothing of the room: {bob_ear}"
+        );
+        assert!(
+            about(4_000, alice_ear),
+            "the room hears carol alone; the held member is gone from it: {alice_ear}"
+        );
+        assert!(
+            about(5_000, mixed),
+            "and the hold audio is nobody else's business, not even the record's: {mixed}"
+        );
+
+        for peer in [&alice, &bob, &carol] {
+            plane
+                .close_session(peer.session)
+                .await
+                .expect("a conference leg closes");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_prompt_played_into_the_room_is_heard_by_every_member_until_it_is_stopped() {
+        let plane = plane();
+        let alice = seat_peer(&plane, 1, "prompted").await;
+        let bob = seat_peer(&plane, 2, "prompted").await;
+        let carol = seat_peer(&plane, 3, "prompted").await;
+        let SessionHandles { hub, .. } = plane
+            .session_handles(bob.session)
+            .expect("the conference leg is live here");
+        let mut monitor = hub
+            .attach(512, TrackSelection::Only(Track::Mixed))
+            .expect("the hub takes a monitor that wants the mix only");
+
+        let prompt = crate::tap_spike::wav_blob(AudioFormat::pcmu_8k_20ms(), &[3_000i16; 16_000])
+            .expect("two seconds of prompt");
+        for peer in [&alice, &bob, &carol] {
+            peer.loudest_ear();
+        }
+        let _ = loudest_mixed(&mut monitor);
+        plane
+            .start_playback(
+                alice.session,
+                PlaybackId::from_raw(9),
+                PlaybackSource::Blob(prompt),
+                Some(MIX_TARGET_EVERYONE.to_string()),
+                false,
+            )
+            .await
+            .expect("a playback targeting all is a prompt into the room");
+        tokio::time::sleep(Duration::from_millis(400)).await;
+
+        let ears = [alice.loudest_ear(), bob.loudest_ear(), carol.loudest_ear()];
+        let mixed = loudest_mixed(&mut monitor);
+        for (peer, ear) in ["alice", "bob", "carol"].iter().zip(ears) {
+            assert!(
+                about(3_000, ear),
+                "{peer} hears the room prompt, whoever it was played through: {ear}"
+            );
+        }
+        assert!(
+            about(3_000, mixed),
+            "and the recording feed carries it: {mixed}"
+        );
+        assert!(
+            plane.metrics().snapshot().conference.prompt_frames > 10,
+            "the room prompt contributed frames to the mix"
+        );
+
+        plane
+            .stop_playback(
+                carol.session,
+                PlaybackId::from_raw(9),
+                Some(MIX_TARGET_EVERYONE.to_string()),
+            )
+            .await
+            .expect("stopping a room prompt flushes what is left of it");
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        for peer in [&alice, &bob, &carol] {
+            peer.loudest_ear();
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let ears = [alice.loudest_ear(), bob.loudest_ear(), carol.loudest_ear()];
+        for (peer, ear) in ["alice", "bob", "carol"].iter().zip(ears) {
+            assert!(ear < SILENT, "{peer}'s ear went quiet again: {ear}");
+        }
+
+        for peer in [&alice, &bob, &carol] {
+            plane
+                .close_session(peer.session)
+                .await
+                .expect("a conference leg closes");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_coach_can_have_its_own_voice_heard_by_one_member_alone() {
+        let plane = plane();
+        let mut coach = seat_peer(&plane, 1, "coaching").await;
+        let mut agent = seat_peer(&plane, 2, "coaching").await;
+        let mut customer = seat_peer(&plane, 3, "coaching").await;
+        let SessionHandles { hub, .. } = plane
+            .session_handles(agent.session)
+            .expect("the conference leg is live here");
+        let mut monitor = hub
+            .attach(512, TrackSelection::Only(Track::Mixed))
+            .expect("the hub takes a monitor that wants the mix only");
+
+        plane
+            .open_attachment(injecting_attachment(
+                coach.session,
+                7,
+                &[
+                    (MIX_TARGET_METADATA_KEY, "req-2"),
+                    (MIX_SOURCE_METADATA_KEY, MIX_SOURCE_LEG),
+                ],
+            ))
+            .await
+            .expect("mix_source=leg routes the member's own rtp instead of injected audio");
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        assert_eq!(plane.metrics().snapshot().conference_whispers_live, 1);
+
+        let _ = loudest_mixed(&mut monitor);
+        everybody_speaks(&mut coach, &mut agent, &mut customer).await;
+        let coach_ear = coach.loudest_ear();
+        let agent_ear = agent.loudest_ear();
+        let customer_ear = customer.loudest_ear();
+        let mixed = loudest_mixed(&mut monitor);
+        assert!(
+            about(5_000, agent_ear),
+            "the agent hears the coach on top of the customer: {agent_ear}"
+        );
+        assert!(
+            about(2_000, customer_ear),
+            "the customer hears the agent alone, never the coach: {customer_ear}"
+        );
+        assert!(
+            about(6_000, coach_ear),
+            "the coach still hears the whole call: {coach_ear}"
+        );
+        assert!(
+            about(7_000, mixed),
+            "and coaching is on the record by default: {mixed}"
+        );
+
+        for peer in [&coach, &agent, &customer] {
+            plane
+                .close_session(peer.session)
+                .await
+                .expect("a conference leg closes");
+        }
+    }
+
+    #[tokio::test]
+    async fn member_verbs_are_refused_by_name_on_a_bad_flag_and_off_a_conference() {
+        let plane = plane();
+        let alice = seat_peer(&plane, 1, "member-refusals").await;
+        let refused = plane
+            .open_attachment(member_attachment(
+                alice.session,
+                7,
+                &[(MEMBER_MUTE_METADATA_KEY, "maybe")],
+            ))
+            .await
+            .expect_err("a member flag is on or off");
+        assert!(
+            refused.to_string().contains("member_mute"),
+            "refused by name: {refused}"
+        );
+
+        let socket = UdpSocket::bind("127.0.0.1:0").expect("a fake peer socket");
+        let port = socket.local_addr().expect("peer address").port();
+        plane
+            .open_session(SessionView {
+                id: SessionId::from_raw(9),
+                external_id: "req-9".to_string(),
+                sdp_offer: Some(inline_offer_sdp(port)),
+                ..session(SessionKind::Inline, "")
+            })
+            .await
+            .expect("a plain inline leg answers");
+        let refused = plane
+            .open_attachment(member_attachment(
+                SessionId::from_raw(9),
+                8,
+                &[(MEMBER_HOLD_METADATA_KEY, MEMBER_FLAG_ON)],
+            ))
+            .await
+            .expect_err("a two-party leg has no mix to be held out of");
+        assert!(
+            refused.to_string().contains("not a conference leg"),
+            "refused by name: {refused}"
+        );
+        let refused = plane
+            .start_playback(
+                SessionId::from_raw(9),
+                PlaybackId::from_raw(9),
+                PlaybackSource::Blob(Vec::new()),
+                Some("from-tag-7".to_string()),
+                false,
+            )
+            .await
+            .expect_err("an inline leg has no sip from-tag to play at");
+        assert!(
+            refused.to_string().contains("from-tag"),
+            "refused by name: {refused}"
+        );
+
+        plane
+            .close_session(SessionId::from_raw(9))
+            .await
+            .expect("the inline leg closes");
+        plane
+            .close_session(alice.session)
+            .await
+            .expect("the conference leg closes");
     }
 
     #[tokio::test]

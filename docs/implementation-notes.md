@@ -1776,6 +1776,107 @@ open (tasks.md D20); D16's pod-local recording group still applies to the
 per-participant shape; and there is no AGC, so the room object clips exactly
 when the mix clips.
 
+### conference.rs — member controls, room prompts and mix_source=leg (item 40, Phase 4, 2026-08-24)
+
+The conference feature tail, still with **no new RPC**: the vehicles are
+`UpdateAttachmentRequest.metadata` (item 38's metadata-verb channel) and
+`StartPlayback.target_tag`. The generic feature list and the adapter parity
+table live in architecture.md Appendix B; this section is the module context.
+
+**Vehicle choice.** `mix_target` (item 38) belongs to the *attachment* that owns
+it and reverts on detach. Mute, deaf and hold are **member state**, so they ride
+on any attachment of that member's own session (`member_mute` / `member_deaf` /
+`member_hold`, each `on` or `off`, absent = untouched) and they **outlive that
+attachment on purpose** — `close_attachment` reverts a whisper route and does
+*not* revert member state, because muting somebody is not a property of the
+consumer that asked for it. That also means no owner and no lease: tasks.md D22.
+No capability is required (the API caller's own authentication is the
+authorization, exactly like `paused`); `MemberControl::from_metadata` in
+`session-core/src/mix.rs` is the only parser, and `EventKind::MemberControlled`
+(proto payload tag 26, `MemberControlled{mute,deaf,hold}` from the *merged*
+metadata) is the audit trail.
+
+**Semantics, as matrix cells.**
+
+- **mute** = `mute_contributor(party.contributor)`: the row, monitor cell
+  included, so a muted member is off the **mixed track** and therefore off the
+  recording as well as out of every ear.
+- **deaf** = the column, minus what is *addressed* to that ear. It is **not**
+  `deafen_listener`, which would also close the member's own injector and kill
+  hold audio. `apply_matrix` collects `(contributor, listener)` pairs that were
+  routed with `route_only` — the member's own private injector, and any whisper
+  named **at** them — and zeroes every other contributor into that ear,
+  including the room prompt and a barge. So: the room goes quiet, audio somebody
+  aimed at them still lands.
+- **hold** = both, which is why hold audio needs no special path: it is an
+  ordinary `StartPlayback` on that session, arriving through the member's own
+  injector, which is addressed to their own ear.
+
+**`reroute_injectors` became `apply_matrix`, and it is now the only writer of
+non-default cells.** Item 37's sharp edge still bites — `join_listener` resets a
+whole column to defaults — so **every** membership change, route change and
+member verb re-derives the whole matrix from `seated`: prompt row, then per
+member the party row, the injector row and the monitor cell, then the deaf pass
+last (it must run after every row-based operation, since `route_to_all` and
+`route_only` rewrite whole rows). Add a feature by adding to this pass, never by
+mutating one cell somewhere else.
+
+**`mix_source=leg`** (the residual item 38 left) picks *which* contributor a
+`mix_target` moves: `inject` (default, item 38's behavior) or `leg`, the
+member's own RTP. `mix_source=leg` + `mix_target=<member>` is the coach shape —
+the coach's own voice reaches one ear, the room hears them no longer, and
+`mix_monitor` still decides whether the coaching is on the record (default:
+include). The member's injector stays private in that case, so private playback
+into the coach's own ear keeps working. `mix_target=own` + `mix_source=leg` is
+*not* a leg route (`MixRoute::is_own_leg` is false): it is an ordinary member.
+A leg route still requires an `INJECT` attachment, on the rule that moving audio
+around a room is the inject right, even when nothing is injected.
+
+**Room prompts.** A conference owns one prompt contributor fed by one
+`ArrayQueue<Vec<i16>>` (`PROMPT_CAPACITY` 64 chunks of `EGRESS_CHUNK_MS`), routed
+`route_to_all`, so a prompt lands in every ear **and** on the mixed track. The
+verb is `StartPlayback` with `target_tag="all"` on any member session;
+`target_tag` empty or `own` is the old private path (unchanged), and any other
+value is now **refused by name** on an inline leg, because an inline leg has no
+SIP from-tag to target. `StopPlayback{target_tag="all"}` flushes the queue and
+the in-flight chunk (an `AtomicBool` the mix thread swaps, like the egress
+flush). One source per room means two overlapping prompts **queue**, they do not
+mix; a per-member prompt is the private playback path, and long-form audio
+belongs on an `INJECT` attachment with `mix_target=all`.
+
+**Enter/exit prompts are a verb, not a trigger** — MSS does not decide that a
+join deserves a beep. Join-triggering is integrator policy: watch the room's
+session events, call `StartPlayback{target_tag="all"}`. Prompt selection, tenant
+policy and localization stay out of the media plane. Same answer for **DTMF**:
+conference control is API-first, MSS delivers digits to consumers (WS `dtmf`,
+gRPC `DtmfFrame`) and interprets none of them — and today those digits never
+reach `mss.events`, which an API-first digit menu would want (D21).
+
+`InjectFeed` became `ChunkFeed` (`fill(pop) -> filled_samples` + `frame()` +
+`discard() -> unplayed_samples`, zero-padding a short frame) so the injector
+feed and the prompt feed are one piece of code; the egress accounting
+(`account_mixed_in` / `discard_pending`, which is what makes a `Mark` on a
+conferenced leg mean "mixed") stayed at the injector call site, since a room
+prompt has no leg to account to.
+
+New metrics: `mss_conference_member_controls_total`,
+`mss_conference_prompt_frames_total`, and the gauges
+`mss_conference_{muted,deaf,held}_members` (muted and deaf count held members
+too, since hold is both).
+
+**Verified** over in-process UDP sockets and replay, no live run (the three
+container peers are P4-6): six new `tap_plane.rs` tests — a muted member is
+inaudible to both other members *and* on the mixed track and comes back on
+`off`; a deaf member's ear is silent while the room and the record still carry
+her; a held member hears his hold audio alone at full level while the room
+loses him and the record never carries the hold audio; a room prompt is heard by
+all three members and the mixed track and stops on `StopPlayback{all}`; a coach
+routed `mix_source=leg` is heard by the agent and not by the customer while
+still hearing everybody; and the refusals (a flag that is not `on`/`off`, a
+member verb on a leg that is in no conference, a from-tag-shaped playback target
+on an inline leg) — plus the mix-metadata parser tests and a registry audit
+test.
+
 ### tap_plane.rs — the control plane's hands in the media world
 
 `TapPlane` implements `control_api::MediaPlane` over the machinery the
