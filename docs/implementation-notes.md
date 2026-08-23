@@ -865,6 +865,20 @@ never silent), then asks the media plane for frames through the new
   20 ms while any mark is outstanding — so an ack is at most one ptime late and
   never early. A tap's `Mark` is never acked: it starts an rtpengine playback,
   which reports no completion.
+- **That poll is one pinned `tokio::time::interval`, never a `sleep` inside
+  `select!`** (2026-08-23, item 35 — this was a live defect, not a style rule).
+  Both loops (`control-api/src/stream.rs`, `mediaserverd/src/consumer_ws.rs`)
+  originally wrote the branch as `tokio::time::sleep(MARK_POLL_INTERVAL)` inside
+  the `select!`, which recreates — and therefore **resets** — the timer on every
+  loop iteration. A subscribed consumer wakes that loop every 20 ms with a
+  tapped frame, and `select!` picks randomly among ready branches, so the sleep
+  was routinely cancelled before it elapsed: the inline drill measured a mark
+  acked **8221 ms** after its audio had already drained on time at 400 ms. The
+  fix is one `interval` (with `MissedTickBehavior::Delay`) constructed **outside**
+  the loop and a guarded branch, `_ = mark_poll.tick(), if marks_pending`, which
+  costs nothing while no mark is outstanding because a disabled branch is not
+  polled. Measured after the fix: 403–410 ms against a 400 ms lead. Any future
+  periodic work in either loop must follow the same shape.
 - **`SpeechReport` is the consumer's only way to report speech** (2026-08-23,
   item 28, defect D19). `ConsumerToServer.report` carries a kind
   (`STARTED`/`PARTIAL`/`FINAL`/`END_OF_UTTERANCE`/`END_OF_INTERACTION`), track,

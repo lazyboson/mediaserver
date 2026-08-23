@@ -15,7 +15,7 @@ Status as of **2026-08-23**.
 | **M3 — fan-out hub** | per-session pub/sub, N consumers, WS-Twilio adapter, pause/resume/send_text parity | ✅ done |
 | **M4 — control plane** | `MediaControl` gRPC, session state machine, Kafka events, Redis registry, tenant-flag pilot | 🔶 **code complete** — pilot gates: translator merge (external), and the consumer half of the barge-in number — **every MSS-owned hop is measured (item 5, 2026-08-23: cut-through p95 4.8 ms from a real consumer `SpeechReport`)**, the D19 ingress gap it found being fixed in item 28. The gRPC lab proof (item 10) and the **live pod-kill drill (item 11, gap 14.41 s)** are both **done 2026-08-22**; the D14 orphan subscription the drill found is **fixed (item 25, 2026-08-23)**, fake- and Redis-verified rather than re-measured live |
 | **M5 — recording (Phase 2)** | per-leg taps → stereo segmenter → S3, identity + callback contract, dual-recording | 🔶 **code complete (2026-08-22)** — a live tapped call recorded end to end to a real MinIO, callbacks read off `mss.events` (2026-08-22, item 10's drill); **recording groups** — N sessions recorded as one recording, one mono object per participant, time-aligned on the group's open instant since item 29 — landed 2026-08-23 (item 21); FS byte-parity **measured against a real FS recording** 2026-08-23 (item 31): container/layout/rms exact, a re-aligned 2 s window agrees 1.0000 at mean diff 0.6/32768; owed: a two-party production-FS comparison and a human listen |
-| M6+ | Phases 3–4 (interactive media, full media plane) | ⬜ not started |
+| M6+ | Phases 3–4 (interactive media, full media plane) | 🔶 **Phase 3 code complete and lab-verified (items 32–35, 2026-08-23)** — an inline leg answers an SDP offer, is spoken to over a continuous inject stream, and barges in **p50 12.2 ms / p95 20.4 ms** measured against a real RTP peer; Phase 4 (mixing) not started |
 
 ### What landed, concretely
 
@@ -201,7 +201,11 @@ such consumer with its own traffic and a call-control hop after `StopPlayback`.
 Two limits remain, both by nature: the consumer's own **detection** latency
 (how long an ASR takes to decide speech began) is the consumer's, not MSS's,
 and `StopPlayback` acked is not the last audible sample — the media-path cut
-needs an ear on the leg (Phase-3 inline drill).
+needs an ear on the leg. **That ear now exists (item 35, 2026-08-23):** on an
+inline leg the media-path cut from `Clear` to silence at the peer measures
+**p50 12.2 ms, p95 20.4 ms** over 20 iterations, one ptime as the pacer
+promised. On a *tapped* call the equivalent tail is rtpengine's `stop media`,
+still unmeasured for want of an ear on a tapped leg.
 
 ### 6. gRPC `MediaStream` data plane — ✅ DONE (2026-08-20)
 `crates/control-api/src/stream.rs` implements `MediaStream::Subscribe` over a
@@ -1824,6 +1828,68 @@ builds its wav and stops its playback.
 in-process socket; no SIP peer and no real voice-AI consumer has spoken through
 this. P3-5's drill is what proves a real ear hears it, and P3-4 owes the
 measured cut-through.
+
+### 35. Inline barge-in measured, and the inline lab drill (Phase 3) — ✅ DONE (2026-08-23)
+
+Items 32–34's mouth met an ear. `lab/inline_call_drill.sh` runs the whole inline
+path with no SIP stack and no human: `lab/inline_peer.py` offers PCMU and
+becomes the far end of MSS's own socket, `mss_ctl inline` answers it,
+`lab/inline_consumer.py` attaches with `SINK | INJECT` and speaks 1000 Hz into
+the leg while the peer speaks 440 Hz back, and `lab/inline_barge_report.py`
+turns the peer's per-packet arrival timeline into the number Phase 3 owed. Both
+python actors run as containers on the lab network so their timestamps come from
+one kernel clock — a host-to-VM skew would be a large error against a 20 ms
+target.
+
+Measured live (stamp 1787508102, 20 iterations; full table in
+[lab.md](lab.md#inline_call_drillsh--an-inline-leg-with-a-real-ear-and-the-barge-in-number-2026-08-23)):
+
+- **barge-in cut-through, `Clear` sent → first silent packet at the peer's ear:
+  p50 12.2 ms, p95 20.4 ms, max 21.0 ms, min 2.4 ms (n=20).** The target was one
+  ptime and the max is one ptime plus a millisecond of transport. The
+  distribution is uniform over one frame because `Clear` flushes the chunk queue
+  *and* the pacer ring, leaving only the wait for the pacer's next 20 ms
+  deadline — the replay claim ("the tick after `clear()` is a silence frame") is
+  now a live number, and it is an *arrival* measurement, so it includes the gRPC
+  hop, the 5 ms pump tick and the lab bridge.
+- **The peer hears the injected audio**: 1710/3312 egress packets carried the
+  1000 Hz tone, peak Goertzel 11910 of a theoretical 12000.
+- **The hub still taps the peer while the leg is being spoken to**: 2770 frames
+  of the peer's own 440 Hz to the same consumer, peak rms 17132.
+- **Egress is properly paced**: 50.19 pkt/s over 66 s, 0 sequence breaks, rtp
+  timestamp step 160 for every one of 3311 gaps, `late_ticks_total` 0,
+  `dropped_samples_total` 0, `send_errors_total` 0, and
+  `drained_samples_total == pushed_samples_total`.
+- **`Mark` acks when the audio drained**: 410 / 404 / 404 ms against 400 ms of
+  queued audio.
+
+Two corrections the drill forced, both worth remembering:
+
+- **The first cut-through numbers were phase-locked and too flattering.** A
+  1.5 s tone plus a 1.0 s gap is exactly 125 packets, so every `Clear` landed at
+  nearly the same phase of the 20 ms grid and the run sampled a quarter of the
+  distribution (p95 15.3 ms, monotonically decreasing per iteration). The
+  consumer now jitters the gap by up to one frame (`JITTER_MS`), and the honest
+  p95 is 20.4 ms. Any future paced-media measurement in this repo must jitter
+  its period or it measures its own arithmetic.
+- **A real defect, found and fixed here: the mark drain-poll starved.** The
+  first run acked a `Mark` after **8221 ms** although the audio drained on time
+  at 400 ms. Both stream loops built item 34's 20 ms poll as
+  `tokio::time::sleep(...)` *inside* `tokio::select!`, so the timer was
+  recreated — and reset — on every loop iteration; with tapped frames arriving
+  every 20 ms and `select!` picking randomly among ready branches, the sleep was
+  cancelled before it ever elapsed. One `tokio::time::interval` pinned outside
+  the loop, with the branch gated on `if marks_pending`, fixes it in
+  `control-api/src/stream.rs` and `mediaserverd/src/consumer_ws.rs`. A `sleep`
+  inside `select!` is a timeout, not a timer.
+
+**What this does not prove:** one PCMU/8 kHz leg, one INJECT consumer, an idle
+box; no PCMA/L16/Opus inline leg, no impairment, no second leg, no SIP (the
+offer and answer travel through two files), no human listening to
+`peer_ear_*.wav`, and the consumer's own detection latency is still outside the
+number — item 5 measures the speech-report→`StopPlayback` hop, this one measures
+`Clear`→silence, and adding them is as close to end-to-end barge-in as MSS can
+honestly get on its own.
 
 ## Open defects and soft spots
 
