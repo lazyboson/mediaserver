@@ -5,6 +5,7 @@ use crate::recorder::{
     self, Layout, RecorderCounters, RecorderHandle, RecorderSpec, RecordingFormat,
     RecordingIdentity, RecordingSupport, RecordingTarget,
 };
+use crate::registry_keeper::TapSubscriptions;
 use crate::rtpengine_capability::NodeCapabilityLog;
 use crate::tap_spike::{
     capture, SharedLegStats, SsrcTrackPublisher, SsrcTracks, TapLeg, MAX_SSRC_TRACKS,
@@ -1412,6 +1413,41 @@ impl MediaPlane for TapPlane {
     }
 }
 
+#[control_api::async_trait]
+impl TapSubscriptions for TapPlane {
+    fn subscription_tag(&self, session: SessionId) -> Option<String> {
+        self.sessions
+            .lock()
+            .ok()?
+            .get(&session)
+            .map(|live| live.to_tag.clone())
+    }
+
+    async fn unsubscribe_orphan(
+        &self,
+        node: &str,
+        call_id: &str,
+        to_tag: &str,
+    ) -> Result<(), MediaPlaneError> {
+        let node: SocketAddr = node.parse().map_err(|_| {
+            MediaPlaneError(format!("rtpengine_node {node} is not an ip:port address"))
+        })?;
+        let transport = NgTransport::bind(
+            SocketAddr::new(self.config.local_media_address, 0),
+            node,
+            NgTransportConfig::default(),
+            self.config.cookie_prefix,
+        )
+        .await
+        .map_err(|error| MediaPlaneError(format!("NG socket: {error}")))?;
+        transport
+            .unsubscribe(call_id, to_tag)
+            .await
+            .map_err(|error| MediaPlaneError(format!("unsubscribe {to_tag}: {error}")))?;
+        Ok(())
+    }
+}
+
 async fn pump_frames(
     mut subscription: Subscription,
     frames: mpsc::Sender<StreamFrame>,
@@ -1841,6 +1877,54 @@ mod tests {
 
     fn identity(endpoint: &str) -> RecordingIdentity {
         RecordingIdentity::parse(endpoint).unwrap()
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_dead_pods_tap_puts_an_unsubscribe_on_the_wire() {
+        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let node = socket.local_addr().unwrap();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let log = Arc::clone(&seen);
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; 2048];
+            while let Ok((len, from)) = socket.recv_from(&mut buf).await {
+                let datagram = buf[..len].to_vec();
+                let (cookie, _) = rtpengine_ng::NgClient::split_cookie(&datagram).unwrap();
+                let mut reply = cookie.to_vec();
+                reply.extend_from_slice(b" d6:result2:oke");
+                log.lock().unwrap().push(datagram);
+                let _ = socket.send_to(&reply, from).await;
+            }
+        });
+
+        let plane = plane();
+        plane
+            .unsubscribe_orphan(&node.to_string(), "call-abc", "tap-of-a-dead-pod")
+            .await
+            .unwrap();
+
+        let sent = seen.lock().unwrap();
+        assert_eq!(sent.len(), 1);
+        let wire = String::from_utf8_lossy(&sent[0]);
+        assert!(wire.contains("7:command11:unsubscribe"), "{wire}");
+        assert!(wire.contains("7:call-id8:call-abc"), "{wire}");
+        assert!(wire.contains("6:to-tag17:tap-of-a-dead-pod"), "{wire}");
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_tap_on_an_unparseable_node_is_refused_without_a_socket() {
+        let plane = plane();
+        let error = plane
+            .unsubscribe_orphan("not-an-address", "call-abc", "tap-a")
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("ip:port"));
+    }
+
+    #[tokio::test]
+    async fn a_session_this_pod_never_tapped_has_no_subscription_tag() {
+        let plane = plane();
+        assert!(plane.subscription_tag(SessionId::from_raw(1)).is_none());
     }
 
     #[tokio::test]

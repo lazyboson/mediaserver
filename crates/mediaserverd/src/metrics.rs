@@ -350,6 +350,21 @@ pub fn render(sources: &MetricsSources) -> String {
             "Registry operations that failed",
             keeper.failed.load(Ordering::Relaxed),
         );
+        counter(
+            "mss_registry_orphans_unsubscribed_total",
+            "Dead pods' rtpengine subscriptions cancelled before re-subscribing",
+            keeper.orphans_unsubscribed.load(Ordering::Relaxed),
+        );
+        counter(
+            "mss_registry_orphans_still_subscribed_total",
+            "Adoptions that left the previous owner's tap in place; rtpengine copies              that call twice until it ends",
+            keeper.orphans_still_subscribed.load(Ordering::Relaxed),
+        );
+        counter(
+            "mss_registry_surrendered_total",
+            "Sessions this pod gave up because another pod holds their lease",
+            keeper.surrendered.load(Ordering::Relaxed),
+        );
     }
 
     let _ = writeln!(

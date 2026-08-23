@@ -6,8 +6,8 @@ use control_api::convert::{capabilities_wire, session_kind_wire, track_name, tra
 use control_api::proto;
 use control_api::proto::media_control_server::MediaControl;
 use control_api::tonic::{self, Request};
-use control_api::SessionController;
-use session_core::{AttachmentView, SessionView, TrackSelector};
+use control_api::{MediaPlaneError, SessionController};
+use session_core::{AttachmentView, SessionId, SessionView, TrackSelector};
 use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -23,6 +23,21 @@ pub struct KeeperCounters {
     pub released: AtomicU64,
     pub failed: AtomicU64,
     pub grouped_not_adopted: AtomicU64,
+    pub orphans_unsubscribed: AtomicU64,
+    pub orphans_still_subscribed: AtomicU64,
+    pub surrendered: AtomicU64,
+}
+
+#[control_api::async_trait]
+pub trait TapSubscriptions: Send + Sync + 'static {
+    fn subscription_tag(&self, session: SessionId) -> Option<String>;
+
+    async fn unsubscribe_orphan(
+        &self,
+        node: &str,
+        call_id: &str,
+        to_tag: &str,
+    ) -> Result<(), MediaPlaneError>;
 }
 
 pub struct RegistryKeeper {
@@ -31,6 +46,7 @@ pub struct RegistryKeeper {
     owner: String,
     counters: Arc<KeeperCounters>,
     persisted_here: Mutex<BTreeSet<String>>,
+    subscriptions: Option<Arc<dyn TapSubscriptions>>,
 }
 
 impl RegistryKeeper {
@@ -45,7 +61,16 @@ impl RegistryKeeper {
             owner: owner.into(),
             counters: Arc::new(KeeperCounters::default()),
             persisted_here: Mutex::new(BTreeSet::new()),
+            subscriptions: None,
         }
+    }
+
+    pub fn with_subscriptions(
+        mut self,
+        subscriptions: Arc<dyn TapSubscriptions>,
+    ) -> RegistryKeeper {
+        self.subscriptions = Some(subscriptions);
+        self
     }
 
     pub fn counters(&self) -> Arc<KeeperCounters> {
@@ -72,6 +97,7 @@ impl RegistryKeeper {
 
     async fn persist_and_renew(&self) {
         let mut live = BTreeSet::new();
+        let mut surrendered = BTreeSet::new();
         for (session, attachments) in self.controller.snapshot() {
             live.insert(session.external_id.clone());
             let persisted = self.persisted_from(&session, &attachments);
@@ -92,8 +118,11 @@ impl RegistryKeeper {
                     warn!(
                         %external_id,
                         owner = %self.owner,
-                        "another pod holds this session's lease; it may now be tapped twice"
+                        "another pod holds this session's lease; giving up the tap here so the \
+                         call is not tapped twice"
                     );
+                    surrendered.insert(external_id.clone());
+                    self.surrender(&external_id).await;
                 }
                 Err(error) => {
                     self.counters.failed.fetch_add(1, Ordering::Relaxed);
@@ -101,13 +130,47 @@ impl RegistryKeeper {
                 }
             }
         }
-        self.release_gone(live).await;
+        for external_id in &surrendered {
+            live.remove(external_id);
+        }
+        self.release_gone(live, &surrendered).await;
     }
 
-    async fn release_gone(&self, live: BTreeSet<String>) {
+    async fn surrender(&self, external_id: &str) {
+        match self
+            .controller
+            .destroy_session(Request::new(proto::SessionRef {
+                id: Some(proto::session_ref::Id::ExternalId(external_id.to_string())),
+            }))
+            .await
+        {
+            Ok(_) => {
+                self.counters.surrendered.fetch_add(1, Ordering::Relaxed);
+                info!(
+                    %external_id,
+                    "released a session whose lease another pod holds; its tap is unsubscribed here"
+                );
+            }
+            Err(error) => {
+                self.counters.failed.fetch_add(1, Ordering::Relaxed);
+                warn!(
+                    %external_id,
+                    %error,
+                    "could not release a session whose lease another pod holds; \
+                     rtpengine may now copy this call to two pods"
+                );
+            }
+        }
+    }
+
+    async fn release_gone(&self, live: BTreeSet<String>, surrendered: &BTreeSet<String>) {
         let gone: Vec<String> = {
             let mut mine = self.persisted_here.lock().unwrap();
-            let gone = mine.difference(&live).cloned().collect();
+            let gone = mine
+                .difference(&live)
+                .filter(|external_id| !surrendered.contains(*external_id))
+                .cloned()
+                .collect();
             *mine = live;
             gone
         };
@@ -181,7 +244,65 @@ impl RegistryKeeper {
         }
     }
 
+    async fn drop_orphan_subscription(&self, session: &PersistedSession) {
+        if session.subscription_tag.is_empty() {
+            self.counters
+                .orphans_still_subscribed
+                .fetch_add(1, Ordering::Relaxed);
+            warn!(
+                external_id = %session.external_id,
+                call_id = %session.call_id,
+                "this record carries no tap to-tag, so the previous owner's subscription \
+                 cannot be cancelled; rtpengine copies the call to both until it ends"
+            );
+            return;
+        }
+        let Some(subscriptions) = self.subscriptions.as_ref() else {
+            self.counters
+                .orphans_still_subscribed
+                .fetch_add(1, Ordering::Relaxed);
+            warn!(
+                external_id = %session.external_id,
+                "no media plane is wired to this keeper, so the previous owner's tap stays"
+            );
+            return;
+        };
+        match subscriptions
+            .unsubscribe_orphan(
+                &session.rtpengine_node,
+                &session.call_id,
+                &session.subscription_tag,
+            )
+            .await
+        {
+            Ok(()) => {
+                self.counters
+                    .orphans_unsubscribed
+                    .fetch_add(1, Ordering::Relaxed);
+                info!(
+                    external_id = %session.external_id,
+                    call_id = %session.call_id,
+                    to_tag = %session.subscription_tag,
+                    "cancelled the previous owner's tap before re-subscribing"
+                );
+            }
+            Err(error) => {
+                self.counters
+                    .orphans_still_subscribed
+                    .fetch_add(1, Ordering::Relaxed);
+                warn!(
+                    external_id = %session.external_id,
+                    to_tag = %session.subscription_tag,
+                    %error,
+                    "could not cancel the previous owner's tap; rtpengine keeps copying this \
+                     call to a pod that is gone until the call ends"
+                );
+            }
+        }
+    }
+
     async fn rebuild(&self, session: &PersistedSession) -> Result<(), tonic::Status> {
+        self.drop_orphan_subscription(session).await;
         self.controller
             .create_session(Request::new(proto::CreateSessionRequest {
                 external_id: session.external_id.clone(),
@@ -263,6 +384,11 @@ impl RegistryKeeper {
             from_tags: session.from_tags.clone(),
             rtpengine_node: session.rtpengine_node.clone(),
             owner: self.owner.clone(),
+            subscription_tag: self
+                .subscriptions
+                .as_ref()
+                .and_then(|subscriptions| subscriptions.subscription_tag(session.id))
+                .unwrap_or_default(),
             attachments: attachments
                 .iter()
                 .map(|attachment| PersistedAttachment {
@@ -296,12 +422,47 @@ mod tests {
     struct RecordingPlane {
         opened: Mutex<Vec<String>>,
         attached: Mutex<Vec<String>>,
+        journal: Arc<Mutex<Vec<String>>>,
+    }
+
+    #[derive(Default)]
+    struct FakeSubscriptions {
+        tag: Option<String>,
+        journal: Arc<Mutex<Vec<String>>>,
+        refuse: bool,
+    }
+
+    #[control_api::async_trait]
+    impl TapSubscriptions for FakeSubscriptions {
+        fn subscription_tag(&self, _session: SessionId) -> Option<String> {
+            self.tag.clone()
+        }
+
+        async fn unsubscribe_orphan(
+            &self,
+            node: &str,
+            call_id: &str,
+            to_tag: &str,
+        ) -> Result<(), MediaPlaneError> {
+            self.journal
+                .lock()
+                .unwrap()
+                .push(format!("unsubscribe {node} {call_id} {to_tag}"));
+            if self.refuse {
+                return Err(MediaPlaneError("rtpengine never answered".to_string()));
+            }
+            Ok(())
+        }
     }
 
     #[control_api::async_trait]
     impl MediaPlane for RecordingPlane {
         async fn open_session(&self, session: SessionView) -> Result<(), MediaPlaneError> {
             self.opened.lock().unwrap().push(session.call_id.clone());
+            self.journal
+                .lock()
+                .unwrap()
+                .push(format!("subscribe {}", session.call_id));
             Ok(())
         }
         async fn close_session(&self, _session: SessionId) -> Result<(), MediaPlaneError> {
@@ -348,7 +509,17 @@ mod tests {
     }
 
     fn pod(name: &str) -> (Arc<SessionController>, Arc<RecordingPlane>) {
-        let plane = Arc::new(RecordingPlane::default());
+        pod_journalling(name, Arc::new(Mutex::new(Vec::new())))
+    }
+
+    fn pod_journalling(
+        name: &str,
+        journal: Arc<Mutex<Vec<String>>>,
+    ) -> (Arc<SessionController>, Arc<RecordingPlane>) {
+        let plane = Arc::new(RecordingPlane {
+            journal,
+            ..RecordingPlane::default()
+        });
         let controller = Arc::new(SessionController::new(name).with_media_plane(plane.clone()));
         (controller, plane)
     }
@@ -561,6 +732,177 @@ mod tests {
         assert!(
             store.stored().is_empty(),
             "an unrebuildable session must not linger and be re-adopted forever"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_tap_to_tag_is_persisted_so_a_survivor_can_cancel_it() {
+        let store = Arc::new(MemorySessionStore::default());
+        let (controller, _) = pod("pod-a");
+        tap_with_consumer(&controller, "req-1").await;
+
+        RegistryKeeper::new(controller, store.clone(), "pod-a")
+            .with_subscriptions(Arc::new(FakeSubscriptions {
+                tag: Some("tap-a".to_string()),
+                ..FakeSubscriptions::default()
+            }))
+            .tick()
+            .await;
+
+        assert_eq!(store.stored()[0].subscription_tag, "tap-a");
+    }
+
+    #[tokio::test]
+    async fn the_adopter_cancels_the_dead_pods_tap_before_re_subscribing() {
+        let store = Arc::new(MemorySessionStore::default());
+        let (first_pod, _) = pod("pod-a");
+        tap_with_consumer(&first_pod, "req-1").await;
+        RegistryKeeper::new(first_pod, store.clone(), "pod-a")
+            .with_subscriptions(Arc::new(FakeSubscriptions {
+                tag: Some("tap-a".to_string()),
+                ..FakeSubscriptions::default()
+            }))
+            .tick()
+            .await;
+        store.expire_lease("req-1");
+
+        let journal = Arc::new(Mutex::new(Vec::new()));
+        let (second_pod, _) = pod_journalling("pod-b", Arc::clone(&journal));
+        let keeper = RegistryKeeper::new(second_pod.clone(), store.clone(), "pod-b")
+            .with_subscriptions(Arc::new(FakeSubscriptions {
+                tag: Some("tap-b".to_string()),
+                journal: Arc::clone(&journal),
+                refuse: false,
+            }));
+        keeper.tick().await;
+
+        assert_eq!(keeper.counters().adopted.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            keeper
+                .counters()
+                .orphans_unsubscribed
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            journal.lock().unwrap().as_slice(),
+            [
+                "unsubscribe 10.0.0.5:22222 call-abc tap-a".to_string(),
+                "subscribe call-abc".to_string()
+            ],
+            "the dead pod's tap must be cancelled before a second one is opened"
+        );
+
+        keeper.tick().await;
+        assert_eq!(
+            store.stored()[0].subscription_tag,
+            "tap-b",
+            "the new owner's to-tag must replace the stale one, or a second death leaks again"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_adoption_that_cannot_cancel_the_old_tap_still_happens_and_is_counted() {
+        let store = Arc::new(MemorySessionStore::default());
+        let (first_pod, _) = pod("pod-a");
+        tap_with_consumer(&first_pod, "req-1").await;
+        RegistryKeeper::new(first_pod, store.clone(), "pod-a")
+            .with_subscriptions(Arc::new(FakeSubscriptions {
+                tag: Some("tap-a".to_string()),
+                ..FakeSubscriptions::default()
+            }))
+            .tick()
+            .await;
+        store.expire_lease("req-1");
+
+        let (second_pod, second_plane) = pod("pod-b");
+        let keeper = RegistryKeeper::new(second_pod.clone(), store.clone(), "pod-b")
+            .with_subscriptions(Arc::new(FakeSubscriptions {
+                tag: Some("tap-b".to_string()),
+                journal: Arc::new(Mutex::new(Vec::new())),
+                refuse: true,
+            }));
+        keeper.tick().await;
+
+        assert_eq!(keeper.counters().adopted.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            keeper
+                .counters()
+                .orphans_still_subscribed
+                .load(Ordering::Relaxed),
+            1,
+            "a refused unsubscribe must be visible, not silent"
+        );
+        assert_eq!(
+            second_plane.opened.lock().unwrap().as_slice(),
+            ["call-abc".to_string()],
+            "a call must still be re-tapped even when the old tap could not be cancelled"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_record_from_before_the_tag_was_persisted_is_adopted_and_counted_as_orphaned() {
+        let store = Arc::new(MemorySessionStore::default());
+        let (first_pod, _) = pod("pod-a");
+        tap_with_consumer(&first_pod, "req-1").await;
+        RegistryKeeper::new(first_pod, store.clone(), "pod-a")
+            .tick()
+            .await;
+        assert_eq!(store.stored()[0].subscription_tag, "");
+        store.expire_lease("req-1");
+
+        let (second_pod, _) = pod("pod-b");
+        let keeper = RegistryKeeper::new(second_pod.clone(), store.clone(), "pod-b")
+            .with_subscriptions(Arc::new(FakeSubscriptions {
+                tag: Some("tap-b".to_string()),
+                ..FakeSubscriptions::default()
+            }));
+        keeper.tick().await;
+
+        assert_eq!(keeper.counters().adopted.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            keeper
+                .counters()
+                .orphans_still_subscribed
+                .load(Ordering::Relaxed),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn a_pod_that_lost_the_lease_stops_tapping_and_leaves_the_record_alone() {
+        let store = Arc::new(MemorySessionStore::default());
+        let (controller, _) = pod("pod-a");
+        tap_with_consumer(&controller, "req-1").await;
+        let keeper = RegistryKeeper::new(controller.clone(), store.clone(), "pod-a")
+            .with_subscriptions(Arc::new(FakeSubscriptions {
+                tag: Some("tap-a".to_string()),
+                ..FakeSubscriptions::default()
+            }));
+        keeper.tick().await;
+
+        store.expire_lease("req-1");
+        let stolen = store.claim_unleased("pod-b", 8).await.unwrap();
+        assert_eq!(stolen.len(), 1);
+
+        keeper.tick().await;
+
+        assert_eq!(keeper.counters().lost.load(Ordering::Relaxed), 1);
+        assert_eq!(keeper.counters().surrendered.load(Ordering::Relaxed), 1);
+        assert!(
+            !controller.holds_external_id("req-1"),
+            "a pod that lost its lease must stop pumping that call"
+        );
+        assert_eq!(
+            store.stored().len(),
+            1,
+            "the surrendering pod must not delete the record its successor holds"
+        );
+        assert_eq!(store.lease_holder("req-1").as_deref(), Some("pod-b"));
+        assert_eq!(
+            keeper.counters().released.load(Ordering::Relaxed),
+            0,
+            "surrender is not the same as an ended call"
         );
     }
 

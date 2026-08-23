@@ -366,7 +366,10 @@ async fn serve_control_plane(
     match session_store_from_env().await {
         Ok(Some(store)) => {
             let keeper =
-                registry_keeper::RegistryKeeper::new(Arc::clone(&controller), store, owner.clone());
+                registry_keeper::RegistryKeeper::new(Arc::clone(&controller), store, owner.clone())
+                    .with_subscriptions(
+                        Arc::clone(&observing) as Arc<dyn registry_keeper::TapSubscriptions>
+                    );
             keeper_counters = Some(keeper.counters());
             tokio::spawn(keeper.run());
         }

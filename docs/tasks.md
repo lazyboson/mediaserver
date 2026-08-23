@@ -13,7 +13,7 @@ Status as of **2026-08-23**.
 | **M1 — scaffold** | workspace, sans-IO cores (RTP, G.711, DTMF, jitter), NG bencode, consumer dialects, two-world daemon skeleton, watchdog | ✅ done (2026-08-13) |
 | **M2 — Phase-0 spike** | real NG subscribe against lab rtpengine, both legs jitter-buffered to WAV, per-tap cost | ✅ **code done**; 3 org-side items open (below) |
 | **M3 — fan-out hub** | per-session pub/sub, N consumers, WS-Twilio adapter, pause/resume/send_text parity | ✅ done |
-| **M4 — control plane** | `MediaControl` gRPC, session state machine, Kafka events, Redis registry, tenant-flag pilot | 🔶 **code complete** — pilot gates: translator merge (external), barge-in number (item 5). The gRPC lab proof (item 10) and the **live pod-kill drill (item 11, gap 14.41 s)** are both **done 2026-08-22**; the drill left D14 open (orphan subscription after a pod death) |
+| **M4 — control plane** | `MediaControl` gRPC, session state machine, Kafka events, Redis registry, tenant-flag pilot | 🔶 **code complete** — pilot gates: translator merge (external), barge-in number (item 5). The gRPC lab proof (item 10) and the **live pod-kill drill (item 11, gap 14.41 s)** are both **done 2026-08-22**; the D14 orphan subscription the drill found is **fixed (item 25, 2026-08-23)**, fake- and Redis-verified rather than re-measured live |
 | **M5 — recording (Phase 2)** | per-leg taps → stereo segmenter → S3, identity + callback contract, dual-recording | 🔶 **code complete (2026-08-22)** — a live tapped call recorded end to end to a real MinIO, callbacks read off `mss.events` (2026-08-22, item 10's drill); **recording groups** — N sessions recorded as one recording, one mono object per participant — landed 2026-08-23 (item 21); owed: FS byte-parity sign-off (harness exists) |
 | M6+ | Phases 3–4 (interactive media, full media plane) | ⬜ not started |
 
@@ -893,8 +893,8 @@ exposes one; (C) eBPF, last resort.
 **Decision gate, in order — do not write eBPF before all three:**
   1. Get the rtpengine-side per-tap cost measured (the open org item).
      If `subscribe` at the target tap count costs little, stop here;
-     eBPF is unjustified complexity. **Fix D14 first** or orphaned taps
-     will pollute the measurement.
+     eBPF is unjustified complexity. D14 is fixed (item 25), so orphaned
+     taps no longer pollute the measurement.
   2. Probe whether a subscription is kernel-forwarded, and **whether
      dropping the transcode request is what decides it** — that is the
      hypothesis item 20 exists to make testable, since the kernel module
@@ -1207,6 +1207,52 @@ an rtpengine codec-mask arrangement that keeps FS out of the codec decision
 below), and the browser leg **outlived the hung-up call by ~12 s** — billable
 media tail after hangup, worth an eye in a pilot.
 
+### 25. Orphaned tap after a pod death (defect D14) — ✅ DONE (2026-08-23)
+
+**What the drill in item 11 priced:** a `kill -9` on the owning pod left its
+rtpengine subscription in place for the rest of the call — 14,743 packets /
+2.5 MB copied to an address nobody was listening on, four ports held. A pod
+restart during a call permanently doubled that call's cost on the rtpengine
+host.
+
+**What shipped.** Three changes, one seam:
+
+1. `PersistedSession.subscription_tag` — the `to-tag` rtpengine answered the
+   `subscribe request` with, persisted every keeper tick. `#[serde(default)]`,
+   so a record written before the field existed still decodes and is still
+   adoptable (asserted both in unit tests and against a real Redis).
+2. `TapSubscriptions`, a two-method trait in `registry_keeper.rs` that
+   `TapPlane` implements (`subscription_tag`, `unsubscribe_orphan`). `rebuild`
+   cancels the previous owner's tap **before** creating its own; the ordering
+   is asserted through a shared journal and the NG `unsubscribe` bytes against
+   a fake rtpengine socket. A refused unsubscribe does not block the adoption —
+   it counts `orphans_still_subscribed`, as does a legacy record with no tag.
+3. The **partitioned-but-alive owner**: `upsert` now writes the lease with
+   `SET NX` instead of overwriting it, so a pod that was adopted away cannot
+   take the lease back 5 s later (it could, before — which made the whole
+   partition case undetectable), while an incumbent still re-acquires a lease
+   that merely expired unclaimed. `renew` returning `false` therefore means
+   exactly "another pod owns this", and the losing pod now **destroys the
+   session locally** — its own `close_session` unsubscribes its own tap — and
+   deliberately leaves the registry record for its successor. `surrendered`
+   counts it.
+
+**Decisions recorded:** the adopter unsubscribes only after winning
+`claim_unleased`'s atomic `SET NX`, never speculatively; lease loss is fatal
+for the session, accepting that a pod stalled past 15 s drops a call it could
+still have served (the adopter has already re-tapped it, and the alternative
+is D14 for the life of the call).
+
+**Verified against what.** Unit tests (store roundtrip including a legacy
+record, adoption ordering, refused unsubscribe, surrender leaves the record
+alone), a fake rtpengine UDP socket for the wire bytes, and the whole
+`session_store` suite against the lab's real Redis (18 tests,
+`MSS_TEST_REDIS_URL=redis://127.0.0.1:16379`). **Not** re-measured on a live
+pod kill: `lab/pod_kill_drill.sh` needs a human-dialed SIP call and a rebuilt
+pod image, so no new rtpengine teardown block was collected. Re-running it is
+the honest close-out for the rtpengine-side per-tap cost handoff, which was
+blocked on this fix.
+
 ## Open defects and soft spots
 
 | # | Item | Where | Severity |
@@ -1224,7 +1270,7 @@ media tail after hangup, worth an eye in a pilot.
 | D8 | `owner_pod` is a config string; real placement and load-aware scheduling do not exist | `main.rs` | low until multi-pod |
 | ~~D12~~ | ~~**NG cookies repeat across sessions on one pod**: `CookieSequence` restarted its serial at 0 and `TapPlane` binds a new `NgTransport` per session, so every session's first command was `<prefix>-0`. Two sessions inside rtpengine's duplicate-cookie reply-cache window get the *same cached subscribe answer*, and the second tap receives **no media at all** while looking healthy~~ — **fixed 2026-08-22 (item 10)**: the serial is process-wide, unit-pinned and lab-proved before/after | `ng_transport.rs` | closed — was **high**, it silently broke every second tap within a minute |
 | D15 | An adopted attachment loses its **negotiated format**: `PersistedAttachment` has no format field and `rebuild` passes `format: None`, so a consumer that attached as L16/16k comes back at the session default (g711 at the tap rate). Found by reading the adoption path during item 11, **not** observed — that drill's consumer was WS/PCMU, where the default is the only legal answer. A gRPC consumer would notice | `session_store.rs`, `registry_keeper.rs` | low today, medium once ASR consumers ask for L16/16k |
-| D14 | **A dead pod's rtpengine subscription is never torn down.** The adopter re-subscribes but nothing cancels the old tap: `PersistedSession` does not carry the subscription's `to-tag`, and only the pod that created it holds one. Measured in the item-11 drill from rtpengine's teardown block: **14,743 packets / 2.5 MB copied to a pod that had been dead for 110 s**, four ports held for the rest of the call — i.e. a pod death permanently doubles that call's cost on the rtpengine host, which is exactly the capacity number still open with the platform team. Fix shape: persist the to-tag, have the adopter `unsubscribe` it before subscribing, and decide what an adopter should do when the previous owner is partitioned rather than dead (`mss_registry_lost_total` is the signal) | `session_store.rs`, `registry_keeper.rs`, `tap_plane.rs` | medium — every pod restart during a call leaks one tap |
+| ~~D14~~ | ~~**A dead pod's rtpengine subscription is never torn down.**~~ — **fixed 2026-08-23 (item 25)**: `PersistedSession` now carries the tap's `to-tag` (`subscription_tag`, `serde(default)` so older records still decode), the adopter sends NG `unsubscribe` for it **before** re-subscribing (after winning the atomic claim), and a pod that loses its lease destroys the session locally so a partitioned-but-alive owner unsubscribes its own tap instead of double-tapping. `upsert` also stopped rewriting the lease key unconditionally (now `SET NX`) — it had made a lease unloseable, so the partitioned case could never be detected. New counters `mss_registry_orphans_unsubscribed_total`, `mss_registry_orphans_still_subscribed_total`, `mss_registry_surrendered_total`. **Verified in unit tests, against a fake rtpengine socket (the `unsubscribe` bytes) and against the lab's real Redis — not re-measured on a live pod kill**; the residual is that a refused `unsubscribe` still leaks one tap, counted rather than retried | `session_store.rs`, `registry_keeper.rs`, `tap_plane.rs` | closed |
 | D16 | **A recording group is one pod's memory.** `TapPlane` holds the group, so every member of a conference recording must attach to the same pod: there is no placement that guarantees it (D8), a member whose session is adopted elsewhere is **refused** rather than restored (`grouped_not_adopted`, so the participant's file simply ends at the pod that died — the D9 shape per participant), and a group name reused on a second pod silently produces a second half-recording under the same prefix. Fix shape: schedule a group's sessions onto one pod, or move the group into shared storage so any pod can serve a member | `tap_plane.rs`, `registry_keeper.rs` | medium once a tenant records conferences across pods |
 | D13 | `StreamStart` (and the Twilio `start` frame's `tracks`) advertises `["customer","agent"]` for `TrackSelector::All`, but a silent `mixed` track is delivered too, at the full frame rate: a consumer must tolerate an unannounced track and pays 50% extra bandwidth for silence. Fixing it means either naming `mixed` in the start frame or not carrying it under `All` — the latter touches the frozen Twilio surface | `stream.rs`, `tap_plane.rs`, `hub.rs` | low for correctness, medium for cost |
 | D17 | **Leg labels invert when the caller's from-tag is not given.** With `from_tags` unspecified (`-`), `TapPlane` labels the two legs in the order rtpengine's `query` returns them, and in the two-node drill that put **FreeSWITCH's** tag first — so `customer` and `agent` were swapped in the recording and in the `tracks` a consumer sees. Speaker attribution is only trustworthy when the caller's from-tag is passed explicitly. Fix shape: refuse to name tracks by direction when no from-tag was supplied (label them `leg_a`/`leg_b`, or resolve the caller from the SIP call-id), rather than guessing an order | `tap_plane.rs` | medium — an ASR or a QA review reads the wrong speaker |
@@ -1247,7 +1293,8 @@ These are not code and have blocked since Phase 0:
    visit: `relayedpackets_kernel` vs `_user` and `media_kernel` vs
    `media_userspace` across baseline / taps-with-transcode /
    taps-without-transcode is the measurement, and architecture §8.1 has the
-   full read-only checklist. **Fix D14 first** or orphaned taps pollute it.
+   full read-only checklist. D14 is fixed (item 25), so a pod restart during the probe no longer
+   pollutes it — though the fix has not been re-measured live.
 3. **OpenSIPS → Redis call→node discovery** — **no longer a blocker
    (2026-08-17).** MSS now resolves a call's participants itself: the legacy controller passes
    the SIP call-id and the caller's from-tag (both already on the channel as
