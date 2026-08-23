@@ -3,7 +3,9 @@ use control_api::proto::{self};
 use control_api::telcompat::{RECORDER_LABEL, STREAM_LABEL};
 use control_api::telcompat_proto::tel_service_server::TelService;
 use control_api::telcompat_proto::{PlayAndGatherRequest, RecordRequest, StreamRequest};
-use control_api::{MediaPlane, MediaPlaneError, PlaybackSource, SessionController, TelCompat};
+use control_api::{
+    MediaPlane, MediaPlaneError, OpenedSession, PlaybackSource, SessionController, TelCompat,
+};
 use session_core::{AttachmentId, AttachmentView, PlaybackId, SessionId, SessionView};
 use std::sync::{Arc, Mutex};
 use tonic::{Code, Request};
@@ -18,8 +20,8 @@ struct FakeMedia {
 
 #[control_api::async_trait]
 impl MediaPlane for FakeMedia {
-    async fn open_session(&self, _session: SessionView) -> Result<(), MediaPlaneError> {
-        Ok(())
+    async fn open_session(&self, _session: SessionView) -> Result<OpenedSession, MediaPlaneError> {
+        Ok(OpenedSession::default())
     }
     async fn close_session(&self, _session: SessionId) -> Result<(), MediaPlaneError> {
         Ok(())

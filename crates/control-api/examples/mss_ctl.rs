@@ -4,6 +4,9 @@ use control_api::proto::media_control_client::MediaControlClient;
 const USAGE: &str = "\
 mss_ctl <endpoint> create <external-id> <call-id> <from-tag|-> [rtpengine-node]
    a from-tag of - lets MSS resolve the call's participants from rtpengine
+mss_ctl <endpoint> inline <external-id> <call-id> <sdp-offer-file>
+   creates an INLINE session: MSS binds an rtp socket, answers the offer and
+   prints the answer sdp for the caller to put in its SIP dialog
 mss_ctl <endpoint> describe <external-id>
 mss_ctl <endpoint> attach <external-id> <ws-url> [label] [authoritative]
 mss_ctl <endpoint> consume <external-id> [label] [track]
@@ -80,9 +83,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     rtpengine_node: args.get(5).cloned().unwrap_or_default(),
                     mix: false,
                     idempotency_key: String::new(),
+                    sdp_offer: String::new(),
                 })
                 .await
                 .map(|response| format!("{:?}", response.into_inner()))
+        }
+        "inline" => {
+            if args.len() < 5 {
+                eprintln!("{USAGE}");
+                std::process::exit(2);
+            }
+            let offer = std::fs::read_to_string(&args[4])?;
+            client
+                .create_session(proto::CreateSessionRequest {
+                    external_id: args[2].clone(),
+                    kind: proto::SessionKind::Inline as i32,
+                    call_id: args[3].clone(),
+                    from_tags: Vec::new(),
+                    rtpengine_node: String::new(),
+                    mix: false,
+                    idempotency_key: String::new(),
+                    sdp_offer: offer,
+                })
+                .await
+                .map(|response| response.into_inner().sdp_answer)
         }
         "describe" => client
             .describe_session(reference(&args[2]))

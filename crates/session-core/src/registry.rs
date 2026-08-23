@@ -78,6 +78,7 @@ pub struct CreateSession {
     pub call_id: String,
     pub from_tags: Vec<String>,
     pub rtpengine_node: String,
+    pub sdp_offer: Option<String>,
     pub idempotency_key: Option<String>,
 }
 
@@ -89,6 +90,7 @@ impl CreateSession {
         self.call_id.hash(&mut hasher);
         self.from_tags.hash(&mut hasher);
         self.rtpengine_node.hash(&mut hasher);
+        self.sdp_offer.hash(&mut hasher);
         hasher.finish()
     }
 }
@@ -163,6 +165,8 @@ pub struct SessionView {
     pub call_id: String,
     pub from_tags: Vec<String>,
     pub rtpengine_node: String,
+    pub sdp_offer: Option<String>,
+    pub sdp_answer: Option<String>,
     pub attachments: Vec<AttachmentId>,
     pub authoritative: Option<AttachmentId>,
 }
@@ -190,6 +194,8 @@ struct SessionRecord {
     call_id: String,
     from_tags: Vec<String>,
     rtpengine_node: String,
+    sdp_offer: Option<String>,
+    sdp_answer: Option<String>,
     attachments: Vec<AttachmentId>,
     authoritative: Option<AttachmentId>,
     next_seq: u64,
@@ -293,6 +299,8 @@ impl SessionRegistry {
                 call_id: request.call_id.clone(),
                 from_tags: request.from_tags.clone(),
                 rtpengine_node: request.rtpengine_node.clone(),
+                sdp_offer: request.sdp_offer.clone(),
+                sdp_answer: None,
                 attachments: Vec::new(),
                 authoritative: None,
                 next_seq: 0,
@@ -364,9 +372,24 @@ impl SessionRegistry {
             call_id: record.call_id.clone(),
             from_tags: record.from_tags.clone(),
             rtpengine_node: record.rtpengine_node.clone(),
+            sdp_offer: record.sdp_offer.clone(),
+            sdp_answer: record.sdp_answer.clone(),
             attachments: record.attachments.clone(),
             authoritative: record.authoritative,
         })
+    }
+
+    pub fn record_sdp_answer(
+        &mut self,
+        session: SessionId,
+        answer: String,
+    ) -> Result<SessionView, ControlError> {
+        let record = self
+            .sessions
+            .get_mut(&session)
+            .ok_or(ControlError::UnknownSession(session))?;
+        record.sdp_answer = Some(answer);
+        self.session_view(session)
     }
 
     pub fn attach(&mut self, spec: AttachSpec) -> Result<AttachmentView, ControlError> {
@@ -728,11 +751,11 @@ impl SessionRegistry {
         legacy_eligible: bool,
         kind: EventKind,
     ) {
-        let (external_id, seq) = match self.sessions.get_mut(&session) {
+        let (external_id, session_kind, seq) = match self.sessions.get_mut(&session) {
             Some(record) => {
                 let seq = record.next_seq;
                 record.next_seq += 1;
-                (record.external_id.clone(), seq)
+                (record.external_id.clone(), record.kind, seq)
             }
             None => return,
         };
@@ -743,6 +766,7 @@ impl SessionRegistry {
         self.outbox.push_back(MediaEvent {
             session,
             external_id,
+            session_kind,
             attachment,
             seq,
             legacy_eligible,
@@ -804,6 +828,7 @@ mod tests {
             call_id: "call-abc".to_string(),
             from_tags: vec!["from-a".to_string()],
             rtpengine_node: "rtpengine-1".to_string(),
+            sdp_offer: None,
             idempotency_key: None,
         }
     }
@@ -863,6 +888,78 @@ mod tests {
             track: Track::Customer,
             text: text.to_string(),
             confidence: 0.9,
+        }
+    }
+
+    #[test]
+    fn an_inline_session_remembers_the_offer_and_the_answer_it_was_given() {
+        let mut registry = SessionRegistry::new(DEFAULT_MAX_ATTACHMENTS);
+        let created = registry
+            .create_session(CreateSession {
+                kind: SessionKind::Inline,
+                sdp_offer: Some("v=0 offer".to_string()),
+                ..tap("req-inline")
+            })
+            .expect("an inline session");
+        assert_eq!(created.sdp_offer.as_deref(), Some("v=0 offer"));
+        assert_eq!(created.sdp_answer, None);
+
+        let answered = registry
+            .record_sdp_answer(created.id, "v=0 answer".to_string())
+            .expect("the answer is recorded");
+        assert_eq!(answered.sdp_answer.as_deref(), Some("v=0 answer"));
+        assert_eq!(
+            registry
+                .session_view(created.id)
+                .expect("the session")
+                .sdp_answer
+                .as_deref(),
+            Some("v=0 answer")
+        );
+    }
+
+    #[test]
+    fn an_offer_is_part_of_what_an_idempotency_key_replays() {
+        let mut registry = SessionRegistry::new(DEFAULT_MAX_ATTACHMENTS);
+        let inline = CreateSession {
+            kind: SessionKind::Inline,
+            sdp_offer: Some("v=0 first".to_string()),
+            idempotency_key: Some("key-1".to_string()),
+            ..tap("req-inline")
+        };
+        registry.create_session(inline.clone()).expect("created");
+        let replayed = registry.create_session(inline).expect("the same request");
+        assert_eq!(replayed.sdp_offer.as_deref(), Some("v=0 first"));
+        assert!(matches!(
+            registry.create_session(CreateSession {
+                sdp_offer: Some("v=0 second".to_string()),
+                ..CreateSession {
+                    kind: SessionKind::Inline,
+                    idempotency_key: Some("key-1".to_string()),
+                    ..tap("req-inline")
+                }
+            }),
+            Err(ControlError::IdempotencyConflict(_))
+        ));
+    }
+
+    #[test]
+    fn every_event_names_the_kind_of_session_that_produced_it() {
+        let mut registry = SessionRegistry::new(DEFAULT_MAX_ATTACHMENTS);
+        let inline = registry
+            .create_session(CreateSession {
+                kind: SessionKind::Inline,
+                sdp_offer: Some("v=0 offer".to_string()),
+                ..tap("req-inline")
+            })
+            .expect("an inline session");
+        registry
+            .destroy_session(inline.id, "hangup")
+            .expect("destroyed");
+        let events = registry.drain_events();
+        assert!(!events.is_empty());
+        for event in events {
+            assert_eq!(event.session_kind, SessionKind::Inline);
         }
     }
 

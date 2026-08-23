@@ -199,9 +199,11 @@ pub fn event_from_bytes(bytes: &[u8]) -> Result<proto::MediaEvent, String> {
 
 pub fn event_wire(event: MediaEvent) -> proto::MediaEvent {
     let legacy_eligible = event.legacy_eligible;
+    let session_kind = session_kind_wire(event.session_kind);
     proto::MediaEvent {
         session_id: event.session.to_string(),
         external_id: event.external_id,
+        session_kind,
         attachment_id: event
             .attachment
             .map(|id| id.to_string())

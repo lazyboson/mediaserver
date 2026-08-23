@@ -27,6 +27,7 @@ pub struct KeeperCounters {
     pub released: AtomicU64,
     pub failed: AtomicU64,
     pub grouped_not_adopted: AtomicU64,
+    pub inline_not_adopted: AtomicU64,
     pub orphans_unsubscribed: AtomicU64,
     pub orphans_still_subscribed: AtomicU64,
     pub surrendered: AtomicU64,
@@ -217,6 +218,19 @@ impl RegistryKeeper {
             if self.controller.holds_external_id(&session.external_id) {
                 continue;
             }
+            if session.is_inline() {
+                self.counters
+                    .inline_not_adopted
+                    .fetch_add(1, Ordering::Relaxed);
+                warn!(
+                    external_id = %session.external_id,
+                    "an inline leg is an rtp endpoint on the pod that answered its offer, so \
+                     no other pod can adopt it: the peer is sending to a socket that died. \
+                     Releasing it; recovery is call control's job, not the registry's"
+                );
+                let _ = self.store.forget(&session.external_id).await;
+                continue;
+            }
             if !session.is_rebuildable() {
                 self.counters.unrebuildable.fetch_add(1, Ordering::Relaxed);
                 warn!(
@@ -318,6 +332,7 @@ impl RegistryKeeper {
                 rtpengine_node: session.rtpengine_node.clone(),
                 mix: false,
                 idempotency_key: format!("adopt-{}", session.external_id),
+                sdp_offer: String::new(),
             }))
             .await?;
 
@@ -526,13 +541,16 @@ mod tests {
 
     #[control_api::async_trait]
     impl MediaPlane for RecordingPlane {
-        async fn open_session(&self, session: SessionView) -> Result<(), MediaPlaneError> {
+        async fn open_session(
+            &self,
+            session: SessionView,
+        ) -> Result<control_api::OpenedSession, MediaPlaneError> {
             self.opened.lock().unwrap().push(session.call_id.clone());
             self.journal
                 .lock()
                 .unwrap()
                 .push(format!("subscribe {}", session.call_id));
-            Ok(())
+            Ok(control_api::OpenedSession::default())
         }
         async fn close_session(&self, _session: SessionId) -> Result<(), MediaPlaneError> {
             Ok(())
@@ -612,6 +630,7 @@ mod tests {
                 rtpengine_node: "10.0.0.5:22222".to_string(),
                 mix: false,
                 idempotency_key: String::new(),
+                sdp_offer: String::new(),
             }))
             .await
             .unwrap();
@@ -957,6 +976,7 @@ mod tests {
                 rtpengine_node: String::new(),
                 mix: false,
                 idempotency_key: String::new(),
+                sdp_offer: String::new(),
             }))
             .await
             .unwrap();
@@ -974,6 +994,47 @@ mod tests {
         assert!(
             store.stored().is_empty(),
             "an unrebuildable session must not linger and be re-adopted forever"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_orphaned_inline_leg_is_released_rather_than_adopted() {
+        let store = Arc::new(MemorySessionStore::default());
+        let (first_pod, _) = pod("pod-a");
+        first_pod
+            .create_session(Request::new(proto::CreateSessionRequest {
+                external_id: "req-inline".to_string(),
+                kind: proto::SessionKind::Inline as i32,
+                call_id: "call-inline".to_string(),
+                from_tags: vec!["from-a".to_string()],
+                rtpengine_node: String::new(),
+                mix: false,
+                idempotency_key: String::new(),
+                sdp_offer: "v=0\r\nc=IN IP4 10.9.0.4\r\nm=audio 41000 RTP/AVP 0\r\n".to_string(),
+            }))
+            .await
+            .unwrap();
+        RegistryKeeper::new(first_pod, store.clone(), "pod-a")
+            .tick()
+            .await;
+        store.expire_lease("req-inline");
+
+        let (second_pod, second_plane) = pod("pod-b");
+        let keeper = RegistryKeeper::new(second_pod.clone(), store.clone(), "pod-b");
+        keeper.tick().await;
+
+        assert_eq!(
+            keeper.counters().inline_not_adopted.load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(keeper.counters().adopted.load(Ordering::Relaxed), 0);
+        assert!(
+            second_plane.opened.lock().unwrap().is_empty(),
+            "an inline leg's peer is sending to a socket on the pod that died"
+        );
+        assert!(
+            store.stored().is_empty(),
+            "an inline leg that cannot be adopted must not be re-claimed forever"
         );
     }
 

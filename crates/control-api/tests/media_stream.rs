@@ -2,8 +2,8 @@ use control_api::proto::media_control_client::MediaControlClient;
 use control_api::proto::media_stream_client::MediaStreamClient;
 use control_api::proto::{self, consumer_to_server, server_to_consumer};
 use control_api::{
-    serve_authenticated_until, AuthPolicy, MediaPlane, MediaPlaneError, PlaybackSource,
-    SessionController, StreamFrame,
+    serve_authenticated_until, AuthPolicy, MediaPlane, MediaPlaneError, OpenedSession,
+    PlaybackSource, SessionController, StreamFrame,
 };
 use session_core::{AttachmentId, PlaybackId, SessionId};
 use std::sync::{Arc, Mutex};
@@ -26,8 +26,8 @@ impl MediaPlane for FakePlane {
     async fn open_session(
         &self,
         _session: session_core::SessionView,
-    ) -> Result<(), MediaPlaneError> {
-        Ok(())
+    ) -> Result<OpenedSession, MediaPlaneError> {
+        Ok(OpenedSession::default())
     }
 
     async fn close_session(&self, _session: SessionId) -> Result<(), MediaPlaneError> {
@@ -149,6 +149,7 @@ async fn session_with_grpc_attachment(
         rtpengine_node: "rtpengine-1".to_string(),
         mix: false,
         idempotency_key: String::new(),
+        sdp_offer: String::new(),
     });
     if let Some(token) = bearer {
         create
@@ -509,6 +510,7 @@ async fn the_shared_secret_guards_media_control_and_the_consumer_hello() {
             rtpengine_node: String::new(),
             mix: false,
             idempotency_key: String::new(),
+            sdp_offer: String::new(),
         })
         .await
         .unwrap_err();

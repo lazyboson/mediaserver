@@ -1,4 +1,5 @@
 use crate::hub::{Hub, TapEvent};
+use crate::inline_leg::InlineEgress;
 use crate::supervisor::{AudioFlowWatchdog, SessionHealth};
 use crossbeam_queue::ArrayQueue;
 use media_core::jitter;
@@ -566,7 +567,18 @@ fn settle_by_elimination(legs: &mut [TapLeg]) {
 
 pub fn capture(
     legs: &mut [TapLeg],
+    hub: Option<&mut Hub>,
+    format: AudioFormat,
+    max_capture: Duration,
+    stop: &AtomicBool,
+) -> CaptureSummary {
+    capture_with_egress(legs, hub, None, format, max_capture, stop)
+}
+
+pub fn capture_with_egress(
+    legs: &mut [TapLeg],
     mut hub: Option<&mut Hub>,
+    mut egress: Option<&mut InlineEgress>,
     format: AudioFormat,
     max_capture: Duration,
     stop: &AtomicBool,
@@ -590,6 +602,9 @@ pub fn capture(
         settle_by_elimination(legs);
 
         let now = Instant::now();
+        if let Some(egress) = egress.as_deref_mut() {
+            egress.pump(now);
+        }
         if now >= next_release {
             for leg in legs.iter_mut() {
                 leg.release_frame(hub.as_deref_mut());

@@ -593,6 +593,42 @@ That is what makes `offered_format` in `rtpengine-ng` a safe question to ask.
   G.722) is **skipped, not guessed**, and if nothing is left the error names
   every offered type.
 
+#### The inline leg's offer/answer (item 33, 2026-08-23)
+
+`InlineOffer` / `InlineAnswer` live in this same module, and the reason is a
+dependency direction, not laziness. This file is already a plain sans-IO SDP
+implementation whose only dependency is `media-core`; the alternative home
+(`media-core/src/sdp.rs`) would have duplicated the line splitter, the rtpmap
+parser and the codec-negotiation types, because `media-core` cannot depend on
+`rtpengine-ng`. The crate's *name* is now narrower than this module — if a third
+SDP dialect ever appears, split the module into its own crate rather than
+copying it. Nothing in `InlineOffer` talks to rtpengine.
+
+- `InlineOffer::parse(sdp, ptime_fallback_ms)` reuses `SubscriptionOffer::parse`
+  and then enforces what an inline leg needs: **exactly one** `m=audio`
+  (`InlineStreamCount`), a non-zero port (`NoPeerPort` — port 0 is held media),
+  an address from the media- or session-level `c=` (`NoPeerAddress`), a codec
+  the leg can both hear *and speak*, and a paceable ptime (`UnusablePtime`,
+  capped at `MAX_INLINE_PTIME_MS` = 120).
+- `negotiate_inline` walks the offer's payload types **in the offer's own
+  order** and takes the first PCMU or PCMA (`INLINE_CODECS`). Opus is refused
+  even though the tap path decodes it: `ConsumerEncoder` has no Opus *encoder*,
+  so an Opus inline leg could listen and never speak. Refusal names what was
+  offered — `NoInlineCodecOffered(vec!["opus", "G722", …])`, from the rtpmaps
+  when present, from the static table otherwise, and `payload type 9` when
+  neither knows it.
+- The answer is one `m=audio <our port> RTP/AVP <pt> [te]`, the chosen rtpmap,
+  the offer's own telephone-event payload type with `a=fmtp:<te> 0-15`, the
+  ptime, and `a=sendrecv`. It deliberately does **not** echo the offer's other
+  payload types — the opposite of the subscription answer above, where echoing
+  everything is what makes rtpengine transcode. Here MSS *is* the endpoint, so
+  the answer is a narrowing, and an offer whose only codecs we refuse never
+  gets an answer at all.
+- The answer bytes are pinned by a test, and a second test re-parses our own
+  answer with `InlineOffer::parse` — the cheapest available proof that what we
+  emit is legal SDP by our own reading of it. No real SIP peer has parsed it
+  yet (item 33 is replay + fake socket only).
+
 ## crates/protocol — frozen wire contracts
 - `twilio.rs` and `fork_events.rs` serialization tests are the contract
   (Constitution VII). Do not change shapes; add new versioned surfaces.
@@ -1005,6 +1041,19 @@ worth knowing:
   anyway and `orphans_still_subscribed` counts the leak, because a re-tapped
   call with a leaked copy is strictly better than a call nobody taps.
 
+**An inline leg is not adoptable, and the registry refuses honestly (item 33,
+2026-08-23).** A tap is re-creatable from any pod because MSS *asks* rtpengine
+for the copy — that is the HA advantage architecture §7 claims for pull-initiated
+taps, and this is where its limit is written down. An inline leg **is** the RTP
+destination: the peer is sending to an ip:port on the pod that answered the
+offer, and no other pod can inherit that socket or that SDP. So
+`PersistedSession::is_rebuildable()` returns false for `kind == INLINE`, and
+`adopt_orphans` checks `is_inline()` *before* the unsubscribe/rebuild path,
+releases the record, counts `mss_registry_inline_not_adopted_total` and logs that
+recovery belongs to call control (a re-INVITE to a live pod), not to the
+registry. The SDP is deliberately not persisted: storing it would invite exactly
+the dishonest rebuild this check exists to prevent.
+
 **Losing the lease is fatal for the session (the partitioned-owner half).**
 A pod whose `renew` returns `false` now destroys the session locally through
 its own `DestroySession` — which closes the tap, and `close_session` already
@@ -1280,6 +1329,44 @@ callers only know the channel uuid — the OpenSIPS→Redis discovery map (M2, o
 is what resolves those, and until it exists a TelCompat-created session cannot
 actually tap.
 
+### inline_leg.rs — the egress pump (item 33, Phase 3, 2026-08-23)
+
+The socket half of `pacer.rs`, and the only place in the daemon where the media
+thread *sends*. Two objects with a deliberate split:
+
+- `InlineEgress` lives on the capture thread. It owns a `try_clone`d handle of
+  the leg's receive socket — so MSS sends **from the port it answered on**,
+  which is what symmetric-RTP peers and NAT expect — plus the `PlayoutPacer`
+  and the consumer end of the queue. `pump(now)` is called from
+  `capture_with_egress` on every loop iteration (roughly every ptime/4): it
+  honours a pending flush, tops the pacer up, and calls `tick`, which self-paces
+  and returns at most one datagram per ptime. `send_to` on a non-blocking socket
+  cannot stall the media thread; a refusal counts `send_errors`.
+- `InlineEgressHandle` is the control-world side: `push(Vec<i16>) -> bool` into
+  a bounded `crossbeam_queue::ArrayQueue` (the same shape `hub.rs`'s inject path
+  already uses) and `clear()`, which sets an `AtomicBool` the media thread
+  swaps. Nothing in the control world can block the media world and nothing in
+  the media world waits on a lock.
+
+Sizing rule worth keeping: the **ArrayQueue is the buffer** (64 chunks; a
+`StartPlayback` chunks at 100 ms, so ≈ 6.4 s) and the **pacer ring is only a
+prebuffer** — `pump` stops popping once the pacer holds two frames. Without
+that rule a 5 s prompt pushed at once would overflow the pacer's 500 ms ring
+and be dropped oldest-first, i.e. the caller would hear the *end* of the prompt.
+A push into a full queue is refused and counted rather than dropped silently.
+
+Counters are published through `InlineEgressShared` (atomics, relaxed) and
+summed into `IngestSnapshot.inline` by `TapPlaneMetrics`, which is how
+`mss_inline_egress_*` reach Prometheus — including `late_ticks`, the metric
+`pacer.rs` asked for when it was written. Deallocation of the popped `Vec`
+still happens on the media thread; that is the pre-existing hub-inject shape,
+and the honest residual until a sample-ring handoff replaces both.
+
+`egress_ssrc(session, salt)` derives a non-zero SSRC (and the initial sequence
+and timestamp) from the session id and the pod's SDP session id rather than
+adding an RNG dependency; distinctness across sessions and pods is what matters,
+not unpredictability, and a test pins that plus never-zero.
+
 ### tap_plane.rs — the control plane's hands in the media world
 
 `TapPlane` implements `control_api::MediaPlane` over the machinery the
@@ -1438,6 +1525,40 @@ into something that actually taps calls.
   because rtpengine's `stop media` targets a participant, not a playback id;
   `close_attachment` aborts the consumer task rather than closing the
   websocket politely.
+
+#### Inline sessions (item 33, 2026-08-23)
+
+`open_session` now dispatches on `SessionKind`: `Tap` keeps the whole
+subscribe/answer/capture path unchanged as `open_tap_session`, `Inline` runs
+`open_inline_session`, `Mix` is refused naming Phase 4. The trait signature
+changed with it — `MediaPlane::open_session` returns `OpenedSession { sdp_answer
+}` instead of `()`, which is how the answer reaches `CreateSession`'s response
+without a second RPC or a side channel.
+
+What an inline session shares with a tap, deliberately: one `TapLeg`, one
+`StreamPipeline`, one `Hub`, one capture thread. The peer is
+`Track::Customer`, so consumers, recorders, recording groups, DTMF observation
+and the metrics that were built for taps all work on an inline leg with no new
+code. What differs:
+
+- `LiveSession.transport` is now `Option<Arc<NgTransport>>` — an inline leg has
+  no rtpengine subscription at all. `session_handles` returns it as an option
+  (as the named `SessionHandles` struct, since the tuple had grown past what
+  clippy tolerates) and `require_subscription` turns `None` into an error that
+  says why. `close_session` skips the `unsubscribe`.
+- **`StartPlayback` is a local mix-in.** `play_into_inline_leg` decodes the wav
+  (16-bit mono at the negotiated rate; anything else refused naming the
+  mismatch, since resampling a prompt is the caller's decision) and queues it in
+  100 ms chunks, refusing the *whole* playback up front if the queue has no room
+  rather than playing a truncated prompt. The 60 KB NG-datagram cap moved into
+  `ng_play_source`, where it belongs — it is a property of rtpengine's control
+  protocol, not of audio.
+- **`StopPlayback` on an inline leg flushes the egress queue** and returns.
+  That is the barge seam end to end: `Clear` → queue emptied → `pacer.clear()`
+  → the next tick is a silence frame. P3-4 measures it; the construction
+  already bounds it at one ptime.
+- The answer is not persisted. See `session_store.rs` on why an inline session
+  is not adoptable.
 
 ### main.rs — how the daemon chooses what to be
 
