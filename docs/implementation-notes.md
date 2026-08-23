@@ -937,6 +937,20 @@ GC pause, a frozen host) drops a call it could still have served. It is the
 right side to err on — the adopter has already re-established that tap, and
 the alternative is the D14 cost forever.
 
+**What a rebuilt attachment restores (D15, fixed 2026-08-23).** The replayed
+`AttachRequest` carries the attachment's **negotiated format**, not `None`.
+`PersistedAttachment.format` is an `Option<PersistedFormat>` — encoding as the
+`proto.Encoding` number plus `sample_rate_hz` / `channels` / `ptime_ms`, the
+same wire shape `kind`, `transport` and `capabilities` are already persisted
+in, deliberately, so there is no second encoding table to drift from the
+proto. `#[serde(default)]` makes a record written before the field existed
+decode to `None`, and `None` is read by `convert::format` as
+`AudioFormat::pcmu_8k_20ms()` — which is what such a record meant anyway.
+Before this, an ASR consumer that attached as L16/16 kHz came back from an
+adoption as g711/8 kHz on the same stream: no error, just a wrong sample rate.
+Two things are **not** restored and stay listed under D16/D9: a recording
+group's membership, and a recording's buffered audio.
+
 **Two failure modes it refuses to paper over:**
 
 - A session with no call-id or from-tags **cannot be re-tapped**, so it is
