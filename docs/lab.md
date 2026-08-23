@@ -1874,3 +1874,97 @@ rtpengine `play media` round trip inside the same RPC (that RPC's own p50 was
 - An idle box, one session, one playback at a time, a single-broker Redpanda
   and no competing load. Under the soak suite these numbers should be
   re-taken.
+
+## inline_call_drill.sh — an inline leg with a real ear, and the barge-in number (2026-08-23)
+
+Items 32–34 built MSS's *mouth* — a socket that answers an SDP offer, a
+sans-IO pacer that speaks on a 20 ms grid, and an inject stream that keeps it
+fed — and none of it had met an endpoint. This drill is the endpoint, and it is
+also the instrument for the one number Phase 3 owed: how long after a consumer
+says *stop talking* does the caller stop hearing the bot.
+
+Three new pieces, no SIP and no human anywhere in it:
+
+- **`lab/inline_peer.py`** — the far end of one RTP flow, in the
+  `call_driver.py` style but with rtpengine removed, because an inline leg *is*
+  MSS's own socket. It writes its offer to `offer.sdp`, waits for the drill to
+  drop `answer.sdp` beside it, then sends 440 Hz µ-law at 50 pkt/s and records
+  every datagram MSS sends with its **arrival wall clock**, ssrc, sequence
+  number, rtp timestamp and the Goertzel energy of the injected tone *in that
+  one 20 ms payload*. It writes one ear wav per ssrc on the rtp-timestamp
+  timeline as well, for a human or `wav_summary.py`.
+- **`lab/inline_consumer.py`** — the voice-AI half: it attaches itself with
+  `CAPABILITY_SINK | CAPABILITY_INJECT` (this is the lab's only INJECT actor;
+  `mss_ctl consume` asks for SINK+EVENTS), streams 1000 Hz as continuous
+  `inject` frames keeping `LEAD_MS` of audio queued, exercises `Mark`, then
+  runs N rounds of *talk 1.5 s, send `Clear`*, stamping each `Clear`.
+- **`lab/inline_barge_report.py`** — reads both timelines and asserts pacing,
+  the ear, the tap, the mark, and prints the cut-through distribution.
+
+Both python actors run as **containers on the lab network**, which is not a
+detail: the barge number is a difference between a stamp taken in the consumer
+and a stamp taken in the peer, and under Docker Desktop on WSL2 a host process
+and a container process do not share a clock. Two containers do — same kernel —
+so no skew estimate is needed and none is claimed.
+
+### The run (stamp 1787508102, 20 iterations)
+
+| What | Measured |
+| --- | --- |
+| SDP answer | `c=IN IP4 172.31.99.31`, `m=audio 39974 RTP/AVP 0 101` (PCMU + telephone-event) |
+| egress pacing at the ear | **50.19 pkt/s** over 66.0 s, **0** sequence breaks, rtp timestamp step 160 for all 3311 gaps |
+| the injected tone arrived | 1710/3312 packets above the floor, peak Goertzel **11910** of a theoretical 12000 (a clean 1000 Hz sine) |
+| the tap still worked | 2770 frames of the peer's own audio to the same consumer, peak rms 17132, peak 440 Hz energy 12213 |
+| `Mark` drain barrier | acked at **410 / 404 / 404 ms** against 400 ms of queued audio |
+| **barge-in cut-through** | n=20, **p50 12.2 ms, p95 20.4 ms, max 21.0 ms**, min 2.4 ms |
+| pod counters | `clears_total` 20, `drained_samples_total` == `pushed_samples_total`, `late_ticks_total` 0, `dropped_samples_total` 0, `send_errors_total` 0 |
+
+The cut-through distribution is the interesting part, and it is exactly the
+shape the design predicts: `Clear` flushes the chunk queue *and* the pacer ring,
+so the only thing left between the flush and silence at the ear is the wait for
+the pacer's next 20 ms deadline. That wait is uniform over one ptime, which is
+why the samples spread almost evenly from 2.4 ms to 21.0 ms with a p50 near half
+a frame. **The target was one ptime and the max is one ptime plus a millisecond
+of transport.**
+
+### Two ways the first attempt lied, and the fixes
+
+- **A phase-locked measurement.** The first run reported p50 12.6 / p95 15.3 /
+  max 16.0 ms with the per-iteration numbers decreasing monotonically — 16.0,
+  15.3, 14.5 … 9.8. Nothing was drifting: the iteration period was
+  1.5 s + 1.0 s = exactly **125 packets**, so every `Clear` landed at nearly the
+  same phase of the pacer's 20 ms grid and the run sampled a quarter of the
+  distribution. `JITTER_MS` (default 20) now adds up to one frame of random
+  delay per iteration, and the p95 moved from 15.3 to 20.4 ms — the tighter
+  number was the wrong one.
+- **A real defect in the mark ack (fixed here).** The first run's `Mark` was
+  acked **8221 ms** after it was sent, while the ear went quiet 400 ms after it,
+  exactly on time — so the audio drained correctly and only the *ack* was late.
+  Cause: both stream loops built the 20 ms drain poll as
+  `tokio::time::sleep(...)` *inside* `tokio::select!`, so the timer was
+  recreated — and therefore reset — on every loop iteration. With tapped frames
+  arriving every 20 ms and `select!` choosing randomly among ready branches, the
+  sleep was cancelled before it ever completed; the ack waited for a lucky gap.
+  Fixed by pinning one `tokio::time::interval` outside the loop and gating the
+  branch on `if marks_pending` (`stream.rs`, `consumer_ws.rs`); the ack is now
+  403–410 ms against a 400 ms lead, i.e. accurate to one frame as documented.
+  The lesson is general: **a `sleep` inside `select!` is a timeout, not a
+  timer**, and it starves under any branch that fires more often.
+
+### What this does not prove
+
+- **One PCMU/8 kHz leg, one INJECT consumer, on an idle box.** No PCMA leg, no
+  L16 consumer, no Opus (an inline leg cannot do Opus at all — there is no
+  encoder), no impairment, no competing load, no second inline leg.
+- **No SIP.** The offer/answer travels through two files and `mss_ctl inline`;
+  a real B2B leg brings re-INVITEs, hold, and DTMF, none of which is exercised.
+- **The consumer's own detection latency is still not in the number** — the
+  same honest boundary `barge_drill.sh` draws. This drill measures
+  `Clear`→silence; item 5 measures speech-report→`StopPlayback`. Adding them is
+  the closest MSS gets to an end-to-end barge-in claim, and the ASR's decision
+  time belongs to whoever ships the ASR.
+- **The cut-through is an arrival measurement**, so it *includes* the gRPC hop,
+  the 5 ms pump tick, and the lab bridge. It is an upper bound on MSS's own
+  cost, never a lower one.
+- The peer's ear was checked by Goertzel and rms, **not by a human listening**
+  to `peer_ear_*.wav`.

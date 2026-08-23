@@ -146,18 +146,15 @@ pub async fn run(
     };
     writer.send(encode(&start, "start")?).await?;
 
+    let mut mark_poll = tokio::time::interval(MARK_POLL_INTERVAL);
+    mark_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
     loop {
         let marks_pending = inline
             .as_ref()
             .is_some_and(|inject| !inject.pending.is_empty());
         tokio::select! {
-            _ = async {
-                if marks_pending {
-                    tokio::time::sleep(MARK_POLL_INTERVAL).await
-                } else {
-                    std::future::pending::<()>().await
-                }
-            } => {
+            _ = mark_poll.tick(), if marks_pending => {
                 let acked = match inline.as_mut() {
                     Some(inject) => inject.drained(),
                     None => Vec::new(),
