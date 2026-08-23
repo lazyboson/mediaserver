@@ -202,6 +202,11 @@ pub fn render(sources: &MetricsSources) -> String {
         snapshot.conference.reanchors,
     );
     counter(
+        "mss_conference_route_changes_total",
+        "Times an injecting attachment was routed to a whisper target, to everyone, or back to private",
+        snapshot.conference.route_changes,
+    );
+    counter(
         "mss_conference_frames_refused_total",
         "Frames the mix matrix refused, by frame size or a stale membership handle",
         snapshot.conference.frames_refused,
@@ -357,6 +362,11 @@ pub fn render(sources: &MetricsSources) -> String {
         "mss_conference_members_live",
         "Inline legs seated in a conference on this pod",
         snapshot.conference_members_live,
+    );
+    gauge(
+        "mss_conference_whispers_live",
+        "Conference legs whose injected audio is routed somewhere other than their own ear",
+        snapshot.conference_whispers_live,
     );
     gauge(
         "mss_consumers_live",

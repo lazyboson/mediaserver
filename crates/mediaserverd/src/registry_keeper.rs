@@ -387,6 +387,7 @@ impl RegistryKeeper {
                         selector: None,
                         format: None,
                         idempotency_key: String::new(),
+                        metadata: std::collections::HashMap::new(),
                     }))
                     .await?;
             }

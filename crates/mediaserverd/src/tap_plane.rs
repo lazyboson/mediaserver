@@ -30,6 +30,7 @@ use rtpengine_ng::{
     InlineOffer, NegotiatedCodec, PlayMedia, PlaySource, PlayTarget, SdpError, SubscribeRequest,
     SubscriptionAnswer, SubscriptionOffer,
 };
+use session_core::mix::MixRoute;
 use session_core::{
     AttachmentId, AttachmentView, Capabilities, Observation, SessionId, SessionKind, SessionView,
     TrackSelector, Transport,
@@ -91,6 +92,7 @@ struct LiveSession {
     stop: Arc<AtomicBool>,
     capture: Option<std::thread::JoinHandle<()>>,
     conference: Option<String>,
+    mix_route: Option<AttachmentId>,
     speakers: Option<tokio::task::JoinHandle<()>>,
 }
 
@@ -246,6 +248,7 @@ pub struct IngestSnapshot {
     pub inline: InlineEgressTotals,
     pub conferences_live: u64,
     pub conference_members_live: u64,
+    pub conference_whispers_live: u64,
     pub conference: ConferenceTotals,
 }
 
@@ -378,6 +381,7 @@ impl TapPlaneMetrics {
         for conference in inner.conferences.values() {
             snapshot.conference.add_shared(conference);
             snapshot.conference_members_live += conference.members_live.load(Ordering::Relaxed);
+            snapshot.conference_whispers_live += conference.whispers_live.load(Ordering::Relaxed);
         }
         for legs in inner.legs.values() {
             for leg in legs {
@@ -1163,6 +1167,7 @@ impl TapPlane {
                 stop,
                 capture: Some(capture_thread),
                 conference: None,
+                mix_route: None,
                 speakers,
             },
         );
@@ -1250,6 +1255,7 @@ impl TapPlane {
                 format,
                 ConferenceMember {
                     session,
+                    external_id: view.external_id.clone(),
                     leg,
                     hub,
                     egress,
@@ -1273,6 +1279,7 @@ impl TapPlane {
                     stop,
                     capture: None,
                     conference,
+                    mix_route: None,
                     speakers: None,
                 },
             );
@@ -1375,6 +1382,7 @@ impl TapPlane {
                 stop,
                 capture: Some(capture_thread),
                 conference: None,
+                mix_route: None,
                 speakers: None,
             },
         );
@@ -1445,6 +1453,97 @@ impl TapPlane {
             info!(conference = %name, "the last leg left this conference; it is closed");
         }
         thread
+    }
+
+    fn conference_of(&self, session: SessionId) -> Result<String, MediaPlaneError> {
+        let held = self
+            .sessions
+            .lock()
+            .map_err(|_| MediaPlaneError("the session table is poisoned".to_string()))?;
+        let live = held
+            .get(&session)
+            .ok_or_else(|| MediaPlaneError(format!("{session} is not live on this pod")))?;
+        live.conference.clone().ok_or_else(|| {
+            MediaPlaneError(format!(
+                "{session} is not a conference leg, so its injected audio has no mix to \
+                 route into; seat the leg with create-session kind=inline group=<conference>"
+            ))
+        })
+    }
+
+    fn route_injection(
+        &self,
+        session: SessionId,
+        attachment: AttachmentId,
+        route: MixRoute,
+    ) -> Result<(), MediaPlaneError> {
+        let name = self.conference_of(session)?;
+        let target = route.target_name().to_string();
+        let monitor_audible = route.monitor_audible;
+        let private = route.is_private();
+        {
+            let mut held = self
+                .conferences
+                .lock()
+                .map_err(|_| MediaPlaneError("the conference table is poisoned".to_string()))?;
+            let conference = held.get_mut(&name).ok_or_else(|| {
+                MediaPlaneError(format!("conference {name} is not running on this pod"))
+            })?;
+            conference
+                .route(session, route)
+                .map_err(|error| MediaPlaneError(format!("conference {name}: {error}")))?;
+        }
+        if let Ok(mut held) = self.sessions.lock() {
+            if let Some(live) = held.get_mut(&session) {
+                live.mix_route = (!private).then_some(attachment);
+            }
+        }
+        info!(
+            %session,
+            %attachment,
+            conference = %name,
+            %target,
+            monitor_audible,
+            "an injecting attachment named where its audio lands in the mix"
+        );
+        Ok(())
+    }
+
+    fn revert_injection(&self, attachment: AttachmentId) {
+        let owner = match self.sessions.lock() {
+            Ok(mut held) => held
+                .iter_mut()
+                .find(|(_, live)| live.mix_route == Some(attachment))
+                .map(|(session, live)| {
+                    live.mix_route = None;
+                    (*session, live.conference.clone())
+                }),
+            Err(_) => None,
+        };
+        let Some((session, Some(name))) = owner else {
+            return;
+        };
+        let mut held = match self.conferences.lock() {
+            Ok(held) => held,
+            Err(_) => return,
+        };
+        if let Some(conference) = held.get_mut(&name) {
+            match conference.route(session, MixRoute::private()) {
+                Ok(()) => info!(
+                    %session,
+                    %attachment,
+                    conference = %name,
+                    "the whisperer detached, so this leg's injected audio is private again"
+                ),
+                Err(error) => warn!(
+                    %session,
+                    %attachment,
+                    conference = %name,
+                    %error,
+                    "the whisperer detached but its route could not be taken back"
+                ),
+            }
+        }
     }
 
     pub fn inline_egress(&self, session: SessionId) -> Option<InlineEgressHandle> {
@@ -1680,7 +1779,20 @@ impl MediaPlane for TapPlane {
                 view.transport, view.group
             )));
         }
-        match view.transport {
+        let route = MixRoute::from_metadata(&view.metadata)
+            .map_err(|error| MediaPlaneError(error.to_string()))?;
+        let routed = match &route {
+            Some(route) => {
+                route
+                    .authorize(view.capabilities)
+                    .map_err(|error| MediaPlaneError(error.to_string()))?;
+                self.route_injection(view.session, view.id, route.clone())?;
+                true
+            }
+            None => false,
+        };
+        let attachment = view.id;
+        let opened = match view.transport {
             Transport::WsTwilio => self.open_ws_attachment(view),
             Transport::GrpcStream => self.open_grpc_attachment(view),
             Transport::FileS3 => self.open_recording_attachment(view),
@@ -1688,7 +1800,11 @@ impl MediaPlane for TapPlane {
                 "{other} attachments are not served yet; ws-twilio, grpc-stream \
                  and file-s3 are"
             ))),
+        };
+        if opened.is_err() && routed {
+            self.revert_injection(attachment);
         }
+        opened
     }
 
     async fn update_attachment(&self, view: AttachmentView) -> Result<(), MediaPlaneError> {
@@ -1731,6 +1847,14 @@ impl MediaPlane for TapPlane {
                 }
             }
         };
+        if let Some(route) = MixRoute::from_metadata(&view.metadata)
+            .map_err(|error| MediaPlaneError(error.to_string()))?
+        {
+            route
+                .authorize(view.capabilities)
+                .map_err(|error| MediaPlaneError(error.to_string()))?;
+            self.route_injection(view.session, view.id, route)?;
+        }
         match applied {
             Applied::Recorder(true) => Ok(()),
             Applied::Recorder(false) => Err(MediaPlaneError(format!(
@@ -1761,6 +1885,7 @@ impl MediaPlane for TapPlane {
                 .map_err(|_| MediaPlaneError("the attachment table is poisoned".to_string()))?;
             held.remove(&attachment)
         };
+        self.revert_injection(attachment);
         if let Some(held) = live {
             self.end_attachment(attachment, held, "the attachment was detached")
                 .await;
@@ -2431,6 +2556,9 @@ fn speaker_track(index: usize) -> Track {
 mod tests {
     use super::*;
     use media_core::AudioFormat;
+    use session_core::mix::{
+        MIX_MONITOR_EXCLUDE, MIX_MONITOR_METADATA_KEY, MIX_TARGET_EVERYONE, MIX_TARGET_METADATA_KEY,
+    };
     use session_core::{Capabilities, PlaybackId};
     use std::collections::BTreeMap;
 
@@ -2889,6 +3017,375 @@ m=audio {peer_port} RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\na=ptime:{ptime_ms}\r\n"
             "the last leg out closes the conference"
         );
         assert_eq!(plane.live_sessions(), 0);
+    }
+
+    fn injecting_attachment(
+        session: SessionId,
+        id: u64,
+        metadata: &[(&str, &str)],
+    ) -> AttachmentView {
+        AttachmentView {
+            id: AttachmentId::from_raw(id),
+            session,
+            capabilities: Capabilities::SINK | Capabilities::INJECT,
+            metadata: metadata
+                .iter()
+                .map(|(key, value)| (key.to_string(), value.to_string()))
+                .collect(),
+            ..attachment(Transport::GrpcStream, "grpc-consumer")
+        }
+    }
+
+    fn inject(plane: &TapPlane, session: SessionId, level: i16, chunks: usize) {
+        let egress = plane
+            .inline_egress(session)
+            .expect("a conference leg has an egress to inject into");
+        for _ in 0..chunks {
+            assert!(
+                egress.push(vec![level; 800]),
+                "the egress queue takes the injected audio"
+            );
+        }
+    }
+
+    fn loudest_mixed(monitor: &mut Subscription) -> i16 {
+        let mut loudest = 0i16;
+        while let Some(event) = monitor.try_next() {
+            if let TapEvent::Media {
+                track: Track::Mixed,
+                len,
+                samples,
+                ..
+            } = event
+            {
+                loudest = loudest.max(samples[..len].iter().copied().max().unwrap_or(0));
+            }
+        }
+        loudest
+    }
+
+    const WHISPER_LEVEL: i16 = 8_000;
+    const HEARD: std::ops::RangeInclusive<i16> = 7_000..=9_500;
+    const SILENT: i16 = 300;
+
+    #[tokio::test]
+    async fn a_monitor_attachment_wants_the_mixed_track_only_and_hears_the_whole_conference() {
+        let plane = plane();
+        let mut alice = seat_peer(&plane, 1, "monitored").await;
+        let mut bob = seat_peer(&plane, 2, "monitored").await;
+        let mut carol = seat_peer(&plane, 3, "monitored").await;
+
+        let mut supervisor = injecting_attachment(alice.session, 7, &[]);
+        supervisor.capabilities = Capabilities::SINK;
+        supervisor.selector = TrackSelector::Only(Track::Mixed);
+        plane
+            .open_attachment(supervisor)
+            .await
+            .expect("a monitor is a consumer that selects the mixed track and injects nothing");
+
+        let SessionHandles { hub, .. } = plane
+            .session_handles(alice.session)
+            .expect("the conference leg is live here");
+        let mut monitor = hub
+            .attach(512, TrackSelection::Only(Track::Mixed))
+            .expect("the hub takes a monitor");
+        for _ in 0..10 {
+            alice.speak(1_000, 4);
+            bob.speak(2_000, 4);
+            carol.speak(4_000, 4);
+            tokio::time::sleep(Duration::from_millis(80)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let mixed = loudest_mixed(&mut monitor);
+        assert!(
+            (6_500..=7_500).contains(&mixed),
+            "a monitor hears every member, itself included: {mixed}"
+        );
+
+        for peer in [&alice, &bob, &carol] {
+            plane
+                .close_session(peer.session)
+                .await
+                .expect("a conference leg closes");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_whisper_reaches_its_target_and_the_mixed_track_and_nobody_else() {
+        let plane = plane();
+        let alice = seat_peer(&plane, 1, "supervision").await;
+        let bob = seat_peer(&plane, 2, "supervision").await;
+        let carol = seat_peer(&plane, 3, "supervision").await;
+        let SessionHandles { hub, .. } = plane
+            .session_handles(bob.session)
+            .expect("the conference leg is live here");
+        let mut monitor = hub
+            .attach(512, TrackSelection::Only(Track::Mixed))
+            .expect("the hub takes a monitor that wants the mix only");
+
+        plane
+            .open_attachment(injecting_attachment(
+                carol.session,
+                7,
+                &[(MIX_TARGET_METADATA_KEY, "req-2")],
+            ))
+            .await
+            .expect("an injecting attachment may name another member as its target");
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        assert_eq!(
+            plane.metrics().snapshot().conference_whispers_live,
+            1,
+            "one leg is whispering"
+        );
+
+        for peer in [&alice, &bob, &carol] {
+            peer.loudest_ear();
+        }
+        let _ = loudest_mixed(&mut monitor);
+        inject(&plane, carol.session, WHISPER_LEVEL, 4);
+        tokio::time::sleep(Duration::from_millis(700)).await;
+
+        let bob_ear = bob.loudest_ear();
+        let alice_ear = alice.loudest_ear();
+        let carol_ear = carol.loudest_ear();
+        let mixed = loudest_mixed(&mut monitor);
+        assert!(
+            HEARD.contains(&bob_ear),
+            "the named member hears the whisper: {bob_ear}"
+        );
+        assert!(
+            alice_ear < SILENT,
+            "nobody else in the conference hears it: alice {alice_ear}"
+        );
+        assert!(
+            carol_ear < SILENT,
+            "not even the leg it was injected on hears it: carol {carol_ear}"
+        );
+        assert!(
+            HEARD.contains(&mixed),
+            "the mixed track is the record of what was said in this conference: {mixed}"
+        );
+
+        plane
+            .update_attachment(injecting_attachment(
+                carol.session,
+                7,
+                &[
+                    (MIX_TARGET_METADATA_KEY, "req-2"),
+                    (MIX_MONITOR_METADATA_KEY, MIX_MONITOR_EXCLUDE),
+                ],
+            ))
+            .await
+            .expect("mix_monitor takes the whisper off the mixed track");
+        for peer in [&alice, &bob, &carol] {
+            peer.loudest_ear();
+        }
+        let _ = loudest_mixed(&mut monitor);
+        inject(&plane, carol.session, WHISPER_LEVEL, 4);
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        let bob_ear = bob.loudest_ear();
+        let mixed = loudest_mixed(&mut monitor);
+        assert!(
+            HEARD.contains(&bob_ear),
+            "the target still hears the whisper: {bob_ear}"
+        );
+        assert!(
+            mixed < SILENT,
+            "and the mixed track no longer carries it: {mixed}"
+        );
+
+        plane
+            .close_attachment(carol.session, AttachmentId::from_raw(7))
+            .await
+            .expect("the whisperer detaches");
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        assert_eq!(
+            plane.metrics().snapshot().conference_whispers_live,
+            0,
+            "the route went back to private when the whisperer detached"
+        );
+        for peer in [&alice, &bob, &carol] {
+            peer.loudest_ear();
+        }
+        inject(&plane, carol.session, WHISPER_LEVEL, 4);
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        let carol_ear = carol.loudest_ear();
+        let bob_ear = bob.loudest_ear();
+        assert!(
+            HEARD.contains(&carol_ear),
+            "injected audio is private playback again: carol {carol_ear}"
+        );
+        assert!(
+            bob_ear < SILENT,
+            "and the whisper target hears nothing more: bob {bob_ear}"
+        );
+
+        for peer in [&alice, &bob, &carol] {
+            plane
+                .close_session(peer.session)
+                .await
+                .expect("a conference leg closes");
+        }
+    }
+
+    #[tokio::test]
+    async fn flipping_the_target_to_all_turns_a_whisper_into_a_barge() {
+        let plane = plane();
+        let alice = seat_peer(&plane, 1, "barge").await;
+        let bob = seat_peer(&plane, 2, "barge").await;
+        let carol = seat_peer(&plane, 3, "barge").await;
+        plane
+            .open_attachment(injecting_attachment(
+                carol.session,
+                7,
+                &[(MIX_TARGET_METADATA_KEY, "req-2")],
+            ))
+            .await
+            .expect("the whisper is attached");
+        plane
+            .update_attachment(injecting_attachment(
+                carol.session,
+                7,
+                &[(MIX_TARGET_METADATA_KEY, MIX_TARGET_EVERYONE)],
+            ))
+            .await
+            .expect("update-attachment metadata is the barge verb");
+
+        for peer in [&alice, &bob, &carol] {
+            peer.loudest_ear();
+        }
+        inject(&plane, carol.session, WHISPER_LEVEL, 4);
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        for (name, ear) in [
+            ("alice", alice.loudest_ear()),
+            ("bob", bob.loudest_ear()),
+            ("carol", carol.loudest_ear()),
+        ] {
+            assert!(
+                HEARD.contains(&ear),
+                "a barge is heard by every listener: {name} {ear}"
+            );
+        }
+        assert!(plane.metrics().snapshot().conference.route_changes >= 2);
+
+        for peer in [&alice, &bob, &carol] {
+            plane
+                .close_session(peer.session)
+                .await
+                .expect("a conference leg closes");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_whisper_waits_for_a_target_that_joins_later_and_survives_the_join() {
+        let plane = plane();
+        let alice = seat_peer(&plane, 1, "handover").await;
+        let bob = seat_peer(&plane, 2, "handover").await;
+        let carol = seat_peer(&plane, 3, "handover").await;
+        plane
+            .open_attachment(injecting_attachment(
+                carol.session,
+                7,
+                &[(MIX_TARGET_METADATA_KEY, "req-4")],
+            ))
+            .await
+            .expect("a whisper may name a member who has not joined yet");
+
+        for peer in [&alice, &bob, &carol] {
+            peer.loudest_ear();
+        }
+        inject(&plane, carol.session, WHISPER_LEVEL, 4);
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        for (name, ear) in [
+            ("alice", alice.loudest_ear()),
+            ("bob", bob.loudest_ear()),
+            ("carol", carol.loudest_ear()),
+        ] {
+            assert!(
+                ear < SILENT,
+                "a whisper to nobody is inaudible, not broadcast: {name} {ear}"
+            );
+        }
+
+        let dave = seat_peer(&plane, 4, "handover").await;
+        for peer in [&alice, &bob, &carol, &dave] {
+            peer.loudest_ear();
+        }
+        inject(&plane, carol.session, WHISPER_LEVEL, 4);
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        let dave_ear = dave.loudest_ear();
+        assert!(
+            HEARD.contains(&dave_ear),
+            "the route resolved when its target joined: dave {dave_ear}"
+        );
+        for (name, ear) in [
+            ("alice", alice.loudest_ear()),
+            ("bob", bob.loudest_ear()),
+            ("carol", carol.loudest_ear()),
+        ] {
+            assert!(
+                ear < SILENT,
+                "and the join did not leak the whisper to anyone else: {name} {ear}"
+            );
+        }
+
+        for peer in [&alice, &bob, &carol, &dave] {
+            plane
+                .close_session(peer.session)
+                .await
+                .expect("a conference leg closes");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_mix_target_is_refused_without_inject_and_off_a_conference() {
+        let plane = plane();
+        let alice = seat_peer(&plane, 1, "refusals").await;
+        let mut listener =
+            injecting_attachment(alice.session, 7, &[(MIX_TARGET_METADATA_KEY, "req-1")]);
+        listener.capabilities = Capabilities::SINK;
+        let refused = plane
+            .open_attachment(listener)
+            .await
+            .expect_err("a sink-only attachment may not route injected audio");
+        assert!(
+            refused.to_string().contains("INJECT"),
+            "refused by name: {refused}"
+        );
+
+        let socket = UdpSocket::bind("127.0.0.1:0").expect("a fake peer socket");
+        let port = socket.local_addr().expect("peer address").port();
+        let two_party = SessionView {
+            id: SessionId::from_raw(9),
+            external_id: "req-9".to_string(),
+            sdp_offer: Some(inline_offer_sdp(port)),
+            ..session(SessionKind::Inline, "")
+        };
+        plane
+            .open_session(two_party)
+            .await
+            .expect("a plain inline leg answers");
+        let refused = plane
+            .open_attachment(injecting_attachment(
+                SessionId::from_raw(9),
+                8,
+                &[(MIX_TARGET_METADATA_KEY, "req-1")],
+            ))
+            .await
+            .expect_err("a leg that is in no conference has no mix to route into");
+        assert!(
+            refused.to_string().contains("not a conference leg"),
+            "refused by name: {refused}"
+        );
+
+        plane
+            .close_session(SessionId::from_raw(9))
+            .await
+            .expect("the inline leg closes");
+        plane
+            .close_session(alice.session)
+            .await
+            .expect("the conference leg closes");
     }
 
     #[tokio::test]

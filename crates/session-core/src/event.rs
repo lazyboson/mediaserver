@@ -103,6 +103,10 @@ pub enum EventKind {
     AttachmentUp {
         label: String,
     },
+    MixRouted {
+        target: String,
+        monitor_audible: bool,
+    },
     AttachmentDown {
         label: String,
         reason: String,
