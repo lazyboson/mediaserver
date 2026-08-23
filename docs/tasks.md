@@ -15,7 +15,7 @@ Status as of **2026-08-23**.
 | **M3 — fan-out hub** | per-session pub/sub, N consumers, WS-Twilio adapter, pause/resume/send_text parity | ✅ done |
 | **M4 — control plane** | `MediaControl` gRPC, session state machine, Kafka events, Redis registry, tenant-flag pilot | 🔶 **code complete** — pilot gates: translator merge (external), and the consumer half of the barge-in number — **every MSS-owned hop is measured (item 5, 2026-08-23: cut-through p95 4.8 ms from a real consumer `SpeechReport`)**, the D19 ingress gap it found being fixed in item 28. The gRPC lab proof (item 10) and the **live pod-kill drill (item 11, gap 14.41 s)** are both **done 2026-08-22**; the D14 orphan subscription the drill found is **fixed (item 25, 2026-08-23)**, fake- and Redis-verified rather than re-measured live |
 | **M5 — recording (Phase 2)** | per-leg taps → stereo segmenter → S3, identity + callback contract, dual-recording | 🔶 **code complete (2026-08-22)** — a live tapped call recorded end to end to a real MinIO, callbacks read off `mss.events` (2026-08-22, item 10's drill); **recording groups** — N sessions recorded as one recording, one mono object per participant, time-aligned on the group's open instant since item 29 — landed 2026-08-23 (item 21); FS byte-parity **measured against a real FS recording** 2026-08-23 (item 31): container/layout/rms exact, a re-aligned 2 s window agrees 1.0000 at mean diff 0.6/32768; owed: a two-party production-FS comparison and a human listen |
-| M6+ | Phases 3–4 (interactive media, full media plane) | 🔶 **Phase 3 code complete and lab-verified (items 32–35, 2026-08-23)** — an inline leg answers an SDP offer, is spoken to over a continuous inject stream, and barges in **p50 12.2 ms / p95 20.4 ms** measured against a real RTP peer. **Phase 4 in progress:** the N-way mix matrix (item 36) and **conferences of inline legs** (item 37, 2026-08-24 — one clock per conference, each leg hears everybody but itself, mixed track on the hub) and **monitor / whisper / barge as metadata-named matrix cells** (item 38, 2026-08-24 — `only=mixed` is the monitor, `mix_target=<member>|all` on an INJECT attachment is the whisper and the barge flip) are code complete and verified over in-process sockets; no real SIP peer has been in a conference yet (P4-6) |
+| M6+ | Phases 3–4 (interactive media, full media plane) | 🔶 **Phase 3 code complete and lab-verified (items 32–35, 2026-08-23)** — an inline leg answers an SDP offer, is spoken to over a continuous inject stream, and barges in **p50 12.2 ms / p95 20.4 ms** measured against a real RTP peer. **Phase 4 in progress:** the N-way mix matrix (item 36) and **conferences of inline legs** (item 37, 2026-08-24 — one clock per conference, each leg hears everybody but itself, mixed track on the hub) and **monitor / whisper / barge as metadata-named matrix cells** (item 38, 2026-08-24 — `only=mixed` is the monitor, `mix_target=<member>|all` on an INJECT attachment is the whisper and the barge flip) are code complete and verified over in-process sockets, as is **native conference recording** (item 39, 2026-08-24 — one mono object for the room via `only=mixed`, one object per participant via a recording group, both at once, the shape named in `RecordingStarted`); no real SIP peer has been in a conference yet (P4-6) |
 
 ### What landed, concretely
 
@@ -2080,6 +2080,79 @@ as P4-5's mute/deaf/hold and belongs there. (d) No real SIP peer has whispered
 yet: P4-6. (e) The reference deployment's monitor/whisper/barge RPC mapping is
 **not** here on purpose — it goes in P4-5's adapter parity table.
 
+### 39. Native conference recording — both shapes at once (Phase 4) — ✅ DONE (2026-08-24)
+
+A conference records two ways, and both may run on the same conference at the
+same time. Neither needed a new RPC, a new transport or a change to the frozen
+identity `${accountID}/${recordingID}.${format}`.
+
+**The room, as one object.** `Attach{transport=FILE_S3, selector.only="mixed",
+endpoint="<account>/<recording>.wav"}` on **any** member session records the
+whole conference as one **mono** object. The conference already publishes its
+full sum to every member's hub as `mixed` (item 37), so the recorder is an
+ordinary hub consumer of one track and `Layout::Mono(Track::Mixed)` renders it;
+pause excises the paused span from that single object, and a spilled segment
+(item 30) stays mono and stitches back in order.
+
+**Every participant, one object each.** A recording **group** over the member
+sessions with `selector.only="customer"` writes one mono object per member under
+`<account>/<recording>/<label>.wav`, time-aligned on the group's `opened_at`
+(item 29's anchor), so a member that joins after the recording started opens its
+file with silence back to t=0 rather than at its own join moment.
+
+**The clock was the one real defect.** A member's own audio is published on its
+hub with the **leg's** frame counter (0 at its join) while the mix was published
+with the **conference's** (0 at the conference's open). On any member that joined
+late the two tracks were therefore offset by the join delay — measured at
+**5120 samples (640 ms)** in the new test before the fix — which made a stereo
+`selector=all` object of a conference member ("me left, the room right")
+misaligned and any timestamp correlation across the two tracks wrong.
+`conference.rs` now stamps each member's `seated_at_frame` and publishes the mix
+to that member's hub on **that member's** clock. Mono shapes were unaffected
+(the segmenter anchors on the first timestamp it sees), so this is a fix for the
+stereo and correlation cases.
+
+**Decision — a recording group of the mixed track is refused on a conference.**
+Every member's `mixed` track carries the same audio, so a group of them would
+write N byte-identical objects under one prefix. `open_recording_attachment`
+refuses it by name and names the two supported shapes in the error. On a
+**non**-conference session `only=mixed` is still the injected/playback track and
+a group of those is legitimate, so the refusal is scoped to a session that is
+seated in a conference (`conference_of`).
+
+**Decision — the event names the shape.** `RecordingStarted` gained
+`string shape = 3` (additive, wire-compatible; next free field on that message
+is 4), emitted per object:
+`stereo` | `track` | `mixed` | `participant`, prefixed `conference-` when the
+session is a conference member. So `mss.events` distinguishes a room object
+(`conference-mixed`) from a participant object (`conference-participant`) from
+an ordinary two-party recording (`stereo`) without the consumer having to parse
+the object key or know the session's group. `RecordingShape::of(layout, grouped)
+.named(conferenced)` is the only place that string is built.
+
+**Verified** over in-process UDP sockets and replay, no live run: four new
+`recorder.rs` tests (a mixed-only object is mono, carries only the mix and keeps
+the frozen key; pause excises the room and leaves no gap; a spilled mixed
+segment stays mono and stitches; the shape vocabulary) and three new
+`tap_plane.rs` tests (one conference recording the room **and** three
+participants at once — the room object reads 6500–7600 for 1000+2000+4000 while
+each participant object reads only its own tone, and the late member's object
+opens with a pad and matches the others' length; the late member's own track and
+the room within 4 frames of each other in a stereo object; the grouped-mixed
+refusal). **The P4-6 conference drill is what will run this live** — the three
+container RTP peers it needs do not exist yet, so nothing here has been through
+a real SIP peer or MinIO.
+
+**Residuals.** (a) The room object is attached to **one member's** session, so
+it ends when that member leaves even though the conference lives on — D20.
+(b) D16 still applies: a recording group is one pod's memory, so every member of
+a per-participant conference recording must be on the same pod. (c) The room
+object's own t=0 is its attach moment; the shapes align with each other only if
+they are attached together (there is no conference-wide recording anchor).
+(d) No AGC: the room object clips exactly when the mix clips
+(`mss_conference_clipped_samples_total`).
+
+
 ## Open defects and soft spots
 
 | # | Item | Where | Severity |
@@ -2098,6 +2171,7 @@ yet: P4-6. (e) The reference deployment's monitor/whisper/barge RPC mapping is
 | ~~D12~~ | ~~**NG cookies repeat across sessions on one pod**: `CookieSequence` restarted its serial at 0 and `TapPlane` binds a new `NgTransport` per session, so every session's first command was `<prefix>-0`. Two sessions inside rtpengine's duplicate-cookie reply-cache window get the *same cached subscribe answer*, and the second tap receives **no media at all** while looking healthy~~ — **fixed 2026-08-22 (item 10)**: the serial is process-wide, unit-pinned and lab-proved before/after | `ng_transport.rs` | closed — was **high**, it silently broke every second tap within a minute |
 | ~~D15~~ | ~~An adopted attachment loses its **negotiated format**: `rebuild` passes `format: None`, so a consumer that attached as L16/16k comes back at the session default.~~ — **fixed 2026-08-23 (item 26)**: `PersistedAttachment.format` (`Option<PersistedFormat>`, `serde(default)`, the wire shape used for the other persisted enums) is written every keeper tick and replayed on adoption; a record without it still decodes and still means the default. Unit-tested (roundtrip, legacy record, an L16/16k gRPC consumer and a default WS consumer re-opened side by side on the adopting pod) and run against the lab's real Redis; **never observed live** — that needs a pod kill with a gRPC L16 consumer attached | `session_store.rs`, `registry_keeper.rs` | closed |
 | ~~D14~~ | ~~**A dead pod's rtpengine subscription is never torn down.**~~ — **fixed 2026-08-23 (item 25)**: `PersistedSession` now carries the tap's `to-tag` (`subscription_tag`, `serde(default)` so older records still decode), the adopter sends NG `unsubscribe` for it **before** re-subscribing (after winning the atomic claim), and a pod that loses its lease destroys the session locally so a partitioned-but-alive owner unsubscribes its own tap instead of double-tapping. `upsert` also stopped rewriting the lease key unconditionally (now `SET NX`) — it had made a lease unloseable, so the partitioned case could never be detected. New counters `mss_registry_orphans_unsubscribed_total`, `mss_registry_orphans_still_subscribed_total`, `mss_registry_surrendered_total`. **Verified in unit tests, against a fake rtpengine socket (the `unsubscribe` bytes) and against the lab's real Redis — not re-measured on a live pod kill**; the residual is that a refused `unsubscribe` still leaks one tap, counted rather than retried | `session_store.rs`, `registry_keeper.rs`, `tap_plane.rs` | closed |
+| D20 | **A room recording belongs to a member, not to the conference.** The mixed-track `FILE_S3` attachment hangs off one member session, so the object ends when *that* member leaves even though the conference keeps mixing — and its t=0 is its attach moment, not the conference's open, so it aligns with the per-participant objects only if both are attached together. Fix shape: a conference-scoped recording owner (an attachment on the conference rather than on a leg) with the conference's `opened_at` as its anchor | `tap_plane.rs`, `conference.rs` | medium once a tenant records conferences whose members come and go |
 | D16 | **A recording group is one pod's memory.** `TapPlane` holds the group, so every member of a conference recording must attach to the same pod: there is no placement that guarantees it (D8), a member whose session is adopted elsewhere is **refused** rather than restored (`grouped_not_adopted`, so the participant's file simply ends at the pod that died — the D9 shape per participant), and a group name reused on a second pod silently produces a second half-recording under the same prefix. Fix shape: schedule a group's sessions onto one pod, or move the group into shared storage so any pod can serve a member | `tap_plane.rs`, `registry_keeper.rs` | medium once a tenant records conferences across pods |
 | ~~D13~~ | ~~`StreamStart` (and the Twilio `start` frame's `tracks`) advertises `["customer","agent"]` for `TrackSelector::All`, but a silent `mixed` track is delivered too~~ — **fixed 2026-08-23 (item 27)**: the hub selection split into `All` (every track, including `mixed`) and `Speakers` (customer + agent). Consumers get `Speakers`, so delivery matches the advertisement exactly; the **recorder keeps `All`** because injected bot speech belongs in the recording. The frozen Twilio start frame and `StreamStart.tracks` were not touched — the delivery was brought in line with them. A consumer that wants the injected track can still ask for it by name (`TrackSelector::Only(Mixed)`). Replay-verified | `hub.rs`, `tap_plane.rs` | closed |
 | D17 | **Leg labels invert when the caller's from-tag is not given.** With `from_tags` unspecified (`-`), `TapPlane` labels the two legs in the order rtpengine's `query` returns them, and in the two-node drill that put **FreeSWITCH's** tag first — so `customer` and `agent` were swapped in the recording and in the `tracks` a consumer sees. Speaker attribution is only trustworthy when the caller's from-tag is passed explicitly. Fix shape: refuse to name tracks by direction when no from-tag was supplied (label them `leg_a`/`leg_b`, or resolve the caller from the SIP call-id), rather than guessing an order | `tap_plane.rs` | medium — an ASR or a QA review reads the wrong speaker |

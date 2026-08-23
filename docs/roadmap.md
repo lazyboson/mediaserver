@@ -235,7 +235,8 @@ on `LEGACY_MEDIA_GATEWAY_BILLING_TOPIC` / `KAFKA_VOICE_AI_AGENT_TOPIC` verified.
 
 Objective: mixing moves to MSS; FreeSWITCH has no media left.
 
-Status (2026-08-24): **the mixer and conferences of inline legs are code
+Status (2026-08-24): **the mixer, conferences of inline legs, the
+monitor/whisper/barge verbs and native conference recording are all code
 complete; nothing has met a SIP peer yet.** `media-core`'s `MixMatrix` is the
 sans-IO engine — N contributors x M listeners, minus-self by default, and all
 three of monitor / whisper / barge are cells of that matrix rather than code
@@ -248,9 +249,22 @@ member's hub as the `mixed` track so a monitor or recorder attaches with the
 verbs that already exist. Verified over real UDP sockets in-process (three peers
 hearing the other two and never themselves, a leg leaving mid-mix, the last leg
 closing the conference); multi-rate conferences are refused by name rather than
-resampled, and conferences are pod-local. Still owed: monitor/whisper/barge
-attachments, native conference recording, the member-control tail with its
-parity table, and the three-peer lab drill.
+resampled, and conferences are pod-local.
+
+Monitor, whisper and barge landed as **matrix cells named by attachment
+metadata** rather than new RPCs (item 38): `selector.only="mixed"` on any member
+session is the monitor, `mix_target=<member>|all` on an INJECT attachment is the
+whisper and the barge flip, and `mix_monitor=include|exclude` decides whether the
+mixed track — which is also the recording feed — carries it. **Native conference
+recording** landed on top of that (item 39) with no new noun either: a
+`FILE_S3` attachment with `only=mixed` on any member records the room as one
+mono object, a recording **group** over the member sessions with
+`only=customer` records one object per participant time-aligned on the group
+anchor, both shapes may run on one conference at once, and `RecordingStarted`
+now names which shape an object is. All three items are verified over
+in-process UDP sockets only. Still owed: the member-control tail with its
+parity table (P4-5) and the three-peer lab drill (P4-6) that puts a real RTP
+peer in a conference and both recording shapes in MinIO.
 
 Work:
 - N-way mixer: conferences as MSS sessions of inline legs with a

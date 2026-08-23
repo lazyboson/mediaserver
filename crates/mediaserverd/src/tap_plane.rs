@@ -661,6 +661,17 @@ impl TapPlane {
             hub, external_id, ..
         } = self.session_handles(view.session)?;
         let selection = recording_selection_of(view.selector);
+        let conferenced = self.conference_of(view.session).is_ok();
+        if conferenced
+            && !view.group.is_empty()
+            && matches!(view.selector, TrackSelector::Only(Track::Mixed))
+        {
+            return Err(MediaPlaneError(format!(
+                "a recording group of the mixed track would write the same conference audio                  to one object per member; record the room once with an ungrouped file-s3                  attachment whose selector is only={}, and use only={} for the                  per-participant objects",
+                consumer_ws::track_name(Track::Mixed),
+                consumer_ws::track_name(Track::Customer)
+            )));
+        }
         let grouped = if view.group.is_empty() {
             None
         } else {
@@ -729,6 +740,14 @@ impl TapPlane {
             .map(|target| target.key.clone())
             .collect();
         let recording_id = identity.recording_id.clone();
+        let shape = recorder::RecordingShape::of(
+            spec.targets
+                .first()
+                .map(|target| target.layout)
+                .unwrap_or(Layout::Stereo),
+            member_of.is_some(),
+        )
+        .named(conferenced);
         let handle = recorder::spawn(
             spec,
             subscription,
@@ -764,6 +783,7 @@ impl TapPlane {
             session = %view.session,
             label = %view.label,
             group = %view.group,
+            %shape,
             ?keys,
             ?selection,
             resume_ms,
@@ -776,6 +796,7 @@ impl TapPlane {
                 Observation::RecordingStarted {
                     recording_id: recording_id.clone(),
                     path: key,
+                    shape: shape.clone(),
                 },
             );
         }
@@ -2586,6 +2607,68 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct BucketSink {
+        puts: Mutex<Vec<(String, Vec<u8>)>>,
+    }
+
+    impl BucketSink {
+        fn keys(&self) -> Vec<String> {
+            self.puts
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(key, _)| key.clone())
+                .collect()
+        }
+
+        fn body(&self, key: &str) -> Vec<u8> {
+            self.puts
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|(held, _)| held == key)
+                .map(|(_, body)| body.clone())
+                .unwrap_or_else(|| panic!("{key} was never uploaded; got {:?}", self.keys()))
+        }
+    }
+
+    #[control_api::async_trait]
+    impl recorder::RecordingSink for BucketSink {
+        async fn put(
+            &self,
+            key: &str,
+            _content_type: &'static str,
+            body: Vec<u8>,
+        ) -> Result<String, recorder::UploadError> {
+            self.puts.lock().unwrap().push((key.to_string(), body));
+            Ok(format!("s3:/{}/{key}", "/lab-recordings"))
+        }
+
+        async fn exists(&self, key: &str) -> Result<bool, recorder::UploadError> {
+            Ok(self
+                .puts
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(held, _)| held == key))
+        }
+
+        fn describe(&self) -> String {
+            "an in-memory bucket".to_string()
+        }
+    }
+
+    fn recorded_wav(body: &[u8]) -> (u16, Vec<i16>) {
+        let reader = hound::WavReader::new(std::io::Cursor::new(body.to_vec())).expect("a wav");
+        let channels = reader.spec().channels;
+        let samples = reader
+            .into_samples::<i16>()
+            .map(|sample| sample.expect("a sample"))
+            .collect();
+        (channels, samples)
+    }
+
     fn plane() -> TapPlane {
         plane_with_recording(RecordingSupport::default())
     }
@@ -3062,6 +3145,258 @@ m=audio {peer_port} RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\na=ptime:{ptime_ms}\r\n"
             }
         }
         loudest
+    }
+
+    fn recording_attachment(
+        id: u64,
+        session: SessionId,
+        endpoint: &str,
+        selector: TrackSelector,
+        group: &str,
+        label: &str,
+    ) -> AttachmentView {
+        AttachmentView {
+            id: AttachmentId::from_raw(id),
+            session,
+            selector,
+            group: group.to_string(),
+            label: label.to_string(),
+            ..attachment(Transport::FileS3, endpoint)
+        }
+    }
+
+    fn bucket_plane(bucket: &Arc<BucketSink>) -> TapPlane {
+        plane_with_recording(RecordingSupport {
+            sink: Some(Arc::clone(bucket) as Arc<dyn recorder::RecordingSink>),
+            spill_dir: None,
+            spill_every: recorder::SPILL_EVERY,
+            counters: Arc::new(RecorderCounters::default()),
+            owner: "pod-a".to_string(),
+        })
+    }
+
+    #[tokio::test]
+    async fn one_conference_records_the_whole_room_and_every_participant_at_once() {
+        let bucket = Arc::new(BucketSink::default());
+        let plane = bucket_plane(&bucket);
+        let mut alice = seat_peer(&plane, 1, "board-room").await;
+        let mut bob = seat_peer(&plane, 2, "board-room").await;
+
+        plane
+            .open_attachment(recording_attachment(
+                11,
+                alice.session,
+                "acct-7/room.wav",
+                TrackSelector::Only(Track::Mixed),
+                "",
+                "room",
+            ))
+            .await
+            .expect("the mixed track of any member records the whole room as one object");
+        for (id, session, label) in [(12u64, alice.session, "alice"), (13, bob.session, "bob")] {
+            plane
+                .open_attachment(recording_attachment(
+                    id,
+                    session,
+                    "acct-7/parties.wav",
+                    TrackSelector::Only(Track::Customer),
+                    "parties",
+                    label,
+                ))
+                .await
+                .expect("a recording group over conference members records one object each");
+        }
+
+        for _ in 0..6 {
+            alice.speak(1_000, 4);
+            bob.speak(2_000, 4);
+            tokio::time::sleep(Duration::from_millis(80)).await;
+        }
+
+        let mut carol = seat_peer(&plane, 3, "board-room").await;
+        plane
+            .open_attachment(recording_attachment(
+                14,
+                carol.session,
+                "acct-7/parties.wav",
+                TrackSelector::Only(Track::Customer),
+                "parties",
+                "carol",
+            ))
+            .await
+            .expect("a member that joins late joins the recording group late");
+
+        for _ in 0..6 {
+            alice.speak(1_000, 4);
+            bob.speak(2_000, 4);
+            carol.speak(4_000, 4);
+            tokio::time::sleep(Duration::from_millis(80)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        for (session, id) in [
+            (alice.session, 11u64),
+            (alice.session, 12),
+            (bob.session, 13),
+            (carol.session, 14),
+        ] {
+            plane
+                .close_attachment(session, AttachmentId::from_raw(id))
+                .await
+                .expect("a recording attachment closes and uploads");
+        }
+
+        let mut keys = bucket.keys();
+        keys.sort();
+        assert_eq!(
+            keys,
+            vec![
+                "acct-7/parties/alice.wav".to_string(),
+                "acct-7/parties/bob.wav".to_string(),
+                "acct-7/parties/carol.wav".to_string(),
+                "acct-7/room.wav".to_string(),
+            ],
+            "both shapes coexist: one room object plus one object per participant"
+        );
+
+        let (room_channels, room) = recorded_wav(&bucket.body("acct-7/room.wav"));
+        assert_eq!(room_channels, 1, "the room records as one mono mix");
+        let room_loudest = room.iter().copied().max().unwrap_or(0);
+        assert!(
+            (6_500..=7_600).contains(&room_loudest),
+            "the room object carries every party summed: {room_loudest}"
+        );
+
+        let mut lengths = Vec::new();
+        for (label, level) in [("alice", 1_000i16), ("bob", 2_000), ("carol", 4_000)] {
+            let (channels, samples) =
+                recorded_wav(&bucket.body(&format!("acct-7/parties/{label}.wav")));
+            assert_eq!(channels, 1, "a participant object is mono");
+            let loudest = samples.iter().copied().max().unwrap_or(0);
+            assert!(
+                (level - 200..=level + 200).contains(&loudest),
+                "{label} records only {label}, not the room: {loudest}"
+            );
+            lengths.push((label, samples.len()));
+        }
+
+        let alice_frames = lengths[0].1;
+        let carol_frames = lengths[2].1;
+        let slack = 8_000usize / 2;
+        assert!(
+            carol_frames + slack >= alice_frames && carol_frames <= alice_frames + slack,
+            "the group anchor pads a late member back to t=0: {lengths:?}"
+        );
+        let (_, carol_samples) = recorded_wav(&bucket.body("acct-7/parties/carol.wav"));
+        let lead = carol_samples
+            .iter()
+            .position(|sample| *sample != 0)
+            .unwrap_or(carol_samples.len());
+        assert!(
+            lead >= 8_000 / 4,
+            "carol joined a quarter second or more after the group opened: {lead} samples"
+        );
+
+        for peer in [&alice, &bob, &carol] {
+            plane
+                .close_session(peer.session)
+                .await
+                .expect("a conference leg closes");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_late_members_own_track_and_the_room_share_one_clock_in_a_stereo_object() {
+        let bucket = Arc::new(BucketSink::default());
+        let plane = bucket_plane(&bucket);
+        let mut alice = seat_peer(&plane, 1, "one-clock").await;
+
+        for _ in 0..8 {
+            alice.speak(1_000, 4);
+            tokio::time::sleep(Duration::from_millis(80)).await;
+        }
+
+        let mut bob = seat_peer(&plane, 2, "one-clock").await;
+        plane
+            .open_attachment(recording_attachment(
+                11,
+                bob.session,
+                "acct-7/late.wav",
+                TrackSelector::All,
+                "",
+                "late",
+            ))
+            .await
+            .expect("a conference member records itself and the room in stereo");
+
+        for _ in 0..8 {
+            alice.speak(1_000, 4);
+            bob.speak(4_000, 4);
+            tokio::time::sleep(Duration::from_millis(80)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        plane
+            .close_attachment(bob.session, AttachmentId::from_raw(11))
+            .await
+            .expect("the stereo object uploads");
+
+        let (channels, samples) = recorded_wav(&bucket.body("acct-7/late.wav"));
+        assert_eq!(channels, 2);
+        let lead = |offset: usize| {
+            samples
+                .iter()
+                .skip(offset)
+                .step_by(2)
+                .position(|sample| *sample != 0)
+                .unwrap_or(samples.len())
+        };
+        let own = lead(0);
+        let room = lead(1);
+        assert!(
+            own < 8_000,
+            "the member's own track is in the object: {own}"
+        );
+        assert!(room < 8_000, "the room is in the object: {room}");
+        assert!(
+            own.abs_diff(room) <= 4 * 160,
+            "a member that joined the conference late still hears the mix on its own \
+             clock: own track opens at {own}, the room at {room}"
+        );
+
+        for peer in [&alice, &bob] {
+            plane
+                .close_session(peer.session)
+                .await
+                .expect("a conference leg closes");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_recording_group_of_the_mixed_track_is_refused_on_a_conference_by_name() {
+        let bucket = Arc::new(BucketSink::default());
+        let plane = bucket_plane(&bucket);
+        let alice = seat_peer(&plane, 1, "duplicated").await;
+        let error = plane
+            .open_attachment(recording_attachment(
+                11,
+                alice.session,
+                "acct-7/room.wav",
+                TrackSelector::Only(Track::Mixed),
+                "parties",
+                "alice",
+            ))
+            .await
+            .expect_err("one object per member of the same room is the same audio N times");
+        assert!(
+            error.to_string().contains("record the room once"),
+            "{error}"
+        );
+        assert!(bucket.keys().is_empty());
+        plane
+            .close_session(alice.session)
+            .await
+            .expect("a conference leg closes");
     }
 
     const WHISPER_LEVEL: i16 = 8_000;

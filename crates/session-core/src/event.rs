@@ -34,6 +34,7 @@ pub enum Observation {
     RecordingStarted {
         recording_id: String,
         path: String,
+        shape: String,
     },
     RecordingPaused {
         recording_id: String,
@@ -79,6 +80,7 @@ pub enum EventKind {
     RecordingStarted {
         recording_id: String,
         path: String,
+        shape: String,
     },
     RecordingPaused {
         recording_id: String,
@@ -198,6 +200,7 @@ mod tests {
             EventKind::RecordingStarted {
                 recording_id: recording_id.clone(),
                 path: "acct-1/rec-1.wav".to_string(),
+                shape: "stereo".to_string(),
             },
             EventKind::RecordingPaused {
                 recording_id: recording_id.clone(),
