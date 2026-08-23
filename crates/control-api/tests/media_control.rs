@@ -10,6 +10,7 @@ use tonic::{Code, Request};
 struct RecordingMediaPlane {
     text: Mutex<Vec<(String, String)>>,
     playbacks: Mutex<Vec<String>>,
+    stopped_playbacks: Mutex<Vec<(String, Option<String>)>>,
     opened_sessions: Mutex<Vec<String>>,
     opened_attachments: Mutex<Vec<String>>,
     closed_attachments: Mutex<Vec<String>>,
@@ -106,8 +107,13 @@ impl MediaPlane for RecordingMediaPlane {
     async fn stop_playback(
         &self,
         _session: SessionId,
-        _playback: PlaybackId,
+        playback: PlaybackId,
+        target_tag: Option<String>,
     ) -> Result<(), MediaPlaneError> {
+        self.stopped_playbacks
+            .lock()
+            .unwrap()
+            .push((playback.to_string(), target_tag));
         Ok(())
     }
 }
@@ -469,6 +475,54 @@ async fn a_playback_the_media_plane_refuses_leaves_no_orphan_behind() {
     }
     assert!(kinds.iter().any(|kind| kind.starts_with("PlaybackStarted")));
     assert!(kinds.iter().any(|kind| kind.starts_with("PlaybackStopped")));
+}
+
+#[tokio::test]
+async fn stopping_a_playback_tells_the_media_plane_which_participant_it_was_played_to() {
+    let media = Arc::new(RecordingMediaPlane::default());
+    let plane: Arc<dyn MediaPlane> = media.clone();
+    let controller = controller().with_media_plane(plane);
+    let session = session_with(&controller, "req-1").await;
+
+    let mut playbacks = Vec::new();
+    for target in ["from-b", ""] {
+        let started = controller
+            .start_playback(Request::new(proto::StartPlaybackRequest {
+                session: Some(proto::SessionRef {
+                    id: Some(proto::session_ref::Id::SessionId(session.clone())),
+                }),
+                source: Some(proto::start_playback_request::Source::File(
+                    "moh".to_string(),
+                )),
+                target_tag: target.to_string(),
+                repeat_times: 0,
+                block_egress: false,
+                requested_by: String::new(),
+                idempotency_key: String::new(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        playbacks.push(started.playback_id);
+    }
+
+    for playback in &playbacks {
+        controller
+            .stop_playback(Request::new(proto::PlaybackRef {
+                playback_id: playback.clone(),
+            }))
+            .await
+            .unwrap();
+    }
+
+    let stopped = media.stopped_playbacks.lock().unwrap().clone();
+    assert_eq!(
+        stopped,
+        vec![
+            (playbacks[0].clone(), Some("from-b".to_string())),
+            (playbacks[1].clone(), None),
+        ]
+    );
 }
 
 #[tokio::test]
@@ -873,6 +927,7 @@ impl MediaPlane for ClosingObserverPlane {
         &self,
         _session: SessionId,
         _playback: PlaybackId,
+        _target_tag: Option<String>,
     ) -> Result<(), MediaPlaneError> {
         Ok(())
     }

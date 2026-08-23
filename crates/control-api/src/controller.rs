@@ -51,6 +51,9 @@ pub enum StreamFrame {
     Text {
         json: String,
     },
+    Stop {
+        reason: String,
+    },
 }
 
 #[tonic::async_trait]
@@ -91,6 +94,7 @@ pub trait MediaPlane: Send + Sync + 'static {
         &self,
         session: SessionId,
         playback: PlaybackId,
+        target_tag: Option<String>,
     ) -> Result<(), MediaPlaneError>;
 
     async fn open_stream(
@@ -638,9 +642,12 @@ impl MediaControl for SessionController {
         request: Request<proto::PlaybackRef>,
     ) -> Result<Response<proto::Ack>, Status> {
         let playback = playback_id(&request.into_inner().playback_id)?;
-        let session = self.commit(|registry| registry.stop_playback(playback, "stop requested"))?;
+        let stopped = self.commit(|registry| registry.stop_playback(playback, "stop requested"))?;
         if let Some(media) = self.media.clone() {
-            if let Err(error) = media.stop_playback(session, playback).await {
+            if let Err(error) = media
+                .stop_playback(stopped.session, playback, stopped.target_tag)
+                .await
+            {
                 tracing::warn!(%playback, %error, "the media plane could not stop this playback");
             }
         }

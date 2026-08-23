@@ -213,6 +213,13 @@ struct AttachmentRecord {
 
 struct PlaybackRecord {
     session: SessionId,
+    target_tag: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoppedPlayback {
+    pub session: SessionId,
+    pub target_tag: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -551,6 +558,7 @@ impl SessionRegistry {
             id,
             PlaybackRecord {
                 session: spec.session,
+                target_tag: spec.target_tag.clone(),
             },
         );
         self.push_event(
@@ -571,7 +579,7 @@ impl SessionRegistry {
         &mut self,
         playback: PlaybackId,
         reason: &str,
-    ) -> Result<SessionId, ControlError> {
+    ) -> Result<StoppedPlayback, ControlError> {
         let record = self
             .playbacks
             .remove(&playback)
@@ -585,7 +593,10 @@ impl SessionRegistry {
                 reason: reason.to_string(),
             },
         );
-        Ok(record.session)
+        Ok(StoppedPlayback {
+            session: record.session,
+            target_tag: record.target_tag,
+        })
     }
 
     pub fn report(
@@ -1216,11 +1227,48 @@ mod tests {
                 idempotency_key: None,
             })
             .unwrap();
-        registry.stop_playback(playback, "barge-in").unwrap();
+        let stopped = registry.stop_playback(playback, "barge-in").unwrap();
+        assert_eq!(stopped.session, session);
+        assert_eq!(stopped.target_tag.as_deref(), Some("from-a"));
 
         assert_eq!(
             registry.stop_playback(playback, "again"),
             Err(ControlError::UnknownPlayback(playback))
+        );
+    }
+
+    #[test]
+    fn stopping_a_playback_returns_the_participant_it_was_played_to() {
+        let (mut registry, session) = started();
+        let everyone = registry
+            .start_playback(PlaybackSpec {
+                session,
+                requested_by: None,
+                target_tag: None,
+                block_egress: false,
+                idempotency_key: None,
+            })
+            .unwrap();
+        let one = registry
+            .start_playback(PlaybackSpec {
+                session,
+                requested_by: None,
+                target_tag: Some("from-b".to_string()),
+                block_egress: false,
+                idempotency_key: None,
+            })
+            .unwrap();
+
+        assert_eq!(
+            registry.stop_playback(one, "barge-in").unwrap().target_tag,
+            Some("from-b".to_string())
+        );
+        assert_eq!(
+            registry
+                .stop_playback(everyone, "prompt done")
+                .unwrap()
+                .target_tag,
+            None
         );
     }
 

@@ -127,6 +127,10 @@ async fn serve_stream(
                 }
             }
             frame = frames.recv() => match frame {
+                Some(StreamFrame::Stop { reason }) => {
+                    let _ = send_stop(&sender, &reason).await;
+                    return;
+                }
                 Some(frame) => {
                     seq += 1;
                     if send_message(&sender, frame_message(frame, seq)).await.is_err() {
@@ -337,6 +341,9 @@ fn frame_message(frame: StreamFrame, seq: u64) -> proto::ServerToConsumer {
         }
         StreamFrame::Text { json } => {
             proto::server_to_consumer::Msg::Text(proto::TextFrame { json })
+        }
+        StreamFrame::Stop { reason } => {
+            proto::server_to_consumer::Msg::Stop(proto::StreamStop { reason })
         }
     };
     proto::ServerToConsumer { msg: Some(msg) }

@@ -533,6 +533,7 @@ mod tests {
             &self,
             _session: SessionId,
             _playback: PlaybackId,
+            _target_tag: Option<String>,
         ) -> Result<(), MediaPlaneError> {
             Ok(())
         }
