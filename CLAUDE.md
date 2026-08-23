@@ -124,33 +124,43 @@ pipeline triggers on `v*` tags.
 Read [docs/tasks.md](docs/tasks.md) — it holds the milestone state and the
 ordered next-up list with a definition of done for each item.
 
-Short version as of 2026-08-23: M1–M3 are done, **M4 (control plane) is code
-complete (~95%)** and **M5 (recording to S3) is code complete** — the recorder
-is a hub consumer that segments on pause, keeps the frozen
-`${accountID}/${recordingID}.${format}` identity, and uploads through
-`object_store` (verified against a real MinIO **and on a live tapped call**,
-2026-08-22; FS byte-parity is still owed). On M4: `MediaControl`, `TelCompat`
-and the gRPC `MediaStream` data plane are served on one port — the last one
-now proved on a live call too (bearer auth via
-`MSS_AUTH_TOKEN`), taps and consumers are driven by the API, events publish
-to Kafka `mss.events`, the Redis registry re-subscribes on pod loss, leg
-identity is solved by SSRC correlation, and Prometheus metrics are exported
-on `MSS_METRICS_LISTEN` with alert rules in `deploy/`. What still gates the
-tenant pilot: reviewing and merging the the legacy controller event translator (written, on
-the legacy controller branch `feature/legacy-translator`) and the barge-in cut-through
-measurement. The **pod-kill re-subscribe drill is done** (2026-08-22): a real
-`kill -9` on the owning pod mid-call cost the consumer a **14.41 s** audio gap
-before another pod adopted the session and re-subscribed — and showed that the
-dead pod's subscription is never torn down (D14). **Opus ingest landed
-2026-08-23** — libopus via the `opus-ffi` crate, decoding at 8/12/16/24/48 kHz
-with libopus's own concealment, proven on a live call by asking rtpengine to
-`transcode: [opus]` (`MSS_TAP_FORMAT=opus`). Building now needs cmake, make and
-g++. **Kernel-module readiness landed 2026-08-23** (item 23): NG `statistics`
-and a kernel-forwarding verdict in `rtpengine-ng`, a per-node capability log in
-mediaserverd, `lab/kernel_probe.sh` (machine-verified on the lab's no-module
-path), and the on-metal checklist in architecture §8.1 — plus the verdict that
-rtpengine's *transcoder*, not its relay, was under-producing Opus: a native
-Opus call taps at **50.0 pkt/s** against 3.8 transcoded. Two Phase-0 items
-remain blocked on other people: the production rtpengine version check — which
-**cannot** be asked over NG, since rtpengine has no NG `version` command — and
-the rtpengine-side per-tap cost.
+Short version as of 2026-08-24: **M1–M5 are done and M6 is code complete** —
+FreeSWITCH is out of the media path for every workload this repository set out
+to take from it. Phase 1 (passive fan-out) closed out: `MediaControl`,
+`TelCompat` and the gRPC `MediaStream` data plane are served on one port with
+bearer auth (`MSS_AUTH_TOKEN`), taps and consumers are driven by the API, events
+publish to Kafka `mss.events` with an at-least-once backlog, the Redis registry
+re-subscribes on pod loss (a real `kill -9` mid-call cost **14.41 s** of
+consumer audio, and the orphaned subscription it exposed — D14 — is fixed), leg
+identity is solved by SSRC correlation, and metrics are exported on
+`MSS_METRICS_LISTEN` with alert rules in `deploy/`. The barge-in cut-through is
+now **measured for every hop MSS owns**: a real consumer `SpeechReport` to an
+acked `StopPlayback` at **p50 3.5 ms** over the bus, and an inline `Clear` to the
+first silent packet at a real peer's ear at **p50 12.2 ms** — one ptime, as
+designed. Phase 2 (recording to S3) keeps the frozen
+`${accountID}/${recordingID}.${format}` identity, segments on pause, spills
+closed segments to disk so a pod death costs the spill interval rather than the
+call, and time-aligns recording-group members on the group's open instant; FS
+parity was measured against a real FreeSWITCH recording (container, layout and
+rms exact; a re-aligned window agreeing 1.0000 at mean diff 0.6/32768) and that
+measurement retired byte-parity-at-a-fixed-offset as an achievable bar.
+**Phase 3 (inline legs) and Phase 4 (conferences) are code complete and
+lab-verified 2026-08-24**: `CreateSession{kind=INLINE, sdp_offer}` answers an
+offer and speaks on real sockets through a sans-IO playout pacer, an INJECT
+attachment streams into it full duplex with `Mark`/`Clear` as the barge seam,
+and legs sharing a `group` share one mix — with monitor, whisper, barge,
+member mute/deaf/hold and room prompts all expressed as **cells of one
+`MixMatrix`** named by metadata verbs on the existing nouns, not as new RPCs. A
+conference records both ways at once (one mono object for the room, one per
+participant). The three-peer conference drill is green on real sockets: twenty
+tone-per-phase assertions at a ≥30:1 margin. **Opus ingest** landed via the
+`opus-ffi` crate (so the build needs cmake, make and g++), and
+kernel-module readiness ships with `lab/kernel_probe.sh` plus the on-metal
+checklist in architecture §8.1 — including the verdict that rtpengine's
+*transcoder*, not its relay, under-produces Opus (50.0 pkt/s native against
+3.8 transcoded). Nothing here has met a **SIP** endpoint on an inline leg, and
+no measurement in this repository has been judged by a human ear. What remains
+is therefore deployment work rather than engineering: see **Integration
+handoffs (deployment-gated)** in [docs/tasks.md](docs/tasks.md) for the eight,
+and the open defects D11, D16, D17, D20, D21 and D22 for what to watch in a
+pilot. The Phase 3/4 work is on branch **`feat/m6-autonomous`**, pending review.

@@ -4,7 +4,7 @@ Living work list. [roadmap.md](roadmap.md) holds the *why* and the phase exit
 criteria; this file holds the *what next*, ordered, with a definition of done
 for each item. Update it in the same PR that changes the state of an item.
 
-Status as of **2026-08-23**.
+Status as of **2026-08-24**.
 
 ## Milestones
 
@@ -15,7 +15,7 @@ Status as of **2026-08-23**.
 | **M3 — fan-out hub** | per-session pub/sub, N consumers, WS-Twilio adapter, pause/resume/send_text parity | ✅ done |
 | **M4 — control plane** | `MediaControl` gRPC, session state machine, Kafka events, Redis registry, tenant-flag pilot | 🔶 **code complete** — pilot gates: translator merge (external), and the consumer half of the barge-in number — **every MSS-owned hop is measured (item 5, 2026-08-23: cut-through p95 4.8 ms from a real consumer `SpeechReport`)**, the D19 ingress gap it found being fixed in item 28. The gRPC lab proof (item 10) and the **live pod-kill drill (item 11, gap 14.41 s)** are both **done 2026-08-22**; the D14 orphan subscription the drill found is **fixed (item 25, 2026-08-23)**, fake- and Redis-verified rather than re-measured live |
 | **M5 — recording (Phase 2)** | per-leg taps → stereo segmenter → S3, identity + callback contract, dual-recording | 🔶 **code complete (2026-08-22)** — a live tapped call recorded end to end to a real MinIO, callbacks read off `mss.events` (2026-08-22, item 10's drill); **recording groups** — N sessions recorded as one recording, one mono object per participant, time-aligned on the group's open instant since item 29 — landed 2026-08-23 (item 21); FS byte-parity **measured against a real FS recording** 2026-08-23 (item 31): container/layout/rms exact, a re-aligned 2 s window agrees 1.0000 at mean diff 0.6/32768; owed: a two-party production-FS comparison and a human listen |
-| M6+ | Phases 3–4 (interactive media, full media plane) | 🔶 **Phase 3 code complete and lab-verified (items 32–35, 2026-08-23)** — an inline leg answers an SDP offer, is spoken to over a continuous inject stream, and barges in **p50 12.2 ms / p95 20.4 ms** measured against a real RTP peer. **Phase 4 in progress:** the N-way mix matrix (item 36) and **conferences of inline legs** (item 37, 2026-08-24 — one clock per conference, each leg hears everybody but itself, mixed track on the hub) and **monitor / whisper / barge as metadata-named matrix cells** (item 38, 2026-08-24 — `only=mixed` is the monitor, `mix_target=<member>|all` on an INJECT attachment is the whisper and the barge flip) are code complete and verified over in-process sockets, as is **native conference recording** (item 39, 2026-08-24 — one mono object for the room via `only=mixed`, one object per participant via a recording group, both at once, the shape named in `RecordingStarted`) and **the conference feature tail** (item 40, 2026-08-24 — `member_mute`/`member_deaf`/`member_hold` as metadata verbs, `StartPlayback{target_tag=all}` as a prompt into the room, `mix_source=leg` for a coach's own voice, plus the generic feature list and the adapter parity table in architecture.md Appendix B). **Phase 4 is now lab-verified on real sockets (item 41, 2026-08-23):** three container peers in one conference, twenty tone-per-phase assertions green at a ≥30:1 margin — minus-self, monitor, whisper isolation, the barge flip, mute/unmute off every ear and off the mixed track, and both recording shapes landing in MinIO at once. Production integration (a SIP proxy's B2B leg into a conference) and the org-gated criteria remain |
+| M6+ | Phases 3–4 (interactive media, full media plane) | 🔶 **Phase 3 code complete and lab-verified (items 32–35, 2026-08-23)** — an inline leg answers an SDP offer, is spoken to over a continuous inject stream, and barges in **p50 12.2 ms / p95 20.4 ms** measured against a real RTP peer. **Phase 4 is code complete and lab-verified too (2026-08-24):** the N-way mix matrix (item 36) and **conferences of inline legs** (item 37, 2026-08-24 — one clock per conference, each leg hears everybody but itself, mixed track on the hub) and **monitor / whisper / barge as metadata-named matrix cells** (item 38, 2026-08-24 — `only=mixed` is the monitor, `mix_target=<member>|all` on an INJECT attachment is the whisper and the barge flip) are code complete and verified over in-process sockets, as is **native conference recording** (item 39, 2026-08-24 — one mono object for the room via `only=mixed`, one object per participant via a recording group, both at once, the shape named in `RecordingStarted`) and **the conference feature tail** (item 40, 2026-08-24 — `member_mute`/`member_deaf`/`member_hold` as metadata verbs, `StartPlayback{target_tag=all}` as a prompt into the room, `mix_source=leg` for a coach's own voice, plus the generic feature list and the adapter parity table in architecture.md Appendix B). **All of it is lab-verified on real sockets (item 41, 2026-08-24):** three container peers in one conference, twenty tone-per-phase assertions green at a ≥30:1 margin — minus-self, monitor, whisper isolation, the barge flip, mute/unmute off every ear and off the mixed track, and both recording shapes landing in MinIO at once. Production integration (a SIP proxy's B2B leg into a conference) and the org-gated criteria remain |
 
 ### What landed, concretely
 
@@ -2245,7 +2245,7 @@ Appendix B lists them with recommendations). (e) Everything here is pod-local,
 like the conference itself.
 
 
-### 41. The conference lab drill — Phase 4 on real sockets (Phase 4) — ✅ DONE (2026-08-23)
+### 41. The conference lab drill — Phase 4 on real sockets (Phase 4) — ✅ DONE (2026-08-24)
 
 `lab/conference_drill.sh`: three `lab/inline_peer.py` containers at
 440 / 880 / 1320 Hz seated in **one conference** (`mss_ctl inline <id> <call>
@@ -2324,9 +2324,34 @@ the monitor and the room object both hang off one member's session (D20);
 | ~~D18~~ | ~~**Recording-group members are not time-aligned.** Each member's file anchored on **its own first frame**, so a late joiner's file started at its join moment and two members of one group differed in length (90.32 s vs 90.26 s in the two-node drill), leaving reassembly to the event timeline~~ — **fixed 2026-08-23 (item 29)**: a recording group stamps `opened_at` when its first member joins and every later member's segmenter pads its first segment with silence from that anchor to its own first frame (`Segmenter::lead_with_silence`, reported as `lead_silence_frames`), padded once per recording so pause/resume cannot double-count it. Replay-verified (late joiner padded, two members equal length, the pause interaction, and a WAV read back out of a fake sink) **and live**: the drill's staggered re-run had bob join 5 s late and his object came back opening with 5016 ms of zeros, 25.116 s against alice's 25.030 s. **Residual:** equal length still assumes the members stop together — the 86 ms here is D11's blocking detach, and D16 keeps the anchor inside one pod's clock | `recorder.rs`, `tap_plane.rs` | closed (residual documented) |
 | ~~D19~~ | ~~A consumer cannot tell MSS that the caller started speaking: `Registry::report` had no caller outside tests~~ — **fixed 2026-08-23 (item 28)**: `ConsumerToServer.SpeechReport` on the gRPC `MediaStream` stream (kind `STARTED`/`PARTIAL`/`FINAL`/`END_OF_UTTERANCE`/`END_OF_INTERACTION`, track, text, confidence, the consumer's own `observed_at`) reaches `Registry::report`, gated on `CAPABILITY_EVENTS` — an attachment without it gets `PERMISSION_DENIED` and the stream ends, the same protocol-violation shape as an unprivileged `inject`. Proven on a live tapped call: `lab/barge_drill.sh` now triggers on a real `SpeechReport` and measures cut-through p50 3.54–3.98 ms (item 5). **Residual, accepted:** the `WS_TWILIO` dialect cannot report speech — its bytes are frozen (Article VII) and it carries no such message, so a WS consumer's only barge stays the `clear` message's direct rtpengine `stop media` (unevented; the D2 shape). Interactive voice-AI on WS should attach over gRPC instead | `stream.rs`, `convert.rs`, `session-core/registry.rs` | closed |
 
+## Integration handoffs (deployment-gated)
+
+Everything below is **out of scope for this repository's code** and cannot be
+closed from a lab: each item needs a deployment — its SIP proxy, its
+FreeSWITCH, its metal, its tenants, its sign-off. They are listed here so no
+future session mistakes them for unfinished engineering. MSS is a generic
+media plane: any deployment whose media anchors in rtpengine can integrate it,
+and the compatibility surfaces (the Twilio Media Streams dialect, the
+`mod_audio_fork` event names, the the legacy verb API façade) are **optional adapters**. The
+reference deployment named in [CLAUDE.md](../CLAUDE.md) appears below only as
+the worked example of each handoff.
+
+| # | Handoff | What MSS already provides | What the integrator owes |
+| --- | --- | --- | --- |
+| H1 | **An event consumer for `mss.events`** | typed `MediaEvent` on one Kafka topic, keyed by `external_id`, gapless per-session `seq`, at-least-once since D5 (so dedupe by `(external_id, seq)`), `legacy_eligible` marking the authoritative attachment | a consumer that renders those events onto whatever the existing control plane already understands. *Worked example:* the reference deployment's translator, which maps them onto its legacy positional `eventTopic` format — written, awaiting review and merge in its own repository (item 1) |
+| H2 | **The deployed rtpengine version check** | `subscribe` verified against lab rtpengine 14.1.1.8; `lab/kernel_probe.sh` prints the finding on any host | read the version from the process, the package or rtpengine's CLI interface (`--listen-cli`) on the target host. **It cannot be asked over NG** — rtpengine has no NG `version` command, in this build or upstream (item 23). If the deployed build lacks `subscribe`, the ingest model needs an upgrade path first |
+| H3 | **rtpengine-side per-tap cost on the target metal** | the MSS-side cost is measured; `lab/kernel_probe.sh` plus the read-only checklist in architecture §8.1 is the instrument | run it on the real box: `relayedpackets_kernel` vs `_user` and `media_kernel` vs `media_userspace` across baseline / taps-with-transcode / taps-without-transcode. This sets the rtpengine capacity plan. D14 is fixed (item 25), so a pod restart mid-probe no longer pollutes the numbers |
+| H4 | **End-to-end barge-in through the integrator's stack** | every MSS-owned hop is measured: consumer `SpeechReport` → bus → `StopPlayback` at **p50 3.5 ms** (item 5), and inline `Clear` → silence at the peer's ear at **p50 12.2 ms**, one ptime (item 35) | the tail is theirs: their event consumer (H1) and their prompt player. Measure the whole path against their perceptual budget |
+| H5 | **The SIP proxy's B2B integration for inline legs** | `CreateSession{kind=INLINE, sdp_offer}` returns a real SDP answer and the leg speaks and listens on real sockets; a `group` seats it in a conference | offer/answer plumbing from their proxy or B2BUA into that API. No inline leg in this repository has met a **SIP** endpoint — every inline and conference measurement is against an RTP peer with no signalling |
+| H6 | **FS byte-parity against real production recordings** | item 31 measured a live call recorded both ways: container, channel layout and rms agree exactly, and a re-aligned 2 s window agrees on 1.0000 of samples at mean diff 0.6/32768. It also established that **byte-parity at a fixed offset is not an achievable bar** — the two recorders conceal independently, so the inter-file offset wanders | a **two-party** comparison on their FreeSWITCH, with their codec, their pause contract, and a human listen. The lab's write side plays silence, so only one channel was truly compared |
+| H7 | **Retiring the legacy media path** | the workloads are served: fan-out, recording, inline legs, conferences, monitor/whisper/barge | the tenant decision to turn the old media bugs off (`record_session`, the audio fork, the conference-per-AI-interaction dummy leg), and to decommission whatever gateway service they run today. Rollback stays config-only while both paths are installed |
+| H8 | **A pilot, a stability period and UX sign-off** | metrics on `MSS_METRICS_LISTEN` with alert rules in `deploy/`, a soak harness (`lab/soak.py`) and an impairment matrix | run flagged tenants for the agreed period; watch D11 (blocking detach), D17 (leg labels without an explicit from-tag) and the conference defects D16/D20/D21/D22 in the field; get a human to judge audio quality, which no automated assertion in this repository claims to have done |
+
 ## Waiting on other people (M2 close-out)
 
-These are not code and have blocked since Phase 0:
+These are not code and have blocked since Phase 0. The first two are the
+Phase-0 face of handoffs **H2** and **H3** above — recorded twice on purpose,
+once as a milestone blocker and once as an integration handoff:
 
 1. **Production rtpengine version check** — lab is 14.1.1.8 with `subscribe`
    working; the deployed version is unverified. If it lacks `subscribe`, the
@@ -2366,24 +2391,36 @@ residual). D1 (item 14) is fixed for a mid-call SSRC change on
 the same from-tag; a transfer that replaces a tag still lands on elimination,
 so a recording of one is only as right as that.
 
-**Phase 3 — Interactive media** has its leg on the wire: item 32 built the
-sans-IO `PlayoutPacer`, and item 33 made `CreateSession{INLINE, sdp_offer}` bind
-a socket, answer the offer (PCMU/PCMA + telephone-event) and pump both
+**Phase 3 — Interactive media** is **code complete and lab-verified**: item 32
+built the sans-IO `PlayoutPacer`, item 33 made `CreateSession{INLINE, sdp_offer}`
+bind a socket, answer the offer (PCMU/PCMA + telephone-event) and pump both
 directions — the peer into the tap hub as the `customer` track, queued PCM back
-out one paced packet per ptime, with `StopPlayback` as the barge flush. What is
-item 34 made it full duplex: an INJECT attachment on either transport streams
-into that queue continuously, `Clear` flushes it and `Mark` is acked when the
-marked audio has drained. What is left is the cut-through measurement (P3-4) and
-a live drill against a real RTP peer (P3-5) — nothing here has met a SIP
-endpoint yet.
+out one paced packet per ptime, with `StopPlayback` as the barge flush. Item 34
+made it full duplex: an INJECT attachment on either transport streams into that
+queue continuously, `Clear` flushes it and `Mark` is acked when the marked audio
+has drained. Item 35 then measured the cut-through against a **real RTP peer**
+over 20 live iterations — `Clear` to the first silent packet at the peer's ear
+**p50 12.2 ms / p95 20.4 ms**, one ptime, as the pacer's design predicts — with
+egress at 50.19 pkt/s, no sequence breaks and the tap still feeding its consumer.
+What Phase 3 still owes is not code: no leg here has met a **SIP** endpoint, so
+a proxy's B2B integration and an end-to-end barge through an integrator's own
+stack remain deployment-gated.
 
-**Phase 4 — Full media plane** is the N-way mixer, monitor/whisper as
-attachments and playbacks rather than conference tricks. Its core landed with
-item 36: `media-core`'s `MixMatrix` mixes N contributors into M listeners with
-minus-self defaults, per-pair gain, and monitor/whisper/barge/mute/deaf all
-expressed as rows and columns of the one matrix — replay-only, since media-core
-has no sockets. What remains is everything around it: conference sessions of
-inline legs (P4-2), the monitor/whisper attachment verbs (P4-3), native
-conference recording of the mixed track (P4-4), the member-control tail and the
-adapter parity table (P4-5), and the three-tone lab drill that judges mixing
-quality against real legs (P4-6).
+**Phase 4 — Full media plane** is **code complete and lab-verified**: the N-way
+mixer, with monitor/whisper as attachments and playbacks rather than conference
+tricks. Its core landed with item 36: `media-core`'s `MixMatrix` mixes N
+contributors into M listeners with minus-self defaults, per-pair gain, and
+monitor/whisper/barge/mute/deaf all expressed as rows and columns of the one
+matrix. Item 37 gave a conference one clock — inline legs sharing a `group` share
+a mix, on one owner thread, with the room's full sum published to every member's
+hub. Item 38 named monitor, whisper and barge as metadata verbs on existing
+nouns (`only=mixed`, `mix_target=<member>|all`), item 39 recorded a conference
+both ways at once (one mono object for the room, one per participant through a
+recording group), and item 40 added the member-control tail
+(`member_mute`/`member_deaf`/`member_hold`, room prompts, `mix_source=leg`) plus
+the generic feature list and the adapter parity table in architecture.md
+Appendix B. Item 41 judged all of it on **real sockets**: three container peers
+at 440/880/1320 Hz in one conference, **twenty tone-per-phase assertions green**
+at a ≥30:1 margin, and both recording shapes in MinIO at once. What the phase
+owes is deployment-gated (a SIP proxy's B2B leg into a conference, a pilot) plus
+the four defects it left open: D16, D20, D21 and D22.
