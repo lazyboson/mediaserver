@@ -59,6 +59,7 @@ fn session(external_id: &str, owner: &str) -> PersistedSession {
         from_tags: vec!["from-a".to_string(), "from-b".to_string()],
         rtpengine_node: "10.0.0.5:22222".to_string(),
         owner: owner.to_string(),
+        subscription_tag: "tap-tag-redis".to_string(),
         attachments: vec![PersistedAttachment {
             label: "rtt".to_string(),
             transport: 1,
@@ -99,6 +100,10 @@ async fn a_session_round_trips_through_redis_without_losing_what_rebuilds_it() {
     assert_eq!(restored.from_tags, original.from_tags);
     assert_eq!(restored.rtpengine_node, original.rtpengine_node);
     assert_eq!(restored.owner, "pod-b");
+    assert_eq!(
+        restored.subscription_tag, original.subscription_tag,
+        "without the tap's to-tag the adopter cannot cancel the dead pod's subscription"
+    );
     assert_eq!(restored.attachments, original.attachments);
 
     wipe(&url, external_id).await;
@@ -223,4 +228,77 @@ async fn forgetting_a_session_removes_it_from_the_index_too() {
         !claimed.iter().any(|held| held.external_id == external_id),
         "an ended call was still adoptable, which would create a tap for a call that is over"
     );
+}
+
+#[tokio::test]
+async fn a_partitioned_pod_cannot_take_a_lease_back_by_persisting() {
+    let Some(url) = url() else {
+        eprintln!("{URL_ENV} not set; skipping");
+        return;
+    };
+    let external_id = "req-nosteal";
+    wipe(&url, external_id).await;
+
+    let store = RedisSessionStore::connect_in(&url, &namespace(external_id))
+        .await
+        .unwrap();
+    store.upsert(&session(external_id, "pod-a")).await.unwrap();
+    expire_now(&url, external_id).await;
+    assert_eq!(store.claim_unleased("pod-b", 8).await.unwrap().len(), 1);
+
+    store.upsert(&session(external_id, "pod-a")).await.unwrap();
+
+    assert!(
+        !store.renew(external_id, "pod-a").await.unwrap(),
+        "the old owner persisted and took the lease back; both pods would keep tapping"
+    );
+    assert!(store.renew(external_id, "pod-b").await.unwrap());
+
+    wipe(&url, external_id).await;
+}
+
+#[tokio::test]
+async fn a_record_written_before_the_tap_tag_existed_is_still_adoptable() {
+    let Some(url) = url() else {
+        eprintln!("{URL_ENV} not set; skipping");
+        return;
+    };
+    let external_id = "req-legacy";
+    wipe(&url, external_id).await;
+
+    let namespace = namespace(external_id);
+    let client = redis::Client::open(url.clone()).unwrap();
+    let mut connection = client.get_multiplexed_async_connection().await.unwrap();
+    let legacy = format!(
+        concat!(
+            r#"{{"external_id":"{id}","kind":1,"call_id":"call-legacy","#,
+            r#""from_tags":["from-a"],"rtpengine_node":"10.0.0.5:22222","#,
+            r#""owner":"pod-a","attachments":[]}}"#
+        ),
+        id = external_id
+    );
+    let _: () = redis::cmd("SET")
+        .arg(format!("{namespace}:session:{external_id}"))
+        .arg(&legacy)
+        .query_async(&mut connection)
+        .await
+        .unwrap();
+    let _: () = redis::cmd("SADD")
+        .arg(format!("{namespace}:sessions"))
+        .arg(external_id)
+        .query_async(&mut connection)
+        .await
+        .unwrap();
+
+    let store = RedisSessionStore::connect_in(&url, &namespace)
+        .await
+        .unwrap();
+    let claimed = store.claim_unleased("pod-b", 8).await.unwrap();
+    let restored = claimed
+        .into_iter()
+        .find(|held| held.external_id == external_id)
+        .expect("a record from before this field existed must still be adoptable");
+    assert_eq!(restored.subscription_tag, "");
+
+    wipe(&url, external_id).await;
 }

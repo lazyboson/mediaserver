@@ -39,6 +39,8 @@ pub struct PersistedSession {
     pub from_tags: Vec<String>,
     pub rtpengine_node: String,
     pub owner: String,
+    #[serde(default)]
+    pub subscription_tag: String,
     pub attachments: Vec<PersistedAttachment>,
 }
 
@@ -125,6 +127,7 @@ impl SessionStore for RedisSessionStore {
             .cmd("SET")
             .arg(self.lease_key(&session.external_id))
             .arg(&session.owner)
+            .arg("NX")
             .arg("EX")
             .arg(LEASE_TTL.as_secs())
             .ignore()
@@ -257,7 +260,8 @@ impl SessionStore for MemorySessionStore {
         self.leases
             .lock()
             .unwrap()
-            .insert(session.external_id.clone(), session.owner.clone());
+            .entry(session.external_id.clone())
+            .or_insert_with(|| session.owner.clone());
         Ok(())
     }
 
@@ -310,6 +314,7 @@ mod tests {
             from_tags: vec!["from-a".to_string(), "from-b".to_string()],
             rtpengine_node: "10.0.0.5:22222".to_string(),
             owner: owner.to_string(),
+            subscription_tag: "tap-tag-1".to_string(),
             attachments: vec![PersistedAttachment {
                 label: "rtt".to_string(),
                 transport: 1,
@@ -335,6 +340,50 @@ mod tests {
         );
         let decoded: PersistedSession = serde_json::from_str(stored).unwrap();
         assert_eq!(decoded.attachments[0].group, "");
+        assert_eq!(
+            decoded.subscription_tag, "",
+            "a record written before the tap tag was persisted must still decode"
+        );
+    }
+
+    #[tokio::test]
+    async fn persisting_does_not_take_back_a_lease_another_pod_now_holds() {
+        let store = MemorySessionStore::default();
+        store.upsert(&session("req-1", "pod-a")).await.unwrap();
+        store.expire_lease("req-1");
+        let adopted = store.claim_unleased("pod-b", 8).await.unwrap();
+        assert_eq!(adopted.len(), 1);
+
+        store.upsert(&session("req-1", "pod-a")).await.unwrap();
+
+        assert_eq!(
+            store.lease_holder("req-1").as_deref(),
+            Some("pod-b"),
+            "a partitioned pod's persist tick stole the lease back and both pods kept tapping"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_holder_reacquires_a_lease_that_merely_expired() {
+        let store = MemorySessionStore::default();
+        store.upsert(&session("req-1", "pod-a")).await.unwrap();
+        store.expire_lease("req-1");
+
+        store.upsert(&session("req-1", "pod-a")).await.unwrap();
+
+        assert!(
+            store.renew("req-1", "pod-a").await.unwrap(),
+            "an unclaimed expiry must not read as split brain"
+        );
+    }
+
+    #[test]
+    fn the_subscription_tag_survives_a_json_roundtrip() {
+        let held = session("req-1", "pod-a");
+        let body = serde_json::to_string(&held).unwrap();
+        let decoded: PersistedSession = serde_json::from_str(&body).unwrap();
+        assert_eq!(decoded.subscription_tag, "tap-tag-1");
+        assert_eq!(decoded, held);
     }
 
     #[tokio::test]
