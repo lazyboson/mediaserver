@@ -15,8 +15,8 @@ is boringly stable in production).
 | 0 | Groundwork spike (M2) | — (de-risking only) | ✅ code done; 3 org-side items open |
 | 1 | Passive fan-out (M3–M4) | `uuid_audio_fork`, `uuid_google_transcribe2` media bugs | 🔶 M3 done, M4 ~95% (code complete; translator merge + barge-in measurement remain) |
 | 2 | Recording | `record_session` bugs, shared-FS recording pipeline | ⬜ |
-| 3 | Interactive media | dummy leg + conference-per-AI-interaction; mediagateway service | ⬜ |
-| 4 | Full media plane | conference mixing, monitor/whisper (`relate nospeak`), MOH | 🔶 mixer, conference sessions, monitor/whisper/barge, conference recording and the member-control tail all code complete (items 36–40); the three-peer lab drill remains |
+| 3 | Interactive media | dummy leg + conference-per-AI-interaction; mediagateway service | 🔶 code complete, lab-verified (items 32–35); production integration and org-gated criteria remain |
+| 4 | Full media plane | conference mixing, monitor/whisper (`relate nospeak`), MOH | 🔶 code complete, lab-verified (items 36–41); production integration and org-gated criteria remain |
 
 The ordered next-up list, with a definition of done per item, open defects
 and what is blocked on other people, lives in [tasks.md](tasks.md).
@@ -191,8 +191,11 @@ tag-replacing transfer triggers a re-subscribe.
 Objective: things that talk back go through MSS inline legs; the
 dummy-leg-conference construct and mediagateway die.
 
-Status (2026-08-23): the leg itself is built and replay-verified, nothing has
-met a SIP peer yet. `CreateSession{kind=INLINE, sdp_offer}` binds a UDP socket
+Status (2026-08-23): **code complete and lab-verified; production integration
+and the org-gated criteria remain.** The leg has met a real RTP peer — a
+SIP-less container endpoint, not a SIP proxy's B2B leg — and barges in at
+p50 12.2 ms / p95 20.4 ms (tasks.md item 35).
+`CreateSession{kind=INLINE, sdp_offer}` binds a UDP socket
 on the pod's media address, answers with MSS-owned SDP (PCMU/PCMA +
 telephone-event; anything else refused by name), returns the answer in
 `Session.sdp_answer`, feeds the peer's audio into the same jitter → decode →
@@ -235,10 +238,14 @@ on `MEDIAGATEWAY_BILLING_TOPIC` / `KAFKA_VOICE_AI_AGENT_TOPIC` verified.
 
 Objective: mixing moves to MSS; FreeSWITCH has no media left.
 
-Status (2026-08-24): **the mixer, conferences of inline legs, the
-monitor/whisper/barge verbs and native conference recording are all code
-complete; nothing has met a SIP peer yet.** `media-core`'s `MixMatrix` is the
-sans-IO engine — N contributors x M listeners, minus-self by default, and all
+Status (2026-08-23): **code complete and lab-verified; production integration
+and the org-gated criteria remain.** Three container RTP peers have been in one
+conference on real sockets, and twenty tone-per-phase assertions decided
+minus-self, the monitor, whisper isolation, the barge flip, mute/unmute and both
+recording shapes at a >=30:1 margin (tasks.md item 41, lab.md). What has *not*
+happened is a SIP proxy's B2B leg into a conference, which is deployment-gated.
+
+`media-core`'s `MixMatrix` is the sans-IO engine — N contributors x M listeners, minus-self by default, and all
 three of monitor / whisper / barge are cells of that matrix rather than code
 paths (tasks.md item 36). `mediaserverd`'s `conference.rs` wires it to sockets
 (item 37): `CreateSession{kind=INLINE, group=<name>}` seats a leg in a
