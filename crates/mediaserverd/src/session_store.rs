@@ -51,6 +51,8 @@ pub struct PersistedFormat {
     pub ptime_ms: u32,
 }
 
+pub const INLINE_SESSION_KIND: i32 = 2;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PersistedSession {
     pub external_id: String,
@@ -65,8 +67,12 @@ pub struct PersistedSession {
 }
 
 impl PersistedSession {
+    pub fn is_inline(&self) -> bool {
+        self.kind == INLINE_SESSION_KIND
+    }
+
     pub fn is_rebuildable(&self) -> bool {
-        !self.call_id.is_empty() && !self.from_tags.is_empty()
+        !self.is_inline() && !self.call_id.is_empty() && !self.from_tags.is_empty()
     }
 }
 

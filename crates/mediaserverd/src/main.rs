@@ -3,6 +3,7 @@
 mod consumer_ws;
 mod event_pump;
 mod hub;
+mod inline_leg;
 mod media_rt;
 mod metrics;
 mod ng_transport;

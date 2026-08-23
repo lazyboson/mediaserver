@@ -8,7 +8,7 @@ use crate::proto::media_control_server::{MediaControl, MediaControlServer};
 use session_core::{
     AttachSpec, AttachmentId, AttachmentUpdate, AttachmentView, ConsumerEvent, ControlError,
     CreateSession, EventKind, MediaEvent, Observation, PlaybackId, PlaybackSpec, SessionId,
-    SessionRegistry, SessionView,
+    SessionKind, SessionRegistry, SessionView,
 };
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -37,6 +37,19 @@ pub enum PlaybackSource {
 #[error("{0}")]
 pub struct MediaPlaneError(pub String);
 
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct OpenedSession {
+    pub sdp_answer: Option<String>,
+}
+
+impl OpenedSession {
+    pub fn answered(sdp: String) -> OpenedSession {
+        OpenedSession {
+            sdp_answer: Some(sdp),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum StreamFrame {
     Media {
@@ -58,7 +71,7 @@ pub enum StreamFrame {
 
 #[tonic::async_trait]
 pub trait MediaPlane: Send + Sync + 'static {
-    async fn open_session(&self, session: SessionView) -> Result<(), MediaPlaneError>;
+    async fn open_session(&self, session: SessionView) -> Result<OpenedSession, MediaPlaneError>;
 
     async fn close_session(&self, session: SessionId) -> Result<(), MediaPlaneError>;
 
@@ -298,6 +311,7 @@ impl SessionController {
             rtpengine_node: view.rtpengine_node,
             owner_pod: self.owner.clone(),
             attachments,
+            sdp_answer: view.sdp_answer.unwrap_or_default(),
         })
     }
 }
@@ -428,6 +442,22 @@ impl MediaControl for SessionController {
             ));
         }
         let kind = session_kind(message.kind)?;
+        let sdp_offer = optional(message.sdp_offer);
+        match (kind, &sdp_offer) {
+            (SessionKind::Inline, None) => {
+                return Err(Status::invalid_argument(
+                    "an inline session needs the peer's sdp_offer; MSS answers it as an \
+                     rtp endpoint",
+                ))
+            }
+            (SessionKind::Tap, Some(_)) => {
+                return Err(Status::invalid_argument(
+                    "a tap has no sdp: it asks rtpengine for a copy of media that is \
+                     already flowing",
+                ))
+            }
+            _ => {}
+        }
         let view = self.commit(|registry| {
             registry.create_session(CreateSession {
                 external_id: message.external_id,
@@ -435,15 +465,23 @@ impl MediaControl for SessionController {
                 call_id: message.call_id,
                 from_tags: message.from_tags,
                 rtpengine_node: message.rtpengine_node,
+                sdp_offer,
                 idempotency_key: optional(message.idempotency_key),
             })
         })?;
         if let Some(media) = self.media.clone() {
-            if let Err(error) = media.open_session(view.clone()).await {
-                let _ = self.commit(|registry| {
-                    registry.destroy_session(view.id, "the media plane refused the session")
-                });
-                return Err(Status::unavailable(error.to_string()));
+            match media.open_session(view.clone()).await {
+                Ok(opened) => {
+                    if let Some(answer) = opened.sdp_answer {
+                        self.commit(|registry| registry.record_sdp_answer(view.id, answer))?;
+                    }
+                }
+                Err(error) => {
+                    let _ = self.commit(|registry| {
+                        registry.destroy_session(view.id, "the media plane refused the session")
+                    });
+                    return Err(Status::unavailable(error.to_string()));
+                }
             }
         }
         self.session_message(view.id).map(Response::new)

@@ -1,10 +1,12 @@
 use control_api::proto::media_control_server::MediaControl;
 use control_api::proto::{self, media_event::Payload};
-use control_api::{MediaPlane, MediaPlaneError, PlaybackSource, SessionController};
+use control_api::{MediaPlane, MediaPlaneError, OpenedSession, PlaybackSource, SessionController};
 use session_core::{AttachmentId, AttachmentView, PlaybackId, SessionId, SessionView};
 use std::sync::{Arc, Mutex};
 use tokio_stream::StreamExt;
 use tonic::{Code, Request};
+
+const ANSWERED_SDP: &str = "v=0\r\no=- 1 1 IN IP4 10.0.0.7\r\ns=mss-inline\r\n";
 
 #[derive(Default)]
 struct RecordingMediaPlane {
@@ -23,7 +25,7 @@ struct RecordingMediaPlane {
 
 #[tonic::async_trait]
 impl MediaPlane for RecordingMediaPlane {
-    async fn open_session(&self, session: SessionView) -> Result<(), MediaPlaneError> {
+    async fn open_session(&self, session: SessionView) -> Result<OpenedSession, MediaPlaneError> {
         if self.refuse_sessions {
             return Err(MediaPlaneError("no rtpengine here".to_string()));
         }
@@ -31,7 +33,10 @@ impl MediaPlane for RecordingMediaPlane {
             .lock()
             .unwrap()
             .push(session.id.to_string());
-        Ok(())
+        match session.sdp_offer {
+            Some(_) => Ok(OpenedSession::answered(ANSWERED_SDP.to_string())),
+            None => Ok(OpenedSession::default()),
+        }
     }
 
     async fn close_session(&self, _session: SessionId) -> Result<(), MediaPlaneError> {
@@ -131,6 +136,7 @@ fn create(external_id: &str) -> proto::CreateSessionRequest {
         rtpengine_node: "rtpengine-1".to_string(),
         mix: false,
         idempotency_key: String::new(),
+        sdp_offer: String::new(),
     }
 }
 
@@ -163,6 +169,77 @@ async fn session_with(controller: &SessionController, external_id: &str) -> Stri
         .unwrap()
         .into_inner()
         .session_id
+}
+
+#[tokio::test]
+async fn an_inline_session_carries_the_media_plane_s_answer_back_to_the_caller() {
+    let plane = Arc::new(RecordingMediaPlane::default());
+    let controller = controller().with_media_plane(plane.clone());
+    let request = proto::CreateSessionRequest {
+        kind: proto::SessionKind::Inline as i32,
+        sdp_offer: "v=0\r\nc=IN IP4 10.9.0.4\r\nm=audio 41000 RTP/AVP 0\r\n".to_string(),
+        ..create("req-inline")
+    };
+
+    let session = controller
+        .create_session(Request::new(request))
+        .await
+        .unwrap()
+        .into_inner();
+
+    assert_eq!(session.kind, proto::SessionKind::Inline as i32);
+    assert_eq!(session.sdp_answer, ANSWERED_SDP);
+
+    let described = controller
+        .describe_session(Request::new(proto::SessionRef {
+            id: Some(proto::session_ref::Id::ExternalId("req-inline".to_string())),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        described.sdp_answer, ANSWERED_SDP,
+        "the answer stays readable for the life of the session"
+    );
+}
+
+#[tokio::test]
+async fn an_inline_session_without_an_offer_and_a_tap_with_one_are_both_refused() {
+    let controller = controller();
+    let no_offer = controller
+        .create_session(Request::new(proto::CreateSessionRequest {
+            kind: proto::SessionKind::Inline as i32,
+            ..create("req-inline")
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(no_offer.code(), Code::InvalidArgument);
+    assert!(no_offer.message().contains("sdp_offer"), "{no_offer}");
+
+    let tap_with_offer = controller
+        .create_session(Request::new(proto::CreateSessionRequest {
+            sdp_offer: "v=0\r\n".to_string(),
+            ..create("req-tap")
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(tap_with_offer.code(), Code::InvalidArgument);
+    assert!(
+        tap_with_offer.message().contains("rtpengine"),
+        "{tap_with_offer}"
+    );
+}
+
+#[tokio::test]
+async fn a_tap_answers_nothing_because_it_never_negotiated_anything() {
+    let plane = Arc::new(RecordingMediaPlane::default());
+    let controller = controller().with_media_plane(plane);
+    let session = controller
+        .create_session(Request::new(create("req-1")))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(session.sdp_answer.is_empty());
 }
 
 #[tokio::test]
@@ -869,8 +946,8 @@ struct ClosingObserverPlane {
 
 #[tonic::async_trait]
 impl MediaPlane for ClosingObserverPlane {
-    async fn open_session(&self, _session: SessionView) -> Result<(), MediaPlaneError> {
-        Ok(())
+    async fn open_session(&self, _session: SessionView) -> Result<OpenedSession, MediaPlaneError> {
+        Ok(OpenedSession::default())
     }
 
     async fn close_session(&self, session: SessionId) -> Result<(), MediaPlaneError> {

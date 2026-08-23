@@ -64,6 +64,10 @@ message CreateSessionRequest {
   bool mix = 6;
   // A retry during pod loss must not create a second session.
   string idempotency_key = 7;
+  // INLINE only: the peer's SDP offer. MSS answers as an RTP endpoint and
+  // returns the answer in Session.sdp_answer. A tap needs no SDP: it asks
+  // rtpengine for a copy instead.
+  string sdp_offer = 8;
 }
 
 message Session {
@@ -76,6 +80,9 @@ message Session {
   string rtpengine_node = 7;
   string owner_pod = 8;
   repeated Attachment attachments = 9;
+  // INLINE only: what MSS answered the peer's offer with. Bound to the pod
+  // that answered it, which is why an inline session is not adoptable.
+  string sdp_answer = 10;
 }
 
 message SessionRef {
@@ -242,6 +249,9 @@ message MediaEvent {
   // False for every non-authoritative attachment: the event still reaches
   // mss.events for analytics and debugging, but must never drive streamfsm.
   bool legacy_eligible = 6;
+  // Which kind of session emitted this: a consumer of mss.events can tell a
+  // tap's events from an inline leg's without asking the API.
+  SessionKind session_kind = 7;
 
   oneof payload {
     SpeechStarted speech_started = 10;
