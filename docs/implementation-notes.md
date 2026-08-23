@@ -877,9 +877,23 @@ several environments):
   the proto `Attachment` response does not carry endpoint or metadata. The
   keeper now reads `SessionController::snapshot()` — the lossless view — not
   the wire types.
+  Since 2026-08-23 it also carries `subscription_tag` — the `to-tag` rtpengine
+  answered the `subscribe request` with — because that string is the only
+  handle that can cancel the tap, and only the pod that created it held one.
+  The field is `#[serde(default)]`, so a record written before it existed
+  still decodes (asserted in unit tests and against real Redis); an empty tag
+  means "unknown", and an adoption that finds one counts
+  `orphans_still_subscribed` instead of pretending it cleaned up.
 - `mss:lease:{external_id}` — the owner pod, **with a TTL** (15 s, renewed
   every 5 s). The lease is the whole HA mechanism: a pod that dies stops
   renewing, the key expires, and the session becomes adoptable.
+  `upsert` writes this key with **`NX`**, not a bare `SET`. It used to
+  overwrite it every persist tick, which quietly made the lease unloseable:
+  a pod that had already been adopted away took ownership back 5 s later and
+  both pods tapped the call. With `NX` the incumbent still re-acquires a lease
+  that merely **expired** unclaimed (so a Redis restart does not read as split
+  brain), but a lease another pod holds stays held, and `renew` returning
+  `false` now means exactly one thing — another pod owns this session.
 - `mss:sessions` — a set, so a sweep never needs `KEYS`.
 
 **How adoption works.** Every 10 s a pod runs `claim_unleased`, which for each
@@ -891,6 +905,37 @@ controller's own API — `CreateSession` then `Attach` per attachment, replaying
 attachment, idempotency) applies to a rebuilt session exactly as to a new one,
 and `TapPlane` re-establishes the rtpengine subscription as a side effect.
 `MAX_ADOPTIONS_PER_SWEEP` (8) stops one pod inhaling every orphan at once.
+
+**Cancelling the previous owner's tap (D14, fixed 2026-08-23).** `rebuild`
+first calls `TapSubscriptions::unsubscribe_orphan(node, call_id, to_tag)` —
+a small trait in `registry_keeper.rs` that `TapPlane` implements by binding a
+throwaway `NgTransport` to the session's node and sending NG `unsubscribe` —
+and only then re-subscribes. The order is asserted in a test through a shared
+journal (`unsubscribe …` must precede `subscribe …`), and the wire bytes are
+asserted in `tap_plane.rs` against a fake rtpengine socket. Two decisions
+worth knowing:
+
+- **Only after winning the claim.** The unsubscribe happens inside `rebuild`,
+  which runs after `claim_unleased`'s atomic `SET NX` — so a pod can never
+  cancel a tap it did not just win the right to own. That is also why the NX
+  change above matters: without it, "won the claim" was not durable.
+- **A refused unsubscribe does not block adoption.** The call is re-tapped
+  anyway and `orphans_still_subscribed` counts the leak, because a re-tapped
+  call with a leaked copy is strictly better than a call nobody taps.
+
+**Losing the lease is fatal for the session (the partitioned-owner half).**
+A pod whose `renew` returns `false` now destroys the session locally through
+its own `DestroySession` — which closes the tap, and `close_session` already
+sends `unsubscribe` for its own `to-tag`, so a partitioned-but-alive owner
+cleans up after itself instead of double-tapping until the call ends.
+`surrendered` counts it. The surrendering pod must **not** `forget` the
+registry record — its successor owns that record now — so `release_gone`
+takes the surrendered set and skips exactly those ids while still dropping
+them from `persisted_here`. `released` therefore stays a count of *ended*
+calls only. The trade-off accepted: a pod stalled past the 15 s lease (a long
+GC pause, a frozen host) drops a call it could still have served. It is the
+right side to err on — the adopter has already re-established that tap, and
+the alternative is the D14 cost forever.
 
 **Two failure modes it refuses to paper over:**
 
@@ -905,9 +950,12 @@ and `TapPlane` re-establishes the rtpengine subscription as a side effect.
   for it was the one that caught it.
 
 Counters (`persisted`, `renewed`, `lost`, `adopted`, `unrebuildable`,
-`released`, `failed`) are logged at shutdown and are the natural next metrics.
-A rising `lost` means two pods believe they own one session — the split-brain
-signal worth alerting on.
+`released`, `failed`, `grouped_not_adopted`, `orphans_unsubscribed`,
+`orphans_still_subscribed`, `surrendered`) are exported as
+`mss_registry_*_total`. A rising `lost`/`surrendered` means two pods believed
+they owned one session and one gave up; a rising `orphans_still_subscribed`
+means rtpengine is copying a call to a pod that is gone — the two worth
+alerting on.
 
 Config: `MSS_REDIS_URL`; unset means sessions live and die with the pod
 (logged), and a configured-but-unreachable Redis **refuses to start** rather
@@ -931,13 +979,13 @@ Gaps: leases are renewed per session per tick with one round trip each (fine
 at hundreds, revisit at thousands); the discovery map (call-id → node + tags)
 is a separate, still-unbuilt concern; `SessionStore` is a `mediaserverd`
 module rather than a crate, so the integration test re-includes it by path;
-and **the dead pod's rtpengine subscription is never cancelled** (D14) —
-`PersistedSession` carries no `to-tag`, so the adopter cannot `unsubscribe`
-what it did not create, and rtpengine keeps copying media to the dead pod's
-address for the rest of the call (measured: 14,743 packets over 110 s).
-`rebuild` also drops the attachment's negotiated `format` (it passes
+and `rebuild` still drops the attachment's negotiated `format` (it passes
 `format: None`), so a consumer that asked for L16/16k is rebuilt at the
-session default.
+session default (D15). D14's fix has **not** been re-measured on a live pod
+kill — the drill needs a live SIP call and a rebuilt pod image, so what is
+proven today is the seam and the ordering (unit tests, a fake rtpengine
+socket, and the store paths against the lab's real Redis), not another
+teardown block showing zero orphaned packets.
 
 ### event_pump.rs — events onto Kafka `mss.events` (M4)
 
