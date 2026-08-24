@@ -14,6 +14,10 @@ mod hub;
 #[path = "../src/recorder.rs"]
 mod recorder;
 
+#[allow(dead_code)]
+#[path = "../src/recording_spill.rs"]
+mod recording_spill;
+
 use hub::{Hub, TapEvent, TrackSelection};
 use recorder::{
     Layout, RecorderCounters, RecorderSpec, RecordingIdentity, RecordingSink, RecordingSupport,
@@ -136,7 +140,9 @@ async fn a_recording_group_lands_one_object_per_participant_in_a_real_bucket() {
     let support = RecordingSupport {
         sink: Some(Arc::new(sink) as Arc<dyn RecordingSink>),
         spill_dir: None,
+        spill_every: recorder::SPILL_EVERY,
         counters: Arc::new(RecorderCounters::default()),
+        owner: "drill".to_string(),
     };
     let counters = Arc::clone(&support.counters);
 
@@ -187,6 +193,8 @@ async fn a_recording_group_lands_one_object_per_participant_in_a_real_bucket() {
                 targets,
                 sample_rate_hz: RATE,
                 max_duration: recorder::MAX_RECORDING,
+                group_anchor: None,
+                resume_ms: 0,
             },
             subscription,
             support.clone(),
@@ -331,7 +339,9 @@ async fn a_paused_recording_lands_in_a_real_bucket_under_the_frozen_identity() {
     let support = RecordingSupport {
         sink: Some(Arc::new(sink) as Arc<dyn RecordingSink>),
         spill_dir: None,
+        spill_every: recorder::SPILL_EVERY,
         counters: Arc::new(RecorderCounters::default()),
+        owner: "drill".to_string(),
     };
     let counters = Arc::clone(&support.counters);
 

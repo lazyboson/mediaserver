@@ -1,6 +1,7 @@
 use crate::capability::{Capabilities, Transport};
 use crate::event::{ConsumerEvent, EventKind, MediaEvent, Observation};
 use crate::ids::{AttachmentId, PlaybackId, SessionId};
+use crate::mix::{MemberControl, MixRoute};
 use media_core::{AudioFormat, Track};
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeMap, VecDeque};
@@ -69,6 +70,8 @@ pub enum ControlError {
     IdempotencyConflict(String),
     #[error("session {session} already holds {limit} attachments")]
     TooManyAttachments { session: SessionId, limit: usize },
+    #[error("{0}")]
+    MixRoute(#[from] crate::mix::MixRouteError),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -78,6 +81,8 @@ pub struct CreateSession {
     pub call_id: String,
     pub from_tags: Vec<String>,
     pub rtpengine_node: String,
+    pub sdp_offer: Option<String>,
+    pub group: String,
     pub idempotency_key: Option<String>,
 }
 
@@ -89,6 +94,8 @@ impl CreateSession {
         self.call_id.hash(&mut hasher);
         self.from_tags.hash(&mut hasher);
         self.rtpengine_node.hash(&mut hasher);
+        self.sdp_offer.hash(&mut hasher);
+        self.group.hash(&mut hasher);
         hasher.finish()
     }
 }
@@ -133,6 +140,7 @@ pub struct AttachmentUpdate {
     pub paused: Option<bool>,
     pub selector: Option<TrackSelector>,
     pub format: Option<AudioFormat>,
+    pub metadata: Option<BTreeMap<String, String>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -163,6 +171,9 @@ pub struct SessionView {
     pub call_id: String,
     pub from_tags: Vec<String>,
     pub rtpengine_node: String,
+    pub sdp_offer: Option<String>,
+    pub sdp_answer: Option<String>,
+    pub group: String,
     pub attachments: Vec<AttachmentId>,
     pub authoritative: Option<AttachmentId>,
 }
@@ -190,6 +201,9 @@ struct SessionRecord {
     call_id: String,
     from_tags: Vec<String>,
     rtpengine_node: String,
+    sdp_offer: Option<String>,
+    sdp_answer: Option<String>,
+    group: String,
     attachments: Vec<AttachmentId>,
     authoritative: Option<AttachmentId>,
     next_seq: u64,
@@ -213,6 +227,13 @@ struct AttachmentRecord {
 
 struct PlaybackRecord {
     session: SessionId,
+    target_tag: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoppedPlayback {
+    pub session: SessionId,
+    pub target_tag: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -286,6 +307,9 @@ impl SessionRegistry {
                 call_id: request.call_id.clone(),
                 from_tags: request.from_tags.clone(),
                 rtpengine_node: request.rtpengine_node.clone(),
+                sdp_offer: request.sdp_offer.clone(),
+                sdp_answer: None,
+                group: request.group.clone(),
                 attachments: Vec::new(),
                 authoritative: None,
                 next_seq: 0,
@@ -357,9 +381,25 @@ impl SessionRegistry {
             call_id: record.call_id.clone(),
             from_tags: record.from_tags.clone(),
             rtpengine_node: record.rtpengine_node.clone(),
+            sdp_offer: record.sdp_offer.clone(),
+            sdp_answer: record.sdp_answer.clone(),
+            group: record.group.clone(),
             attachments: record.attachments.clone(),
             authoritative: record.authoritative,
         })
+    }
+
+    pub fn record_sdp_answer(
+        &mut self,
+        session: SessionId,
+        answer: String,
+    ) -> Result<SessionView, ControlError> {
+        let record = self
+            .sessions
+            .get_mut(&session)
+            .ok_or(ControlError::UnknownSession(session))?;
+        record.sdp_answer = Some(answer);
+        self.session_view(session)
     }
 
     pub fn attach(&mut self, spec: AttachSpec) -> Result<AttachmentView, ControlError> {
@@ -377,6 +417,11 @@ impl SessionRegistry {
         if spec.capabilities.is_empty() {
             return Err(ControlError::NoCapabilityDeclared);
         }
+        let route = MixRoute::from_metadata(&spec.metadata)?;
+        if let Some(route) = &route {
+            route.authorize(spec.capabilities)?;
+        }
+        let control = MemberControl::from_metadata(&spec.metadata)?;
         let unsupported = spec.capabilities.missing_from(spec.transport.carries());
         if !unsupported.is_empty() {
             return Err(ControlError::TransportCannotCarry {
@@ -432,6 +477,25 @@ impl SessionRegistry {
                 label: spec.label.clone(),
             },
         );
+        if let Some(route) = &route {
+            self.push_event(
+                spec.session,
+                Some(id),
+                spec.authoritative,
+                EventKind::MixRouted {
+                    target: route.target_name().to_string(),
+                    monitor_audible: route.monitor_audible,
+                },
+            );
+        }
+        if let Some(control) = &control {
+            self.push_event(
+                spec.session,
+                Some(id),
+                spec.authoritative,
+                member_controlled(control),
+            );
+        }
         self.remember(
             &spec.idempotency_key,
             spec.fingerprint(),
@@ -472,6 +536,27 @@ impl SessionRegistry {
             .attachments
             .get_mut(&attachment)
             .ok_or(ControlError::UnknownAttachment(attachment))?;
+        let before = MixRoute::from_metadata(&record.metadata)?;
+        let controlled_before = MemberControl::from_metadata(&record.metadata)?;
+        let merged = update.metadata.map(|carried| {
+            let mut merged = record.metadata.clone();
+            merged.extend(carried);
+            merged
+        });
+        let after = match &merged {
+            Some(merged) => MixRoute::from_metadata(merged)?,
+            None => before.clone(),
+        };
+        let controlled_after = match &merged {
+            Some(merged) => MemberControl::from_metadata(merged)?,
+            None => controlled_before,
+        };
+        if let Some(route) = &after {
+            route.authorize(record.capabilities)?;
+        }
+        if let Some(merged) = merged {
+            record.metadata = merged;
+        }
         if let Some(paused) = update.paused {
             record.paused = paused;
         }
@@ -480,6 +565,31 @@ impl SessionRegistry {
         }
         if let Some(format) = update.format {
             record.format = format;
+        }
+        let session = record.session;
+        let authoritative = record.authoritative;
+        if after != before {
+            if let Some(route) = after {
+                self.push_event(
+                    session,
+                    Some(attachment),
+                    authoritative,
+                    EventKind::MixRouted {
+                        target: route.target_name().to_string(),
+                        monitor_audible: route.monitor_audible,
+                    },
+                );
+            }
+        }
+        if controlled_after != controlled_before {
+            if let Some(control) = &controlled_after {
+                self.push_event(
+                    session,
+                    Some(attachment),
+                    authoritative,
+                    member_controlled(control),
+                );
+            }
         }
         self.attachment_view(attachment)
     }
@@ -551,6 +661,7 @@ impl SessionRegistry {
             id,
             PlaybackRecord {
                 session: spec.session,
+                target_tag: spec.target_tag.clone(),
             },
         );
         self.push_event(
@@ -571,7 +682,7 @@ impl SessionRegistry {
         &mut self,
         playback: PlaybackId,
         reason: &str,
-    ) -> Result<SessionId, ControlError> {
+    ) -> Result<StoppedPlayback, ControlError> {
         let record = self
             .playbacks
             .remove(&playback)
@@ -585,7 +696,10 @@ impl SessionRegistry {
                 reason: reason.to_string(),
             },
         );
-        Ok(record.session)
+        Ok(StoppedPlayback {
+            session: record.session,
+            target_tag: record.target_tag,
+        })
     }
 
     pub fn report(
@@ -644,9 +758,15 @@ impl SessionRegistry {
         }
         let kind = match observation {
             Observation::Dtmf { track, digit } => EventKind::Dtmf { track, digit },
-            Observation::RecordingStarted { recording_id, path } => {
-                EventKind::RecordingStarted { recording_id, path }
-            }
+            Observation::RecordingStarted {
+                recording_id,
+                path,
+                shape,
+            } => EventKind::RecordingStarted {
+                recording_id,
+                path,
+                shape,
+            },
             Observation::RecordingPaused {
                 recording_id,
                 paused,
@@ -717,11 +837,11 @@ impl SessionRegistry {
         legacy_eligible: bool,
         kind: EventKind,
     ) {
-        let (external_id, seq) = match self.sessions.get_mut(&session) {
+        let (external_id, session_kind, seq) = match self.sessions.get_mut(&session) {
             Some(record) => {
                 let seq = record.next_seq;
                 record.next_seq += 1;
-                (record.external_id.clone(), seq)
+                (record.external_id.clone(), record.kind, seq)
             }
             None => return,
         };
@@ -732,6 +852,7 @@ impl SessionRegistry {
         self.outbox.push_back(MediaEvent {
             session,
             external_id,
+            session_kind,
             attachment,
             seq,
             legacy_eligible,
@@ -782,6 +903,14 @@ impl SessionRegistry {
     }
 }
 
+fn member_controlled(control: &MemberControl) -> EventKind {
+    EventKind::MemberControlled {
+        mute: control.muted(),
+        deaf: control.deafened(),
+        hold: control.held(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -793,6 +922,8 @@ mod tests {
             call_id: "call-abc".to_string(),
             from_tags: vec!["from-a".to_string()],
             rtpengine_node: "rtpengine-1".to_string(),
+            sdp_offer: None,
+            group: String::new(),
             idempotency_key: None,
         }
     }
@@ -852,6 +983,79 @@ mod tests {
             track: Track::Customer,
             text: text.to_string(),
             confidence: 0.9,
+        }
+    }
+
+    #[test]
+    fn an_inline_session_remembers_the_offer_and_the_answer_it_was_given() {
+        let mut registry = SessionRegistry::new(DEFAULT_MAX_ATTACHMENTS);
+        let created = registry
+            .create_session(CreateSession {
+                kind: SessionKind::Inline,
+                sdp_offer: Some("v=0 offer".to_string()),
+                ..tap("req-inline")
+            })
+            .expect("an inline session");
+        assert_eq!(created.sdp_offer.as_deref(), Some("v=0 offer"));
+        assert_eq!(created.sdp_answer, None);
+
+        let answered = registry
+            .record_sdp_answer(created.id, "v=0 answer".to_string())
+            .expect("the answer is recorded");
+        assert_eq!(answered.sdp_answer.as_deref(), Some("v=0 answer"));
+        assert_eq!(
+            registry
+                .session_view(created.id)
+                .expect("the session")
+                .sdp_answer
+                .as_deref(),
+            Some("v=0 answer")
+        );
+    }
+
+    #[test]
+    fn an_offer_is_part_of_what_an_idempotency_key_replays() {
+        let mut registry = SessionRegistry::new(DEFAULT_MAX_ATTACHMENTS);
+        let inline = CreateSession {
+            kind: SessionKind::Inline,
+            sdp_offer: Some("v=0 first".to_string()),
+            group: String::new(),
+            idempotency_key: Some("key-1".to_string()),
+            ..tap("req-inline")
+        };
+        registry.create_session(inline.clone()).expect("created");
+        let replayed = registry.create_session(inline).expect("the same request");
+        assert_eq!(replayed.sdp_offer.as_deref(), Some("v=0 first"));
+        assert!(matches!(
+            registry.create_session(CreateSession {
+                sdp_offer: Some("v=0 second".to_string()),
+                ..CreateSession {
+                    kind: SessionKind::Inline,
+                    idempotency_key: Some("key-1".to_string()),
+                    ..tap("req-inline")
+                }
+            }),
+            Err(ControlError::IdempotencyConflict(_))
+        ));
+    }
+
+    #[test]
+    fn every_event_names_the_kind_of_session_that_produced_it() {
+        let mut registry = SessionRegistry::new(DEFAULT_MAX_ATTACHMENTS);
+        let inline = registry
+            .create_session(CreateSession {
+                kind: SessionKind::Inline,
+                sdp_offer: Some("v=0 offer".to_string()),
+                ..tap("req-inline")
+            })
+            .expect("an inline session");
+        registry
+            .destroy_session(inline.id, "hangup")
+            .expect("destroyed");
+        let events = registry.drain_events();
+        assert!(!events.is_empty());
+        for event in events {
+            assert_eq!(event.session_kind, SessionKind::Inline);
         }
     }
 
@@ -1127,6 +1331,164 @@ mod tests {
     }
 
     #[test]
+    fn muting_a_member_is_audited_the_same_way_a_whisper_is() {
+        let (mut registry, session) = started();
+        let id = registry.attach(rtt(session)).unwrap().id;
+        registry.drain_events();
+
+        registry
+            .update_attachment(
+                id,
+                AttachmentUpdate {
+                    metadata: Some(BTreeMap::from([(
+                        crate::mix::MEMBER_MUTE_METADATA_KEY.to_string(),
+                        crate::mix::MEMBER_FLAG_ON.to_string(),
+                    )])),
+                    ..AttachmentUpdate::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            registry.drain_events().pop().map(|event| event.kind),
+            Some(EventKind::MemberControlled {
+                mute: true,
+                deaf: false,
+                hold: false,
+            }),
+            "a member verb needs no capability and no new rpc, only an audit trail"
+        );
+
+        registry
+            .update_attachment(
+                id,
+                AttachmentUpdate {
+                    metadata: Some(BTreeMap::from([(
+                        crate::mix::MEMBER_HOLD_METADATA_KEY.to_string(),
+                        crate::mix::MEMBER_FLAG_ON.to_string(),
+                    )])),
+                    ..AttachmentUpdate::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            registry.drain_events().pop().map(|event| event.kind),
+            Some(EventKind::MemberControlled {
+                mute: true,
+                deaf: false,
+                hold: true,
+            }),
+            "the merged metadata is the member's declared state, not just the last verb"
+        );
+
+        registry
+            .update_attachment(
+                id,
+                AttachmentUpdate {
+                    paused: Some(true),
+                    ..AttachmentUpdate::default()
+                },
+            )
+            .unwrap();
+        assert!(
+            registry.drain_events().is_empty(),
+            "an update that touches no member verb says nothing about them"
+        );
+
+        let refused = registry.update_attachment(
+            id,
+            AttachmentUpdate {
+                metadata: Some(BTreeMap::from([(
+                    crate::mix::MEMBER_DEAF_METADATA_KEY.to_string(),
+                    "later".to_string(),
+                )])),
+                ..AttachmentUpdate::default()
+            },
+        );
+        assert!(matches!(refused, Err(ControlError::MixRoute(_))));
+    }
+
+    #[test]
+    fn a_mix_target_is_audited_when_it_is_declared_and_every_time_it_moves() {
+        let (mut registry, session) = started();
+        let mut whisperer = bridge(session);
+        whisperer.metadata.insert(
+            crate::mix::MIX_TARGET_METADATA_KEY.to_string(),
+            "agent-7".to_string(),
+        );
+        let id = registry.attach(whisperer).unwrap().id;
+        let declared: Vec<EventKind> = registry
+            .drain_events()
+            .into_iter()
+            .map(|event| event.kind)
+            .collect();
+        assert!(
+            declared.contains(&EventKind::MixRouted {
+                target: "agent-7".to_string(),
+                monitor_audible: true,
+            }),
+            "attaching a whisperer says who it whispers to: {declared:?}"
+        );
+
+        let flipped = registry
+            .update_attachment(
+                id,
+                AttachmentUpdate {
+                    metadata: Some(BTreeMap::from([(
+                        crate::mix::MIX_TARGET_METADATA_KEY.to_string(),
+                        crate::mix::MIX_TARGET_EVERYONE.to_string(),
+                    )])),
+                    ..AttachmentUpdate::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            flipped
+                .metadata
+                .get(crate::mix::MIX_TARGET_METADATA_KEY)
+                .map(String::as_str),
+            Some("all"),
+            "an update merges metadata rather than replacing it"
+        );
+        let events = registry.drain_events();
+        assert_eq!(
+            events.last().map(|event| event.kind.clone()),
+            Some(EventKind::MixRouted {
+                target: "all".to_string(),
+                monitor_audible: true,
+            }),
+            "the barge flip is auditable too"
+        );
+
+        registry
+            .update_attachment(
+                id,
+                AttachmentUpdate {
+                    paused: Some(true),
+                    ..AttachmentUpdate::default()
+                },
+            )
+            .unwrap();
+        assert!(
+            registry.drain_events().is_empty(),
+            "an update that leaves the route alone says nothing about it"
+        );
+    }
+
+    #[test]
+    fn a_sink_only_attachment_may_not_name_a_mix_target() {
+        let (mut registry, session) = started();
+        let mut listener = rtt(session);
+        listener.metadata.insert(
+            crate::mix::MIX_TARGET_METADATA_KEY.to_string(),
+            "agent-7".to_string(),
+        );
+        assert!(matches!(
+            registry.attach(listener),
+            Err(ControlError::MixRoute(_))
+        ));
+    }
+
+    #[test]
     fn pausing_an_attachment_is_an_update_rather_than_a_verb_of_its_own() {
         let (mut registry, session) = started();
         let id = registry.attach(rtt(session)).unwrap().id;
@@ -1150,6 +1512,7 @@ mod tests {
                     paused: Some(false),
                     selector: Some(TrackSelector::Only(Track::Customer)),
                     format: Some(AudioFormat::l16_16k_20ms()),
+                    metadata: None,
                 },
             )
             .unwrap();
@@ -1216,11 +1579,48 @@ mod tests {
                 idempotency_key: None,
             })
             .unwrap();
-        registry.stop_playback(playback, "barge-in").unwrap();
+        let stopped = registry.stop_playback(playback, "barge-in").unwrap();
+        assert_eq!(stopped.session, session);
+        assert_eq!(stopped.target_tag.as_deref(), Some("from-a"));
 
         assert_eq!(
             registry.stop_playback(playback, "again"),
             Err(ControlError::UnknownPlayback(playback))
+        );
+    }
+
+    #[test]
+    fn stopping_a_playback_returns_the_participant_it_was_played_to() {
+        let (mut registry, session) = started();
+        let everyone = registry
+            .start_playback(PlaybackSpec {
+                session,
+                requested_by: None,
+                target_tag: None,
+                block_egress: false,
+                idempotency_key: None,
+            })
+            .unwrap();
+        let one = registry
+            .start_playback(PlaybackSpec {
+                session,
+                requested_by: None,
+                target_tag: Some("from-b".to_string()),
+                block_egress: false,
+                idempotency_key: None,
+            })
+            .unwrap();
+
+        assert_eq!(
+            registry.stop_playback(one, "barge-in").unwrap().target_tag,
+            Some("from-b".to_string())
+        );
+        assert_eq!(
+            registry
+                .stop_playback(everyone, "prompt done")
+                .unwrap()
+                .target_tag,
+            None
         );
     }
 

@@ -47,6 +47,7 @@ impl TapEvent {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TrackSelection {
     All,
+    Speakers,
     Only(Track),
 }
 
@@ -54,6 +55,7 @@ impl TrackSelection {
     pub fn wants(self, track: Track) -> bool {
         match self {
             TrackSelection::All => true,
+            TrackSelection::Speakers => track != Track::Mixed,
             TrackSelection::Only(only) => only == track,
         }
     }
@@ -63,6 +65,8 @@ struct Shared {
     frames: ArrayQueue<TapEvent>,
     dropped_oldest: AtomicU64,
     delivered: AtomicU64,
+    suppressed_while_paused: AtomicU64,
+    paused: AtomicBool,
     closed: AtomicBool,
     wake: Notify,
 }
@@ -137,6 +141,16 @@ impl Hub {
             if !consumer.selection.wants(event.track()) {
                 continue;
             }
+            if consumer.shared.closed.load(Ordering::Acquire) {
+                continue;
+            }
+            if consumer.shared.paused.load(Ordering::Relaxed) {
+                consumer
+                    .shared
+                    .suppressed_while_paused
+                    .fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
             if consumer.shared.frames.force_push(event).is_some() {
                 consumer
                     .shared
@@ -207,6 +221,8 @@ impl HubClient {
             frames: ArrayQueue::new(capacity.max(1)),
             dropped_oldest: AtomicU64::new(0),
             delivered: AtomicU64::new(0),
+            suppressed_while_paused: AtomicU64::new(0),
+            paused: AtomicBool::new(false),
             closed: AtomicBool::new(false),
             wake: Notify::new(),
         });
@@ -258,10 +274,39 @@ impl Subscription {
         self.shared.delivered.load(Ordering::Relaxed)
     }
 
+    #[cfg(test)]
+    pub fn suppressed_while_paused(&self) -> u64 {
+        self.shared.suppressed_while_paused.load(Ordering::Relaxed)
+    }
+
     pub fn metrics(&self) -> SubscriptionMetrics {
         SubscriptionMetrics {
             shared: Arc::clone(&self.shared),
         }
+    }
+
+    pub fn control(&self) -> SubscriptionControl {
+        SubscriptionControl {
+            shared: Arc::clone(&self.shared),
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct SubscriptionControl {
+    shared: Arc<Shared>,
+}
+
+impl SubscriptionControl {
+    pub fn set_paused(&self, paused: bool) {
+        self.shared.paused.store(paused, Ordering::Relaxed);
+        if !paused {
+            self.shared.wake.notify_one();
+        }
+    }
+
+    pub fn end_of_stream(&self) {
+        self.shared.close();
     }
 }
 
@@ -281,6 +326,10 @@ impl SubscriptionMetrics {
 
     pub fn delivered(&self) -> u64 {
         self.shared.delivered.load(Ordering::Relaxed)
+    }
+
+    pub fn suppressed_while_paused(&self) -> u64 {
+        self.shared.suppressed_while_paused.load(Ordering::Relaxed)
     }
 }
 
@@ -420,6 +469,64 @@ mod tests {
         assert_eq!(stamps, vec![0, 20, 40, 60, 80]);
         assert_eq!(speech, vec![false, true, true, true, false]);
         assert_eq!(std::iter::from_fn(|| listener.try_next()).count(), 5);
+    }
+
+    #[test]
+    fn a_speakers_consumer_never_sees_the_mixed_track_while_an_all_consumer_does() {
+        let (mut hub, client) = Hub::new();
+        let mut speakers = client.attach(8, TrackSelection::Speakers).unwrap();
+        let mut everything = client.attach(8, TrackSelection::All).unwrap();
+        hub.poll_commands();
+
+        hub.publish(frame(Track::Customer, 0));
+        hub.publish(frame(Track::Mixed, 0));
+        hub.publish(frame(Track::Agent, 20));
+
+        assert_eq!(std::iter::from_fn(|| speakers.try_next()).count(), 2);
+        assert_eq!(std::iter::from_fn(|| everything.try_next()).count(), 3);
+        assert!(TrackSelection::Speakers.wants(Track::Customer));
+        assert!(TrackSelection::Speakers.wants(Track::Agent));
+        assert!(!TrackSelection::Speakers.wants(Track::Mixed));
+    }
+
+    #[test]
+    fn a_paused_consumer_is_not_fed_and_resumes_where_the_tap_now_is() {
+        let (mut hub, client) = Hub::new();
+        let mut consumer = client.attach(8, TrackSelection::All).unwrap();
+        let control = consumer.control();
+        let metrics = consumer.metrics();
+        hub.poll_commands();
+
+        hub.publish(frame(Track::Customer, 0));
+        control.set_paused(true);
+        hub.publish(frame(Track::Customer, 20));
+        hub.publish(frame(Track::Customer, 40));
+        control.set_paused(false);
+        hub.publish(frame(Track::Customer, 60));
+
+        let seen: Vec<u64> = std::iter::from_fn(|| consumer.try_next())
+            .map(|e| timestamp(&e))
+            .collect();
+        assert_eq!(seen, vec![0, 60]);
+        assert_eq!(consumer.suppressed_while_paused(), 2);
+        assert_eq!(metrics.suppressed_while_paused(), 2);
+        assert_eq!(consumer.dropped_oldest(), 0);
+        assert_eq!(consumer.delivered(), 2);
+    }
+
+    #[tokio::test]
+    async fn ending_a_stream_lets_the_consumer_drain_and_finish_on_its_own() {
+        let (mut hub, client) = Hub::new();
+        let mut consumer = client.attach(8, TrackSelection::All).unwrap();
+        let control = consumer.control();
+        hub.poll_commands();
+
+        hub.publish(frame(Track::Customer, 0));
+        control.end_of_stream();
+        hub.publish(frame(Track::Customer, 20));
+
+        assert_eq!(timestamp(&consumer.next().await.unwrap()), 0);
+        assert!(consumer.next().await.is_none());
     }
 
     #[test]

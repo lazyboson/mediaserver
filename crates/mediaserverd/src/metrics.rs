@@ -122,6 +122,111 @@ pub fn render(sources: &MetricsSources) -> String {
         snapshot.totals.reresolutions,
     );
     counter(
+        "mss_inline_egress_packets_total",
+        "RTP packets an inline leg paced out to its peer",
+        snapshot.inline.datagrams_sent,
+    );
+    counter(
+        "mss_inline_egress_send_errors_total",
+        "Datagrams the inline egress socket refused",
+        snapshot.inline.send_errors,
+    );
+    counter(
+        "mss_inline_egress_silence_frames_total",
+        "Paced frames the inline egress filled with silence because its queue was empty",
+        snapshot.inline.silence_frames,
+    );
+    counter(
+        "mss_inline_egress_late_ticks_total",
+        "Inline egress pacing deadlines missed by more than one frame",
+        snapshot.inline.late_ticks,
+    );
+    counter(
+        "mss_inline_egress_chunks_refused_total",
+        "Audio chunks the control world could not queue because the egress queue was full",
+        snapshot.inline.chunks_refused,
+    );
+    counter(
+        "mss_inline_egress_dropped_samples_total",
+        "Samples dropped from the inline egress ring as oldest-first",
+        snapshot.inline.dropped_samples,
+    );
+    counter(
+        "mss_inline_egress_clears_total",
+        "Times the inline egress queue was flushed for a barge-in",
+        snapshot.inline.clears,
+    );
+    counter(
+        "mss_inline_egress_cleared_samples_total",
+        "Samples discarded by inline egress flushes",
+        snapshot.inline.cleared_samples,
+    );
+    counter(
+        "mss_inline_egress_pushed_samples_total",
+        "PCM samples the control world queued for an inline leg to speak",
+        snapshot.inline.pushed_samples,
+    );
+    counter(
+        "mss_inline_egress_drained_samples_total",
+        "Queued samples that have left the inline egress, whether paced out, dropped or flushed",
+        snapshot.inline.drained_samples,
+    );
+    counter(
+        "mss_conference_joins_total",
+        "Inline legs seated in a conference mix",
+        snapshot.conference.joins,
+    );
+    counter(
+        "mss_conference_leaves_total",
+        "Inline legs that left a conference mix",
+        snapshot.conference.leaves,
+    );
+    counter(
+        "mss_conference_mixed_frames_total",
+        "Frames a conference mixed and paced to its members",
+        snapshot.conference.mixed_frames,
+    );
+    counter(
+        "mss_conference_clipped_samples_total",
+        "Mixed samples saturated at the i16 rail; a conference that wants AGC",
+        snapshot.conference.clipped_samples,
+    );
+    counter(
+        "mss_conference_absent_frames_total",
+        "Conference ticks a member contributed no frame to and was mixed as silence",
+        snapshot.conference.absent_frames,
+    );
+    counter(
+        "mss_conference_reanchors_total",
+        "Times a conference clock fell a whole frame behind and re-anchored",
+        snapshot.conference.reanchors,
+    );
+    counter(
+        "mss_conference_route_changes_total",
+        "Times an injecting attachment was routed to a whisper target, to everyone, or back to private",
+        snapshot.conference.route_changes,
+    );
+    counter(
+        "mss_conference_member_controls_total",
+        "Times a member was muted, deafened, put on hold or released",
+        snapshot.conference.member_controls,
+    );
+    counter(
+        "mss_conference_prompt_frames_total",
+        "Frames a prompt played into the whole room contributed to the mix",
+        snapshot.conference.prompt_frames,
+    );
+    counter(
+        "mss_conference_frames_refused_total",
+        "Frames the mix matrix refused, by frame size or a stale membership handle",
+        snapshot.conference.frames_refused,
+    );
+    counter(
+        "mss_inline_egress_encode_errors_total",
+        "Inline egress frames that could not be encoded or serialized",
+        snapshot.inline.encode_errors,
+    );
+    counter(
         "mss_ssrc_requeries_total",
         "rtpengine queries made to re-resolve a leg whose ssrc changed",
         snapshot.ssrc_requeries,
@@ -140,6 +245,11 @@ pub fn render(sources: &MetricsSources) -> String {
         "mss_consumer_delivered_total",
         "Frames queued to consumers",
         snapshot.consumer_delivered,
+    );
+    counter(
+        "mss_consumer_suppressed_while_paused_total",
+        "Frames not delivered to a consumer because its attachment was paused",
+        snapshot.consumer_suppressed_while_paused,
     );
     counter(
         "mss_recordings_started_total",
@@ -170,6 +280,36 @@ pub fn render(sources: &MetricsSources) -> String {
         "mss_recording_spills_total",
         "Recordings written to local disk because their upload failed",
         snapshot.recording_spills,
+    );
+    counter(
+        "mss_recording_spill_segments_total",
+        "Closed recording segments written to local disk while the call was still up",
+        snapshot.recording_segments_spilled,
+    );
+    counter(
+        "mss_recording_spill_failures_total",
+        "Closed recording segments that could not be written to local disk",
+        snapshot.recording_segment_spill_failures,
+    );
+    counter(
+        "mss_recording_salvaged_total",
+        "Recordings uploaded from segments an earlier life of this pod left on disk",
+        snapshot.recording_salvaged,
+    );
+    counter(
+        "mss_recording_salvage_skipped_total",
+        "Spilled recordings left alone because the object was already in storage",
+        snapshot.recording_salvage_skipped,
+    );
+    counter(
+        "mss_recording_salvage_failures_total",
+        "Spilled recordings that could not be uploaded on this pod's start",
+        snapshot.recording_salvage_failures,
+    );
+    counter(
+        "mss_recording_frames_lost_on_adopt_total",
+        "Recorded frames a dead pod held that the adopting pod could not read back",
+        snapshot.recording_frames_lost_on_adopt,
     );
     counter(
         "mss_recordings_truncated_total",
@@ -217,6 +357,41 @@ pub fn render(sources: &MetricsSources) -> String {
         "mss_legs_stalled",
         "Live legs the audio-flow watchdog reports as stalled",
         snapshot.legs_stalled,
+    );
+    gauge(
+        "mss_inline_legs_live",
+        "Inline rtp endpoints this pod is pacing audio out of",
+        snapshot.inline_legs_live,
+    );
+    gauge(
+        "mss_conferences_live",
+        "Conference mixes this pod is running",
+        snapshot.conferences_live,
+    );
+    gauge(
+        "mss_conference_members_live",
+        "Inline legs seated in a conference on this pod",
+        snapshot.conference_members_live,
+    );
+    gauge(
+        "mss_conference_whispers_live",
+        "Conference legs whose injected audio is routed somewhere other than their own ear",
+        snapshot.conference_whispers_live,
+    );
+    gauge(
+        "mss_conference_muted_members",
+        "Conference members whose own audio reaches nobody, hold included",
+        snapshot.conference_members_muted,
+    );
+    gauge(
+        "mss_conference_deaf_members",
+        "Conference members the room is silent to, hold included",
+        snapshot.conference_members_deaf,
+    );
+    gauge(
+        "mss_conference_held_members",
+        "Conference members on hold: neither heard nor hearing the room",
+        snapshot.conference_members_held,
     );
     gauge(
         "mss_consumers_live",
@@ -350,6 +525,31 @@ pub fn render(sources: &MetricsSources) -> String {
             "Registry operations that failed",
             keeper.failed.load(Ordering::Relaxed),
         );
+        counter(
+            "mss_registry_orphans_unsubscribed_total",
+            "Dead pods' rtpengine subscriptions cancelled before re-subscribing",
+            keeper.orphans_unsubscribed.load(Ordering::Relaxed),
+        );
+        counter(
+            "mss_registry_orphans_still_subscribed_total",
+            "Adoptions that left the previous owner's tap in place; rtpengine copies              that call twice until it ends",
+            keeper.orphans_still_subscribed.load(Ordering::Relaxed),
+        );
+        counter(
+            "mss_registry_inline_not_adopted_total",
+            "Orphaned inline legs released without adoption; an rtp endpoint cannot move pods",
+            keeper.inline_not_adopted.load(Ordering::Relaxed),
+        );
+        counter(
+            "mss_registry_grouped_not_adopted_total",
+            "Recording-group members not restored on the adopting pod",
+            keeper.grouped_not_adopted.load(Ordering::Relaxed),
+        );
+        counter(
+            "mss_registry_surrendered_total",
+            "Sessions this pod gave up because another pod holds their lease",
+            keeper.surrendered.load(Ordering::Relaxed),
+        );
     }
 
     let _ = writeln!(
@@ -472,6 +672,9 @@ mod tests {
             "mss_recording_upload_failures_total",
             "mss_recordings_truncated_total",
             "mss_recording_spills_total",
+            "mss_recording_spill_segments_total",
+            "mss_recording_salvaged_total",
+            "mss_recording_frames_lost_on_adopt_total",
         ] {
             assert!(text.contains(name), "missing {name} in:\n{text}");
         }

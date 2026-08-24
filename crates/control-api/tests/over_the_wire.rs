@@ -38,6 +38,8 @@ async fn a_client_drives_a_whole_session_across_a_real_socket() {
             rtpengine_node: "rtpengine-1".to_string(),
             mix: false,
             idempotency_key: "key-wire".to_string(),
+            sdp_offer: String::new(),
+            group: String::new(),
         })
         .await
         .unwrap()
@@ -122,6 +124,8 @@ async fn a_refusal_reaches_the_client_as_a_status_not_a_broken_connection() {
             rtpengine_node: String::new(),
             mix: false,
             idempotency_key: String::new(),
+            sdp_offer: String::new(),
+            group: String::new(),
         })
         .await
         .unwrap()
@@ -198,6 +202,8 @@ async fn a_watch_on_one_session_ends_when_that_session_does() {
             rtpengine_node: String::new(),
             mix: false,
             idempotency_key: String::new(),
+            sdp_offer: String::new(),
+            group: String::new(),
         })
         .await
         .unwrap()

@@ -13,10 +13,10 @@ is boringly stable in production).
 | --- | --- | --- | --- |
 | — | M1 scaffold | — | ✅ done (2026-08-13) |
 | 0 | Groundwork spike (M2) | — (de-risking only) | ✅ code done; 3 org-side items open |
-| 1 | Passive fan-out (M3–M4) | `uuid_audio_fork`, `uuid_google_transcribe2` media bugs | 🔶 M3 done, M4 ~95% (code complete; translator merge + barge-in measurement remain) |
-| 2 | Recording | `record_session` bugs, shared-FS recording pipeline | ⬜ |
-| 3 | Interactive media | dummy leg + conference-per-AI-interaction; mediagateway service | ⬜ |
-| 4 | Full media plane | conference mixing, monitor/whisper (`relate nospeak`), MOH | ⬜ |
+| 1 | Passive fan-out (M3–M4) | `uuid_audio_fork`, `uuid_google_transcribe2` media bugs | 🔶 M3 done, M4 code complete; the barge-in cut-through is **measured for every MSS-owned hop** (tasks item 5, p50 3.5 ms from a real consumer `SpeechReport`) — what remains is an integrator's own event consumer and the pilot |
+| 2 | Recording | `record_session` bugs, shared-FS recording pipeline | 🔶 code complete (M5, tasks items 15/21/29/30); FS parity measured (item 31) — a two-party production-FS comparison and the tenant cutover remain |
+| 3 | Interactive media | dummy leg + conference-per-AI-interaction; mediagateway service | 🔶 code complete, lab-verified (items 32–35); production integration and org-gated criteria remain |
+| 4 | Full media plane | conference mixing, monitor/whisper (`relate nospeak`), MOH | 🔶 code complete, lab-verified (items 36–41); production integration and org-gated criteria remain |
 
 The ordered next-up list, with a definition of done per item, open defects
 and what is blocked on other people, lives in [tasks.md](tasks.md).
@@ -144,7 +144,7 @@ reduction; one full quarter (or agreed period) of pilot stability;
 audio-flow watchdog + re-subscribe recovery observed working in
 production incidents, not just tests (the lab half of the re-subscribe
 criterion is met — 2026-08-22, a real `kill -9` mid-call with a measured
-14.41 s gap; what remains is seeing it in production, and D14).
+14.41 s gap, and the D14 orphan subscription it exposed is fixed — tasks item 25; what remains is seeing the recovery in production).
 
 ## Phase 2 — Recording
 
@@ -160,13 +160,19 @@ Work:
 - Compliance option: per-tenant dual-recording (FS + MSS) during
   transition; keep `record_session` as fallback until sign-off.
 
-Status (2026-08-22, tasks item 15): **code complete.** The recorder is a hub
+Status (updated 2026-08-24; tasks items 15, 21, 29, 30, 31): **code complete.** The recorder is a hub
 consumer in the control world — stereo segmenter (customer left, agent right),
 the frozen `${accountID}/${recordingID}.${format}` identity parsed from the
 `FILE_S3` attachment endpoint, `recordStart/recordPause/recordStop/
 uploadCompleted` on `mss.events` with pause = segment + defer + accumulated
 duration, and direct upload through `object_store` to S3 or MinIO. Verified
-against a real MinIO from a synthetic hub, not yet from a live tapped call.
+against a real MinIO from a synthetic hub **and on a live tapped call**
+(item 10). Since then: **recording groups** record N sessions as one recording
+with one mono object per participant (item 21), time-aligned on the group's open
+instant (item 29, closing D18), and closed segments **spill to disk as the call
+runs** so a pod death costs the spill interval rather than the call (item 30,
+partly closing D9 — the spill dir is per-pod local disk, so the cross-pod half
+stays open with D16).
 Hold/pause arrives as `UpdateAttachment{paused}` (which now reaches the media
 world at all) rather than from Redis; cigol drives it through
 `TelCompat`. Dual recording remains a cigol per-tenant flag and nothing here
@@ -181,20 +187,56 @@ lab drill: a real SIP call to MinIO, duration matching the reported
 `duration_ms` to the sample, and the recording callbacks read off the real
 `mss.events` topic.
 
-Exit criteria still open: the byte comparison itself — `lab/recording_parity.py`
-is the harness and has never seen a FreeSWITCH recording — and the transfer
-scenario, which still lands on speaker naming by elimination until a
-tag-replacing transfer triggers a re-subscribe.
+The byte comparison ran against a **real FreeSWITCH recording** on 2026-08-23
+(item 31, `lab/fs_parity_drill.sh` records one live call both ways): container,
+channel layout and rms agree exactly, and a re-aligned 2 s window agrees on
+1.0000 of samples at mean difference 0.6/32768 — there is no transform
+difference. That run also **retired "byte-comparable" as a literal bar**: MSS and
+FS conceal loss independently, so the inter-file offset wanders and a single
+global offset fails by construction. The criterion is restated as container +
+layout + duration + rms + windowed agreement.
+
+Exit criteria still open: a **two-party** comparison on a production
+FreeSWITCH — the lab's write side plays silence, so only one channel was truly
+compared — the pause contract and a human listen against the tenant's codec; the
+transfer scenario, which still lands on speaker naming by elimination until a
+tag-replacing transfer triggers a re-subscribe; and the tenant decision to
+disable dual recording.
 
 ## Phase 3 — Interactive media
 
 Objective: things that talk back go through MSS inline legs; the
 dummy-leg-conference construct and mediagateway die.
 
+Status (2026-08-23): **code complete and lab-verified; production integration
+and the org-gated criteria remain.** The leg has met a real RTP peer — a
+SIP-less container endpoint, not a SIP proxy's B2B leg — and barges in at
+p50 12.2 ms / p95 20.4 ms (tasks.md item 35).
+`CreateSession{kind=INLINE, sdp_offer}` binds a UDP socket
+on the pod's media address, answers with MSS-owned SDP (PCMU/PCMA +
+telephone-event; anything else refused by name), returns the answer in
+`Session.sdp_answer`, feeds the peer's audio into the same jitter → decode →
+hub pipeline the taps use as the `customer` track, and paces queued PCM back
+out through the sans-IO `PlayoutPacer` (tasks.md items 32 and 33).
+`StopPlayback` flushes the egress queue, which is the barge seam. Item 34 made
+it **full duplex**: an INJECT attachment on either transport (gRPC
+`MediaStream`, WS-Twilio) streams into that queue continuously, `Clear` flushes
+it, and `Mark` is acked once the marked audio has drained out of it. Item 35
+put a **real RTP peer** on the other end (`lab/inline_call_drill.sh`, no SIP and
+no human) and measured what was owed: the peer hears the injected tone, the hub
+still taps the peer at the same time, egress paces at 50.19 pkt/s with unbroken
+sequence numbers, `Mark` acks 404 ms after a 400 ms lead, and **barge-in
+cut-through is p50 12.2 ms / p95 20.4 ms / max 21.0 ms over 20 iterations** —
+one ptime, as the pacer's flush promised. Owed now: a SIP/B2B leg, codecs other
+than PCMU/8 kHz, and the integrator's own consumer half of barge-in.
+
 Work:
 - Inline RTP endpoint mode: answer OpenSIPS B2B INVITEs
   (`X-Conversation-ID` / `X-ccId` correlation, `ua_session_reply` via MI)
   with MSS-owned SDP; per-pod addressable RTP (hostNetwork/port range).
+  **The SDP answer and the media path exist; the SIP/B2B side is the
+  integrator's, and an inline leg is deliberately not adoptable across pods —
+  unlike a tap, its socket dies with its pod, so recovery is call control's.**
 - Full-duplex sessions: caller audio to bot, streaming TTS from bot to
   caller through the playout pacer; barge-in cut-through in MSS.
 - Pre-agent AI calls routed by OpenSIPS straight to MSS — FreeSWITCH
@@ -213,14 +255,62 @@ on `MEDIAGATEWAY_BILLING_TOPIC` / `KAFKA_VOICE_AI_AGENT_TOPIC` verified.
 
 Objective: mixing moves to MSS; FreeSWITCH has no media left.
 
+Status (2026-08-24): **code complete and lab-verified; production integration
+and the org-gated criteria remain.** Three container RTP peers have been in one
+conference on real sockets, and twenty tone-per-phase assertions decided
+minus-self, the monitor, whisper isolation, the barge flip, mute/unmute and both
+recording shapes at a >=30:1 margin (tasks.md item 41, lab.md). What has *not*
+happened is a SIP proxy's B2B leg into a conference, which is deployment-gated.
+
+`media-core`'s `MixMatrix` is the sans-IO engine — N contributors x M listeners, minus-self by default, and all
+three of monitor / whisper / barge are cells of that matrix rather than code
+paths (tasks.md item 36). `mediaserverd`'s `conference.rs` wires it to sockets
+(item 37): `CreateSession{kind=INLINE, group=<name>}` seats a leg in a
+conference, the legs that share a group share one mix driven by one
+capture-world clock, each hears everybody but itself, a prompt played into one
+leg stays private to it, and the conference's full mix is published to every
+member's hub as the `mixed` track so a monitor or recorder attaches with the
+verbs that already exist. Verified over real UDP sockets in-process (three peers
+hearing the other two and never themselves, a leg leaving mid-mix, the last leg
+closing the conference); multi-rate conferences are refused by name rather than
+resampled, and conferences are pod-local.
+
+Monitor, whisper and barge landed as **matrix cells named by attachment
+metadata** rather than new RPCs (item 38): `selector.only="mixed"` on any member
+session is the monitor, `mix_target=<member>|all` on an INJECT attachment is the
+whisper and the barge flip, and `mix_monitor=include|exclude` decides whether the
+mixed track — which is also the recording feed — carries it. **Native conference
+recording** landed on top of that (item 39) with no new noun either: a
+`FILE_S3` attachment with `only=mixed` on any member records the room as one
+mono object, a recording **group** over the member sessions with
+`only=customer` records one object per participant time-aligned on the group
+anchor, both shapes may run on one conference at once, and `RecordingStarted`
+now names which shape an object is.
+
+The **conference feature tail** closed the same way (item 40): `member_mute`,
+`member_deaf` and `member_hold` are member-state metadata verbs — mute zeroes a
+contributor row (off every ear and off the record), deaf silences the room into
+one ear while audio addressed at that member still lands, hold is both with the
+ear left open for hold audio — a prompt into the whole room is
+`StartPlayback{target_tag="all"}`, and `mix_source=leg` routes a member's own RTP
+to one ear, which is the coach shape. Enter/exit sounds are a verb rather than a
+trigger and DTMF control is API-first, both on purpose; the generic conference
+feature list and the ADAPTER parity table against one integrator's 14 conference
+RPCs are architecture.md Appendix B. Items 37-40 are verified over in-process
+UDP sockets; **item 41 then ran the three-peer drill for real** — three container
+RTP peers in one conference, twenty green assertions, both recording shapes in
+MinIO at once. What no conference here has met is a **SIP** peer.
+
 Work:
 - N-way mixer: conferences as MSS sessions of inline legs with a
   per-listener mix matrix (sum/saturate DSP, active-speaker, AGC).
 - Monitor = a hub subscriber (no SIP leg at all); whisper = injection
   routed only into the agent's mix; barge = matrix flip — replacing
   conference `relate … nospeak`.
-- Conference feature tail: enter/exit sounds, member mute/deaf/hold,
-  conference recording, DTMF controls (parity list from cigol's 14
+- Conference feature tail: member mute/deaf/hold, prompts into the room,
+  conference recording (items 39–40 — done; enter/exit sounds and DTMF
+  menus are deliberately integrator policy, see architecture.md
+  Appendix B for the parity table against one integrator's 14
   conference RPCs).
 - Fallback path if hand-rolled mixing disappoints: embed GStreamer
   (`gstreamer-rs`, `audiomixer`) behind the same session API

@@ -4,7 +4,7 @@ Living work list. [roadmap.md](roadmap.md) holds the *why* and the phase exit
 criteria; this file holds the *what next*, ordered, with a definition of done
 for each item. Update it in the same PR that changes the state of an item.
 
-Status as of **2026-08-23**.
+Status as of **2026-08-24**.
 
 ## Milestones
 
@@ -13,9 +13,9 @@ Status as of **2026-08-23**.
 | **M1 — scaffold** | workspace, sans-IO cores (RTP, G.711, DTMF, jitter), NG bencode, consumer dialects, two-world daemon skeleton, watchdog | ✅ done (2026-08-13) |
 | **M2 — Phase-0 spike** | real NG subscribe against lab rtpengine, both legs jitter-buffered to WAV, per-tap cost | ✅ **code done**; 3 org-side items open (below) |
 | **M3 — fan-out hub** | per-session pub/sub, N consumers, WS-Twilio adapter, pause/resume/send_text parity | ✅ done |
-| **M4 — control plane** | `MediaControl` gRPC, session state machine, Kafka events, Redis registry, tenant-flag pilot | 🔶 **code complete** — pilot gates: translator merge (external), barge-in number (item 5). The gRPC lab proof (item 10) and the **live pod-kill drill (item 11, gap 14.41 s)** are both **done 2026-08-22**; the drill left D14 open (orphan subscription after a pod death) |
-| **M5 — recording (Phase 2)** | per-leg taps → stereo segmenter → S3, identity + callback contract, dual-recording | 🔶 **code complete (2026-08-22)** — a live tapped call recorded end to end to a real MinIO, callbacks read off `mss.events` (2026-08-22, item 10's drill); **recording groups** — N sessions recorded as one recording, one mono object per participant — landed 2026-08-23 (item 21); owed: FS byte-parity sign-off (harness exists) |
-| M6+ | Phases 3–4 (interactive media, full media plane) | ⬜ not started |
+| **M4 — control plane** | `MediaControl` gRPC, session state machine, Kafka events, Redis registry, tenant-flag pilot | 🔶 **code complete** — pilot gates: translator merge (external), and the consumer half of the barge-in number — **every MSS-owned hop is measured (item 5, 2026-08-23: cut-through p95 4.8 ms from a real consumer `SpeechReport`)**, the D19 ingress gap it found being fixed in item 28. The gRPC lab proof (item 10) and the **live pod-kill drill (item 11, gap 14.41 s)** are both **done 2026-08-22**; the D14 orphan subscription the drill found is **fixed (item 25, 2026-08-23)**, fake- and Redis-verified rather than re-measured live |
+| **M5 — recording (Phase 2)** | per-leg taps → stereo segmenter → S3, identity + callback contract, dual-recording | 🔶 **code complete (2026-08-22)** — a live tapped call recorded end to end to a real MinIO, callbacks read off `mss.events` (2026-08-22, item 10's drill); **recording groups** — N sessions recorded as one recording, one mono object per participant, time-aligned on the group's open instant since item 29 — landed 2026-08-23 (item 21); FS byte-parity **measured against a real FS recording** 2026-08-23 (item 31): container/layout/rms exact, a re-aligned 2 s window agrees 1.0000 at mean diff 0.6/32768; owed: a two-party production-FS comparison and a human listen |
+| M6+ | Phases 3–4 (interactive media, full media plane) | 🔶 **Phase 3 code complete and lab-verified (items 32–35, 2026-08-23)** — an inline leg answers an SDP offer, is spoken to over a continuous inject stream, and barges in **p50 12.2 ms / p95 20.4 ms** measured against a real RTP peer. **Phase 4 is code complete and lab-verified too (2026-08-24):** the N-way mix matrix (item 36) and **conferences of inline legs** (item 37, 2026-08-24 — one clock per conference, each leg hears everybody but itself, mixed track on the hub) and **monitor / whisper / barge as metadata-named matrix cells** (item 38, 2026-08-24 — `only=mixed` is the monitor, `mix_target=<member>|all` on an INJECT attachment is the whisper and the barge flip) are code complete and verified over in-process sockets, as is **native conference recording** (item 39, 2026-08-24 — one mono object for the room via `only=mixed`, one object per participant via a recording group, both at once, the shape named in `RecordingStarted`) and **the conference feature tail** (item 40, 2026-08-24 — `member_mute`/`member_deaf`/`member_hold` as metadata verbs, `StartPlayback{target_tag=all}` as a prompt into the room, `mix_source=leg` for a coach's own voice, plus the generic feature list and the adapter parity table in architecture.md Appendix B). **All of it is lab-verified on real sockets (item 41, 2026-08-24):** three container peers in one conference, twenty tone-per-phase assertions green at a ≥30:1 margin — minus-self, monitor, whisper isolation, the barge flip, mute/unmute off every ear and off the mixed track, and both recording shapes landing in MinIO at once. Production integration (a SIP proxy's B2B leg into a conference) and the org-gated criteria remain |
 
 ### What landed, concretely
 
@@ -111,9 +111,11 @@ cigol's byte for byte. Serves stream/recording/playback verbs onto the nouns,
 one test per mapping row, both surfaces on one port, proven over a real socket
 with a generated cigol client. `StartCallTranscription` returns `UNIMPLEMENTED`
 by design (the ASR endpoint is not in its request message).
-**Blocked before a tenant can be flipped:** a TelCompat session has only the
-channel uuid, so it needs the OpenSIPS→Redis discovery map (M2 item 3) to
-resolve call-id and tags before it can tap.
+**No longer blocked (2026-08-17):** a TelCompat session has only the channel
+uuid, but MSS resolves the rest itself — the caller passes the SIP call-id and
+the caller's from-tag (both already on the channel) and `TapPlane` asks
+rtpengine's `query` for the participants. The OpenSIPS→Redis discovery map is
+now an optimisation, not a prerequisite (see the M2 close-out list below).
 
 ### 2b. (original description, for reference) `TelCompat` façade
 **Where:** `crates/control-api`.
@@ -177,15 +179,35 @@ Constitution wants them first-class with alerts, and Phase-1 pilot needs
 them for the FS-CPU-reduction claim.
 **Done when:** `/metrics` serves them and the drop counters have alert rules.
 
-### 5. Barge-in cut-through measurement
-**Where:** lab.
-**What:** measure `partial_speech_result` → `StopPlayback` end to end
-(consumer → MSS → Kafka → translator → cigol → FS `break`), since MSS is a
-single writer per session and therefore on that critical path (§5.5).
-**Why now:** it is a **Phase-1 exit criterion**, and if the Kafka hop is too
-slow the fallback (a gRPC stream for speech events only) is a design change,
-not a tuning knob — better known early.
-**Done when:** a number exists, compared against the barge-in budget.
+### 5. Barge-in cut-through measurement — 🔶 **every MSS hop measured (2026-08-23)**
+**Where:** lab — `lab/barge_drill.sh`, `lab/barge_translator.py`.
+**What was measured:** the whole chain MSS owns, against the live lab stack —
+a real gRPC consumer sends `SpeechReport(STARTED)` → MSS publishes
+`SpeechStarted` on Kafka `mss.events` → a mock translator consumes it → it
+calls `StopPlayback` → MSS acks. Two runs of 10 iterations, 10/10 completed,
+no event missed: **cut-through p50 3.98 / 3.54 ms, p95 4.78 / 4.38 ms, max
+4.78 / 4.38 ms**; the consumer wire plus the bus (hops 1–2) 1.7–2.4 ms; the
+translator's own decide-and-call 1.9–2.6 ms; container/host clock skew
+−0.14 ms. The first version of this drill had to trigger on `PlaybackStarted`
+because hop 1 had no wire (D19, found by that run and **now fixed**); it read
+p50 3.31 / 3.15 ms, so **putting the real consumer report in front of the bus
+cost under a millisecond**. The whole chain fits inside one 20 ms frame with an
+order of magnitude to spare, so **architecture §9 risk 9's fallback (a gRPC
+stream for speech events only) is not needed** on these numbers. Method, the
+per-interval table and the caveats are in
+[lab.md](lab.md#barge_drillsh--barge-in-cut-through-all-four-hops-2026-08-23).
+**What is still owed, and by whom:** the **integrator's consumer half is
+theirs to add** — hop 3 here is a Python mock with the topic to itself, and
+the reference deployment's translator (awaiting review in its own repo) is one
+such consumer with its own traffic and a call-control hop after `StopPlayback`.
+Two limits remain, both by nature: the consumer's own **detection** latency
+(how long an ASR takes to decide speech began) is the consumer's, not MSS's,
+and `StopPlayback` acked is not the last audible sample — the media-path cut
+needs an ear on the leg. **That ear now exists (item 35, 2026-08-23):** on an
+inline leg the media-path cut from `Clear` to silence at the peer measures
+**p50 12.2 ms, p95 20.4 ms** over 20 iterations, one ptime as the pacer
+promised. On a *tapped* call the equivalent tail is rtpengine's `stop media`,
+still unmeasured for want of an ear on a tapped leg.
 
 ### 6. gRPC `MediaStream` data plane — ✅ DONE (2026-08-20)
 `crates/control-api/src/stream.rs` implements `MediaStream::Subscribe` over a
@@ -204,8 +226,8 @@ one connected consumer per attachment (reconnect allowed after it drops),
 the attachment format must be one the encoder serves (since item 8: g711 at
 the tap rate, or L16 at 8k/16k/48k — Opus is item 9),
 and an utterance is capped at one playback datagram — chunked/paced playback
-stays with the WS bridge. **Still to prove: a live tap over gRPC in the lab**
-— every consumer today speaks WS, so this ran only against the fake plane.
+stays with the WS bridge. This was proved on a **live tapped call** in item 10
+(2026-08-22): L16/16k over the gRPC data plane, ASR-verified intelligible.
 
 ### 7. Auth on attachments — ✅ DONE (2026-08-20)
 `crates/control-api/src/auth.rs`: `AuthPolicy`, a shared bearer secret from
@@ -240,14 +262,15 @@ but PCMU 8k by name (frozen dialect). gRPC inject also accepts L16.
 Done-when met: an L16/16k consumer is verified by replay
 (`l16_16k_doubles_the_sample_count_and_preserves_the_tone`, pump test).
 
-### 9. Opus output
-**Where:** `media-core` (+ a dedicated FFI wrapper crate).
-**What:** Opus encode via `audiopus` (Article XI: adopt libopus, never
-reimplement). **The build trade must be decided first:** `audiopus_sys`
-compiles libopus with cmake/gcc, which breaks the hermetic
-pure-Rust build the repo chose twice already (protox over protoc, rskafka
-over rdkafka). Options: accept the toolchain in CI + Dockerfile, or a
-prebuilt static lib, or a pure-Rust decoder-only stopgap.
+### ~~9. Opus output~~ — superseded by 16a and 16d
+**The build trade this item existed to pose has been decided** (16a,
+2026-08-23): the toolchain is accepted, libopus is vendored and bound through
+the `opus-ffi` crate, and building needs cmake/make/g++. **Opus ingest is
+done**; Opus *output* to consumers is tracked in **16d** and is still genuinely
+later, because no consumer has asked for it. The original framing is kept below
+for the reasoning it records, but read 16a/16d for the current state.
+**Where:** `media-core` (+ a dedicated FFI wrapper crate — now `opus-ffi`).
+**What:** Opus encode (Article XI: adopt libopus, never reimplement).
 **Why later:** no consumer asks for Opus yet; L16/16k covers the ASR
 vendors we know about.
 **Done when:** a consumer can request Opus and get it, verified by replay,
@@ -380,16 +403,22 @@ Docker Desktop on WSL2 the pods reach a host-run consumer at
 **Also filed:** D15 — an adopted attachment loses its negotiated format
 (`PersistedAttachment` has no format field). Found by reading the adoption
 path, not observed, since this drill's consumer was WS/PCMU.
-**Not covered:** the D9 half of a pod death — a recording buffered in the
-dead pod's memory is still lost, and the adopter starts a new segment; this
-drill attached no recorder. And the gap is a lab number on an idle box; the
+**Not covered:** the D9 half of a pod death — this drill attached no recorder.
+Item 30 has since spilled closed segments to disk and made the adopter pad and
+count what it cannot read, but that is replay-proven only: a pod-kill drill
+*with a recorder attached* has still never been run. And the gap is a lab number on an idle box; the
 soak suite (item 19) should re-measure it under load.
 
-### 12. Barge-in cut-through measurement
-Item 5 above, unchanged — still gated on the cigol translator merge
-(external). It is a **Phase-1 exit criterion**; if the Kafka hop misses the
-budget, the fallback (a gRPC stream for speech events only) is a design
-change better known early.
+### 12. Barge-in cut-through measurement — 🔶 **MSS+bus half measured (2026-08-23)**
+Item 5 above carries the numbers, and they are the ones to quote: a real
+consumer `SpeechReport` to an acked `StopPlayback` at **p50 3.98 / 3.54 ms and
+p95 4.78 / 4.38 ms over two runs of 10 live iterations** (the earlier ~3.2 ms
+figure was the pre-D19 `PlaybackStarted` trigger). The Kafka hop makes the budget
+and the gRPC-for-speech-events fallback stays unbuilt. What remains for the
+Phase-1 exit criterion is not ours to measure: the **integrator's consumer
+half** (the cigol translator merge, still external) plus the two gaps named in
+item 5 — of which the missing consumer→MSS speech-report wire (D19) is now
+**fixed and measured** (item 28), leaving the audible cut inside rtpengine.
 
 ### 13. Event delivery durability (defect D5) — ✅ DONE (2026-08-22)
 **Where:** `crates/mediaserverd/src/event_pump.rs`.
@@ -552,10 +581,14 @@ call the gRPC probe listened to was also recorded — `RECORD=1
 edges, so nothing accumulated while paused — `RecordingStopped{39880}` and
 `UploadCompleted{s3://lab-recordings/acct-grpc/rec-<id>.wav}`, ten events
 accepted and ten published with zero failures.
-**Not verified at all:** FS byte-parity —
-`lab/recording_parity.py` exists and was exercised on the drill's own output
-and on perturbed copies, but **has never seen a FreeSWITCH recording**. That
-comparison is the remaining human step for the Phase-2 exit criterion.
+**FS byte-parity: measured 2026-08-23 (item 31).** `lab/fs_parity_drill.sh`
+recorded one live call both ways and `lab/recording_parity.py` finally saw a
+real FreeSWITCH recording: container, channel layout and rms agree exactly, and
+a re-aligned 2 s window agrees on **1.0000** of samples at mean difference
+**0.6/32768** — so there is no transform difference. Byte-for-byte parity at
+one fixed offset is *not* achievable across two independent jitter buffers and
+should not be the bar. What is still owed is a two-party call, the pause
+contract compared, and the tenant's own codec — see item 31.
 **One dependency decision to know about:** an S3 client needs TLS, and TLS in
 Rust needs a crypto provider. `object_store`'s `aws` feature pulls aws-lc-rs
 (cmake — absent from `rust:1.95-slim-bookworm`), so the features are
@@ -769,8 +802,9 @@ in the lab, but 960 samples exceeds the hub frame, so a 48 kHz tap cannot fan
 out to consumers yet — that is the remaining piece if anyone ever wants it.
 
 #### 16d. Opus output to consumers — ⬜ still genuinely later
-The original item 9 framing. `opus-rs` ships an encoder too, so this is now
-mostly plumbing, but no consumer has asked and ingest is what WebRTC needs.
+The original item 9 framing. libopus — already vendored and bound through
+`opus-ffi` for ingest (16a) — ships an encoder too, so this is now mostly
+plumbing, but no consumer has asked and ingest is what WebRTC needs.
 
 ### ~~17. Jitter hardening (defect D7)~~ — done 2026-08-22
 **Where:** `crates/media-core` (`jitter.rs`, `pipeline.rs`, new `plc.rs`,
@@ -893,8 +927,8 @@ exposes one; (C) eBPF, last resort.
 **Decision gate, in order — do not write eBPF before all three:**
   1. Get the rtpengine-side per-tap cost measured (the open org item).
      If `subscribe` at the target tap count costs little, stop here;
-     eBPF is unjustified complexity. **Fix D14 first** or orphaned taps
-     will pollute the measurement.
+     eBPF is unjustified complexity. D14 is fixed (item 25), so orphaned
+     taps no longer pollute the measurement.
   2. Probe whether a subscription is kernel-forwarded, and **whether
      dropping the transcode request is what decides it** — that is the
      hypothesis item 20 exists to make testable, since the kernel module
@@ -1018,10 +1052,11 @@ one path segment (no `/`, whitespace, control characters, `.`/`..`) because it
 lands in an object key. **An empty group is byte-identical to before** — same
 single object under the frozen `${accountID}/${recordingID}.${format}` — pinned
 by `an_ungrouped_recording_still_writes_the_frozen_two_leg_identity`.
-**Per-participant files are the design, not a shortcut:** aligning N sessions'
-clocks into one N-channel WAV is a real problem with no cheap answer, and it
-would make one slow member's buffer the whole conference's; separate files hand
-that to the consumer, which can align on the `RecordingStarted` events.
+**Per-participant files are the design, not a shortcut:** interleaving N
+sessions into one N-channel WAV would make one slow member's buffer the whole
+conference's. Separate files keep the members independent, and since item 29
+they are time-aligned anyway — every member anchors on the instant the group
+opened, so a consumer can lay the objects side by side.
 **Recommend `TRACK_CUSTOMER` per member** — a participant's own voice is leg
 index 0 — so each file is one speaker.
 **Three refusals, by name and counted** (`mss_recording_group_joins_refused_total`):
@@ -1066,6 +1101,14 @@ persisted on the attachment, but `RegistryKeeper::rebuild` **refuses** to
 restore a grouped recording on an adopting pod (counted `grouped_not_adopted`)
 rather than split one recording across two pods. Placement — scheduling a
 group's sessions onto one pod — is the real fix and does not exist (D8).
+
+### 22. (number unused)
+
+There is no item 22. The number was skipped when items were being written in
+parallel and is left unused rather than renumbered, so that every reference to
+an item number elsewhere in this file, in commit messages and in
+implementation-notes keeps pointing at the same work.
+
 ### 23. rtpengine kernel-module readiness — ✅ DONE (2026-08-23)
 **Why this exists:** item 18's decision gate cannot be opened without knowing
 whether a tap rides rtpengine's kernel path, and the production deployment runs
@@ -1207,32 +1250,1122 @@ an rtpengine codec-mask arrangement that keeps FS out of the codec decision
 below), and the browser leg **outlived the hung-up call by ~12 s** — billable
 media tail after hangup, worth an eye in a pilot.
 
+### 25. Orphaned tap after a pod death (defect D14) — ✅ DONE (2026-08-23)
+
+**What the drill in item 11 priced:** a `kill -9` on the owning pod left its
+rtpengine subscription in place for the rest of the call — 14,743 packets /
+2.5 MB copied to an address nobody was listening on, four ports held. A pod
+restart during a call permanently doubled that call's cost on the rtpengine
+host.
+
+**What shipped.** Three changes, one seam:
+
+1. `PersistedSession.subscription_tag` — the `to-tag` rtpengine answered the
+   `subscribe request` with, persisted every keeper tick. `#[serde(default)]`,
+   so a record written before the field existed still decodes and is still
+   adoptable (asserted both in unit tests and against a real Redis).
+2. `TapSubscriptions`, a two-method trait in `registry_keeper.rs` that
+   `TapPlane` implements (`subscription_tag`, `unsubscribe_orphan`). `rebuild`
+   cancels the previous owner's tap **before** creating its own; the ordering
+   is asserted through a shared journal and the NG `unsubscribe` bytes against
+   a fake rtpengine socket. A refused unsubscribe does not block the adoption —
+   it counts `orphans_still_subscribed`, as does a legacy record with no tag.
+3. The **partitioned-but-alive owner**: `upsert` now writes the lease with
+   `SET NX` instead of overwriting it, so a pod that was adopted away cannot
+   take the lease back 5 s later (it could, before — which made the whole
+   partition case undetectable), while an incumbent still re-acquires a lease
+   that merely expired unclaimed. `renew` returning `false` therefore means
+   exactly "another pod owns this", and the losing pod now **destroys the
+   session locally** — its own `close_session` unsubscribes its own tap — and
+   deliberately leaves the registry record for its successor. `surrendered`
+   counts it.
+
+**Decisions recorded:** the adopter unsubscribes only after winning
+`claim_unleased`'s atomic `SET NX`, never speculatively; lease loss is fatal
+for the session, accepting that a pod stalled past 15 s drops a call it could
+still have served (the adopter has already re-tapped it, and the alternative
+is D14 for the life of the call).
+
+**Verified against what.** Unit tests (store roundtrip including a legacy
+record, adoption ordering, refused unsubscribe, surrender leaves the record
+alone), a fake rtpengine UDP socket for the wire bytes, and the whole
+`session_store` suite against the lab's real Redis (18 tests,
+`MSS_TEST_REDIS_URL=redis://127.0.0.1:16379`). **Not** re-measured on a live
+pod kill: `lab/pod_kill_drill.sh` needs a human-dialed SIP call and a rebuilt
+pod image, so no new rtpengine teardown block was collected. Re-running it is
+the honest close-out for the rtpengine-side per-tap cost handoff, which was
+blocked on this fix.
+
+### 26. An adopted attachment kept the session default, not its format (defect D15) — ✅ DONE (2026-08-23)
+
+`PersistedAttachment` carried no format, so `rebuild` passed
+`format: None` on every re-`Attach` — and `None` means
+`AudioFormat::pcmu_8k_20ms()` in `control_api::convert::format`. A consumer
+that negotiated L16/16 kHz came back after an adoption as g711/8 kHz on the
+same stream: not an error, a silently wrong sample rate feeding an ASR.
+
+**What shipped.** `PersistedAttachment.format: Option<PersistedFormat>`
+(`#[serde(default)]`), persisted from `AttachmentView.format` on every keeper
+tick and replayed into the `AttachRequest` on adoption. `PersistedFormat` is
+the **wire** shape — encoding as the `proto.Encoding` number, plus
+`sample_rate_hz` / `channels` / `ptime_ms` — matching how `kind`, `transport`
+and `capabilities` are already persisted, so no new mapping table exists to
+drift from the proto. `None` keeps meaning "the default", which is exactly the
+right reading of a record written before this field existed.
+
+**Verified against what.** Unit tests: the JSON roundtrip, a legacy record
+without the field decoding to `None`, and an adoption test where two
+attachments on one session — a WS consumer on the default and a gRPC consumer
+on L16/16 kHz/20 ms — are both re-opened on the adopting pod with the format
+each one asked for (asserted on the `AttachmentView` the media plane receives,
+against a fake plane). Plus the whole `redis_registry` suite against the lab's
+real Redis (19 tests, `MSS_TEST_REDIS_URL=redis://127.0.0.1:16379`), whose
+roundtrip asserts full attachment equality — that legacy-record test now
+carries an attachment, since it had asserted its field on an empty list. **Not**
+observed on a live call: it would take a live pod kill with a gRPC L16
+consumer attached, which is the D14 close-out drill's shape.
+
+### 27. Consumer-facing defect batch: D2, D3, D10, D13 — ✅ DONE (2026-08-23)
+
+Four defects that all live on the seam between the hub and a consumer.
+
+**D13 — an unannounced silent track.** The hub's `TrackSelection::All` meant
+literally every track, so a consumer that asked for `All` was fed the `mixed`
+track (the injected-playback track, silence whenever nothing is playing) at the
+full frame rate, while its `StreamStart` / Twilio `start` frame advertised only
+`["customer","agent"]`: an unannounced track and 50% extra bandwidth for
+silence. The selection now has two shapes — `All` (every track, **including**
+`mixed`) and `Speakers` (customer and agent only). Consumers map
+`TrackSelector::All` to `Speakers`, so they receive exactly the tracks they were
+told about; the **recorder keeps `All`**, because bot speech played into the
+call belongs in the recording. Nothing about the frozen Twilio start frame or
+`StreamStart.tracks` changed — the delivery was brought in line with the
+advertisement, not the other way round.
+
+**D10 — pause was a note in the registry.** A paused `WS_TWILIO` /
+`GRPC_STREAM` attachment kept receiving media; only the recorder honoured
+pause. A subscription now carries a pause flag the control world flips
+(`SubscriptionControl::set_paused`) and the hub checks per frame: a paused
+consumer is skipped and the skips are counted
+(`mss_consumer_suppressed_while_paused_total`). Resume delivers from where the
+tap now is — no backlog is replayed. A gRPC attachment paused before its
+consumer subscribes stays paused when the stream opens. Recorder pause is
+untouched (it still segments).
+
+**D3 — detach aborted the consumer task.** `close_attachment` (and
+`close_session`) called `JoinHandle::abort()`, so a websocket consumer's stream
+just stopped mid-frame with no Twilio `stop` message, and a gRPC consumer got a
+dropped channel. Both paths now go through `TapPlane::end_attachment`, which
+ends the *subscription* (`SubscriptionControl::end_of_stream`) and lets the
+consumer finish on its own: the WS task drains its queue and sends the `stop`
+frame it always had code for, the gRPC pump drains and a new
+`StreamFrame::Stop { reason }` becomes a `StreamStop` carrying why the stream
+ended ("the attachment was detached" / "the call ended"). A consumer that will
+not finish within `POLITE_CLOSE` (2 s) is still aborted, counted as a warning
+in the log. This also means a normal hangup now ends every consumer stream
+politely, not just an explicit `Detach`.
+
+**D2 — `stop_playback` stopped every playback on the call.** It sent NG
+`stop media` with `all: all` regardless of what the playback was aimed at. The
+registry now remembers each playback's `target_tag` (`PlaybackRecord`), returns
+it from `stop_playback` (`StoppedPlayback`), and the media plane passes it to
+rtpengine as `from-tag` — or `all: all` when the playback was for everyone.
+
+**Verified against what.** Unit/replay tests: the hub (a `Speakers` consumer
+never sees `mixed` while an `All` consumer does; a paused consumer is fed
+nothing and resumes at the current tap position with the suppressions counted;
+an ended stream drains then finishes), `tap_plane` (detaching a WS consumer
+lets its task run to completion instead of being aborted, detaching a gRPC
+consumer ends its stream with a `Stop` frame carrying the reason, pausing
+through `update_attachment` stops hub delivery), `stream.rs` over the wire (a
+`Stop` frame reaches a real gRPC consumer as `StreamStop` with its reason), the
+registry (a stopped playback reports the participant it was played to), and the
+controller end-to-end against a recording fake (two playbacks, one aimed at
+`from-b` and one at everyone, are stopped with `Some("from-b")` and `None`
+respectively). D2's rtpengine half was measured on the live lab node with the
+new `lab/ng_stop_media_probe.py` — see lab.md; the numbers are in the D2 row
+below. No live MSS call was driven for D3/D10/D13: the lab's `mss-control`
+image predates this commit.
+
+### 28. The speech-report ingress had no wire (defect D19) — ✅ DONE (2026-08-23)
+
+`SessionRegistry::report` — `ConsumerEvent` → `SpeechStarted` / `Partial` /
+`Final` / `EndOfUtterance` / `EndOfInteraction`, the documented head of the
+barge-in chain — had **no caller outside its own tests**. A consumer could hear
+the caller start talking and had no way to say so.
+
+**What shipped.** `ConsumerToServer` gains a `SpeechReport` message (field 5,
+additive; `protox` regenerates), carrying `kind`
+(`STARTED`/`PARTIAL`/`FINAL`/`END_OF_UTTERANCE`/`END_OF_INTERACTION`), `track`,
+`text`, `confidence`, `observed_at` and a `reason` for
+`END_OF_INTERACTION`. The gRPC pump converts it (`convert::speech_report`) and
+calls `SessionController::record_report`, which commits through the registry
+like every other event — so it publishes on `mss.events` through the same
+`event_pump`, with `first_final` still decided by MSS rather than the consumer.
+
+**Capability enforcement.** `Registry::report` already required
+`Capabilities::EVENTS`; the wire now surfaces that as the same
+protocol-violation shape as an unprivileged `inject` — `PERMISSION_DENIED` and
+the stream ends, not a silent no-op.
+
+**Two decisions worth recording.** *The consumer's clock is not trusted:*
+`observed_at` is carried and logged as a lag (`convert::observed_lag_ms`), but
+the published `MediaEvent.at` is stamped by MSS, because reconciling two clocks
+across a bus is not something an event consumer can do after the fact. *An
+unknown or unspecified `kind` is `INVALID_ARGUMENT`*, never a default — a
+consumer built against a newer proto learns it was misunderstood.
+
+**The WS residual, accepted.** The `WS_TWILIO` dialect gets **no** speech
+report: its bytes are frozen (Article VII) and it has no message that could
+carry one, so a WS consumer cannot report speech and its only barge stays the
+`clear` message's direct rtpengine `stop media`. Interactive voice-AI should
+attach over gRPC. This is now the documented adapter limitation rather than an
+open defect.
+
+**Verified against what.** Unit tests on the conversion (every kind, an unknown
+kind, an unknown track, `END_OF_INTERACTION` needing no track, the lag
+calculation) and two over-the-wire gRPC tests (an `EVENTS` consumer's reports
+arrive on `WatchEvents` as `SpeechStarted` then `FinalTranscript{first_final:
+true}`; a `SINK`-only consumer gets `PERMISSION_DENIED` naming `EVENTS`).
+**Live:** `lab/barge_drill.sh` was extended to attach a real gRPC consumer
+(`mss_ctl consume`, new subcommand) and trigger on a real `SpeechReport`; two
+runs of 10 iterations against the live stack, 10/10 each, no event missed, the
+consumer taking 378 tapped audio frames on the same stream while it measured.
+Numbers in item 5 and lab.md.
+
+### 29. Recording-group members were not time-aligned (defect D18) — ✅ DONE (2026-08-23)
+
+Every member's segmenter anchored on **its own first frame**, so a participant
+that joined a conference recording ten seconds late produced a file whose
+sample 0 was ten seconds later than the first member's. Two objects under one
+recording prefix, different lengths, and nothing in the audio to say where the
+second one begins: reassembly needed the `RecordingStarted` event timeline.
+
+**What shipped.** The group owns t=0. `RecordingGroup` stamps `opened_at:
+Instant` when its first member joins, `join_group` hands that instant to every
+later member, `RecorderSpec.group_anchor: Option<Instant>` carries it into the
+recorder task, and when that member's **first media frame** arrives the task
+converts `now - anchor` into leading silence through the new sans-IO seam
+`Segmenter::lead_with_silence(Duration)`. All members share t=0, and members
+that stop together are the same length to within one frame.
+
+**Three decisions.** *Measured at the first frame, not at the attach*, so the
+member's own subscribe round-trip is inside the pad (and the same latency on
+every member cancels out of their relative alignment). *Padded once per
+recording, never per segment*: the pad is written into `segment_start` under a
+`stats.lead_silence_frames` guard and `pause` now takes
+`frames().max(segment_start)`, so pause/resume (pause = segment + defer) can
+neither erase nor re-add it. *The pad counts against `MAX_RECORDING`* — a
+member joining an hour into the 2 h cap gets an hour of its own audio, not two.
+An ungrouped recording passes `group_anchor: None` and is byte-identical to
+before.
+
+**Verified against what.** Four new tests: the late member's file opens with
+silence to the anchor and its own audio lands after it; two members that end
+together render the same length (one padded 1 s, one not); a paused late member
+pads its lead once and a second `lead_with_silence` is refused; and one
+end-to-end recorder test (spawn → hub frames → real WAV bytes out of a fake
+sink) proving a 400 ms anchor becomes 400 ms of leading zeros in the uploaded
+object. `join_group` also asserts every member gets the same instant.
+**Live:** `lab/group_recording_drill.sh` grew `JOIN_STAGGER_SECONDS` (default
+5) and was run against the live lab — bob joined 5 s late, the pod logged
+`lead_silence_ms=5016`, and the object read back off MinIO opens with **40128
+zero samples = 5016 ms**. Lengths: alice 25.030 s vs bob 25.116 s, an **86 ms**
+difference where the stagger was 5 s. The residual 86 ms is the *tail*: `Detach`
+waits for the upload (D11) and the drill detaches the members one after the
+other. Numbers in lab.md.
+
+**Residual.** Head alignment is exact; equal length still assumes the members
+stop together, and D11 (blocking detach) and D16 (a group is one pod's memory,
+so the anchor is one pod's monotonic clock) are unchanged.
+
+### 30. Recording durability across pod death (defect D9) — 🔶 **partly closed (2026-08-23)**
+
+A recording used to live entirely in the recording pod's memory until the call
+ended: `kill -9` on that pod lost every second of it, the adopting pod started
+a fresh recording under the same object key, and nothing said how much audio
+had gone. The spill directory existed but was only ever written *after* a
+failed upload, which never happens if the process dies first.
+
+**What shipped.**
+
+1. **Closed segments leave memory for disk while the call is still up.** The
+   segmenter grew a peek-then-commit seam — `closable_frames()`,
+   `render_closable(frames, layout)`, `close_segment(frames)` — so the recorder
+   renders a whole-millisecond prefix per target, writes it, and only then
+   drops it from memory: a failed disk write loses nothing, it just leaves the
+   audio in RAM and retries on the next tick. Closing rebases the segmenter's
+   timestamp anchor by exactly the frames removed, so track alignment across a
+   segment boundary is preserved rather than re-zeroed (that is what makes this
+   different from a pause, which deliberately drops the wall-clock gap). The
+   2 h `MAX_RECORDING` cap now counts spilled frames too, so spilling does not
+   hand a recording a fresh length budget.
+2. **A spill journal per recording.** `crates/mediaserverd/src/recording_spill.rs`
+   writes `<MSS_RECORDING_SPILL_DIR>/journal/<object key>/{manifest.json,
+   <target>-<seq>.pcm}`: raw interleaved i16 chunks plus a manifest naming the
+   recording id, sample rate, owning pod, frames on disk and one entry per
+   object key. The manifest is rewritten by atomic rename after each segment.
+   Segments close every `MSS_RECORDING_SPILL_SECONDS` (default 30) and on every
+   pause. The final upload **stitches** the journal's chunks with the tail still
+   in memory into one object at the frozen
+   `${accountID}/${recordingID}.${format}` key, then deletes the journal; if
+   the upload fails the journal stays for the next start.
+3. **Restart salvage.** `recording_spill::salvage` runs in `mediaserverd`'s
+   boot path, before it serves: every journal left on this pod's disk is
+   stitched and uploaded. It is guarded by a new `RecordingSink::exists` —
+   if the object is already in storage (because another pod adopted the session
+   and finished it), the salvage is **skipped, counted and left on disk** for an
+   operator, never written over the fuller object.
+4. **A recording's progress is in the registry.** `PersistedAttachment.recording:
+   Option<PersistedRecording>` (serde(default), legacy records decode)
+   carries `{recording_id, owner, recorded_ms, spilled_ms}`, fed by a new
+   `TapSubscriptions::recording_journal(attachment)` seam off the live
+   recorder's `RecordingProgress`. On adoption the keeper injects
+   `mss.recording.resumeMs` / `mss.recording.spillOwner` into the rebuilt
+   attachment's metadata (derived every time, stripped when persisting, so it
+   never accumulates).
+5. **The adopter recovers what it can read and counts what it cannot.** The new
+   recorder opens the journal at the same key: if the journal is on *this* pod's
+   disk (same-pod restart) its segments are picked up and continue the same
+   object. Whatever the registry says was recorded but is not on a disk this pod
+   can read becomes leading silence, so the object keeps its wall-clock
+   timeline, and every one of those frames is counted in
+   **`mss_recording_frames_lost_on_adopt_total`**. Beyond `MAX_ADOPT_LEAD`
+   (5 min) the padding is refused rather than allocated, and the loss is
+   counted and logged.
+
+**What is NOT possible today, honestly.** The spill directory is per-pod local
+disk. An adopter on another pod **cannot read the dead pod's segments**, so
+cross-pod stitching does not exist: the adopter's object contains silence for
+the dead pod's audio, and that audio is only recoverable if the dead pod comes
+back with the same volume *and* the object has not already been written (the
+`exists` guard then keeps the salvage from clobbering it, which is the correct
+choice but means the audio stays on disk as an operator's problem). Making this
+whole needs a spill target every pod can read — a shared volume or a multipart
+upload straight to object storage per segment — which is the same shape D16
+(recording groups are one pod's memory) needs. **The spill directory has no
+retention policy: skipped and failed journals stay until an operator removes
+them.**
+
+**Verified: replay/unit only** (fake `SessionStore`, fake object store, real
+local disk under a scratch directory) — a closed segment leaving memory without
+moving the recording's clock, the cap surviving a spill, a spilled segment plus
+the in-memory tail uploading as **one** object in the right order, a journal
+left behind being salvaged on the next start, salvage refusing to overwrite an
+object that already exists, an adopted recording padding and counting what its
+dead pod never spilled, and an adopted recording that finds its own spill
+keeping that audio (spilled | silence | new). The keeper test proves the
+journal is persisted with the owning pod and handed to the adopter as metadata.
+**Not observed live**: no pod-kill drill was re-run with a recorder attached,
+so the numbers a real `kill -9` costs a recording are still unmeasured.
+
+### 31. FS byte-parity against a real FreeSWITCH recording — 🔶 **measured, one blocker documented (2026-08-23)**
+
+`lab/recording_parity.py` had existed since item 15 but had **never seen a
+FreeSWITCH recording**; the Phase-2 exit criterion asks for "byte-comparable
+recordings vs FS output". `lab/fs_parity_drill.sh` now records **one live call
+both ways** — FS's own `uuid_record` with `RECORD_STEREO=true`, and an MSS
+`FILE_S3` attachment on the same call — pulls both wavs and runs the harness.
+
+**The lab FS image can record.** Probed: `mod_dptools` gives `record`,
+`record_session`, `record_session_pause/resume/mask/unmask`,
+`stop_record_session` and `mod_commands` gives `uuid_record`; `mod_sndfile`
+provides the `wav` file format; `/var/lib/freeswitch/recordings` is writable
+(the container runs as root). So the "the image cannot record" escape hatch in
+the item's original framing does **not** apply.
+
+**The run (2026-08-23, 25 s of a live PCMA call through OpenSIPS → rtpengine →
+FS ext 9000, MSS tapping the same call):**
+
+| Check | MSS | FreeSWITCH | verdict |
+| --- | --- | --- | --- |
+| container | 2ch 8000 Hz 16-bit | 2ch 8000 Hz 16-bit | **exact agreement** |
+| channel layout | customer left, agent right | read left, write right | **agrees** |
+| customer rms | 624 | 623 | **agrees to 1 part in 624** |
+| duration | 25500 ms | 25120 ms | 380 ms apart |
+| samples @ one global offset | identical 0.3746, mean_diff 485.6 | | fails the 200 bar |
+| samples, best 2 s window | agreeing **1.0000**, mean_diff **0.6** | | **parity** |
+
+**What this establishes.** Container, channel layout and amplitude are in exact
+agreement — an MSS stereo recording is drop-in for an FS `RECORD_STEREO` one as
+far as any downstream consumer can tell. And there is **no transform
+difference**: re-aligned per 2 s window, one window reaches a 1.0000 agreeing
+ratio at a mean absolute difference of **0.6 out of 32768**, i.e. MSS's
+PCMA→L16 decode and FS's produce the same samples.
+
+**What fails, and why it is not a recorder defect.** A single global offset
+cannot hold for the whole call: MSS and FS have **independent jitter buffers
+and conceal loss independently** (MSS does G.711 Appendix I PLC since item 17;
+FS does not), so the offset between the two files wanders and per-sample
+identity collapses everywhere the grid slips. The 380 ms duration gap is drill
+skew — the MSS attach precedes the `fs_cli uuid_record` by three `docker exec`
+round trips — not accumulated drift. The harness gained `--drift-window` /
+`--drift-stride` so this is reproducible rather than a one-off observation.
+
+**The honest conclusion: byte-for-byte parity at a fixed offset is not an
+achievable bar across two independent jitter buffers, and should not be the
+exit criterion.** The bar that means what the criterion intended is: identical
+container and layout, duration within tolerance, matching per-channel rms, and
+near-perfect agreement in a re-aligned window. All four are met.
+
+**What a production-FS visit still owes** (this is the residual, and it is
+deployment-gated):
+1. **A two-party call.** The lab's ext 9000 answers and plays
+   `silence_stream://-1`, so FS's write side is silence: the agent/right
+   channel compares silence against silence (mss rms 8 vs fs rms 0) and only
+   the customer channel is a real comparison. Two live voices need a bridging
+   extension on a richer rig.
+2. **The pause contract compared**, `record_session_pause` against MSS `Pause`
+   — this drill did not pause.
+3. **The tenant's own codec, rate and any recording post-processing**; this run
+   was PCMA/8000 only.
+4. **A human listening to both files**, which the harness has never claimed to
+   replace.
+5. The windowed offsets in this run **clip at `--align-search` (1600 frames)**,
+   so the reported 260 ms wander is a floor, not a measurement. A wider search
+   is O(search x window) and was not worth a second lab cycle.
+
+### 32. Inline-leg egress groundwork — the playout pacer (Phase 3) — ✅ DONE (2026-08-23)
+
+Phase 3 needs a *mouth*: taps can only listen, so an interactive session has to
+own an RTP sender. `crates/media-core/src/pacer.rs` is that sender's brain,
+sans-IO and thread-free: the control world pushes PCM, the media thread calls
+`tick(now)` once per wakeup, and the pacer hands back at most **one
+ready-to-send RTP datagram per ptime** — header included (SSRC, sequence,
+timestamp, payload type, marker), built with the `rtp.rs` serializer that
+already existed, and payload encoded by the existing `ConsumerEncoder` (so
+G.711 µ-law/A-law, L16, and 8→16/48 kHz resampling come for free; Opus
+**output** is still unbuilt — decode-only, as `encode.rs` says by name).
+
+Contract, decided here and recorded so P3-2/P3-3 do not re-litigate it:
+
+- **Deadlines are wall-clock-anchored** (architecture §7): the first `tick`
+  anchors, each emission advances the deadline by exactly one ptime. A caller
+  that overslept catches up one packet per call and every skipped deadline is
+  counted in `late_ticks` — no burst inside one tick, no drift.
+- **Underrun never starves the far end.** Default `UnderrunPolicy::Silence`
+  emits an encoded silence frame (counted `silence_frames`); a partially
+  filled frame is zero-padded (`partial_frames`). `UnderrunPolicy::Suppress`
+  is the DTX-shaped alternative: it emits nothing, still advances the
+  timestamp (`suppressed_frames`) and does **not** consume a sequence number,
+  so a far-end jitter buffer reads the gap as silence, not as loss.
+- **Marker on talkspurt start** — the first packet of the stream and the first
+  voice packet after any silence or suppression carry it.
+- **The queue is bounded and drops the oldest**, in samples, counted
+  (`dropped_samples`); a push larger than the whole queue keeps only its tail.
+  `clear()` flushes it and counts `flushed_samples` — that is the barge-in
+  cut-through seam P3-3's `Clear` and P3-4's measurement will use: the tick
+  after a `clear()` is silence.
+- **No allocation after construction.** The sample ring, the frame scratch
+  buffer and the datagram buffer are sized once from the negotiated formats
+  (payload capacity carries 8 samples of resampler slack). An encode or
+  serialize failure is counted (`encode_errors`) and drops that one frame
+  instead of panicking.
+
+Replay-tested (14 tests, `cargo test -p media-core pacer`): tick cadence at 5 ms
+polling emits exactly at 0/20/40… ms; oversleeping is counted and caught up;
+underrun → silence → marker on resume; header fields on the wire re-parsed and
+compared against the reported ones with timestamps stepping 160 with no skip;
+suppression advancing timestamp but not sequence; drop-oldest keeping the newest
+two frames; sequence/timestamp wrap; partial-frame padding; the wideband→G.711
+resampling path; and **10 000 ticks with all three internal buffer capacities
+unchanged** at the end (with drops and silence both exercised in the loop).
+
+This is replay-only by construction — media-core has no sockets. The pacer is
+not wired to anything yet; P3-2 (inline session + SDP answer + UDP socket pair)
+is what puts it on the wire, and only then can the cadence be judged against a
+real far end.
+
+### 33. Inline sessions in mediaserverd — the leg on the wire (Phase 3) — ✅ DONE (2026-08-23)
+
+`SessionKind::INLINE` stops being refused. `CreateSession{kind=INLINE,
+sdp_offer=...}` now binds a UDP socket on `MSS_TAP_LOCAL_IP`, answers the offer
+as an RTP endpoint and returns the answer in the new `Session.sdp_answer` field.
+The peer's audio enters the **existing** capture pipeline (jitter → decode →
+hub) as the session's `customer` track, so every consumer, recorder and
+recording group already built for taps works on an inline leg unchanged; audio
+leaves through item 32's `PlayoutPacer`, driven from the capture thread's own
+clock.
+
+Decisions, recorded so P3-3/P3-4 do not re-litigate them:
+
+- **The SDP lives in `rtpengine-ng/src/sdp.rs`**, next to the subscription
+  offer/answer, as `InlineOffer`/`InlineAnswer`. That module was already a
+  plain sans-IO SDP implementation depending only on `media-core`; a second
+  parser in `media-core` would have duplicated the line splitting, the rtpmap
+  table and the codec-negotiation types, and `media-core` must not depend on
+  `rtpengine-ng` (dependency direction). The crate name is now narrower than
+  its sdp module — if a third dialect appears, split the module into its own
+  crate rather than duplicating it.
+- **PCMU or PCMA, in the offer's own order, plus telephone-event.** Anything
+  else is refused **by name** (`SdpError::NoInlineCodecOffered` lists what was
+  offered, from the rtpmaps, so an opus/G722 offer says so). The reason is
+  honest: `ConsumerEncoder` has no Opus *encoder*, so an Opus inline leg could
+  hear but not speak. The answer echoes the offered telephone-event payload
+  type with `fmtp 0-15`, one `m=audio`, `a=sendrecv`, and the offer's ptime
+  (falling back to the configured one, refusing anything over 120 ms).
+- **The egress queue is the buffer; the pacer ring is the prebuffer.** The
+  control world pushes `Vec<i16>` chunks into a bounded `ArrayQueue` (64 chunks
+  ≈ 6.4 s at the 100 ms chunking `StartPlayback` uses) exactly as the hub's
+  inject path already does; the media thread pops at most 4 chunks per tick and
+  only while the pacer holds less than two frames. A full queue **refuses** the
+  chunk (counted) rather than blocking the control world, and a playback longer
+  than the free queue is refused whole rather than truncated.
+- **`StartPlayback` on an inline leg is a local mix-in, not an NG command.**
+  rtpengine `play media` needs a subscription and an inline leg has none, so a
+  wav blob/file is decoded in the control world (16-bit mono at the negotiated
+  rate; anything else is refused naming the mismatch) and queued. **`StopPlayback`
+  on an inline leg flushes the egress queue** — that is the barge seam, and the
+  tick after it is silence by construction (item 32), so P3-4's job is to
+  measure it, not to build it. Streaming playback still refuses by name: it is
+  an INJECT attachment (P3-3).
+- **An inline session is not adoptable, and the registry says so.** A tap is
+  re-creatable from another pod because MSS asks rtpengine for the copy; an
+  inline leg *is* the RTP destination the peer is sending to, and that socket
+  died with the pod. `PersistedSession::is_rebuildable()` is now false for
+  kind INLINE, the keeper releases such an orphan with a counter
+  (`mss_registry_inline_not_adopted_total`) and a log line saying recovery is
+  call control's job. The SDP is deliberately **not** persisted — persisting it
+  would only invite a dishonest rebuild.
+- **Every event now carries the session kind** (`MediaEvent.session_kind`,
+  wire field 7), rather than a new `SessionCreated` event. A bus consumer can
+  tell a tap's events from an inline leg's without asking the API, and no
+  existing event sequence shifted.
+- `CreateSession` validation is symmetric: INLINE without an offer is
+  `INVALID_ARGUMENT`, and a TAP *with* an offer is too (a tap has no SDP).
+
+Tested: 10 SDP offer/answer replay tests (answer bytes asserted exactly, our own
+answer re-parsed, offer-order PCMA, opus/G722/bare-PT refusals by name, two
+m-lines, port 0, no `c=`, absurd ptime, stream-level `c=` winning); 6 egress
+tests (paced RTP the fake peer parses with pt/seq/ts checked, clear-then-silence,
+queue-full refusal, unreachable peer counted not stalled, ssrc derivation, an
+Opus wire format refused); and an **over-the-wire test with a fake peer socket**:
+the peer sends 8 G.711 packets and the hub delivers them as `customer` frames
+(tone amplitude asserted), then a queued wav comes back as ≥8 paced datagrams
+from the port MSS answered on, all PT 0, sequence never skipping. Plus
+`stop_playback` flushing, the long-playback and wrong-rate refusals, the keeper's
+inline-orphan release, the API's answer round-trip through `DescribeSession`, and
+the registry's offer/answer bookkeeping. `mss_ctl inline <id> <call-id>
+<offer-file>` prints the answer for the P3-5 drill.
+
+**Not verified live.** No SIP peer has ever answered this leg: everything above
+is replay or a fake socket in-process. P3-5's `inline_call_drill.sh` is what
+puts a real RTP peer (and a real tone) on it, and only then can the cadence,
+the DTMF path and the 20 ms budget be judged.
+
+### 34. Full duplex to consumers — a continuous inject stream (Phase 3) — ✅ DONE (2026-08-23)
+
+An INJECT-capable attachment on an **INLINE** session now feeds the leg's egress
+queue continuously, on both transports. Nothing about a **TAP** session changed:
+its `Mark` still builds one wav and calls `StartPlayback`, its `Clear` still
+stops that playback, and the one-playback-datagram cap (`MAX_UTTERANCE_SAMPLES`)
+still applies there — an rtpengine `play media` really does carry one datagram,
+so the cap is the protocol, not our choice.
+
+The seam is one trait: `control_api::InlineEgressSink` (`egress_format`,
+`push_pcm`, `flush`, `pushed_watermark`, `drained_watermark`), returned by the
+new `MediaPlane::inline_egress_sink(session)` — default `None`, so a media plane
+that has no inline legs (and every fake) needs no change. `TapPlane` implements
+it over item 33's `InlineEgressHandle`, and the trait is resolved **once** per
+stream, so a per-frame inject costs a lock-free queue push and no async hop into
+the plane.
+
+Decisions, recorded so P3-4/P3-5 and Phase 4 do not re-litigate them:
+
+- **The consumer's declared format is decoded to PCM, and the rate must match
+  the leg.** PCMU/PCMA/L16 decode as they always did (`decode_inject`); Opus is
+  still refused by name. What is *new* is a refusal: an inject stream whose
+  attachment declared a sample rate other than the one the leg negotiated is
+  `FAILED_PRECONDITION` naming both rates, at the first inject frame. The
+  honest reason: one pacer serves the whole leg, its `source` rate is the
+  negotiated rate, and there is no streaming resampler on the inject path —
+  `ConsumerEncoder` resamples a *packet* at a time and truncates past
+  `chunk_in`, so reusing it here would silently eat audio. A 16 kHz TTS
+  consumer therefore attaches at the leg's rate (or as L16/8k) until an inject
+  resampler is built. Mismatch is checked once, at the first inject, not per
+  frame, and never at subscribe time — a SINK-only consumer on an inline leg is
+  perfectly legal and must not be refused for a rate it will never use.
+- **`Clear` flushes the egress; it does not stop a playback.** On an inline
+  session `Clear` calls `flush()` (item 32's queue+pacer clear, so the next tick
+  is silence by construction) and drops every pending mark. It also **requires
+  INJECT**, like `Inject` itself: flushing a leg's mouth is a media-affecting
+  act, and so is `Mark`, so the whole inject sub-protocol is capability-gated on
+  an inline session. On a tap, `Clear`/`Mark` keep their old unauthorized-but-
+  harmless behavior — that path only touches the consumer's own playback.
+- **`Mark` acks when the marked audio has actually drained**, not on enqueue.
+  This is cheaply knowable because every sample the control world queues ends up
+  in exactly one of three places, so `InlineEgressShared` publishes
+  `drained_samples = samples flushed straight out of the chunk queue +
+  pacer.pushed_samples - pacer.queued_samples()` — an exact identity (a partial
+  frame drains the remainder, a ring overflow counts as dropped). A `Mark`
+  records the queue's `pushed_samples` watermark, and the ack goes out when
+  `drained_samples` passes it. The pump does not notify, so each stream **polls
+  every 20 ms while a mark is outstanding** (one ptime; no timer at all when
+  none is) — an ack is therefore accurate to within one frame, late rather than
+  early, which is the safe direction for "the prompt finished". At most 64 marks
+  may be outstanding (gRPC refuses beyond that; the WS dialect drops the oldest,
+  having no error frame).
+- **The gRPC ack needed a wire, so `ServerToConsumer` gained `Mark mark = 6`**
+  (additive; next free tag is 7). The WS dialect already had `Outbound::Mark`
+  and its bytes are untouched — the Twilio serialization tests still pin them.
+  A tap's `Mark` is never acked on either transport: it starts a playback, and
+  rtpengine gives no completion signal.
+- **A full egress queue drops the chunk and counts it** rather than ending the
+  stream. 64 chunks is ≈6.4 s of backlog; a consumer that far ahead of the
+  wire is misbehaving, but killing a live voice-AI stream over a transient
+  overrun is worse than dropping a frame. Visible as
+  `mss_inline_egress_chunks_refused_total` plus a warning, and on WS as
+  `ConsumerStats::inject_dropped`.
+- **WS inbound media on an inline session flows straight through** — no
+  utterance accumulation, no 700 ms idle flush, no `BridgeCommand`. The
+  accumulate-then-play path stays exactly as it was for taps. The dialect's
+  optional `sampleRate` is honored: a value other than the leg's rate is
+  counted as an unknown encoding and dropped. The dialect decodes µ-law to PCM,
+  so a PCMA leg is fed correctly — only the *rate* has to agree.
+
+New metrics: `mss_inline_egress_pushed_samples_total`,
+`mss_inline_egress_drained_samples_total`.
+
+Tested: 4 new over-the-wire gRPC tests (three inject frames land as 480 samples
+of decoded PCM in the sink with **no** playback issued; `Clear` flushes it and
+stops nothing; a mark stays unacked for 300 ms while its audio is queued and is
+acked by name the moment the sink drains; a 16 kHz-vs-8 kHz mismatch refused by
+name; an unprivileged inject still `PERMISSION_DENIED` with an empty sink) and 3
+new WS tests against a **real** `InlineEgress` and a real peer socket (inbound
+media reaches the peer as paced µ-law rather than an utterance, `Clear` makes the
+next paced frame silence, a mark is acked only after six pumps drained it). The
+pre-existing tap tests are the regression proof that taps did not move: the fake
+plane now offers an inline sink for *every* session, and the tap path still
+builds its wav and stops its playback.
+
+**Not verified live.** Both transports were driven against a fake plane or an
+in-process socket; no SIP peer and no real voice-AI consumer has spoken through
+this. P3-5's drill is what proves a real ear hears it, and P3-4 owes the
+measured cut-through.
+
+### 35. Inline barge-in measured, and the inline lab drill (Phase 3) — ✅ DONE (2026-08-23)
+
+Items 32–34's mouth met an ear. `lab/inline_call_drill.sh` runs the whole inline
+path with no SIP stack and no human: `lab/inline_peer.py` offers PCMU and
+becomes the far end of MSS's own socket, `mss_ctl inline` answers it,
+`lab/inline_consumer.py` attaches with `SINK | INJECT` and speaks 1000 Hz into
+the leg while the peer speaks 440 Hz back, and `lab/inline_barge_report.py`
+turns the peer's per-packet arrival timeline into the number Phase 3 owed. Both
+python actors run as containers on the lab network so their timestamps come from
+one kernel clock — a host-to-VM skew would be a large error against a 20 ms
+target.
+
+Measured live (stamp 1787508102, 20 iterations; full table in
+[lab.md](lab.md#inline_call_drillsh--an-inline-leg-with-a-real-ear-and-the-barge-in-number-2026-08-23)):
+
+- **barge-in cut-through, `Clear` sent → first silent packet at the peer's ear:
+  p50 12.2 ms, p95 20.4 ms, max 21.0 ms, min 2.4 ms (n=20).** The target was one
+  ptime and the max is one ptime plus a millisecond of transport. The
+  distribution is uniform over one frame because `Clear` flushes the chunk queue
+  *and* the pacer ring, leaving only the wait for the pacer's next 20 ms
+  deadline — the replay claim ("the tick after `clear()` is a silence frame") is
+  now a live number, and it is an *arrival* measurement, so it includes the gRPC
+  hop, the 5 ms pump tick and the lab bridge.
+- **The peer hears the injected audio**: 1710/3312 egress packets carried the
+  1000 Hz tone, peak Goertzel 11910 of a theoretical 12000.
+- **The hub still taps the peer while the leg is being spoken to**: 2770 frames
+  of the peer's own 440 Hz to the same consumer, peak rms 17132.
+- **Egress is properly paced**: 50.19 pkt/s over 66 s, 0 sequence breaks, rtp
+  timestamp step 160 for every one of 3311 gaps, `late_ticks_total` 0,
+  `dropped_samples_total` 0, `send_errors_total` 0, and
+  `drained_samples_total == pushed_samples_total`.
+- **`Mark` acks when the audio drained**: 410 / 404 / 404 ms against 400 ms of
+  queued audio.
+
+Two corrections the drill forced, both worth remembering:
+
+- **The first cut-through numbers were phase-locked and too flattering.** A
+  1.5 s tone plus a 1.0 s gap is exactly 125 packets, so every `Clear` landed at
+  nearly the same phase of the 20 ms grid and the run sampled a quarter of the
+  distribution (p95 15.3 ms, monotonically decreasing per iteration). The
+  consumer now jitters the gap by up to one frame (`JITTER_MS`), and the honest
+  p95 is 20.4 ms. Any future paced-media measurement in this repo must jitter
+  its period or it measures its own arithmetic.
+- **A real defect, found and fixed here: the mark drain-poll starved.** The
+  first run acked a `Mark` after **8221 ms** although the audio drained on time
+  at 400 ms. Both stream loops built item 34's 20 ms poll as
+  `tokio::time::sleep(...)` *inside* `tokio::select!`, so the timer was
+  recreated — and reset — on every loop iteration; with tapped frames arriving
+  every 20 ms and `select!` picking randomly among ready branches, the sleep was
+  cancelled before it ever elapsed. One `tokio::time::interval` pinned outside
+  the loop, with the branch gated on `if marks_pending`, fixes it in
+  `control-api/src/stream.rs` and `mediaserverd/src/consumer_ws.rs`. A `sleep`
+  inside `select!` is a timeout, not a timer.
+
+**What this does not prove:** one PCMU/8 kHz leg, one INJECT consumer, an idle
+box; no PCMA/L16/Opus inline leg, no impairment, no second leg, no SIP (the
+offer and answer travel through two files), no human listening to
+`peer_ear_*.wav`, and the consumer's own detection latency is still outside the
+number — item 5 measures the speech-report→`StopPlayback` hop, this one measures
+`Clear`→silence, and adding them is as close to end-to-end barge-in as MSS can
+honestly get on its own.
+
+### 36. The N-way mixer core (Phase 4) — ✅ DONE (2026-08-23)
+
+Phase 4 is where FreeSWITCH loses its last media job, and this is its engine:
+`crates/media-core/src/mixer.rs`, a sans-IO `MixMatrix` of **N contributors x M
+listeners**. Push each contributor's frame for tick T, call `mix()`, get one
+frame per listener back — i32 accumulate, saturate to i16, minus-self by
+default. Nothing about it knows what a session, a socket or an rtpengine is;
+P4-2 is what puts legs on either side of it (per-leg ingest in, one `pacer.rs`
+per listener out).
+
+The design decision worth recording is that **all three Phase-4 features are
+the same matrix**, not three code paths: contributors and listeners are
+separate memberships, so a *party* is one of each linked by a muted self-pair, a
+**monitor** is a listener with no contributor (hears all, contributes nothing),
+a **whisper** is a contributor whose row is unity into exactly one listener and
+muted elsewhere (`route_only`), and **barge** is `route_to_all` — a matrix
+flip. Mute is a zeroed row, deaf is a zeroed column, and their inverses restore
+the minus-self defaults, which is the whole of P4-5's routing work.
+
+Membership is generational: `ContributorId`/`ListenerId` carry the slot
+generation, so a handle from a party that already left is refused rather than
+addressing whoever reused the index; leaving clears the pending frame, the
+speech state, the self-link, the gain row and column, and the listener's output
+region, so a reused slot cannot leak the previous occupant's routing or a tail
+of their audio. Active-speaker flags are per contributor with attack **and**
+hangover (default 2 frames up, 12 frames ≈ 240 ms down) so they cannot flap;
+they are reported (`speaking`, `level`, `active_speakers`) and never affect
+routing. Per-pair gain is Q12 fixed point, capped at 8x so no sum can overflow
+i32; clipping is counted (`clipped_samples`) rather than hidden, which is the
+signal that a conference wants AGC — AGC and any DC filter are not built.
+
+Replay-tested, 23 tests (`cargo test -p media-core mixer`): 2/3/8 parties each
+hearing exactly everyone-but-self; a frame consumed by one tick only; an absent
+contributor as silence; positive and negative saturation with the clip count
+asserted; per-pair gain scaling one direction only; whisper heard by its target
+and by nobody else, then promoted to all; a monitor hearing the sum and
+contributing nothing; mute/deaf as row/column zeroing and their restore;
+active-speaker attack, hangover and the alternating-frame case that must produce
+**zero** onsets; a stale identity refused after leaving; a reused slot starting
+clean and silent; growth past the initial capacity; and **10 000 ticks of an
+8-party conference plus a monitor with every buffer length and capacity
+unchanged at the end** (the no-allocation-per-frame rule, asserted rather than
+asserted-in-prose).
+
+Deliberately deferred, and recorded in implementation-notes so P4-2 does not
+rediscover them: the sum-once-subtract-self fast path (invalid the moment
+whisper or per-pair gain is in play, so it needs a "matrix is default" flag if
+conference fan-in ever demands it); multi-rate conferences (every contributor
+must arrive at the conference rate and frame size — resampling belongs to the
+leg); AGC; and Opus egress, still absent crate-wide, so a conference of Opus
+legs transcodes on the way out. This is replay-only by construction: media-core
+has no sockets, so mixing quality against real legs cannot be judged until the
+P4-6 drill.
+
+### 37. Conference sessions in mediaserverd (Phase 4) — ✅ DONE (2026-08-24)
+
+`CreateSession{kind=INLINE, group="<conference>"}` now joins a leg into a
+conference: the legs that name one group share **one** `MixMatrix` driven by
+**one** capture-world clock, each hears everybody but itself, and the
+conference's full mix is published to every member's hub as the `mixed` track so
+monitors and recorders attach with the verbs that already exist. New proto
+fields (additive, wire-compatible): `CreateSessionRequest.group = 9` and
+`Session.group = 11`, mirroring the recording group on `Attach` rather than
+inventing a conference noun; a `group` on a TAP is refused by name, since a
+recording group is named on the attachment. `mss_ctl inline <external-id>
+<call-id> <offer-file> [conference-group]` is the lab handle for it.
+
+The design decision this item owed was **threading**, and it is recorded in
+implementation-notes: one *conference-owner thread the legs migrate onto*. Each
+inline leg is still built in the control world exactly as a two-party leg is
+(socket, jitter/decode pipeline, hub, `InlineEgress`), but a grouped one is then
+handed to the conference thread over a bounded queue instead of getting a thread
+of its own. Mixing is frame-synchronous, so a matrix shared between per-leg
+threads would need a lock in the packet path — the two-world rule forbids
+exactly that. Membership is decided in the control world under the conference
+table's lock (so a join cannot race the last leave), the thread never removes
+itself from the table, and the leave that empties a conference hands its
+`JoinHandle` back to `close_session`, which joins it the same way it joins a
+per-session capture thread. Per-session teardown stays one path.
+
+Per tick: each leg's released frame goes to its own hub as `customer` **and**
+into the matrix as its contributor (`TapLeg::release_frame_with`, no copy); each
+member's queued playback/inject audio is cut into exact frames and pushed as
+that member's private injector (`route_only` into its own ear, so a prompt
+played into one leg still reaches only that leg); one `mix()`; then every
+member's minus-self ear goes to its own `PlayoutPacer` and the monitor
+listener's full sum goes to every member's hub as `mixed`. A leg that releases
+nothing is silence and counted; a leg leaving is a command handled at the top of
+a tick, so **a member leaving cannot stall the mix**. One mixer sharp edge found
+here and now documented: `join_listener` resets its column to the defaults, so
+every non-default route (the injectors') must be re-applied after each
+membership change.
+
+**Multi-rate conferences are refused by name**, as the item asked: the joining
+leg's rate, ptime and channels must equal the conference's (its first leg sets
+them), and the error says why. Encoding may differ, because each leg owns its
+own egress encoder. Per-leg resampling is the residual.
+
+Verified in-process over real UDP sockets (5 new tests in `tap_plane.rs`, plus a
+control-api test for the API rule): three fake peers in one group with 1000 /
+2000 / 4000 tones read **6000 / 5000 / 3000** off the wire — the sum of the
+other two, never their own; a hub monitor on one member sees the mixed track at
+**7000** (everyone, self included); closing one leg mid-mix leaves the survivors
+reading exactly each other while the conference stays live, and the last leg out
+closes it; a prompt played into one leg is absent from the other's ear; a 40 ms
+leg is refused from a 20 ms conference. New metrics: `mss_conferences_live`,
+`mss_conference_members_live`, plus joins/leaves/mixed-frames/clipped/absent/
+reanchor/refused counters.
+
+**Not proven and not claimed:** no real SIP peer has ever been in a conference —
+that is P4-6's drill. Conferences are pod-local (a group is one pod's table, and
+an inline leg is not adoptable anyway), have no tenant scope on the group name
+(two tenants picking the same name would share a mix; prefix it until sessions
+carry a tenant), and there is no AGC. Conference recording as one mixed file is
+P4-4; monitor/whisper/barge attachments are P4-3; member mute/deaf/hold verbs
+are P4-5.
+
+### 38. Monitor, whisper and barge (Phase 4) — ✅ DONE (2026-08-24)
+
+Three conference features, **no new RPC**: they are matrix cells named by
+attachment metadata, exactly as item 36 predicted.
+
+**Monitor** is the verb that already existed and now has a name:
+`Attach{transport=GRPC_STREAM|WS_TWILIO, capabilities=SINK,
+selector.only="mixed"}` on **any** member session. The conference's full sum is
+published to every member's hub as `mixed`, so a consumer that selects that one
+track hears the whole conference (itself included — a monitor is a record, not
+an ear) and injects nothing. Verified: a `mixed`-only subscriber on a
+three-tone conference reads **7000** (1000+2000+4000), and the plane accepts a
+`only=mixed` SINK attachment on a conference leg. No code was needed for it.
+
+**Whisper** is `mix_target=<member-external-id>` in the metadata of an
+**INJECT** attachment on a member session: everything that attachment injects
+is routed into that member's ear **only**. The supervisor case is a supervisor
+leg in the conference plus an INJECT attachment on it naming the agent.
+`mix_target` without INJECT is refused by name (`invalid_argument`), and so is
+`mix_target` on a leg that is in no conference.
+
+**Barge** is the same key flipped to `mix_target=all`, carried by
+`UpdateAttachment` — which gained `map<string,string> metadata = 6` (additive;
+merge semantics: named keys are overwritten, the rest untouched). That was the
+cheapest additive path: pause/resume already lives on `UpdateAttachment`, so
+every metadata-carried verb can ride it without a new RPC. `mss_ctl mix
+<attachment-id> <own|all|member-id> [include|exclude]` drives it from the lab.
+
+**Decision — the mixed track hears whispers, and a flag can silence it.**
+Default: a whisper and a barge are audible on `mixed`, private playback
+(`mix_target=own`, the item-37 behavior) is not. The mixed track is the monitor
+**and** the recording feed, and a recording that omits what the agent was told
+mid-call is a recording that lies about the call; audit beats privacy here
+because a whisper is a human speaking into a live conversation. Deployments that
+disagree set `mix_monitor=exclude` (and `include` forces the other direction on
+private playback). Both are documented reserved keys in
+`session-core/src/mix.rs`, parsed in exactly one place.
+
+Events: `MediaEvent.mix_routed` (oneof tag 25, `MixRouted{mix_target,
+monitor_audible}`) is published on the attach that declares a route and on every
+change, so `mss.events` can answer *who whispered to whom, and was it on the
+record*. A pause/resume that leaves the route alone says nothing.
+
+Membership churn was the sharp edge (item 37's warning): `join_listener` resets
+its column, so `conference.rs::reroute_injectors` re-resolves **every** route by
+name after every join and leave. Two consequences fell out of that and are now
+tested: a whisper to a member who has not joined yet is **muted, not
+broadcast**, and it starts being heard the moment that member joins.
+
+New metrics: `mss_conference_whispers_live` (gauge) and
+`mss_conference_route_changes_total`.
+
+Verified in-process over real UDP sockets (5 new tests in `tap_plane.rs`, 3 in
+`session-core`, 6 in `mix.rs`): whisperer injecting 8000 into a three-leg
+conference — target reads **~8000**, the other two and the injecting leg itself
+read **< 300**, and the `mixed` track carries it; `mix_monitor=exclude` keeps
+the target's ear and empties the mixed track; the flip to `all` puts it in all
+three ears; a fourth leg joining mid-whisper does not disturb the route; and
+detaching the whisperer puts the leg's injected audio back to private playback.
+
+**Residuals.** (a) `all` is audible to the injecting leg too (the injector has
+no minus-self link) — a human barging through their own leg hears themselves;
+inject on a dedicated silent leg until P4-5 decides whether to add a
+minus-self variant. (b) The route belongs to the **leg**, not the attachment
+(one injector per leg): two INJECT attachments on one leg share it, last
+writer wins, and detaching the owner reverts it to private. (c) A whisper
+sourced from a member's **own RTP** rather than an injected stream (the
+`mix_source=leg` shape) is not built — that is the same row/column verb family
+as P4-5's mute/deaf/hold and belongs there. (d) No real SIP peer has whispered
+yet: P4-6. (e) The reference deployment's monitor/whisper/barge RPC mapping is
+**not** here on purpose — it goes in P4-5's adapter parity table.
+
+### 39. Native conference recording — both shapes at once (Phase 4) — ✅ DONE (2026-08-24)
+
+A conference records two ways, and both may run on the same conference at the
+same time. Neither needed a new RPC, a new transport or a change to the frozen
+identity `${accountID}/${recordingID}.${format}`.
+
+**The room, as one object.** `Attach{transport=FILE_S3, selector.only="mixed",
+endpoint="<account>/<recording>.wav"}` on **any** member session records the
+whole conference as one **mono** object. The conference already publishes its
+full sum to every member's hub as `mixed` (item 37), so the recorder is an
+ordinary hub consumer of one track and `Layout::Mono(Track::Mixed)` renders it;
+pause excises the paused span from that single object, and a spilled segment
+(item 30) stays mono and stitches back in order.
+
+**Every participant, one object each.** A recording **group** over the member
+sessions with `selector.only="customer"` writes one mono object per member under
+`<account>/<recording>/<label>.wav`, time-aligned on the group's `opened_at`
+(item 29's anchor), so a member that joins after the recording started opens its
+file with silence back to t=0 rather than at its own join moment.
+
+**The clock was the one real defect.** A member's own audio is published on its
+hub with the **leg's** frame counter (0 at its join) while the mix was published
+with the **conference's** (0 at the conference's open). On any member that joined
+late the two tracks were therefore offset by the join delay — measured at
+**5120 samples (640 ms)** in the new test before the fix — which made a stereo
+`selector=all` object of a conference member ("me left, the room right")
+misaligned and any timestamp correlation across the two tracks wrong.
+`conference.rs` now stamps each member's `seated_at_frame` and publishes the mix
+to that member's hub on **that member's** clock. Mono shapes were unaffected
+(the segmenter anchors on the first timestamp it sees), so this is a fix for the
+stereo and correlation cases.
+
+**Decision — a recording group of the mixed track is refused on a conference.**
+Every member's `mixed` track carries the same audio, so a group of them would
+write N byte-identical objects under one prefix. `open_recording_attachment`
+refuses it by name and names the two supported shapes in the error. On a
+**non**-conference session `only=mixed` is still the injected/playback track and
+a group of those is legitimate, so the refusal is scoped to a session that is
+seated in a conference (`conference_of`).
+
+**Decision — the event names the shape.** `RecordingStarted` gained
+`string shape = 3` (additive, wire-compatible; next free field on that message
+is 4), emitted per object:
+`stereo` | `track` | `mixed` | `participant`, prefixed `conference-` when the
+session is a conference member. So `mss.events` distinguishes a room object
+(`conference-mixed`) from a participant object (`conference-participant`) from
+an ordinary two-party recording (`stereo`) without the consumer having to parse
+the object key or know the session's group. `RecordingShape::of(layout, grouped)
+.named(conferenced)` is the only place that string is built.
+
+**Verified** over in-process UDP sockets and replay, no live run: four new
+`recorder.rs` tests (a mixed-only object is mono, carries only the mix and keeps
+the frozen key; pause excises the room and leaves no gap; a spilled mixed
+segment stays mono and stitches; the shape vocabulary) and three new
+`tap_plane.rs` tests (one conference recording the room **and** three
+participants at once — the room object reads 6500–7600 for 1000+2000+4000 while
+each participant object reads only its own tone, and the late member's object
+opens with a pad and matches the others' length; the late member's own track and
+the room within 4 frames of each other in a stereo object; the grouped-mixed
+refusal). **Item 41 then ran it live** — three container RTP peers in one
+conference, both recording shapes landing in MinIO at once. What has still never
+been through this path is a real **SIP** peer.
+
+**Residuals.** (a) The room object is attached to **one member's** session, so
+it ends when that member leaves even though the conference lives on — D20.
+(b) D16 still applies: a recording group is one pod's memory, so every member of
+a per-participant conference recording must be on the same pod. (c) The room
+object's own t=0 is its attach moment; the shapes align with each other only if
+they are attached together (there is no conference-wide recording anchor).
+(d) No AGC: the room object clips exactly when the mix clips
+(`mss_conference_clipped_samples_total`).
+
+
+### 40. The conference feature tail + the parity table (Phase 4) — ✅ DONE (2026-08-24)
+
+Member **mute / deaf / hold**, **prompts into the room**, and a whisper sourced
+from a member's **own RTP** — the residuals items 37–39 left. Still **no new
+RPC**: the vehicles are item 38's `UpdateAttachmentRequest.metadata` and
+`StartPlayback.target_tag`. The **generic conference feature list** (what exists,
+what is deliberately absent and why) and the clearly-marked **ADAPTER parity
+table** against one integrator's 14 conference RPCs are in
+**architecture.md Appendix B**.
+
+**Member verbs are member state, and that is the design decision here.**
+`member_mute` / `member_deaf` / `member_hold`, each `on` or `off`, ride on **any
+attachment of that member's own session** (an absent key means untouched, per
+the merge semantics of the metadata channel). Unlike `mix_target`, which belongs
+to the whisperer and reverts when it detaches, member state **outlives the
+attachment that set it** — muting somebody is not a property of the consumer
+that asked for it. No capability is required: the API caller's authentication is
+the authorization, exactly like `paused`. `MemberControlled{mute,deaf,hold}`
+(payload tag 26, additive; **next free payload tag is 27**) publishes each change
+to `mss.events`.
+
+- **mute** zeroes the member's contributor row, monitor cell included, so a
+  muted member is out of every ear **and** off the mixed track, which is the
+  recording feed.
+- **deaf** silences the room into that member's ear — but not audio *addressed*
+  to them. `apply_matrix` remembers which contributors were routed at a listener
+  with `route_only` (their own private injector, a whisper named at them) and
+  zeroes everything else into that ear, prompts and barge included. Blanket
+  `deafen_listener` was **not** used: it would close the member's own injector
+  and there would be no way to play hold audio.
+- **hold** is both, which is why hold audio needed no new path: it is an
+  ordinary `StartPlayback` on that member's session.
+
+**Prompt into the room.** A conference owns one prompt contributor fed by one
+bounded queue, routed to everybody, so a prompt is in every ear and on the
+mixed track. `StartPlayback` with `target_tag="all"` on any member session plays
+it; `StopPlayback` with `"all"` flushes it; empty or `own` is the unchanged
+private path, and **any other value is now refused by name on an inline leg**
+(an inline leg has no SIP from-tag to target). Two overlapping prompts **queue**
+rather than mix, and long-form room audio belongs on an INJECT attachment with
+`mix_target=all`.
+
+**Decision — enter/exit prompts are a verb, not a trigger.** MSS does not decide
+that a join deserves a beep. Play-into-room is the verb; join-triggering is
+integrator policy (watch the room's session events, call
+`StartPlayback{target_tag="all"}`), which keeps prompt selection, tenant policy
+and localization out of the media plane.
+
+**Decision — conference control is API-first, so there is no in-band DTMF menu.**
+MSS delivers digits to consumers (WS `dtmf` frames, gRPC `DtmfFrame`) and
+interprets none of them; an integrator that wants `*6` to mute maps the digit to
+an `UpdateAttachment` call. Gap found while documenting it: those digits never
+reach `mss.events` — D21.
+
+**`mix_source=leg`.** A `mix_target` now picks its source: `inject` (default,
+item 38) or `leg`, the member's own RTP. `leg` + a member target is the **coach**
+shape — the coach's own voice in one ear, the room no longer hearing them,
+`mix_monitor` still deciding whether the coaching is recorded (default: include).
+The coach's injector stays private, so private playback into their own ear still
+works. A leg route still requires an INJECT attachment, on the rule that moving
+audio around a room is the inject right even when nothing is injected.
+
+`reroute_injectors` became `apply_matrix`: the **single writer** of every
+non-default matrix cell, re-derived from the seated members on every membership
+change, route change and member verb (item 37's `join_listener` resets a whole
+column, so nothing may be applied once and forgotten). The deaf pass runs last,
+after every row-based operation. New metrics:
+`mss_conference_member_controls_total`, `mss_conference_prompt_frames_total`,
+`mss_conference_{muted,deaf,held}_members`. `mss_ctl` gained
+`member <attachment-id> <mute|deaf|hold> <on|off> ...`, `mix` gained the
+`inject|leg` qualifier, and `play <session> <wav> all` is the room prompt.
+
+**Verified** over in-process UDP sockets and replay, **no live run** (the three
+container peers are P4-6): a muted member inaudible to both other members and on
+the mixed track, back on `off`; a deaf member's ear silent while the room and the
+record still carry her; a held member hearing his hold audio alone at full level
+while the room loses him and the record never carries the hold audio; a room
+prompt heard by all three members and the mixed track and silenced by
+`StopPlayback{all}`; a coach heard by the agent, never by the customer, still
+hearing everybody; and the refusals (a flag that is not `on`/`off`, a member verb
+off a conference, a from-tag-shaped playback target on an inline leg). Plus the
+mix-metadata parser tests and a registry audit test for `MemberControlled`.
+
+**Residuals.** (a) Member state has no owner and no lease, and no API reads it
+back — D22. (b) One prompt source per room: overlapping prompts queue.
+(c) Enter/exit sounds and DTMF menus are integrator work by design, and D21 says
+the digit half is not on the bus yet. (d) Per-member volume/energy, member
+enumeration, room lock and moderator roles are not built (architecture.md
+Appendix B lists them with recommendations). (e) Everything here is pod-local,
+like the conference itself.
+
+
+### 41. The conference lab drill — Phase 4 on real sockets (Phase 4) — ✅ DONE (2026-08-24)
+
+`lab/conference_drill.sh`: three `lab/inline_peer.py` containers at
+440 / 880 / 1320 Hz seated in **one conference** (`mss_ctl inline <id> <call>
+<offer> <group>`), with **no FreeSWITCH and no rtpengine in the path** — an
+inline leg is MSS's own socket. New lab pieces: `lab/conference_actor.py` (one
+file, two roles: `ROLE=monitor` attaches `SINK` + `only=mixed`; `ROLE=injector`
+attaches `SINK`+`INJECT` with `mix_target=<member>`, then flips itself to
+`mix_target=all` over `UpdateAttachment` — the barge) and
+`lab/conference_report.py` (`ears` / `wavs` / `lengths`). `inline_peer.py`
+gained `EAR_TONES` (a Goertzel **per tone per arriving packet**, stamped with
+its arrival wall clock) and `TONE_AMPLITUDE`.
+
+**Everything below is machine-decided**: the drill stamps phase boundaries on
+the same kernel clock the peers stamp arrivals with (both are containers on the
+lab network), trims 400 ms off each edge, and judges each tone present or absent
+against the loudest tone in that same ear during that same phase. **Twenty
+expectations, all green, present ~3000 against absent 36–98 — a ≥30:1 margin.**
+Full tables in [lab.md](lab.md).
+
+- **minus-self**: no ear ever carried its own tone (`three/A`: 880 = 2996,
+  1320 = 3003, own 440 = 98).
+- **monitor** (`only=mixed`, needing no code since item 37): all three tones.
+- **whisper** (`mix_target=<member B>` at a 4th tone, 1760 Hz): B = 2989,
+  **A = 63, C = 56** — isolation, not attenuation.
+- **barge** (`mix_target=all`): 1760 in every ear, the injecting leg's included
+  (item 38's known residual, now observed).
+- **mute** (`member_mute=on` on one of A's attachments): 440 leaves both other
+  ears *and* the mixed track (53 / 69 / 98); `off` restores it.
+- **both recording shapes at once**: `acct-conf/room-<stamp>.wav` 71.88 s
+  carrying all three tones, and a group's `party-<stamp>/{a,b,c}.wav` at
+  71.96 / 72.02 / 72.10 s carrying **only** their own tone (cross-talk 0–8
+  against 3000), with C's file opening on **10.66 s** of the P2-1 anchor pad.
+  The three group files agree to 140 ms (D11's sequential detaches).
+- `mss_conference_clipped_samples_total` = **0**, deliberately: all four sources
+  run at `TONE_AMPLITUDE=6000`. At the peers' default 24000 the mix clips, and
+  clipping intermodulates onto exactly the harmonics being measured — the
+  drill's absent-tone assertions would have been reading their own distortion.
+
+**Found and fixed here (D23):** `Segmenter::close_segment` advanced `anchor_ms`
+by the whole closed segment while *also* subtracting it from `segment_start`,
+double-counting the group anchor pad — the first run's `party-c.wav` was
+**55.88 s against a/b's 66.16/66.24**, pad at the front and 10.28 s missing off
+the tail. Ungrouped recordings have `segment_start == 0` and never saw it;
+item 29's drill is too short to spill. See the defect row.
+
+**What it does not prove:** no SIP, no rtpengine, no human; one pod (D16, D22);
+the monitor and the room object both hang off one member's session (D20);
+`deaf` and `hold` have item 40's socket tests only; PCMU 8 kHz/20 ms only.
+
+
 ## Open defects and soft spots
 
 | # | Item | Where | Severity |
 | --- | --- | --- | --- |
 | ~~D1~~ | ~~A **mid-call SSRC change** (re-INVITE, transfer, codec renegotiation) does not re-resolve leg identity~~ — **fixed 2026-08-22 (item 14)**: the leg re-enters resolution on a confirmed SSRC change and a control-world task re-queries rtpengine and pushes a fresh map through a bounded queue. Replay-verified only, not yet on a live call. Residual: a transfer that replaces a *from-tag* still needs a re-subscribe, not a re-resolve | `tap_spike.rs`, `tap_plane.rs` | closed |
-| D2 | `stop_playback` stops **all** playback on the call: rtpengine's `stop media` targets a participant, not a playback id | `tap_plane.rs` | low until multiple concurrent playbacks exist |
-| D3 | `close_attachment` **aborts** the consumer task instead of closing the websocket politely (no `stop` frame) | `tap_plane.rs` | low, but consumers see a truncated stream |
-| ~~D4~~ | ~~`WS_TWILIO` and `GRPC_STREAM` attachments are served; `FILE_S3` (phase 2) and `RTP_INLINE` (phase 3) are refused by name~~ — **`FILE_S3` now served (2026-08-22, item 15)**: the recorder is a hub consumer with the frozen identity, pause-segmenting and `object_store` upload. `RTP_INLINE` is still refused by name and stays Phase 3 | `tap_plane.rs` | partly closed — inline is phase 3 |
-| D9 | A recording lives in the recording pod's memory until the call ends: a pod death loses the buffered audio even though the *session* is adopted elsewhere, and no upload is resumed. Also caps a recording at `MAX_RECORDING` (2 h) | `recorder.rs` | medium once a tenant records for real |
+| ~~D2~~ | ~~`stop_playback` stops **all** playback on the call~~ — **fixed 2026-08-23 (item 27)**: the registry remembers each playback's `target_tag` and `stop_playback` sends NG `stop media` with that `from-tag` (`all: all` only when the playback itself was for everyone). Measured on the lab node with `lab/ng_stop_media_probe.py`, three consistent runs: with a player on each participant, `stop media {from-tag: tagA}` left tagA at **1 packet** (a tail) and tagB still at **75 packets per 1.5 s**; an `all: all` player stopped with one from-tag keeps playing to the *other* participant (1 vs 75), which is why "no target" still maps to `all: all`. **Residual, now measured rather than assumed:** a second `play media` at the *same* from-tag is accepted, and one `stop media` for that from-tag clears the participant entirely (1 packet in a 3 s window) — rtpengine has no playback identifier, so two playbacks aimed at one participant cannot be stopped independently. MSS is now as precise as the protocol allows | `tap_plane.rs`, `registry.rs` | closed (residual documented) |
+| ~~D3~~ | ~~`close_attachment` **aborts** the consumer task instead of closing the websocket politely (no `stop` frame)~~ — **fixed 2026-08-23 (item 27)**: `TapPlane::end_attachment` ends the hub subscription and lets the consumer finish, so a WS consumer sends its Twilio `stop` frame and a gRPC consumer gets a `StreamStop` naming the reason ("the attachment was detached" / "the call ended"); a consumer that will not finish inside `POLITE_CLOSE` (2 s) is still aborted, with a warning. `close_session` takes the same path, so an ordinary hangup is polite too. Replay-verified (the task runs to completion instead of being aborted; the `Stop` frame reaches a real gRPC consumer over the wire); not observed against a live consumer | `tap_plane.rs` | closed |
+| ~~D4~~ | ~~`WS_TWILIO` and `GRPC_STREAM` attachments are served; `FILE_S3` (phase 2) and `RTP_INLINE` (phase 3) are refused by name~~ — **`FILE_S3` now served (2026-08-22, item 15)**: the recorder is a hub consumer with the frozen identity, pause-segmenting and `object_store` upload. `RTP_INLINE` is still refused by name as an **attachment transport**, and item 33 (2026-08-23) did not change that: an inline leg is a session *kind*, and a consumer reaches one over `GRPC_STREAM`/`WS_TWILIO` like any other — the INJECT direction is P3-3. `RTP_INLINE` may end up never being needed | `tap_plane.rs` | partly closed — the transport stays unused |
+| 🔶 D9 | ~~A recording lives in the recording pod's memory until the call ends: a pod death loses the buffered audio and no upload is resumed~~ — **partly closed 2026-08-23 (item 30)**: closed segments now spill to `MSS_RECORDING_SPILL_DIR` every `MSS_RECORDING_SPILL_SECONDS` (default 30) and on pause, the final upload stitches spill + memory tail into the one frozen key, this pod's leftovers are salvaged on its next start (never over an object that already exists), and an adopter recovers what it can read while padding and counting the rest (`mss_recording_frames_lost_on_adopt_total`). **Residual, by construction:** the spill dir is per-pod local disk, so a **cross-pod** adopter still cannot read the dead pod's segments — worst-case loss falls from the whole call to the spill interval *on the same pod*, and stays the whole prefix across pods until the spill lives somewhere every pod can read (same fix as D16). No retention policy on the spill dir. Replay/fake-verified only; no live pod-kill drill with a recorder attached. `MAX_RECORDING` (2 h) is unchanged | `recorder.rs`, `recording_spill.rs`, `registry_keeper.rs` | medium — cross-pod half open |
 | D11 | `StopRecording`/`Detach` **blocks until the upload finishes** (bounded 60 s/90 s), because `observe` needs a live session and a backgrounded upload would lose `UploadCompleted` on every hangup. A pilot may find the latency unacceptable; the fix is a session-independent event path | `tap_plane.rs`, `recorder.rs` | medium — watch it in the pilot |
-| D10 | Pause is honoured by the recorder only. A paused `WS_TWILIO`/`GRPC_STREAM` attachment keeps receiving media (registry state only) — now logged explicitly instead of being invisible, but `StreamPause` still does not stop feeding an ASR | `tap_plane.rs` | medium for cost, low for correctness |
+| ~~D10~~ | ~~Pause is honoured by the recorder only; a paused `WS_TWILIO`/`GRPC_STREAM` attachment keeps receiving media~~ — **fixed 2026-08-23 (item 27)**: the hub checks a per-subscription pause flag before every frame, so `StreamPause` really stops feeding an ASR; skipped frames are counted (`mss_consumer_suppressed_while_paused_total`) and resume starts at the current tap position rather than replaying a backlog. A gRPC attachment paused before its consumer subscribes stays paused when the stream opens. Recorder pause behaviour is unchanged. Replay-verified through `update_attachment`; not observed live | `tap_plane.rs`, `hub.rs` | closed |
 | ~~D5~~ | ~~Event delivery is **at-most-once**; a broker outage drops events~~ — **fixed 2026-08-22 (item 13)**: bounded retry backlog, order preserved, drop-oldest counted. Now **at-least-once**, so the translator must dedupe by `(external_id, seq)`; a backlog past its 8192 cap or a pod death still loses events | `event_pump.rs` | closed |
 | D6 | `play media` `from-tag` semantics are **unmeasured** — architecture §6's claim was retracted after the instrument turned out to be broken (see lab.md correction) | docs + lab | low, but §6 must not be trusted until re-probed |
 | ~~D7~~ | ~~Jitter buffer: fixed target depth, no adaptive sizing, no timestamp-aware gap handling, silence instead of real PLC~~ — **fixed 2026-08-22 (item 17)**: adaptive depth from the RFC 3550 estimate, timestamp-aware silence gaps, comfort noise accounted, G.711 Appendix I-shaped PLC, restart on SSRC change. Replay-verified across the impairment matrix, and since item 19 also **on a real link** in the soak — 1%/5% injected loss reported as 1.06%/5.01% with `frames_concealed` equal to `jitter_lost` to the packet, reorder and ±35 ms jitter costing zero loss and zero late drops. Still open: never impaired with `tc netem` on the **tap link** (this box's kernel has none), so burst loss, reorder-beyond-depth and dedupe stay replay-only, and the concealment has never been judged perceptually | `jitter.rs`, `pipeline.rs`, `plc.rs` | closed |
 | D8 | `owner_pod` is a config string; real placement and load-aware scheduling do not exist | `main.rs` | low until multi-pod |
 | ~~D12~~ | ~~**NG cookies repeat across sessions on one pod**: `CookieSequence` restarted its serial at 0 and `TapPlane` binds a new `NgTransport` per session, so every session's first command was `<prefix>-0`. Two sessions inside rtpengine's duplicate-cookie reply-cache window get the *same cached subscribe answer*, and the second tap receives **no media at all** while looking healthy~~ — **fixed 2026-08-22 (item 10)**: the serial is process-wide, unit-pinned and lab-proved before/after | `ng_transport.rs` | closed — was **high**, it silently broke every second tap within a minute |
-| D15 | An adopted attachment loses its **negotiated format**: `PersistedAttachment` has no format field and `rebuild` passes `format: None`, so a consumer that attached as L16/16k comes back at the session default (g711 at the tap rate). Found by reading the adoption path during item 11, **not** observed — that drill's consumer was WS/PCMU, where the default is the only legal answer. A gRPC consumer would notice | `session_store.rs`, `registry_keeper.rs` | low today, medium once ASR consumers ask for L16/16k |
-| D14 | **A dead pod's rtpengine subscription is never torn down.** The adopter re-subscribes but nothing cancels the old tap: `PersistedSession` does not carry the subscription's `to-tag`, and only the pod that created it holds one. Measured in the item-11 drill from rtpengine's teardown block: **14,743 packets / 2.5 MB copied to a pod that had been dead for 110 s**, four ports held for the rest of the call — i.e. a pod death permanently doubles that call's cost on the rtpengine host, which is exactly the capacity number still open with the platform team. Fix shape: persist the to-tag, have the adopter `unsubscribe` it before subscribing, and decide what an adopter should do when the previous owner is partitioned rather than dead (`mss_registry_lost_total` is the signal) | `session_store.rs`, `registry_keeper.rs`, `tap_plane.rs` | medium — every pod restart during a call leaks one tap |
+| ~~D15~~ | ~~An adopted attachment loses its **negotiated format**: `rebuild` passes `format: None`, so a consumer that attached as L16/16k comes back at the session default.~~ — **fixed 2026-08-23 (item 26)**: `PersistedAttachment.format` (`Option<PersistedFormat>`, `serde(default)`, the wire shape used for the other persisted enums) is written every keeper tick and replayed on adoption; a record without it still decodes and still means the default. Unit-tested (roundtrip, legacy record, an L16/16k gRPC consumer and a default WS consumer re-opened side by side on the adopting pod) and run against the lab's real Redis; **never observed live** — that needs a pod kill with a gRPC L16 consumer attached | `session_store.rs`, `registry_keeper.rs` | closed |
+| ~~D14~~ | ~~**A dead pod's rtpengine subscription is never torn down.**~~ — **fixed 2026-08-23 (item 25)**: `PersistedSession` now carries the tap's `to-tag` (`subscription_tag`, `serde(default)` so older records still decode), the adopter sends NG `unsubscribe` for it **before** re-subscribing (after winning the atomic claim), and a pod that loses its lease destroys the session locally so a partitioned-but-alive owner unsubscribes its own tap instead of double-tapping. `upsert` also stopped rewriting the lease key unconditionally (now `SET NX`) — it had made a lease unloseable, so the partitioned case could never be detected. New counters `mss_registry_orphans_unsubscribed_total`, `mss_registry_orphans_still_subscribed_total`, `mss_registry_surrendered_total`. **Verified in unit tests, against a fake rtpengine socket (the `unsubscribe` bytes) and against the lab's real Redis — not re-measured on a live pod kill**; the residual is that a refused `unsubscribe` still leaks one tap, counted rather than retried | `session_store.rs`, `registry_keeper.rs`, `tap_plane.rs` | closed |
+| ~~D23~~ | ~~**A padded recording-group member lost its pad's worth of audio off the tail.** `Segmenter::close_segment` subtracted the closed frames from `segment_start` (the lead-silence offset) *and* advanced `anchor_ms` by the same frames, so every spill moved a late joiner's timeline forward by the pad twice~~ — **found and fixed 2026-08-24 (item 41)**: the anchor now advances only by `frames - segment_start`. Invisible to every earlier test because an ungrouped recording has `segment_start == 0` and item 29's group drill (5 s stagger, 20 s run) never reached the 30 s spill. Live in the conference drill: `party-c.wav` **55.88 s against 66.16/66.24** before, **72.10 against 71.96/72.02** after, with the 10.66 s pad still at the front. Guarded by `a_padded_member_keeps_its_whole_tail_across_a_spill`, which fails by exactly the lead if the fix is reverted | `recorder.rs` | closed |
+| D20 | **A room recording belongs to a member, not to the conference.** The mixed-track `FILE_S3` attachment hangs off one member session, so the object ends when *that* member leaves even though the conference keeps mixing — and its t=0 is its attach moment, not the conference's open, so it aligns with the per-participant objects only if both are attached together. Fix shape: a conference-scoped recording owner (an attachment on the conference rather than on a leg) with the conference's `opened_at` as its anchor | `tap_plane.rs`, `conference.rs` | medium once a tenant records conferences whose members come and go |
+| D21 | **DTMF digits never reach the event bus.** A tapped or inline leg's digits are delivered to consumers (WS `dtmf` frames, gRPC `DtmfFrame`) and counted in `mss_ingest_dtmf_digits_total`, but nothing publishes `Observation::Dtmf`, so `mss.events` carries no digit. Conference control is API-first by design (item 40), and an integrator mapping digits to API calls therefore needs a consumer stream rather than the bus. Fix shape: publish the observation from the capture path, capability-gated like the speech report | `tap_spike.rs`, `tap_plane.rs`, `registry.rs` | medium for anyone wanting an in-call digit menu |
+| D22 | **Member state has no owner, no lease and no read-back.** `member_mute`/`member_deaf`/`member_hold` deliberately outlive the attachment that set them (item 40), so a controller that dies between `on` and `off` leaves a member muted for the life of the conference, and there is no API that reports a room's member state — only the aggregate gauges. Fix shape: expose member state on `DescribeSession` (and consider an optional lease on it, mirroring the session lease) | `conference.rs`, `tap_plane.rs`, `registry.rs` | medium once a tenant drives mute from a UI |
 | D16 | **A recording group is one pod's memory.** `TapPlane` holds the group, so every member of a conference recording must attach to the same pod: there is no placement that guarantees it (D8), a member whose session is adopted elsewhere is **refused** rather than restored (`grouped_not_adopted`, so the participant's file simply ends at the pod that died — the D9 shape per participant), and a group name reused on a second pod silently produces a second half-recording under the same prefix. Fix shape: schedule a group's sessions onto one pod, or move the group into shared storage so any pod can serve a member | `tap_plane.rs`, `registry_keeper.rs` | medium once a tenant records conferences across pods |
-| D13 | `StreamStart` (and the Twilio `start` frame's `tracks`) advertises `["customer","agent"]` for `TrackSelector::All`, but a silent `mixed` track is delivered too, at the full frame rate: a consumer must tolerate an unannounced track and pays 50% extra bandwidth for silence. Fixing it means either naming `mixed` in the start frame or not carrying it under `All` — the latter touches the frozen Twilio surface | `stream.rs`, `tap_plane.rs`, `hub.rs` | low for correctness, medium for cost |
+| ~~D13~~ | ~~`StreamStart` (and the Twilio `start` frame's `tracks`) advertises `["customer","agent"]` for `TrackSelector::All`, but a silent `mixed` track is delivered too~~ — **fixed 2026-08-23 (item 27)**: the hub selection split into `All` (every track, including `mixed`) and `Speakers` (customer + agent). Consumers get `Speakers`, so delivery matches the advertisement exactly; the **recorder keeps `All`** because injected bot speech belongs in the recording. The frozen Twilio start frame and `StreamStart.tracks` were not touched — the delivery was brought in line with them. A consumer that wants the injected track can still ask for it by name (`TrackSelector::Only(Mixed)`). Replay-verified | `hub.rs`, `tap_plane.rs` | closed |
 | D17 | **Leg labels invert when the caller's from-tag is not given.** With `from_tags` unspecified (`-`), `TapPlane` labels the two legs in the order rtpengine's `query` returns them, and in the two-node drill that put **FreeSWITCH's** tag first — so `customer` and `agent` were swapped in the recording and in the `tracks` a consumer sees. Speaker attribution is only trustworthy when the caller's from-tag is passed explicitly. Fix shape: refuse to name tracks by direction when no from-tag was supplied (label them `leg_a`/`leg_b`, or resolve the caller from the SIP call-id), rather than guessing an order | `tap_plane.rs` | medium — an ASR or a QA review reads the wrong speaker |
-| D18 | **Recording-group members are not time-aligned.** Each member's file anchors on **its own first frame** (`recorder.rs` takes the offset from the per-member anchor), so a participant that joins late produces a file that starts at its join moment with no leading pad, and two members of the same group differ in length — 90.32 s vs 90.26 s in the drill above, with nothing to say where in the first file the second one begins. Reassembling a conference from the participant objects therefore needs the event timeline as well as the audio. Fix: record the group's open instant and pad each member's first segment with silence from that anchor | `recorder.rs`, `tap_plane.rs` | medium once anyone reassembles a multi-party recording |
+| ~~D18~~ | ~~**Recording-group members are not time-aligned.** Each member's file anchored on **its own first frame**, so a late joiner's file started at its join moment and two members of one group differed in length (90.32 s vs 90.26 s in the two-node drill), leaving reassembly to the event timeline~~ — **fixed 2026-08-23 (item 29)**: a recording group stamps `opened_at` when its first member joins and every later member's segmenter pads its first segment with silence from that anchor to its own first frame (`Segmenter::lead_with_silence`, reported as `lead_silence_frames`), padded once per recording so pause/resume cannot double-count it. Replay-verified (late joiner padded, two members equal length, the pause interaction, and a WAV read back out of a fake sink) **and live**: the drill's staggered re-run had bob join 5 s late and his object came back opening with 5016 ms of zeros, 25.116 s against alice's 25.030 s. **Residual:** equal length still assumes the members stop together — the 86 ms here is D11's blocking detach, and D16 keeps the anchor inside one pod's clock | `recorder.rs`, `tap_plane.rs` | closed (residual documented) |
+| ~~D19~~ | ~~A consumer cannot tell MSS that the caller started speaking: `Registry::report` had no caller outside tests~~ — **fixed 2026-08-23 (item 28)**: `ConsumerToServer.SpeechReport` on the gRPC `MediaStream` stream (kind `STARTED`/`PARTIAL`/`FINAL`/`END_OF_UTTERANCE`/`END_OF_INTERACTION`, track, text, confidence, the consumer's own `observed_at`) reaches `Registry::report`, gated on `CAPABILITY_EVENTS` — an attachment without it gets `PERMISSION_DENIED` and the stream ends, the same protocol-violation shape as an unprivileged `inject`. Proven on a live tapped call: `lab/barge_drill.sh` now triggers on a real `SpeechReport` and measures cut-through p50 3.54–3.98 ms (item 5). **Residual, accepted:** the `WS_TWILIO` dialect cannot report speech — its bytes are frozen (Article VII) and it carries no such message, so a WS consumer's only barge stays the `clear` message's direct rtpengine `stop media` (unevented; the D2 shape). Interactive voice-AI on WS should attach over gRPC instead | `stream.rs`, `convert.rs`, `session-core/registry.rs` | closed |
+
+## Integration handoffs (deployment-gated)
+
+Everything below is **out of scope for this repository's code** and cannot be
+closed from a lab: each item needs a deployment — its SIP proxy, its
+FreeSWITCH, its metal, its tenants, its sign-off. They are listed here so no
+future session mistakes them for unfinished engineering. MSS is a generic
+media plane: any deployment whose media anchors in rtpengine can integrate it,
+and the compatibility surfaces (the Twilio Media Streams dialect, the
+`mod_audio_fork` event names, the telsvc façade) are **optional adapters**. The
+reference deployment named in [CLAUDE.md](../CLAUDE.md) appears below only as
+the worked example of each handoff.
+
+| # | Handoff | What MSS already provides | What the integrator owes |
+| --- | --- | --- | --- |
+| H1 | **An event consumer for `mss.events`** | typed `MediaEvent` on one Kafka topic, keyed by `external_id`, gapless per-session `seq`, at-least-once since D5 (so dedupe by `(external_id, seq)`), `legacy_eligible` marking the authoritative attachment | a consumer that renders those events onto whatever the existing control plane already understands. *Worked example:* the reference deployment's translator, which maps them onto its legacy positional `eventTopic` format — written, awaiting review and merge in its own repository (item 1) |
+| H2 | **The deployed rtpengine version check** | `subscribe` verified against lab rtpengine 14.1.1.8; `lab/kernel_probe.sh` prints the finding on any host | read the version from the process, the package or rtpengine's CLI interface (`--listen-cli`) on the target host. **It cannot be asked over NG** — rtpengine has no NG `version` command, in this build or upstream (item 23). If the deployed build lacks `subscribe`, the ingest model needs an upgrade path first |
+| H3 | **rtpengine-side per-tap cost on the target metal** | the MSS-side cost is measured; `lab/kernel_probe.sh` plus the read-only checklist in architecture §8.1 is the instrument | run it on the real box: `relayedpackets_kernel` vs `_user` and `media_kernel` vs `media_userspace` across baseline / taps-with-transcode / taps-without-transcode. This sets the rtpengine capacity plan. D14 is fixed (item 25), so a pod restart mid-probe no longer pollutes the numbers |
+| H4 | **End-to-end barge-in through the integrator's stack** | every MSS-owned hop is measured: consumer `SpeechReport` → bus → `StopPlayback` at **p50 3.5 ms** (item 5), and inline `Clear` → silence at the peer's ear at **p50 12.2 ms**, one ptime (item 35) | the tail is theirs: their event consumer (H1) and their prompt player. Measure the whole path against their perceptual budget |
+| H5 | **The SIP proxy's B2B integration for inline legs** | `CreateSession{kind=INLINE, sdp_offer}` returns a real SDP answer and the leg speaks and listens on real sockets; a `group` seats it in a conference | offer/answer plumbing from their proxy or B2BUA into that API. No inline leg in this repository has met a **SIP** endpoint — every inline and conference measurement is against an RTP peer with no signalling |
+| H6 | **FS byte-parity against real production recordings** | item 31 measured a live call recorded both ways: container, channel layout and rms agree exactly, and a re-aligned 2 s window agrees on 1.0000 of samples at mean diff 0.6/32768. It also established that **byte-parity at a fixed offset is not an achievable bar** — the two recorders conceal independently, so the inter-file offset wanders | a **two-party** comparison on their FreeSWITCH, with their codec, their pause contract, and a human listen. The lab's write side plays silence, so only one channel was truly compared |
+| H7 | **Retiring the legacy media path** | the workloads are served: fan-out, recording, inline legs, conferences, monitor/whisper/barge | the tenant decision to turn the old media bugs off (`record_session`, the audio fork, the conference-per-AI-interaction dummy leg), and to decommission whatever gateway service they run today. Rollback stays config-only while both paths are installed |
+| H8 | **A pilot, a stability period and UX sign-off** | metrics on `MSS_METRICS_LISTEN` with alert rules in `deploy/`, a soak harness (`lab/soak.py`) and an impairment matrix | run flagged tenants for the agreed period; watch D11 (blocking detach), D17 (leg labels without an explicit from-tag) and the conference defects D16/D20/D21/D22 in the field; get a human to judge audio quality, which no automated assertion in this repository claims to have done |
 
 ## Waiting on other people (M2 close-out)
 
-These are not code and have blocked since Phase 0:
+These are not code and have blocked since Phase 0. The first two are the
+Phase-0 face of handoffs **H2** and **H3** above — recorded twice on purpose,
+once as a milestone blocker and once as an integration handoff:
 
 1. **Production rtpengine version check** — lab is 14.1.1.8 with `subscribe`
    working; the deployed version is unverified. If it lacks `subscribe`, the
@@ -1247,7 +2380,8 @@ These are not code and have blocked since Phase 0:
    visit: `relayedpackets_kernel` vs `_user` and `media_kernel` vs
    `media_userspace` across baseline / taps-with-transcode /
    taps-without-transcode is the measurement, and architecture §8.1 has the
-   full read-only checklist. **Fix D14 first** or orphaned taps pollute it.
+   full read-only checklist. D14 is fixed (item 25), so a pod restart during the probe no longer
+   pollutes it — though the fix has not been re-measured live.
 3. **OpenSIPS → Redis call→node discovery** — **no longer a blocker
    (2026-08-17).** MSS now resolves a call's participants itself: cigol passes
    the SIP call-id and the caller's from-tag (both already on the channel as
@@ -1263,16 +2397,44 @@ stereo segmenter, the `${accountID}/${recordingID}.${format}` identity, the
 `recordStart/recordPause/recordStop/uploadCompleted` callbacks with pause =
 segment + defer + accumulate, and direct upload to S3/MinIO all landed and are
 verified against real object storage from a synthetic hub. What the phase
-still owes: a live tapped call recorded end to end, the FS byte-parity
-comparison (harness in `lab/recording_parity.py`), and the tenant decision to
-turn `record_session` off. D1 (item 14) is fixed for a mid-call SSRC change on
+still owes: the tenant decision to turn `record_session` off. The live tapped
+call landed with item 10, and FS byte-parity was measured against a real FS
+recording in item 31 (container/layout/rms exact, a re-aligned window agreeing
+1.0000 at mean difference 0.6; a two-party comparison on production FS is the
+residual). D1 (item 14) is fixed for a mid-call SSRC change on
 the same from-tag; a transfer that replaces a tag still lands on elimination,
 so a recording of one is only as right as that.
 
-**Phase 3 — Interactive media** needs the inline RTP leg (`SessionKind::INLINE`
-is already accepted by the API), streaming TTS playback, and barge-in
-cut-through in MSS.
+**Phase 3 — Interactive media** is **code complete and lab-verified**: item 32
+built the sans-IO `PlayoutPacer`, item 33 made `CreateSession{INLINE, sdp_offer}`
+bind a socket, answer the offer (PCMU/PCMA + telephone-event) and pump both
+directions — the peer into the tap hub as the `customer` track, queued PCM back
+out one paced packet per ptime, with `StopPlayback` as the barge flush. Item 34
+made it full duplex: an INJECT attachment on either transport streams into that
+queue continuously, `Clear` flushes it and `Mark` is acked when the marked audio
+has drained. Item 35 then measured the cut-through against a **real RTP peer**
+over 20 live iterations — `Clear` to the first silent packet at the peer's ear
+**p50 12.2 ms / p95 20.4 ms**, one ptime, as the pacer's design predicts — with
+egress at 50.19 pkt/s, no sequence breaks and the tap still feeding its consumer.
+What Phase 3 still owes is not code: no leg here has met a **SIP** endpoint, so
+a proxy's B2B integration and an end-to-end barge through an integrator's own
+stack remain deployment-gated.
 
-**Phase 4 — Full media plane** is the N-way mixer, monitor/whisper as
-attachments and playbacks rather than conference tricks. Do not start before
-Phases 1–3 are boringly stable (Constitution, Article VIII).
+**Phase 4 — Full media plane** is **code complete and lab-verified**: the N-way
+mixer, with monitor/whisper as attachments and playbacks rather than conference
+tricks. Its core landed with item 36: `media-core`'s `MixMatrix` mixes N
+contributors into M listeners with minus-self defaults, per-pair gain, and
+monitor/whisper/barge/mute/deaf all expressed as rows and columns of the one
+matrix. Item 37 gave a conference one clock — inline legs sharing a `group` share
+a mix, on one owner thread, with the room's full sum published to every member's
+hub. Item 38 named monitor, whisper and barge as metadata verbs on existing
+nouns (`only=mixed`, `mix_target=<member>|all`), item 39 recorded a conference
+both ways at once (one mono object for the room, one per participant through a
+recording group), and item 40 added the member-control tail
+(`member_mute`/`member_deaf`/`member_hold`, room prompts, `mix_source=leg`) plus
+the generic feature list and the adapter parity table in architecture.md
+Appendix B. Item 41 judged all of it on **real sockets**: three container peers
+at 440/880/1320 Hz in one conference, **twenty tone-per-phase assertions green**
+at a ≥30:1 margin, and both recording shapes in MinIO at once. What the phase
+owes is deployment-gated (a SIP proxy's B2B leg into a conference, a pilot) plus
+the four defects it left open: D16, D20, D21 and D22.
