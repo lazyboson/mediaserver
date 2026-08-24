@@ -28,8 +28,30 @@ pub struct PersistedAttachment {
     pub paused: bool,
     #[serde(default)]
     pub group: String,
+    #[serde(default)]
+    pub format: Option<PersistedFormat>,
+    #[serde(default)]
+    pub recording: Option<PersistedRecording>,
     pub metadata: BTreeMap<String, String>,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PersistedRecording {
+    pub recording_id: String,
+    pub owner: String,
+    pub recorded_ms: u64,
+    pub spilled_ms: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PersistedFormat {
+    pub encoding: i32,
+    pub sample_rate_hz: u32,
+    pub channels: u32,
+    pub ptime_ms: u32,
+}
+
+pub const INLINE_SESSION_KIND: i32 = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PersistedSession {
@@ -39,12 +61,18 @@ pub struct PersistedSession {
     pub from_tags: Vec<String>,
     pub rtpengine_node: String,
     pub owner: String,
+    #[serde(default)]
+    pub subscription_tag: String,
     pub attachments: Vec<PersistedAttachment>,
 }
 
 impl PersistedSession {
+    pub fn is_inline(&self) -> bool {
+        self.kind == INLINE_SESSION_KIND
+    }
+
     pub fn is_rebuildable(&self) -> bool {
-        !self.call_id.is_empty() && !self.from_tags.is_empty()
+        !self.is_inline() && !self.call_id.is_empty() && !self.from_tags.is_empty()
     }
 }
 
@@ -125,6 +153,7 @@ impl SessionStore for RedisSessionStore {
             .cmd("SET")
             .arg(self.lease_key(&session.external_id))
             .arg(&session.owner)
+            .arg("NX")
             .arg("EX")
             .arg(LEASE_TTL.as_secs())
             .ignore()
@@ -257,7 +286,8 @@ impl SessionStore for MemorySessionStore {
         self.leases
             .lock()
             .unwrap()
-            .insert(session.external_id.clone(), session.owner.clone());
+            .entry(session.external_id.clone())
+            .or_insert_with(|| session.owner.clone());
         Ok(())
     }
 
@@ -310,6 +340,7 @@ mod tests {
             from_tags: vec!["from-a".to_string(), "from-b".to_string()],
             rtpengine_node: "10.0.0.5:22222".to_string(),
             owner: owner.to_string(),
+            subscription_tag: "tap-tag-1".to_string(),
             attachments: vec![PersistedAttachment {
                 label: "rtt".to_string(),
                 transport: 1,
@@ -319,6 +350,13 @@ mod tests {
                 authoritative: true,
                 paused: false,
                 group: String::new(),
+                format: Some(PersistedFormat {
+                    encoding: 3,
+                    sample_rate_hz: 16_000,
+                    channels: 1,
+                    ptime_ms: 20,
+                }),
+                recording: None,
                 metadata: BTreeMap::new(),
             }],
         }
@@ -335,6 +373,91 @@ mod tests {
         );
         let decoded: PersistedSession = serde_json::from_str(stored).unwrap();
         assert_eq!(decoded.attachments[0].group, "");
+        assert_eq!(
+            decoded.subscription_tag, "",
+            "a record written before the tap tag was persisted must still decode"
+        );
+        assert_eq!(
+            decoded.attachments[0].format, None,
+            "a record written before the negotiated format was persisted must still decode"
+        );
+        assert_eq!(
+            decoded.attachments[0].recording, None,
+            "a record written before recordings were journalled must still decode"
+        );
+    }
+
+    #[test]
+    fn a_recordings_spill_journal_survives_a_json_roundtrip() {
+        let mut written = session("req-1", "pod-a");
+        written.attachments[0].recording = Some(PersistedRecording {
+            recording_id: "rec-9".to_string(),
+            owner: "pod-a".to_string(),
+            recorded_ms: 61_000,
+            spilled_ms: 60_000,
+        });
+        let body = serde_json::to_string(&written).unwrap();
+        let decoded: PersistedSession = serde_json::from_str(&body).unwrap();
+        assert_eq!(decoded, written);
+        let journal = decoded.attachments[0].recording.clone().unwrap();
+        assert_eq!(journal.recorded_ms - journal.spilled_ms, 1_000);
+    }
+
+    #[test]
+    fn the_negotiated_format_survives_a_json_roundtrip() {
+        let written = session("req-1", "pod-a");
+        let body = serde_json::to_string(&written).unwrap();
+        let decoded: PersistedSession = serde_json::from_str(&body).unwrap();
+        assert_eq!(decoded, written);
+        assert_eq!(
+            decoded.attachments[0].format,
+            Some(PersistedFormat {
+                encoding: 3,
+                sample_rate_hz: 16_000,
+                channels: 1,
+                ptime_ms: 20,
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn persisting_does_not_take_back_a_lease_another_pod_now_holds() {
+        let store = MemorySessionStore::default();
+        store.upsert(&session("req-1", "pod-a")).await.unwrap();
+        store.expire_lease("req-1");
+        let adopted = store.claim_unleased("pod-b", 8).await.unwrap();
+        assert_eq!(adopted.len(), 1);
+
+        store.upsert(&session("req-1", "pod-a")).await.unwrap();
+
+        assert_eq!(
+            store.lease_holder("req-1").as_deref(),
+            Some("pod-b"),
+            "a partitioned pod's persist tick stole the lease back and both pods kept tapping"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_holder_reacquires_a_lease_that_merely_expired() {
+        let store = MemorySessionStore::default();
+        store.upsert(&session("req-1", "pod-a")).await.unwrap();
+        store.expire_lease("req-1");
+
+        store.upsert(&session("req-1", "pod-a")).await.unwrap();
+
+        assert!(
+            store.renew("req-1", "pod-a").await.unwrap(),
+            "an unclaimed expiry must not read as split brain"
+        );
+    }
+
+    #[test]
+    fn the_subscription_tag_survives_a_json_roundtrip() {
+        let held = session("req-1", "pod-a");
+        let body = serde_json::to_string(&held).unwrap();
+        let decoded: PersistedSession = serde_json::from_str(&body).unwrap();
+        assert_eq!(decoded.subscription_tag, "tap-tag-1");
+        assert_eq!(decoded, held);
     }
 
     #[tokio::test]

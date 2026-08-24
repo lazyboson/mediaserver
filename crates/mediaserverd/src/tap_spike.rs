@@ -1,4 +1,5 @@
 use crate::hub::{Hub, TapEvent};
+use crate::inline_leg::InlineEgress;
 use crate::supervisor::{AudioFlowWatchdog, SessionHealth};
 use crossbeam_queue::ArrayQueue;
 use media_core::jitter;
@@ -14,7 +15,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use thiserror::Error;
 
-const MAX_DATAGRAM: usize = 2048;
+pub const MAX_DATAGRAM: usize = 2048;
 const MAX_DATAGRAMS_PER_DRAIN: usize = 64;
 const MAX_RECORDED_DIGITS: usize = 32;
 const SILENCE: [i16; 480] = [0; 480];
@@ -176,6 +177,8 @@ impl SharedLegStats {
         self.stalls.store(stalls, Ordering::Relaxed);
     }
 }
+
+pub type MixedFrameSink<'a> = &'a mut dyn FnMut(&[i16]);
 
 pub struct TapLeg {
     track: Track,
@@ -440,7 +443,7 @@ impl TapLeg {
         }
     }
 
-    fn drain(&mut self, buf: &mut [u8], mut hub: Option<&mut Hub>) {
+    pub fn drain(&mut self, buf: &mut [u8], mut hub: Option<&mut Hub>) {
         for received in 0..MAX_DATAGRAMS_PER_DRAIN {
             match self.socket.recv_from(buf) {
                 Ok((len, _from)) => {
@@ -489,7 +492,15 @@ impl TapLeg {
         self.datagram_log.extend_from_slice(datagram);
     }
 
-    fn release_frame(&mut self, hub: Option<&mut Hub>) {
+    pub fn release_frame(&mut self, hub: Option<&mut Hub>) {
+        self.release_frame_with(hub, None)
+    }
+
+    pub fn release_frame_with(
+        &mut self,
+        hub: Option<&mut Hub>,
+        mixed_into: Option<MixedFrameSink<'_>>,
+    ) {
         let Self {
             track,
             pipeline,
@@ -507,6 +518,9 @@ impl TapLeg {
             Playout::Pcm(pcm) | Playout::Concealed(pcm) | Playout::Suppressed(pcm) => {
                 if let Some(hub) = hub {
                     hub.publish(TapEvent::media(*track, timestamp_ms, pcm));
+                }
+                if let Some(sink) = mixed_into {
+                    sink(pcm);
                 }
                 append_within_capacity(samples, *capacity_samples, pcm, stats)
             }
@@ -566,7 +580,18 @@ fn settle_by_elimination(legs: &mut [TapLeg]) {
 
 pub fn capture(
     legs: &mut [TapLeg],
+    hub: Option<&mut Hub>,
+    format: AudioFormat,
+    max_capture: Duration,
+    stop: &AtomicBool,
+) -> CaptureSummary {
+    capture_with_egress(legs, hub, None, format, max_capture, stop)
+}
+
+pub fn capture_with_egress(
+    legs: &mut [TapLeg],
     mut hub: Option<&mut Hub>,
+    mut egress: Option<&mut InlineEgress>,
     format: AudioFormat,
     max_capture: Duration,
     stop: &AtomicBool,
@@ -590,6 +615,9 @@ pub fn capture(
         settle_by_elimination(legs);
 
         let now = Instant::now();
+        if let Some(egress) = egress.as_deref_mut() {
+            egress.pump(now);
+        }
         if now >= next_release {
             for leg in legs.iter_mut() {
                 leg.release_frame(hub.as_deref_mut());

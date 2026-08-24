@@ -1,8 +1,8 @@
 use crate::proto;
 use media_core::{AudioFormat, Encoding, Track};
 use session_core::{
-    AttachmentId, Capabilities, ControlError, EventKind, MediaEvent, PlaybackId, SessionId,
-    SessionKind, TrackSelector, Transport,
+    AttachmentId, Capabilities, ConsumerEvent, ControlError, EventKind, MediaEvent, PlaybackId,
+    SessionId, SessionKind, TrackSelector, Transport,
 };
 use std::str::FromStr;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -22,7 +22,9 @@ pub fn status_of(error: ControlError) -> Status {
         ControlError::ExternalIdInUse { .. } => Status::already_exists(error.to_string()),
         ControlError::IdempotencyConflict(_) => Status::aborted(error.to_string()),
         ControlError::TooManyAttachments { .. } => Status::resource_exhausted(error.to_string()),
-        ControlError::NoCapabilityDeclared => Status::invalid_argument(error.to_string()),
+        ControlError::NoCapabilityDeclared | ControlError::MixRoute(_) => {
+            Status::invalid_argument(error.to_string())
+        }
     }
 }
 
@@ -199,9 +201,11 @@ pub fn event_from_bytes(bytes: &[u8]) -> Result<proto::MediaEvent, String> {
 
 pub fn event_wire(event: MediaEvent) -> proto::MediaEvent {
     let legacy_eligible = event.legacy_eligible;
+    let session_kind = session_kind_wire(event.session_kind);
     proto::MediaEvent {
         session_id: event.session.to_string(),
         external_id: event.external_id,
+        session_kind,
         attachment_id: event
             .attachment
             .map(|id| id.to_string())
@@ -249,9 +253,15 @@ fn payload_wire(kind: EventKind) -> proto::media_event::Payload {
             track: track_name(track).to_string(),
             digit: digit.to_string(),
         }),
-        EventKind::RecordingStarted { recording_id, path } => {
-            Payload::RecordingStarted(proto::RecordingStarted { recording_id, path })
-        }
+        EventKind::RecordingStarted {
+            recording_id,
+            path,
+            shape,
+        } => Payload::RecordingStarted(proto::RecordingStarted {
+            recording_id,
+            path,
+            shape,
+        }),
         EventKind::RecordingPaused {
             recording_id,
             paused,
@@ -283,6 +293,16 @@ fn payload_wire(kind: EventKind) -> proto::media_event::Payload {
             })
         }
         EventKind::AttachmentUp { label } => Payload::AttachmentUp(proto::AttachmentUp { label }),
+        EventKind::MixRouted {
+            target,
+            monitor_audible,
+        } => Payload::MixRouted(proto::MixRouted {
+            mix_target: target,
+            monitor_audible,
+        }),
+        EventKind::MemberControlled { mute, deaf, hold } => {
+            Payload::MemberControlled(proto::MemberControlled { mute, deaf, hold })
+        }
         EventKind::AttachmentDown { label, reason } => {
             Payload::AttachmentDown(proto::AttachmentDown { label, reason })
         }
@@ -300,9 +320,144 @@ fn now() -> prost_types::Timestamp {
     }
 }
 
+pub fn speech_report(report: proto::SpeechReport) -> Result<ConsumerEvent, Status> {
+    let kind = proto::SpeechReportKind::try_from(report.kind).unwrap_or_default();
+    let confidence = report.confidence as f32;
+    match kind {
+        proto::SpeechReportKind::Unspecified => Err(Status::invalid_argument(
+            "a speech report must name its kind",
+        )),
+        proto::SpeechReportKind::Started => Ok(ConsumerEvent::SpeechStarted {
+            track: track(&report.track)?,
+        }),
+        proto::SpeechReportKind::Partial => Ok(ConsumerEvent::Partial {
+            track: track(&report.track)?,
+            text: report.text,
+            confidence,
+        }),
+        proto::SpeechReportKind::Final => Ok(ConsumerEvent::Final {
+            track: track(&report.track)?,
+            text: report.text,
+            confidence,
+        }),
+        proto::SpeechReportKind::EndOfUtterance => Ok(ConsumerEvent::EndOfUtterance {
+            track: track(&report.track)?,
+        }),
+        proto::SpeechReportKind::EndOfInteraction => Ok(ConsumerEvent::EndOfInteraction {
+            reason: report.reason,
+        }),
+    }
+}
+
+pub fn observed_lag_ms(observed_at: Option<&prost_types::Timestamp>) -> Option<i64> {
+    let observed = observed_at?;
+    let now = now();
+    let seconds = now.seconds.checked_sub(observed.seconds)?;
+    let nanos = i64::from(now.nanos) - i64::from(observed.nanos);
+    seconds.checked_mul(1_000)?.checked_add(nanos / 1_000_000)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn report(kind: proto::SpeechReportKind) -> proto::SpeechReport {
+        proto::SpeechReport {
+            kind: kind as i32,
+            track: "customer".to_string(),
+            text: "hello".to_string(),
+            confidence: 0.75,
+            observed_at: None,
+            reason: "hangup".to_string(),
+        }
+    }
+
+    #[test]
+    fn every_speech_report_kind_becomes_the_consumer_event_it_names() {
+        assert_eq!(
+            speech_report(report(proto::SpeechReportKind::Started)).unwrap(),
+            ConsumerEvent::SpeechStarted {
+                track: Track::Customer
+            }
+        );
+        assert_eq!(
+            speech_report(report(proto::SpeechReportKind::Partial)).unwrap(),
+            ConsumerEvent::Partial {
+                track: Track::Customer,
+                text: "hello".to_string(),
+                confidence: 0.75
+            }
+        );
+        assert_eq!(
+            speech_report(report(proto::SpeechReportKind::Final)).unwrap(),
+            ConsumerEvent::Final {
+                track: Track::Customer,
+                text: "hello".to_string(),
+                confidence: 0.75
+            }
+        );
+        assert_eq!(
+            speech_report(report(proto::SpeechReportKind::EndOfUtterance)).unwrap(),
+            ConsumerEvent::EndOfUtterance {
+                track: Track::Customer
+            }
+        );
+        assert_eq!(
+            speech_report(report(proto::SpeechReportKind::EndOfInteraction)).unwrap(),
+            ConsumerEvent::EndOfInteraction {
+                reason: "hangup".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn a_speech_report_with_no_kind_or_an_unknown_track_is_an_argument_error() {
+        let unspecified = speech_report(report(proto::SpeechReportKind::Unspecified)).unwrap_err();
+        assert_eq!(unspecified.code(), tonic::Code::InvalidArgument);
+
+        let mut unknown = report(proto::SpeechReportKind::Started);
+        unknown.track = "sidecar".to_string();
+        assert_eq!(
+            speech_report(unknown).unwrap_err().code(),
+            tonic::Code::InvalidArgument
+        );
+
+        let mut future = report(proto::SpeechReportKind::Started);
+        future.kind = 99;
+        assert_eq!(
+            speech_report(future).unwrap_err().code(),
+            tonic::Code::InvalidArgument
+        );
+    }
+
+    #[test]
+    fn an_end_of_interaction_report_needs_no_track_because_it_names_no_track() {
+        let mut report = report(proto::SpeechReportKind::EndOfInteraction);
+        report.track = String::new();
+        assert_eq!(
+            speech_report(report).unwrap(),
+            ConsumerEvent::EndOfInteraction {
+                reason: "hangup".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn the_consumers_own_clock_yields_a_lag_only_when_it_sent_one() {
+        assert_eq!(observed_lag_ms(None), None);
+        let recent = now();
+        let lag = observed_lag_ms(Some(&recent)).unwrap();
+        assert!((0..5_000).contains(&lag), "implausible lag {lag} ms");
+        let earlier = prost_types::Timestamp {
+            seconds: recent.seconds - 2,
+            nanos: recent.nanos,
+        };
+        let older = observed_lag_ms(Some(&earlier)).unwrap();
+        assert!(
+            (1_900..3_000).contains(&older),
+            "expected ~2 s, got {older}"
+        );
+    }
 
     #[test]
     fn a_capability_list_round_trips_through_the_wire_form() {

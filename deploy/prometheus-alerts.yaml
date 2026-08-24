@@ -141,8 +141,21 @@ groups:
         annotations:
           summary: "A session lease moved to another pod while this one was alive"
           description: >-
-            Two pods may believe they own one session (split brain). Check
-            Redis reachability and lease TTL versus renew cadence.
+            This pod gave the session up (mss_registry_surrendered_total) so the
+            call is not tapped twice. Check Redis reachability and lease TTL
+            versus renew cadence.
+
+      - alert: MssOrphanedTapLeft
+        expr: increase(mss_registry_orphans_still_subscribed_total[10m]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "An adopted session left the previous owner's rtpengine tap in place"
+          description: >-
+            rtpengine keeps copying that call to a pod that is gone until the
+            call ends, doubling its cost on the media node. Either the record
+            carried no subscription to-tag or the unsubscribe was refused;
+            check the adopting pod's logs for the call-id.
 
       - alert: MssRegistryFailing
         expr: rate(mss_registry_failed_total[5m]) > 0

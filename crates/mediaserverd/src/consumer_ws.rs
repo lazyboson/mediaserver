@@ -1,10 +1,13 @@
 use crate::hub::{Subscription, TapEvent};
+use crate::inline_leg::InlineEgressHandle;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
 use futures_util::{SinkExt, StreamExt};
 use media_core::{g711, AudioFormat, Track};
-use protocol::twilio::{DtmfInfo, Inbound, MediaFormat, MediaPayload, Outbound, StartInfo};
-use std::collections::HashMap;
+use protocol::twilio::{
+    DtmfInfo, Inbound, MarkInfo, MediaFormat, MediaPayload, Outbound, StartInfo,
+};
+use std::collections::{HashMap, VecDeque};
 use std::time::Duration;
 use thiserror::Error;
 use tokio::sync::mpsc;
@@ -14,6 +17,8 @@ use tracing::{info, warn};
 
 const PCMU_ENCODING: &str = "PCMU";
 const UTTERANCE_IDLE: Duration = Duration::from_millis(700);
+const MARK_POLL_INTERVAL: Duration = Duration::from_millis(20);
+const MAX_PENDING_MARKS: usize = 64;
 
 #[derive(Debug, Error)]
 pub enum ConsumerError {
@@ -39,6 +44,53 @@ pub struct ConsumerStats {
     pub utterances: u64,
     pub barges: u64,
     pub text_sent: u64,
+    pub inject_samples: u64,
+    pub inject_dropped: u64,
+    pub marks_acked: u64,
+}
+
+pub struct InlineInject {
+    egress: InlineEgressHandle,
+    pending: VecDeque<(String, u64)>,
+}
+
+impl InlineInject {
+    pub fn new(egress: InlineEgressHandle) -> InlineInject {
+        InlineInject {
+            egress,
+            pending: VecDeque::new(),
+        }
+    }
+
+    fn speak(&self, pcm: Vec<i16>) -> bool {
+        self.egress.push(pcm)
+    }
+
+    fn mark(&mut self, name: String) {
+        if self.pending.len() >= MAX_PENDING_MARKS {
+            self.pending.pop_front();
+        }
+        let watermark = self.egress.watermark();
+        self.pending.push_back((name, watermark));
+    }
+
+    fn barge(&mut self) {
+        self.egress.clear();
+        self.pending.clear();
+    }
+
+    fn drained(&mut self) -> Vec<String> {
+        let drained = self.egress.drained_samples();
+        let mut acked = Vec::new();
+        while let Some((_, watermark)) = self.pending.front() {
+            if *watermark > drained {
+                break;
+            }
+            let (name, _) = self.pending.pop_front().expect("the front was just read");
+            acked.push(name);
+        }
+        acked
+    }
 }
 
 pub struct ConsumerConfig {
@@ -49,6 +101,7 @@ pub struct ConsumerConfig {
     pub format: AudioFormat,
     pub tracks: Vec<String>,
     pub custom_parameters: HashMap<String, String>,
+    pub egress: Option<InlineEgressHandle>,
 }
 
 pub fn track_name(track: Track) -> &'static str {
@@ -73,6 +126,7 @@ pub async fn run(
     let mut sequence: u64 = 1;
     let mut utterance: Vec<i16> = Vec::new();
     let mut idle_deadline: Option<Instant> = None;
+    let mut inline = config.egress.clone().map(InlineInject::new);
 
     let start = Outbound::Start {
         sequence_number: sequence.to_string(),
@@ -92,8 +146,28 @@ pub async fn run(
     };
     writer.send(encode(&start, "start")?).await?;
 
+    let mut mark_poll = tokio::time::interval(MARK_POLL_INTERVAL);
+    mark_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
     loop {
+        let marks_pending = inline
+            .as_ref()
+            .is_some_and(|inject| !inject.pending.is_empty());
         tokio::select! {
+            _ = mark_poll.tick(), if marks_pending => {
+                let acked = match inline.as_mut() {
+                    Some(inject) => inject.drained(),
+                    None => Vec::new(),
+                };
+                for name in acked {
+                    stats.marks_acked += 1;
+                    let message = Outbound::Mark {
+                        stream_sid: config.stream_sid.clone(),
+                        mark: MarkInfo { name },
+                    };
+                    writer.send(encode(&message, "mark")?).await?;
+                }
+            }
             event = events.next() => {
                 let Some(event) = event else { break };
                 sequence += 1;
@@ -141,7 +215,7 @@ pub async fn run(
             inbound = reader.next() => {
                 match inbound {
                     Some(Ok(Message::Text(text))) => {
-                        handle_inbound(&text, &mut utterance, &mut idle_deadline, &mut stats, commands.as_ref()).await;
+                        handle_inbound(&text, &mut utterance, &mut idle_deadline, &mut stats, commands.as_ref(), inline.as_mut()).await;
                     }
                     Some(Ok(Message::Close(_))) | None => break,
                     Some(Ok(_)) => {}
@@ -204,12 +278,13 @@ async fn handle_inbound(
     idle_deadline: &mut Option<Instant>,
     stats: &mut ConsumerStats,
     commands: Option<&mpsc::Sender<BridgeCommand>>,
+    inline: Option<&mut InlineInject>,
 ) {
     let Ok(message) = serde_json::from_str::<Inbound>(text) else {
         return;
     };
-    match message {
-        Inbound::Media { media, .. } => {
+    match (message, inline) {
+        (Inbound::Media { media, .. }, inline) => {
             if media
                 .encoding
                 .as_deref()
@@ -222,14 +297,39 @@ async fn handle_inbound(
                 stats.inbound_unknown_encoding += 1;
                 return;
             };
+            let Some(inject) = inline else {
+                stats.inbound_media += 1;
+                utterance.extend(bytes.iter().map(|byte| g711::ulaw_to_linear(*byte)));
+                *idle_deadline = Some(Instant::now() + UTTERANCE_IDLE);
+                return;
+            };
+            let rate = inject.egress.format().sample_rate_hz;
+            if media.sample_rate.is_some_and(|declared| declared != rate) {
+                stats.inbound_unknown_encoding += 1;
+                return;
+            }
             stats.inbound_media += 1;
-            utterance.extend(bytes.iter().map(|byte| g711::ulaw_to_linear(*byte)));
-            *idle_deadline = Some(Instant::now() + UTTERANCE_IDLE);
+            let pcm: Vec<i16> = bytes
+                .iter()
+                .map(|byte| g711::ulaw_to_linear(*byte))
+                .collect();
+            let samples = pcm.len() as u64;
+            if inject.speak(pcm) {
+                stats.inject_samples += samples;
+            } else {
+                stats.inject_dropped += samples;
+                warn!("the inline egress queue is full; an inbound media frame was dropped");
+            }
         }
-        Inbound::Mark { .. } => {
+        (Inbound::Mark { mark, .. }, Some(inject)) => inject.mark(mark.name),
+        (Inbound::Mark { .. }, None) => {
             flush_utterance(utterance, idle_deadline, stats, commands).await;
         }
-        Inbound::Clear { .. } => {
+        (Inbound::Clear { .. }, Some(inject)) => {
+            stats.barges += 1;
+            inject.barge();
+        }
+        (Inbound::Clear { .. }, None) => {
             utterance.clear();
             *idle_deadline = None;
             stats.barges += 1;
@@ -237,7 +337,7 @@ async fn handle_inbound(
                 commands.send(BridgeCommand::Barge).await.ok();
             }
         }
-        Inbound::EndOfInteraction { .. } => {
+        (Inbound::EndOfInteraction { .. }, _) => {
             flush_utterance(utterance, idle_deadline, stats, commands).await;
         }
     }
@@ -309,6 +409,7 @@ mod tests {
             format: AudioFormat::pcmu_8k_20ms(),
             tracks: vec!["inbound".into(), "outbound".into()],
             custom_parameters: HashMap::new(),
+            egress: None,
         };
         let consumer = tokio::spawn(run(config, subscription, None, None));
 
@@ -360,6 +461,7 @@ mod tests {
             format: AudioFormat::pcmu_8k_20ms(),
             tracks: vec!["inbound".into()],
             custom_parameters: HashMap::new(),
+            egress: None,
         };
         let (text, inbound) = mpsc::channel(4);
         let consumer = tokio::spawn(run(config, subscription, None, Some(inbound)));
@@ -387,8 +489,24 @@ mod tests {
         let payload = BASE64.encode([0xFFu8, 0x7F, 0x00]);
 
         let frame = format!(r#"{{"event":"media","media":{{"payload":"{payload}"}}}}"#);
-        handle_inbound(&frame, &mut utterance, &mut idle, &mut stats, Some(&tx)).await;
-        handle_inbound(&frame, &mut utterance, &mut idle, &mut stats, Some(&tx)).await;
+        handle_inbound(
+            &frame,
+            &mut utterance,
+            &mut idle,
+            &mut stats,
+            Some(&tx),
+            None,
+        )
+        .await;
+        handle_inbound(
+            &frame,
+            &mut utterance,
+            &mut idle,
+            &mut stats,
+            Some(&tx),
+            None,
+        )
+        .await;
         assert_eq!(stats.inbound_media, 2);
         assert!(rx.try_recv().is_err());
 
@@ -398,6 +516,7 @@ mod tests {
             &mut idle,
             &mut stats,
             Some(&tx),
+            None,
         )
         .await;
         match rx.try_recv().unwrap() {
@@ -418,7 +537,15 @@ mod tests {
         let frame =
             format!(r#"{{"event":"media","media":{{"encoding":"PCMU","payload":"{payload}"}}}}"#);
 
-        handle_inbound(&frame, &mut utterance, &mut idle, &mut stats, Some(&tx)).await;
+        handle_inbound(
+            &frame,
+            &mut utterance,
+            &mut idle,
+            &mut stats,
+            Some(&tx),
+            None,
+        )
+        .await;
         assert!(idle.is_some());
         assert!(rx.try_recv().is_err());
 
@@ -446,6 +573,7 @@ mod tests {
             &mut idle,
             &mut stats,
             Some(&tx),
+            None,
         )
         .await;
 
@@ -467,11 +595,161 @@ mod tests {
             &mut idle,
             &mut stats,
             Some(&tx),
+            None,
         )
         .await;
 
         assert_eq!(stats.inbound_unknown_encoding, 1);
         assert_eq!(stats.inbound_media, 0);
         assert!(utterance.is_empty());
+    }
+
+    fn inline_pair() -> (
+        crate::inline_leg::InlineEgress,
+        InlineInject,
+        std::net::UdpSocket,
+    ) {
+        let peer = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        peer.set_nonblocking(true).unwrap();
+        let ours = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        ours.set_nonblocking(true).unwrap();
+        let (egress, handle) = crate::inline_leg::InlineEgress::bind(
+            ours,
+            peer.local_addr().unwrap(),
+            AudioFormat::pcmu_8k_20ms(),
+            0,
+            0x4321,
+            std::time::Instant::now(),
+        )
+        .unwrap();
+        (egress, InlineInject::new(handle), peer)
+    }
+
+    fn inbound_media_frame(samples: usize) -> String {
+        let payload = BASE64.encode(vec![g711::linear_to_ulaw(4_000); samples]);
+        format!(r#"{{"event":"media","media":{{"payload":"{payload}"}}}}"#)
+    }
+
+    fn payloads(peer: &std::net::UdpSocket) -> Vec<Vec<u8>> {
+        let mut seen = Vec::new();
+        let mut buf = [0u8; 2048];
+        while let Ok((len, _)) = peer.recv_from(&mut buf) {
+            let packet = media_core::rtp::RtpPacket::parse(&buf[..len]).unwrap();
+            seen.push(packet.payload.to_vec());
+        }
+        seen
+    }
+
+    #[tokio::test]
+    async fn inbound_media_reaches_an_inline_leg_at_once_instead_of_becoming_an_utterance() {
+        let (mut egress, mut inject, peer) = inline_pair();
+        let (tx, mut rx) = mpsc::channel(4);
+        let mut utterance = Vec::new();
+        let mut idle = None;
+        let mut stats = ConsumerStats::default();
+
+        handle_inbound(
+            &inbound_media_frame(160),
+            &mut utterance,
+            &mut idle,
+            &mut stats,
+            Some(&tx),
+            Some(&mut inject),
+        )
+        .await;
+
+        assert_eq!(stats.inbound_media, 1);
+        assert_eq!(stats.inject_samples, 160);
+        assert!(
+            utterance.is_empty(),
+            "an inline leg is fed frame by frame, never buffered into an utterance"
+        );
+        assert!(idle.is_none(), "there is no utterance to time out");
+        assert!(rx.try_recv().is_err(), "no playback command is issued");
+
+        let epoch = std::time::Instant::now();
+        egress.pump(epoch);
+        egress.pump(epoch + Duration::from_millis(20));
+        let heard = payloads(&peer);
+        assert_eq!(heard.len(), 2);
+        assert_eq!(heard[0][0], g711::linear_to_ulaw(4_000));
+    }
+
+    #[tokio::test]
+    async fn a_clear_flushes_the_inline_egress_so_the_next_paced_frame_is_silence() {
+        let (mut egress, mut inject, peer) = inline_pair();
+        let (tx, _rx) = mpsc::channel(4);
+        let mut utterance = Vec::new();
+        let mut idle = None;
+        let mut stats = ConsumerStats::default();
+
+        handle_inbound(
+            &inbound_media_frame(1_600),
+            &mut utterance,
+            &mut idle,
+            &mut stats,
+            Some(&tx),
+            Some(&mut inject),
+        )
+        .await;
+        let epoch = std::time::Instant::now();
+        egress.pump(epoch);
+        let _ = payloads(&peer);
+
+        handle_inbound(
+            r#"{"event":"clear","streamSid":"MZ-1"}"#,
+            &mut utterance,
+            &mut idle,
+            &mut stats,
+            Some(&tx),
+            Some(&mut inject),
+        )
+        .await;
+        egress.pump(epoch + Duration::from_millis(20));
+
+        assert_eq!(stats.barges, 1);
+        let heard = payloads(&peer);
+        assert_eq!(heard.len(), 1);
+        assert_eq!(heard[0][0], g711::linear_to_ulaw(0));
+    }
+
+    #[tokio::test]
+    async fn a_mark_is_acked_only_once_its_audio_has_drained_out_of_the_egress() {
+        let (mut egress, mut inject, _peer) = inline_pair();
+        let (tx, _rx) = mpsc::channel(4);
+        let mut utterance = Vec::new();
+        let mut idle = None;
+        let mut stats = ConsumerStats::default();
+
+        handle_inbound(
+            &inbound_media_frame(320),
+            &mut utterance,
+            &mut idle,
+            &mut stats,
+            Some(&tx),
+            Some(&mut inject),
+        )
+        .await;
+        handle_inbound(
+            r#"{"event":"mark","mark":{"name":"prompt-done"}}"#,
+            &mut utterance,
+            &mut idle,
+            &mut stats,
+            Some(&tx),
+            Some(&mut inject),
+        )
+        .await;
+
+        assert!(
+            inject.drained().is_empty(),
+            "the mark waits while its audio is still queued"
+        );
+        let epoch = std::time::Instant::now();
+        let mut acked = Vec::new();
+        for tick in 0..6 {
+            egress.pump(epoch + Duration::from_millis(tick * 20));
+            acked.extend(inject.drained());
+        }
+        assert_eq!(acked, vec!["prompt-done".to_string()]);
     }
 }

@@ -697,6 +697,101 @@ Net: ~80% of the FS capability surface we use is commodity libraries or trivial 
 
 ---
 
+## Appendix B — Conference features: what the mix does, and one integrator's parity table
+
+Every conference feature in MSS is a **cell in the mix matrix**, named by
+metadata on an ordinary attachment or session — not a conference RPC surface of
+its own. There is no `CreateConference`, no `MuteMember` RPC and no conference
+id: a room is a **group name** shared by inline legs
+(`CreateSession{kind=INLINE, group=<room>}`), the first leg opens it, the last
+leg out closes it, and the verbs below ride on `Attach` / `UpdateAttachment`
+metadata (merge semantics: named keys overwritten, the rest untouched) and on
+`StartPlayback` / `StopPlayback`.
+
+Two rules explain most of the table. **A member verb is member state:** it rides
+on any attachment of that member's own session and it outlives that attachment,
+because muting somebody is not a property of the consumer that asked for it. **A
+routing verb belongs to the attachment that owns it:** a whisper reverts to
+private when the whisperer detaches.
+
+### B.1 What exists (generic, no adapter required)
+
+| Feature | Verb | Shape |
+| --- | --- | --- |
+| Open / close a room | `CreateSession{kind=INLINE, group=<room>}` / `DestroySession` | lazily opened by its first leg, closed by its last; MSS answers SDP, it never dials |
+| Everyone hears everyone but themselves | mixer default | one clock per room; every leg must negotiate the same rate and ptime (refused by name otherwise) |
+| Room feed | `mixed` track on every member's hub | the monitor and recording feed, on each member's own clock |
+| Monitor (silent listen) | `Attach{SINK, selector.only="mixed"}` | a listener, not a leg: no SIP dialog and no mixer slot |
+| Whisper | `mix_target=<member external id>` on an `INJECT` attachment | injected audio (TTS, a bot, a supervisor's console) into one ear |
+| Coach with your own voice | `mix_target=<member>` + `mix_source=leg` | routes that member's **own RTP** to one ear instead of the room |
+| Barge | `mix_target=all` | the same attachment, one metadata flip |
+| Whisper on or off the record | `mix_monitor=include\|exclude` | the mixed track is the recording feed, so this decides whether the whisper is recorded |
+| Mute a member | `member_mute=on\|off` | contributor row zeroed: heard by nobody, and off the mixed track too |
+| Deafen a member | `member_deaf=on\|off` | the room is silenced into that ear; audio **addressed** to them (their own playback, a whisper named at them) still lands |
+| Hold a member | `member_hold=on\|off` | mute and deaf in one verb, with the ear left open for hold audio |
+| Hold audio / MOH | `StartPlayback` on the held member's session (`target_tag` empty or `own`) | the ordinary private playback path |
+| Prompt into the room | `StartPlayback` with `target_tag="all"`; `StopPlayback` with `"all"` flushes it | one prompt source per room, mixed into every ear and the mixed track |
+| Record the room as one object | `Attach{FILE_S3, selector.only="mixed"}` | one mono object under the frozen identity |
+| Record every participant | a recording **group** over the member sessions | one object per member, time-aligned on the group anchor |
+| Member state, observable | `MemberControlled` on `mss.events`; `mss_conference_{muted,deaf,held}_members`, `mss_conference_whispers_live` | |
+
+### B.2 What is deliberately absent
+
+- **In-band DTMF menus.** Conference control is **API-first**: an integrator that
+  wants `*6` to mute maps the digit to an `UpdateAttachment` call. MSS delivers
+  digits to consumers (WS `dtmf` frames, gRPC `DtmfFrame`) and never interprets
+  them. No digit ever changes the mix by itself.
+- **Automatic enter / exit sounds.** Play-into-room is a verb, not a trigger:
+  MSS does not decide that a join deserves a beep. The integrator subscribes to
+  the session events for the room and calls `StartPlayback{target_tag="all"}`.
+  This keeps prompt selection, tenant policy and localization out of the media
+  plane.
+- **Per-member volume and energy thresholds.** The matrix carries a per-pair
+  Q12 gain, so this is one metadata verb away; nothing depends on it yet.
+- **Member enumeration and room policy** (list members, lock, moderator roles,
+  ordering, floor control). A room over 32 members is refused; anything richer
+  belongs to the controller that owns the roster.
+- **Multi-rate rooms, AGC, DC filter, video.** A room mixes one rate and one
+  ptime; `mss_conference_clipped_samples_total` is the signal that a room wants
+  AGC.
+- **Cross-pod rooms.** A room is one pod's mix thread; placement of a room's
+  legs is the scheduler's problem.
+
+### B.3 ADAPTER — one integrator's conference RPCs onto these verbs
+
+**This table is reference-deployment material, not part of the core design.**
+The worked example is the reference stack's telephony controller (the legacy controller), whose
+conference surface is described as **14 RPCs**; its IDL is not in this repo, so
+the rows below are named **by function** and the exact RPC names are
+*unknown-by-name here* — rename the left column when the IDL is at hand. Any
+other integrator's conference API maps the same way, because the right-hand
+column is the whole conference surface MSS has.
+
+| # | Integrator RPC (by function) | MSS verb | Status | Recommendation |
+| --- | --- | --- | --- | --- |
+| 1 | Create conference / open room | none — `CreateSession{INLINE, group}` opens it lazily | **implemented** | map create to a no-op that remembers the room name; do not add a room noun |
+| 2 | Add participant (dial into the room) | `CreateSession{INLINE, group, sdp_offer}` | **implemented** (MSS half) | the dial is the integrator's: its proxy/controller routes a leg to MSS with the room as `group` |
+| 3 | Remove participant / kick | `DestroySession` | **implemented** | the SIP leg is the integrator's to tear down; MSS unseats and stops mixing |
+| 4 | List participants / room state | `DescribeSession` per session, `SessionCreated`/`SessionEnded` on the bus, `mss_conference_members_live` | **mappable** | keep the roster in the controller; add a `ListSessions{group}` filter only if a UI needs MSS as the source of truth |
+| 5 | Mute participant | `member_mute=on` | **implemented** | |
+| 6 | Unmute participant | `member_mute=off` | **implemented** | |
+| 7 | Deafen / undeafen participant | `member_deaf=on\|off` | **implemented** | |
+| 8 | Hold participant (+ MOH) | `member_hold=on` + `StartPlayback` on that session | **implemented** | hold audio is the integrator's prompt; MSS keeps the held ear open for it |
+| 9 | Monitor / silent listen | `Attach{SINK, only="mixed"}` | **implemented** | a supervisor listening costs no leg and no mixer slot — this is the big win over a muted conference member |
+| 10 | Whisper / coach (`relate … nospeak`) | `mix_target=<member>`, with `mix_source=leg` when the coach's own voice is the audio | **implemented** | one attachment does both shapes; the coach needs no separate room |
+| 11 | Barge (full-duplex join) | `mix_target=all` | **implemented** | it is a metadata flip on the same attachment, so barge-in is not a re-INVITE |
+| 12 | Play prompt / announcement into the room | `StartPlayback{target_tag="all"}` | **implemented** | enter/exit sounds are the integrator's trigger on the event stream (§B.2) |
+| 13 | Record the conference | `Attach{FILE_S3, only="mixed"}` (room) or a recording group (per participant) | **implemented** | both shapes may run at once, under the frozen identity |
+| 14 | In-conference DTMF control menu | none by design | **not planned** | map digits to these API calls in the integrator; MSS hands over the digits on the consumer stream and interprets none of them. The digits do **not** reach `mss.events` today (tasks.md D21) |
+
+Two soft spots an adapter author must know: member state has **no owner and no
+lease** — a controller that dies between `member_mute=on` and `off` leaves the
+member muted, and there is no API to read the room's member state back
+(tasks.md D22); and a room lives on one pod, so every member of a room, and any
+per-participant recording of it, must be placed on the same pod.
+
+---
+
 ## 11. Sources
 
 - [rtpengine NG control protocol — subscribe request/answer, unsubscribe, publish, play media, block/silence media](https://rtpengine.readthedocs.io/en/latest/ng_control_protocol.html)

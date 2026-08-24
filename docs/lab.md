@@ -158,6 +158,48 @@ ffmpeg-decodable blob) or an inline leg (continuous stream), with nothing
 in between. An AI agent can speak into a tapped call today, one utterance
 at a time; streaming TTS with barge-in still needs Phase 3.
 
+## How precisely can a playback be stopped? (2026-08-23)
+
+`lab/ng_stop_media_probe.py` answers the question defect D2 raised: MSS used to
+stop *every* playback on a call, because it sent `stop media` with `all: all`.
+The probe builds its own two-leg call over NG, both legs transmit mu-law
+silence and count non-silent payloads, and it plays a 2 s 440 Hz blob with
+`repeat-times: 30` so a player is still running when the stop arrives.
+
+```sh
+docker run --rm --network mss-microsip_lab --ip 172.31.99.20 \
+    -v "$PWD/lab:/lab" -w /lab -e SELF_IP=172.31.99.20 \
+    -e CALL_ID=stop-media-probe-5 -e CALLER_RTP_PORT=40050 \
+    -e CALLEE_RTP_PORT=40052 python:3-slim python ng_stop_media_probe.py
+```
+
+Findings against rtpengine 14.1.1.8, reproduced in three runs (packet counts
+are non-silent payloads received in a 1.5 s window, one packet being the tail
+already in flight when the stop landed):
+
+| Experiment | Result |
+| --- | --- |
+| a player on each participant, then `stop media {from-tag: tagA}` | **only tagA stops** — tagA 75 → 1, tagB 75 → 75 |
+| two `play media` at the **same** from-tag | both accepted, but one `stop media {from-tag}` clears the participant (1 packet in a 3 s window) |
+| a player started `all: all`, stopped with one from-tag | that participant stops, the **other keeps hearing it** — 1 vs 75 |
+| `play media {from-tag: tagA}` | corroborates the injection probe: only tagA hears it (76 vs 0) |
+
+So a targeted stop is exactly as precise as rtpengine gets: per participant.
+MSS therefore aims `stop media` at the from-tag the playback was started with
+and keeps `all: all` only for playbacks that were for everyone. What no NG
+command can express is *which* playback to stop: two playbacks aimed at one
+participant are one player as far as rtpengine is concerned.
+
+**A trap this probe fell into first, worth remembering for any NG script:**
+cookies must be unique per *run*, not just per command. The first version
+restarted its serial at 1, so the second run's `offer`/`answer`/`play media`
+were answered from rtpengine's duplicate-cookie reply cache — every command
+came back "accepted" against a call that did not exist, and the run measured
+pure silence while looking healthy. That is defect D12 in a script instead of
+in mediaserverd: the cookie prefix now carries the pid and a timestamp. Any
+lab run whose "while playing" control reads zero should be treated as invalid
+rather than as a finding.
+
 ## The whole loop, closed in the lab
 
 `lab/mock_bridge.py` stands in for stream-llm-bridge: a stdlib-only
@@ -578,14 +620,95 @@ bit-for-bit). Exit code is 0 only when every bar is met.
 
 Exercised on the drill's own upload (`--mss` and `--fs` the same file):
 `identical=1.0000 mean_diff=0.0` at offset 0, and on deliberately perturbed
-copies, where it fails with numbers. **It has never seen a real FreeSWITCH
-recording** — getting the same call recorded both ways is the human step the
-exit criterion still needs, and the docstring says how to capture it.
+copies, where it fails with numbers. Since 2026-08-23 it has also seen a **real
+FreeSWITCH recording** — `fs_parity_drill.sh` below captures one.
+
+`--drift-window SECONDS` (with `--drift-stride N` to trade accuracy for time)
+re-aligns **every window** instead of once for the whole file, and prints the
+offset and agreement per window plus the best window and how far the offset
+wandered. This is the mode that matters, for the reason the next section
+measures: a single global offset assumes the two recorders hold one sample grid
+for the whole call, and they do not.
 
 One caveat the harness cannot see: bit-for-bit equality is not expected under
 loss, because the two paths conceal differently (MSS grew G.711 Appendix I
 PLC in item 17, FS does not). Compare on a clean link, or compare RMS and
 mean difference rather than identity.
+
+## fs_parity_drill.sh — the same live call recorded by FS and by MSS (2026-08-23)
+
+Item 31. `lab/fs_parity_drill.sh` is the drill the parity harness was waiting
+for: it dials a call with `host_test_caller.py`, reads the call-id and tags out
+of `call_watcher`'s `/shared/call.env`, finds the **FreeSWITCH channel** by
+matching `uuid_getvar <uuid> sip_call_id` against that call-id, then records the
+one call twice — `uuid_record <uuid> start` with `RECORD_STEREO=true` on the FS
+side, an MSS `FILE_S3` attachment on the other — pulls both wavs (`docker cp`
+from FS, `mc cp` + `docker cp` from MinIO) and runs `recording_parity.py`.
+
+```sh
+DOCKER_API_VERSION=1.43 ./lab/fs_parity_drill.sh
+```
+
+**The lab FS image can record**, which had been an open question. Probed with
+`show application` / `show api`: `mod_dptools` supplies `record`,
+`record_session`, `record_session_pause`, `record_session_resume`,
+`record_session_mask`, `record_session_unmask`, `stop_record_session`;
+`mod_commands` supplies `uuid_record`; `mod_sndfile` supplies the `wav` format
+(and `mod_native_file` PCMA/PCMU/L16); `/var/lib/freeswitch/recordings` exists
+and is writable — the container runs as root. The drill prints this probe at the
+top of every run.
+
+### The run (25 s of a live PCMA call, MicroSIP → OpenSIPS → rtpengine → FS 9000)
+
+```
+mss:  2ch 8000Hz 16bit 204000 frames (25500 ms)
+fs:   2ch 8000Hz 16bit 200960 frames (25120 ms)
+duration difference: 380 ms (tolerance 200)
+alignment: fs is offset by -1578 frames (-198 ms)
+customer-left: identical=0.3746 mean_diff=485.6 rms mss=624 fs=623
+agent-right:   identical=0.0000 mean_diff=8.0   rms mss=8   fs=0
+windowed re-alignment (2s windows, stride 4):
+  t=   6.0s offset= -1600 agreeing=0.9762 mean_diff=    9.2
+  t=  16.0s offset=  +480 agreeing=1.0000 mean_diff=    0.6
+  best window t=16.0s agreeing=1.0000 mean_diff=0.6
+```
+
+**Container, layout and amplitude agree exactly**: 2 channels at 8 kHz 16-bit
+both, customer left / agent right matching FS's read-left write-right, and the
+customer channel's rms is 624 against 623. An MSS recording is drop-in for an FS
+`RECORD_STEREO` one as far as any downstream consumer can tell.
+
+**There is no transform difference.** Re-aligned per window, one 2 s window
+agrees on **1.0000** of its samples at a mean absolute difference of **0.6 out
+of 32768** — MSS's PCMA→L16 decode and FS's produce the same samples.
+
+**Why the global-offset comparison fails anyway.** MSS and FS have independent
+jitter buffers and conceal loss independently, so the offset between the two
+files wanders across the call and per-sample identity collapses wherever the
+grid slips. That is why the windowed mode exists. The lesson for the Phase-2
+exit criterion: **byte-for-byte parity at a fixed offset is not an achievable
+bar across two independent jitter buffers**; the bar that means what the
+criterion intended is identical container and layout, duration within
+tolerance, matching per-channel rms, and near-perfect agreement in a re-aligned
+window.
+
+The 380 ms duration gap is **drill skew**, not drift: the MSS attach precedes
+the `fs_cli uuid_record` by three `docker exec` round trips.
+
+### What this lab cannot show, and a production FS still owes
+
+- **A two-party call.** Ext 9000 answers and plays `silence_stream://-1`, so
+  FS's write side is silence: the agent/right channel compares silence against
+  silence (rms 8 vs 0) and **only the customer channel is a real comparison**.
+  Set `DIAL` to a bridging extension on a rig that has two live legs.
+- The **pause contract** compared (`record_session_pause` vs MSS `Pause`) — this
+  drill does not pause.
+- The tenant's **own codec and rate** (this was PCMA/8000) and any recording
+  post-processing on their side.
+- **A human listening to both files.**
+- The per-window offsets **clip at `--align-search`** (1600 frames), so the
+  reported 260 ms wander is a floor, not a measurement; a wider search costs
+  O(search x window) per window.
 
 ## grpc_stream_drill.sh — a live tapped call over the gRPC data plane (2026-08-22)
 
@@ -1311,6 +1434,33 @@ recording group acct-conf/conf-drill is already recording rec-1787429250 and
   a different group
 ```
 
+### The staggered re-run that proved the group time anchor (P2-1, 2026-08-23)
+
+The drill grew `JOIN_STAGGER_SECONDS` (default 5): alice attaches, the drill
+waits, **then** bob attaches, so the second member joins a group that is
+already open — which is what D18 was about. With P2-1, bob's file is padded
+back to the group's open instant instead of starting at its join moment.
+
+Run 2026-08-23 16:03 UTC, `JOIN_STAGGER_SECONDS=5 RECORD_SECONDS=20`:
+
+```
+pod log: this recording group member joined late; lead_silence_ms=10    (alice)
+pod log: this recording group member joined late; lead_silence_ms=5016  (bob)
+
+acct-conf/rec-1787500885/alice.wav  400524 B  200240 frames  25.030 s
+acct-conf/rec-1787500885/bob.wav    401900 B  200928 frames  25.116 s
+```
+
+Read back off MinIO and measured sample by sample: **bob.wav opens with 40128
+zero samples = 5016 ms of silence**, exactly its pad, and alice.wav opens with
+50 ms. Both files therefore start at the same wall instant, and they differ in
+length by **86 ms** rather than by the 5 s stagger — the residual is the tail,
+not the head: `Detach` waits for the upload (D11) and the drill detaches
+alice first, so bob records through alice's ~47 ms upload.
+
+`mss_recording_group_joins_refused_total` is still 2 (the reused label and the
+second recording id), so the anchor changed no refusal.
+
 **The drill found a bug in the instrument first (worth keeping).**
 `call_driver.py` could not fabricate **two** calls at once: both containers
 number their NG cookies from `lab-1`, so rtpengine's duplicate-cookie reply
@@ -1568,9 +1718,11 @@ Two soft spots this run exposed are recorded as defects in
 [tasks.md](tasks.md): the leg labels **inverted** when `from_tags` was left
 unspecified (`-`), because rtpengine's `query` answered with FreeSWITCH's tag
 first (**D17** — speaker attribution is only trustworthy when the caller tag is
-passed explicitly), and the group's member files are **not time-aligned**: each
-anchors on its own first frame, so the three lengths above differ by up to
-0.26 s and a late joiner's file would simply start at its join moment (**D18**).
+passed explicitly), and the group's member files were **not time-aligned**: each
+anchored on its own first frame, so the three lengths above differ by up to
+0.26 s and a late joiner's file simply started at its join moment (**D18**,
+fixed 2026-08-23 by the group time anchor — see the staggered re-run above;
+these numbers are from before that fix).
 The browser leg also **outlived the hung-up call by ~12 s** — the tone ran to
 second 29 against the customer leg's 17 — which is billable media tail after
 hangup and deserves an eye in a pilot.
@@ -1607,3 +1759,314 @@ arrangement that keeps FS out of the codec decision, which is a future item.
 Until then MSS has decoded browser **G.711**, not browser **Opus** — and the
 gap between browser Opus and `opus_call_driver.py` is spelled out in
 [testing.md](testing.md).
+
+## barge_drill.sh — barge-in cut-through, all four hops (2026-08-23)
+
+Barge-in is four hops, and all four are MSS's once D19 is fixed:
+
+1. a consumer (ASR, voice-AI) decides the caller started talking and **tells
+   MSS**;
+2. MSS publishes that as a `MediaEvent` on Kafka `mss.events`;
+3. somebody's translator consumes the event and decides to cut the prompt;
+4. that translator calls `StopPlayback` on `MediaControl`, and MSS stops the
+   media.
+
+`lab/barge_drill.sh` + `lab/barge_translator.py` measure all four hops against
+the live lab.
+
+**The first version of this drill could only measure hops 2–4**, because hop 1
+had no wire: `session-core`'s `Registry::report` — the `ConsumerEvent` →
+`SpeechStarted`/`Partial`/`Final` path that feeds the pump — was reachable only
+from unit tests (defect D19, found by that run). Its trigger event was
+therefore `PlaybackStarted`. **D19 is fixed** (2026-08-23): a gRPC consumer
+holding `CAPABILITY_EVENTS` sends `ConsumerToServer.SpeechReport` on its
+`MediaStream.Subscribe` stream and MSS publishes the event the report names, so
+the drill now triggers on a **real `SpeechReport(STARTED)` → `SpeechStarted`**.
+
+Two things are still out of frame, both by nature rather than by omission. The
+consumer's own **detection** latency — how long an ASR takes to decide speech
+began — belongs to whatever consumer an integrator runs and nothing in MSS can
+measure it. And a **WS-Twilio consumer cannot report speech at all**: that
+dialect's bytes are frozen and carry no such message, so its only barge is the
+Twilio `clear`, which takes a different road entirely (a direct rtpengine
+`stop media` from `tap_session.rs`, never an event).
+
+The drill runs **beside** the live compose lab and adds one container: a
+fabricated call (`lab/call_driver.py`, no SIP) at 172.31.99.123, tapped by the
+lab's own `mss-control` pod, so events travel the real pump into the real
+Redpanda (`mss.events`, published to the host at 127.0.0.1:19092). The mock
+translator runs on the WSL host: a `kafka-python-ng` consumer parked at the
+end of the topic plus a warm gRPC channel to 127.0.0.1:50551. It plays **both**
+integrator roles on purpose — it starts the prompt, **reports the speech** as
+the gRPC consumer, *and* barges it as the translator — so every interval in the
+headline is measured on one clock, with no container/host skew in it. The
+consumer role is a real attachment (`mss_ctl <endpoint> consume`, transport
+`GRPC_STREAM`, capabilities `SINK`+`EVENTS`) on a live stream: it took **378
+tapped audio frames** while measuring, drained on a thread because a consumer
+that lets its outbound queue back up gets dropped. Skew was measured anyway (`PlaybackStopped` is stamped inside the
+`StopPlayback` call, so its `at` must fall inside this process's send/ack
+window): **median −0.12 ms**, i.e. negligible.
+
+### Numbers with the real speech report (two runs of 10 iterations, 2026-08-23)
+
+Every hop MSS owns, from the consumer's word to the stop being acked. 10/10
+iterations completed in both runs, no event missed.
+
+| interval | run A p50 / p95 / max | run B p50 / p95 / max |
+| --- | --- | --- |
+| **cut-through**: `SpeechReport` sent → `StopPlayback` acked | **3.98 / 4.78 / 4.78 ms** | **3.54 / 4.38 / 4.38 ms** |
+| hops 1–2: `SpeechReport` sent → `SpeechStarted` consumed | 1.79 / 2.43 / 2.43 ms | 1.73 / 2.23 / 2.23 ms |
+| hops 3–4: event in hand → `StopPlayback` acked | 2.04 / 2.63 / 2.63 ms | 1.86 / 2.15 / 2.15 ms |
+| MSS's event `at` → consumed (skewed) | 0.93 / 1.46 / 1.46 ms | 0.94 / 1.23 / 1.23 ms |
+| `StartPlayback` acked → `PlaybackStarted` consumed | 1.57 / 2.43 / 2.43 ms | 1.62 / 2.01 / 2.01 ms |
+
+**Adding the missing first hop cost under a millisecond.** The earlier
+`PlaybackStarted`-triggered runs (25 iterations each, same stack, same day)
+read cut-through p50 3.31 / 3.15 ms and p95 4.19 / 3.64 ms; putting the real
+consumer wire in front of the bus moved p50 to 3.54–3.98 ms. The consumer
+report is, to the measurement's resolution, free.
+
+Per-iteration rows are kept in `lab/out/barge-drill-<stamp>.jsonl`.
+
+**The Kafka hop is not the problem.** The whole chain MSS owns fits inside a
+single 20 ms frame with an order of magnitude to spare — p95 4.8 ms — so
+architecture §9 risk 9's fallback (a gRPC stream *for speech events only*) is not
+needed on these numbers. `StartPlayback` itself is the slow call in the drill
+(p50 11–43 ms: it ships a WAV blob to rtpengine), which is a prompt-start cost,
+not a barge cost.
+
+What no lab number here covers: `StopPlayback` **acked** is not the last
+audible sample. Measuring the audible cut needs an ear on the leg — the
+Phase-3 inline drill.
+
+**Why the last row is not the bus latency.** `at` is stamped when the registry
+commits the event, and in the `StartPlayback` path that happens *before* MSS's
+rtpengine `play media` round trip inside the same RPC (that RPC's own p50 was
+10.84 ms). So `at` is a **commit** timestamp, not a publish timestamp, and the
+11 ms is mostly rtpengine. The honest publish→consume number is the
+`PlaybackStopped` row: **~1 ms**. Run A's 38.88 ms outlier tracks a 38.9 ms
+`play media` round trip in the same iteration, not a broker stall.
+
+### Setup notes
+
+- The host `python3` (WSL, 3.10) has no `ensurepip`, so there is no venv:
+  `pip install --user grpcio grpcio-tools kafka-python-ng`. The drill
+  generates the `MediaControl` stubs into `lab/out/pb` itself.
+- A playback blob is capped at 60 000 bytes (`MAX_PLAYBACK_BLOB_BYTES`, one NG
+  datagram) — about 3.7 s of 8 kHz s16. A 6 s tone is refused with *"exceeds
+  what one NG datagram carries; chunked playback is not implemented"*, so the
+  drill's prompt is 3 s of 440 Hz; `TONE_SECONDS` must stay under the cap.
+- One `COOKIE_PREFIX` per call driver, as always (the D12 shape).
+
+### What this does not prove
+
+- **Hop 1 does not exist** (D19), so no consumer-detection latency is in these
+  numbers, and the *shape* of the eventual speech-report hop could add its own
+  cost.
+- **The integrator's half is theirs.** Hop 3 here is a 40-line Python mock with
+  the topic to itself; a real translator (the reference deployment's, awaiting
+  review in its own repo) has other traffic, other consumers in its group, and
+  a downstream call-control hop after `StopPlayback`.
+- **`StopPlayback` acked is not the last audible sample.** The ack means
+  rtpengine accepted `stop media`; how quickly the caller stops hearing the
+  prompt is a media-path number that needs an ear on the leg, and that
+  measurement belongs to the Phase-3 inline drill.
+- An idle box, one session, one playback at a time, a single-broker Redpanda
+  and no competing load. Under the soak suite these numbers should be
+  re-taken.
+
+## inline_call_drill.sh — an inline leg with a real ear, and the barge-in number (2026-08-23)
+
+Items 32–34 built MSS's *mouth* — a socket that answers an SDP offer, a
+sans-IO pacer that speaks on a 20 ms grid, and an inject stream that keeps it
+fed — and none of it had met an endpoint. This drill is the endpoint, and it is
+also the instrument for the one number Phase 3 owed: how long after a consumer
+says *stop talking* does the caller stop hearing the bot.
+
+Three new pieces, no SIP and no human anywhere in it:
+
+- **`lab/inline_peer.py`** — the far end of one RTP flow, in the
+  `call_driver.py` style but with rtpengine removed, because an inline leg *is*
+  MSS's own socket. It writes its offer to `offer.sdp`, waits for the drill to
+  drop `answer.sdp` beside it, then sends 440 Hz µ-law at 50 pkt/s and records
+  every datagram MSS sends with its **arrival wall clock**, ssrc, sequence
+  number, rtp timestamp and the Goertzel energy of the injected tone *in that
+  one 20 ms payload*. It writes one ear wav per ssrc on the rtp-timestamp
+  timeline as well, for a human or `wav_summary.py`.
+- **`lab/inline_consumer.py`** — the voice-AI half: it attaches itself with
+  `CAPABILITY_SINK | CAPABILITY_INJECT` (this is the lab's only INJECT actor;
+  `mss_ctl consume` asks for SINK+EVENTS), streams 1000 Hz as continuous
+  `inject` frames keeping `LEAD_MS` of audio queued, exercises `Mark`, then
+  runs N rounds of *talk 1.5 s, send `Clear`*, stamping each `Clear`.
+- **`lab/inline_barge_report.py`** — reads both timelines and asserts pacing,
+  the ear, the tap, the mark, and prints the cut-through distribution.
+
+Both python actors run as **containers on the lab network**, which is not a
+detail: the barge number is a difference between a stamp taken in the consumer
+and a stamp taken in the peer, and under Docker Desktop on WSL2 a host process
+and a container process do not share a clock. Two containers do — same kernel —
+so no skew estimate is needed and none is claimed.
+
+### The run (stamp 1787508102, 20 iterations)
+
+| What | Measured |
+| --- | --- |
+| SDP answer | `c=IN IP4 172.31.99.31`, `m=audio 39974 RTP/AVP 0 101` (PCMU + telephone-event) |
+| egress pacing at the ear | **50.19 pkt/s** over 66.0 s, **0** sequence breaks, rtp timestamp step 160 for all 3311 gaps |
+| the injected tone arrived | 1710/3312 packets above the floor, peak Goertzel **11910** of a theoretical 12000 (a clean 1000 Hz sine) |
+| the tap still worked | 2770 frames of the peer's own audio to the same consumer, peak rms 17132, peak 440 Hz energy 12213 |
+| `Mark` drain barrier | acked at **410 / 404 / 404 ms** against 400 ms of queued audio |
+| **barge-in cut-through** | n=20, **p50 12.2 ms, p95 20.4 ms, max 21.0 ms**, min 2.4 ms |
+| pod counters | `clears_total` 20, `drained_samples_total` == `pushed_samples_total`, `late_ticks_total` 0, `dropped_samples_total` 0, `send_errors_total` 0 |
+
+The cut-through distribution is the interesting part, and it is exactly the
+shape the design predicts: `Clear` flushes the chunk queue *and* the pacer ring,
+so the only thing left between the flush and silence at the ear is the wait for
+the pacer's next 20 ms deadline. That wait is uniform over one ptime, which is
+why the samples spread almost evenly from 2.4 ms to 21.0 ms with a p50 near half
+a frame. **The target was one ptime and the max is one ptime plus a millisecond
+of transport.**
+
+### Two ways the first attempt lied, and the fixes
+
+- **A phase-locked measurement.** The first run reported p50 12.6 / p95 15.3 /
+  max 16.0 ms with the per-iteration numbers decreasing monotonically — 16.0,
+  15.3, 14.5 … 9.8. Nothing was drifting: the iteration period was
+  1.5 s + 1.0 s = exactly **125 packets**, so every `Clear` landed at nearly the
+  same phase of the pacer's 20 ms grid and the run sampled a quarter of the
+  distribution. `JITTER_MS` (default 20) now adds up to one frame of random
+  delay per iteration, and the p95 moved from 15.3 to 20.4 ms — the tighter
+  number was the wrong one.
+- **A real defect in the mark ack (fixed here).** The first run's `Mark` was
+  acked **8221 ms** after it was sent, while the ear went quiet 400 ms after it,
+  exactly on time — so the audio drained correctly and only the *ack* was late.
+  Cause: both stream loops built the 20 ms drain poll as
+  `tokio::time::sleep(...)` *inside* `tokio::select!`, so the timer was
+  recreated — and therefore reset — on every loop iteration. With tapped frames
+  arriving every 20 ms and `select!` choosing randomly among ready branches, the
+  sleep was cancelled before it ever completed; the ack waited for a lucky gap.
+  Fixed by pinning one `tokio::time::interval` outside the loop and gating the
+  branch on `if marks_pending` (`stream.rs`, `consumer_ws.rs`); the ack is now
+  403–410 ms against a 400 ms lead, i.e. accurate to one frame as documented.
+  The lesson is general: **a `sleep` inside `select!` is a timeout, not a
+  timer**, and it starves under any branch that fires more often.
+
+### What this does not prove
+
+- **One PCMU/8 kHz leg, one INJECT consumer, on an idle box.** No PCMA leg, no
+  L16 consumer, no Opus (an inline leg cannot do Opus at all — there is no
+  encoder), no impairment, no competing load, no second inline leg.
+- **No SIP.** The offer/answer travels through two files and `mss_ctl inline`;
+  a real B2B leg brings re-INVITEs, hold, and DTMF, none of which is exercised.
+- **The consumer's own detection latency is still not in the number** — the
+  same honest boundary `barge_drill.sh` draws. This drill measures
+  `Clear`→silence; item 5 measures speech-report→`StopPlayback`. Adding them is
+  the closest MSS gets to an end-to-end barge-in claim, and the ASR's decision
+  time belongs to whoever ships the ASR.
+- **The cut-through is an arrival measurement**, so it *includes* the gRPC hop,
+  the 5 ms pump tick, and the lab bridge. It is an upper bound on MSS's own
+  cost, never a lower one.
+- The peer's ear was checked by Goertzel and rms, **not by a human listening**
+  to `peer_ear_*.wav`.
+
+## conference_drill.sh — three legs in one conference, and the whole feature set (2026-08-23)
+
+`lab/conference_drill.sh` is Phase 4's proving run: three `lab/inline_peer.py`
+containers, at 440 / 880 / 1320 Hz, seated in **one conference** by
+`mss_ctl inline <id> <call> <offer> <group>`. There is no FreeSWITCH in the
+path and **no rtpengine either** — an inline leg is MSS's own UDP socket
+answering an SDP offer, so this drill exercises the mix, the routes and the
+recorders with nothing else able to take the blame.
+
+Everything is decided by numbers. Each peer computes a Goertzel **per tone per
+arriving packet** (`EAR_TONES`) and writes it with the packet's arrival wall
+clock; the drill and the injector stamp phase boundaries on the same clock
+(both actors are containers on the lab network, so it is one kernel's clock);
+`lab/conference_report.py` joins the two and judges each tone as present or
+absent **relative to the loudest tone in that same ear during that same
+phase**. Nobody listened to anything.
+
+### The run (stamp 1787515279)
+
+Phases, each 7–8 s with 400 ms trimmed off both edges: `pair` (A+B only),
+`three` (C joins ~10 s late), `whisper`, `barge`, `mute`, `unmute`. Twenty
+expectations, all green. A "present" tone reads **~3000** and an "absent" one
+**36–98** — a **≥30:1** margin, so nothing here is near a threshold:
+
+| phase / ear | present | absent |
+| --- | --- | --- |
+| pair / A | 880 = 2993 | 440 = 69, 1320 = 64, 1760 = 54 |
+| three / A | 880 = 2996, 1320 = 3003 | **440 = 98** (its own tone) |
+| three / B | 440 = 3000, 1320 = 2998 | 880 = 91 |
+| three / C | 440 = 3011, 880 = 2999 | 1320 = 74 |
+| three / monitor (`only=mixed`) | 440 = 2999, 880 = 2992, 1320 = 2999 | 1760 = 69 |
+| whisper / B | 440 = 3011, 1320 = 3014, **1760 = 2989** | — |
+| whisper / A | 880 = 2996, 1320 = 3003 | **1760 = 63** |
+| whisper / C | 440 = 3011, 880 = 2999 | **1760 = 56** |
+| whisper / monitor | all four, 1760 = 2988 | — |
+| barge / A, B, C | 1760 = 2992 / 2989 / 2982, plus the other two members | — |
+| mute / B | 1320 = 3000 | **440 = 53** |
+| mute / C | 880 = 2993 | **440 = 69** |
+| mute / monitor | 880 = 2996, 1320 = 3002 | **440 = 98** |
+| unmute / B, C, monitor | 440 is back (3000 / 3011 / 2999) | — |
+
+So, machine-verified on real sockets: **minus-self** (nobody hears their own
+tone), a **monitor** attached with `only=mixed` hears all three, a **whisper**
+named at one member lands in that member's ear and in **neither** of the other
+two, the **barge** flip puts it in every ear including the injecting leg's,
+**mute** takes a member off every ear *and* off the mixed track, and unmute
+restores it. Identical readings recur across phases (`three/A` == `mute/monitor`
+to the digit) because the sources are deterministic sines — that is the harness
+agreeing with itself, not a copy-paste.
+
+### Both recording shapes, at once, from the same conference
+
+One `FILE_S3` attachment with `only=mixed` (the room) and a recording **group**
+over the three member sessions with `only=customer` (per participant) ran
+together:
+
+| object | length | contents |
+| --- | --- | --- |
+| `acct-conf/room-<stamp>.wav` | 71.88 s, 1 ch | 440 = 2664, 880 = 2993, 1320 = 2583 — all three, the two lower because A was muted for 8 s and C joined late |
+| `party-<stamp>/a.wav` | 71.96 s | 440 = 3000; 880 = 0, 1320 = 8, 1760 = 0 |
+| `party-<stamp>/b.wav` | 72.02 s | 880 = 2992; everything else 0 |
+| `party-<stamp>/c.wav` | 72.10 s | 1320 = 2556; everything else ≤ 3 — and **10.66 s of leading silence**, the P2-1 group anchor pad for its late join |
+
+Cross-talk in a participant file is **0–8** against 3000: an inline leg's own
+track really is its own. The three group files agree to **140 ms** (the
+sequential detaches, D11).
+
+### The bug this drill found in the recorder — and the tone amplitude that nearly hid it
+
+**The first run's `party-c.wav` was 55.88 s against a/b's 66.16/66.24 s** — the
+10.43 s pad was at the front, correctly, and 10.28 s of C's audio was **missing
+off the tail**. `Segmenter::close_segment` subtracted the closed frames from
+*both* `segment_start` (the lead-silence offset) *and* `anchor_ms`, so the first
+spill (30 s by default) advanced the timeline by the pad twice and everything
+after it landed one pad-length early. Ungrouped recordings never showed it
+because their `segment_start` is 0; the group drill never showed it because its
+5 s stagger and 20 s run finished before the first spill. Fixed here
+(`past_lead = frames - segment_start` is what the anchor advances by) with a
+test that fails by exactly the lead, and re-measured live: 71.96 / 72.02 /
+72.10 s.
+
+Also worth keeping: **`TONE_AMPLITUDE` must leave headroom.** At the peers'
+default 24000 a three-way mix plus a whisper clips, and clipping
+intermodulates onto exactly the harmonics being measured (440/880/1320/1760).
+The drill runs all four sources at 6000 and `mss_conference_clipped_samples_total`
+read **0**. A drill whose tones are harmonics of each other and whose mixer has
+no AGC has to be arithmetically incapable of clipping, or its absent-tone
+assertions are measuring their own distortion.
+
+### What this does not prove
+
+- **No SIP, no rtpengine, no human.** The peers are raw UDP sockets; a real
+  B2B leg into a conference is deployment-gated.
+- **One pod.** Conferences, recording groups and member state are all pod-local
+  (D16, D22); nothing here survives a pod kill.
+- The monitor is one consumer on **one member's** session, so it inherits D20:
+  the room recording and the monitor both end if *that* member leaves.
+- `deaf` and `hold` are **not** in this drill — they have socket-level tests
+  from item 40 only.
+- Only PCMU at 8 kHz/20 ms. No per-leg resampler exists, and a conference
+  refuses a rate/ptime mismatch by name.

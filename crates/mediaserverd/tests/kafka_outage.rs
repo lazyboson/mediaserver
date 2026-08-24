@@ -37,6 +37,7 @@ fn event(external_id: &str, seq: u64) -> MediaEvent {
     MediaEvent {
         session: SessionId::from_raw(seq + 1),
         external_id: external_id.to_string(),
+        session_kind: session_core::SessionKind::Tap,
         attachment: None,
         seq,
         legacy_eligible: true,

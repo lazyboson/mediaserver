@@ -1,5 +1,8 @@
 #!/bin/sh
-# Item 21: proves a recording group across two calls. Two fabricated calls
+# Item 21 (+ P2-1): proves a recording group across two calls, the second
+# member joining JOIN_STAGGER_SECONDS late so the group time anchor is
+# exercised: both participant objects must come back the same length. Two
+# fabricated calls
 # (lab/call_driver.py, no SIP) become two MSS sessions on one pod, each
 # attaching a FILE_S3 recording with the same `group`, so the conference is
 # one recording with one object per participant.
@@ -30,6 +33,7 @@ REGISTRY_VOLUME=${REGISTRY_VOLUME:-${NET}-registry}
 CONTROL_PORT=${CONTROL_PORT:-19090}
 METRICS_PORT=${METRICS_PORT:-19091}
 RECORD_SECONDS=${RECORD_SECONDS:-20}
+JOIN_STAGGER_SECONDS=${JOIN_STAGGER_SECONDS:-5}
 ACCOUNT=${ACCOUNT:-acct-conf}
 GROUP=${GROUP:-conf-drill}
 STAMP=$(date +%s)
@@ -43,7 +47,12 @@ CTL="$REPO/target/debug/examples/mss_ctl"
 
 say() { printf 'group-drill: %s\n' "$*"; }
 
+DRILL_REACHED_END=0
 cleanup() {
+  if [ "$DRILL_REACHED_END" = 0 ]; then
+    say "the drill did not finish; the pod's own last words follow"
+    docker logs --tail 40 mss-group-pod 2>&1 | sed 's/^/pod: /' || true
+  fi
   say "cleaning up"
   docker rm -f mss-group-pod group-driver-a group-driver-b >/dev/null 2>&1 || true
   docker volume rm "$TARGET_VOLUME" >/dev/null 2>&1 || true
@@ -98,6 +107,8 @@ say "tapping both calls and joining them to group $GROUP as $ENDPOINT"
 "$CTL" "$CONTROL" create conf-bob group-call-b gbA,gbB
 alice=$("$CTL" "$CONTROL" record conf-alice "$ENDPOINT" alice "$GROUP" customer |
   sed -n 's/.*attachment_id: "\([^"]*\)".*/\1/p')
+say "staggering bob's join by ${JOIN_STAGGER_SECONDS}s: P2-1 pads bob's file back to the group anchor"
+sleep "$JOIN_STAGGER_SECONDS"
 bob=$("$CTL" "$CONTROL" record conf-bob "$ENDPOINT" bob "$GROUP" customer |
   sed -n 's/.*attachment_id: "\([^"]*\)".*/\1/p')
 say "members: alice=$alice bob=$bob"
@@ -119,10 +130,13 @@ say "what landed in the bucket"
 docker exec "$(docker ps --filter name=minio --format '{{.Names}}' | head -1)" sh -c \
   "mc alias set lab http://127.0.0.1:9000 minioadmin minioadmin >/dev/null &&
    mc ls -r lab/$BUCKET/$ACCOUNT/$RECORDING/ &&
-   mc stat lab/$BUCKET/$ACCOUNT/$RECORDING/alice.wav"
+   mc stat lab/$BUCKET/$ACCOUNT/$RECORDING/alice.wav &&
+   mc stat lab/$BUCKET/$ACCOUNT/$RECORDING/bob.wav"
+say "both members must be the same length: a staggered join is padded, not shifted"
 say "the frozen two-leg identity must NOT exist for a grouped recording"
 docker exec "$(docker ps --filter name=minio --format '{{.Names}}' | head -1)" sh -c \
   "mc stat lab/$BUCKET/$ENDPOINT" && say "UNEXPECTED: $ENDPOINT exists" || say "absent, as it should be"
 
-docker logs mss-group-pod 2>&1 | grep -E 'recording group|recording this call|recording uploaded'
+docker logs mss-group-pod 2>&1 | grep -E 'recording group|recording this call|recording uploaded|opens with silence'
+DRILL_REACHED_END=1
 say "done"
