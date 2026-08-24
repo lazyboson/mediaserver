@@ -499,6 +499,7 @@ fn consumer_config_from_env(request: &TapSpikeRequest) -> Option<ConsumerConfig>
             .map(|track| consumer_ws::track_name(track).to_string())
             .collect(),
         custom_parameters: HashMap::new(),
+        egress: None,
     })
 }
 
@@ -523,6 +524,7 @@ fn listener_configs(request: &TapSpikeRequest) -> Vec<(String, ConsumerConfig)> 
                     consumer_ws::track_name(Track::Agent).to_string(),
                 ],
                 custom_parameters: HashMap::new(),
+                egress: None,
             };
             (name, config)
         })

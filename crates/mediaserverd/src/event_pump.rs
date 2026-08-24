@@ -468,6 +468,7 @@ mod tests {
         MediaEvent {
             session: SessionId::from_raw(1),
             external_id: external_id.to_string(),
+            session_kind: session_core::SessionKind::Tap,
             attachment: None,
             seq,
             legacy_eligible: true,
@@ -506,6 +507,11 @@ mod tests {
             assert_eq!(decoded.seq, index as u64);
             assert_eq!(decoded.external_id, "req-1");
             assert!(matches!(decoded.payload, Some(Payload::SessionEnded(_))));
+            assert_eq!(
+                decoded.session_kind,
+                control_api::proto::SessionKind::Tap as i32,
+                "a bus consumer can tell a tap's events from an inline leg's"
+            );
         }
 
         drop(pump);

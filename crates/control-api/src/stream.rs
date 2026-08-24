@@ -1,19 +1,25 @@
 use crate::auth::AuthPolicy;
-use crate::controller::{SessionController, StreamFrame};
-use crate::convert::{attachment_id, format, format_wire, track_name};
+use crate::controller::{InlineEgressSink, SessionController, StreamFrame};
+use crate::convert::{
+    attachment_id, format, format_wire, observed_lag_ms, speech_report, track_name,
+};
 use crate::proto;
 use crate::proto::media_control_server::MediaControl;
 use crate::proto::media_stream_server::{MediaStream, MediaStreamServer};
 use media_core::{g711, Encoding, Track};
-use session_core::{AttachmentView, SessionView, TrackSelector, Transport};
+use session_core::{AttachmentView, SessionKind, SessionView, TrackSelector, Transport};
+use std::collections::VecDeque;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, Streaming};
-use tracing::info;
+use tracing::{debug, info, warn};
 
 pub const STREAM_QUEUE_DEPTH: usize = 64;
 pub const MAX_UTTERANCE_SAMPLES: usize = 29_900;
+pub const MARK_POLL_INTERVAL: Duration = Duration::from_millis(20);
+pub const MAX_PENDING_MARKS: usize = 64;
 const STREAM_SID_METADATA_KEY: &str = "streamSid";
 
 pub struct MediaStreamService {
@@ -116,10 +122,26 @@ async fn serve_stream(
     }
 
     let mut seq: u64 = 0;
-    let mut inject = InjectState::new(view.format.encoding, view.format.sample_rate_hz);
+    let mut inject = match (session.kind, controller.inline_egress_sink(view.session)) {
+        (SessionKind::Inline, Some(sink)) => {
+            InjectState::inline(view.format.encoding, view.format.sample_rate_hz, sink)
+        }
+        _ => InjectState::new(view.format.encoding, view.format.sample_rate_hz),
+    };
+
+    let mut mark_poll = tokio::time::interval(MARK_POLL_INTERVAL);
+    mark_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     loop {
+        let marks_pending = !inject.marks.is_empty();
         tokio::select! {
+            _ = mark_poll.tick(), if marks_pending => {
+                for name in inject.drained_marks() {
+                    if send_message(&sender, mark_message(name)).await.is_err() {
+                        return;
+                    }
+                }
+            }
             changed = draining.changed() => {
                 if changed.is_err() || *draining.borrow() {
                     let _ = send_stop(&sender, "this pod is draining").await;
@@ -127,6 +149,10 @@ async fn serve_stream(
                 }
             }
             frame = frames.recv() => match frame {
+                Some(StreamFrame::Stop { reason }) => {
+                    let _ = send_stop(&sender, &reason).await;
+                    return;
+                }
                 Some(frame) => {
                     seq += 1;
                     if send_message(&sender, frame_message(frame, seq)).await.is_err() {
@@ -153,12 +179,19 @@ async fn serve_stream(
     }
 }
 
+struct PendingMark {
+    name: String,
+    watermark: u64,
+}
+
 struct InjectState {
     encoding: Encoding,
     sample_rate_hz: u32,
     utterance: Vec<i16>,
     authorized: bool,
     last_playback: Option<String>,
+    inline: Option<Arc<dyn InlineEgressSink>>,
+    marks: VecDeque<PendingMark>,
 }
 
 impl InjectState {
@@ -169,8 +202,60 @@ impl InjectState {
             utterance: Vec::new(),
             authorized: false,
             last_playback: None,
+            inline: None,
+            marks: VecDeque::new(),
         }
     }
+
+    fn inline(
+        encoding: Encoding,
+        sample_rate_hz: u32,
+        sink: Arc<dyn InlineEgressSink>,
+    ) -> InjectState {
+        InjectState {
+            inline: Some(sink),
+            ..InjectState::new(encoding, sample_rate_hz)
+        }
+    }
+
+    fn drained_marks(&mut self) -> Vec<String> {
+        let Some(sink) = self.inline.as_ref() else {
+            return Vec::new();
+        };
+        let drained = sink.drained_watermark();
+        let mut acked = Vec::new();
+        while let Some(mark) = self.marks.front() {
+            if mark.watermark > drained {
+                break;
+            }
+            acked.push(
+                self.marks
+                    .pop_front()
+                    .expect("the front was just read")
+                    .name,
+            );
+        }
+        acked
+    }
+}
+
+fn inline_inject_refusal(
+    declared: media_core::AudioFormat,
+    egress: media_core::AudioFormat,
+) -> Option<Status> {
+    if declared.channels != 1 {
+        return Some(Status::failed_precondition(
+            "an inline inject stream must be mono",
+        ));
+    }
+    if declared.sample_rate_hz != egress.sample_rate_hz {
+        return Some(Status::failed_precondition(format!(
+            "this attachment declared {} Hz and the inline leg negotiated {} Hz; \
+             inject-path resampling is not built, so attach at the leg's rate",
+            declared.sample_rate_hz, egress.sample_rate_hz
+        )));
+    }
+    None
 }
 
 async fn handle_consumer(
@@ -184,9 +269,21 @@ async fn handle_consumer(
             "a consumer hello arrives exactly once, first",
         )),
         Some(proto::consumer_to_server::Msg::Inject(frame)) => {
-            if !inject.authorized {
-                controller.authorize_inject(view.id)?;
-                inject.authorized = true;
+            authorize_inject_once(controller, view, inject)?;
+            if let Some(sink) = inject.inline.clone() {
+                let mut pcm = Vec::new();
+                decode_inject(inject.encoding, &frame.payload, &mut pcm)?;
+                if pcm.is_empty() {
+                    return Ok(());
+                }
+                if !sink.push_pcm(pcm) {
+                    warn!(
+                        attachment = %view.id,
+                        session = %view.session,
+                        "the inline egress queue is full; an injected chunk was dropped"
+                    );
+                }
+                return Ok(());
             }
             if inject.utterance.len() + frame.payload.len() > MAX_UTTERANCE_SAMPLES {
                 return Err(Status::resource_exhausted(format!(
@@ -197,7 +294,21 @@ async fn handle_consumer(
             }
             decode_inject(inject.encoding, &frame.payload, &mut inject.utterance)
         }
-        Some(proto::consumer_to_server::Msg::Mark(_)) => {
+        Some(proto::consumer_to_server::Msg::Mark(mark)) => {
+            if let Some(sink) = inject.inline.clone() {
+                authorize_inject_once(controller, view, inject)?;
+                if inject.marks.len() >= MAX_PENDING_MARKS {
+                    return Err(Status::resource_exhausted(format!(
+                        "an inline inject stream carries at most {MAX_PENDING_MARKS} \
+                         unacked marks"
+                    )));
+                }
+                inject.marks.push_back(PendingMark {
+                    name: mark.name,
+                    watermark: sink.pushed_watermark(),
+                });
+                return Ok(());
+            }
             if inject.utterance.is_empty() {
                 return Ok(());
             }
@@ -222,6 +333,12 @@ async fn handle_consumer(
             Ok(())
         }
         Some(proto::consumer_to_server::Msg::Clear(_)) => {
+            if let Some(sink) = inject.inline.clone() {
+                authorize_inject_once(controller, view, inject)?;
+                sink.flush();
+                inject.marks.clear();
+                return Ok(());
+            }
             inject.utterance.clear();
             let Some(playback_id) = inject.last_playback.take() else {
                 return Ok(());
@@ -236,9 +353,45 @@ async fn handle_consumer(
                 Err(status) => Err(status),
             }
         }
+        Some(proto::consumer_to_server::Msg::Report(report)) => {
+            if let Some(lag_ms) = observed_lag_ms(report.observed_at.as_ref()) {
+                debug!(
+                    attachment = %view.id,
+                    kind = report.kind,
+                    lag_ms,
+                    "a consumer reported speech it observed on its own clock"
+                );
+            }
+            let event = speech_report(report)?;
+            controller.record_report(view.id, event)
+        }
         None => Err(Status::invalid_argument(
             "a consumer message carried no payload",
         )),
+    }
+}
+
+fn authorize_inject_once(
+    controller: &Arc<SessionController>,
+    view: &AttachmentView,
+    inject: &mut InjectState,
+) -> Result<(), Status> {
+    if inject.authorized {
+        return Ok(());
+    }
+    controller.authorize_inject(view.id)?;
+    if let Some(sink) = inject.inline.as_ref() {
+        if let Some(status) = inline_inject_refusal(view.format, sink.egress_format()) {
+            return Err(status);
+        }
+    }
+    inject.authorized = true;
+    Ok(())
+}
+
+fn mark_message(name: String) -> proto::ServerToConsumer {
+    proto::ServerToConsumer {
+        msg: Some(proto::server_to_consumer::Msg::Mark(proto::Mark { name })),
     }
 }
 
@@ -337,6 +490,9 @@ fn frame_message(frame: StreamFrame, seq: u64) -> proto::ServerToConsumer {
         }
         StreamFrame::Text { json } => {
             proto::server_to_consumer::Msg::Text(proto::TextFrame { json })
+        }
+        StreamFrame::Stop { reason } => {
+            proto::server_to_consumer::Msg::Stop(proto::StreamStop { reason })
         }
     };
     proto::ServerToConsumer { msg: Some(msg) }

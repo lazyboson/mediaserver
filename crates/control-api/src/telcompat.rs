@@ -112,6 +112,8 @@ impl TelCompat {
                     rtpengine_node: String::new(),
                     mix: false,
                     idempotency_key: format!("telcompat-session-{external_id}"),
+                    sdp_offer: String::new(),
+                    group: String::new(),
                 }))
                 .await
                 .map(Response::into_inner),
@@ -171,6 +173,7 @@ impl TelCompat {
                 selector: None,
                 format: None,
                 idempotency_key: String::new(),
+                metadata: std::collections::HashMap::new(),
             }))
             .await?;
         Ok(())

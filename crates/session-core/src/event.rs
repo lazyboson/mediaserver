@@ -1,4 +1,5 @@
 use crate::ids::{AttachmentId, PlaybackId, SessionId};
+use crate::registry::SessionKind;
 use media_core::Track;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -33,6 +34,7 @@ pub enum Observation {
     RecordingStarted {
         recording_id: String,
         path: String,
+        shape: String,
     },
     RecordingPaused {
         recording_id: String,
@@ -78,6 +80,7 @@ pub enum EventKind {
     RecordingStarted {
         recording_id: String,
         path: String,
+        shape: String,
     },
     RecordingPaused {
         recording_id: String,
@@ -101,6 +104,15 @@ pub enum EventKind {
     },
     AttachmentUp {
         label: String,
+    },
+    MixRouted {
+        target: String,
+        monitor_audible: bool,
+    },
+    MemberControlled {
+        mute: bool,
+        deaf: bool,
+        hold: bool,
     },
     AttachmentDown {
         label: String,
@@ -133,6 +145,7 @@ impl EventKind {
 pub struct MediaEvent {
     pub session: SessionId,
     pub external_id: String,
+    pub session_kind: SessionKind,
     pub attachment: Option<AttachmentId>,
     pub seq: u64,
     pub legacy_eligible: bool,
@@ -192,6 +205,7 @@ mod tests {
             EventKind::RecordingStarted {
                 recording_id: recording_id.clone(),
                 path: "acct-1/rec-1.wav".to_string(),
+                shape: "stereo".to_string(),
             },
             EventKind::RecordingPaused {
                 recording_id: recording_id.clone(),
@@ -216,6 +230,7 @@ mod tests {
         let event = MediaEvent {
             session: SessionId::from_raw(1),
             external_id: "req-1".to_string(),
+            session_kind: SessionKind::Tap,
             attachment: Some(AttachmentId::from_raw(2)),
             seq: 7,
             legacy_eligible: false,
