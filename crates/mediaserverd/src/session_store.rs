@@ -134,6 +134,15 @@ impl RedisSessionStore {
         format!("{}:sessions", self.namespace)
     }
 
+    pub async fn read_key(&self, key: &str) -> Result<Option<String>, StoreError> {
+        let mut connection = self.connection().await?;
+        redis::cmd("GET")
+            .arg(key)
+            .query_async::<Option<String>>(&mut connection)
+            .await
+            .map_err(|error| StoreError::Backend(error.to_string()))
+    }
+
     async fn connection(&self) -> Result<redis::aio::MultiplexedConnection, StoreError> {
         self.client
             .get_multiplexed_async_connection()

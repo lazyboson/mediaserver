@@ -2395,6 +2395,54 @@ process holds, and asserts: sockets inside the range while tapping, ingest
 datagrams climbing, nothing inside the range once the session is destroyed, and
 `in_use` back to `capacity`.
 
+### discovery.rs — the optional call-id → rtpengine node map (item 51, G11, 2026-08-26)
+
+Three pieces, deliberately small. `parse_mapped_node(&str)` is pure and holds
+every format decision: a value that does not start with `{` must parse as a
+`SocketAddr` (the bare `host:port` form); one that does is a `MappedNode`
+(`node`, optional `from_tags`, optional `caller_tag`) and the caller's tag is
+moved to the **front** of the tag list, deduped, with blanks dropped. It returns
+`Result<DiscoveredNode, String>` — a `String` because the only consumer logs it.
+
+`NodeMap` is the one-method trait (`read(key) -> Option<String>`) that keeps the
+lookup testable without Redis. `RedisSessionStore` implements it through its new
+`read_key`, which is a plain `GET` on the connection helper the registry already
+uses: **this daemon has one Redis client type**, and a second one would have been
+a second place to get connection handling wrong. `NodeDiscovery` owns the prefix
+and the counters and does the logging; `resolve(call_id)` returns
+`Option<DiscoveredNode>` and *never* an error, because there is no failure mode
+here that should reach the caller — every one of them is "use the default node,
+and say so".
+
+In `tap_plane.rs` the entry point is `discover_through`, a `OnceLock` set after
+the store connects (the plane is built before the registry in `main.rs`, so the
+wiring has to be late — the same shape as `observe_through`). `resolve_node`
+replaced the direct `node_for` call in `open_tap_session` and returns
+`ResolvedNode { node, view, caller_named }`. Two things about it are load-bearing:
+
+- `caller_named` starts as "the request named from_tags" and is **only** raised
+  by a map value carrying `caller_tag`. It is passed into `complete_from_tags`,
+  which used to derive the same fact from `from_tags.is_empty()` — that
+  inference is exactly what a map-supplied tag list would have broken, silently
+  promoting an unattributed call to `explicit`. Now a full tag list with no named
+  caller returns `Attribution::Unknown` and warns, and a partial one lets the
+  `query` complete the set but still cannot claim a direction (`seeded` in that
+  function);
+- the map fills `view.from_tags` **only if the request left them empty**, and
+  truncates to `MAX_TAPPED_LEGS`. A caller who named tags is never second-guessed.
+
+When both tags come from the map the tap issues **no `query`** — that is the
+whole point of the map, and the reason `from_tags` is in the value format at all.
+
+Not done here, and worth knowing: the resolved node is not persisted into the
+session registry, so an adopting pod re-reads the map rather than inheriting the
+answer. That is fine while the call is up and the key's TTL holds, and it is why
+`deploy.md` says the TTL must outlive the longest call.
+
+`metrics.rs` renders the three counters only when `MetricsSources.discovery` is
+`Some`, which it is only when a prefix is configured — the same "absent beats a
+lying zero" rule the pump and keeper counters follow.
+
 ### health.rs — the readiness snapshot behind /readyz (item 44, G4, 2026-08-26)
 
 `Readiness` is the whole design in one sentence: a `Mutex<[DependencyHealth; 3]>`

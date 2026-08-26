@@ -43,9 +43,14 @@ services:
     depends_on: [rtpengine, redpanda, redis]
     entrypoint: ["/bin/sh", "-c"]
     command:
-      - sed "s/__ADVERTISED_IP__/${ADVERTISED_IP:-127.0.0.1}/" /etc/opensips/opensips.cfg.tmpl > /tmp/opensips.cfg && exec /usr/sbin/opensips -F -f /tmp/opensips.cfg
+      - sed -e "s|__ADVERTISED_IP__|${ADVERTISED_IP:-127.0.0.1}|" -e "s|__DISCOVERY__|${DISCOVERY:-off}|g" -e "s|__DISCOVERY_PREFIX__|${DISCOVERY_PREFIX:-mss:call-node:}|g" -e "s|__DISCOVERY_TTL__|${DISCOVERY_TTL:-3600}|g" -e "s|__DISCOVERY_NODE__|${DISCOVERY_NODE:-172.31.99.10:22222}|g" /etc/opensips/opensips.cfg.tmpl > /tmp/opensips.cfg && exec /usr/sbin/opensips -F -f /tmp/opensips.cfg
+    # DISCOVERY=on turns on the call-id -> rtpengine node map (item G11). Off by
+    # default, so every existing drill sees the proxy it always saw.
+    environment:
+      DISCOVERY_REDIS: 172.31.99.61:6379
     volumes:
       - ./opensips/opensips.cfg:/etc/opensips/opensips.cfg.tmpl:ro
+      - ./opensips/discovery_publish.py:/lab/discovery_publish.py:ro
     ports:
       - "5060:5060/udp"
     networks:
@@ -148,7 +153,7 @@ services:
     environment:
       CARGO_TARGET_DIR: /target
       RUST_LOG: info
-      MSS_RTPENGINE_NODE: 172.31.99.10:22222
+      MSS_RTPENGINE_NODE: ${MSS_RTPENGINE_NODE:-172.31.99.10:22222}
       MSS_TAP_TRANSCODE: ${MSS_TAP_TRANSCODE:-on}
       MSS_TAP_LOCAL_IP: 172.31.99.30
       MSS_TAP_SECONDS: "900"
@@ -235,7 +240,7 @@ services:
       MSS_CONTROL_LISTEN: 0.0.0.0:50551
       MSS_METRICS_LISTEN: 0.0.0.0:9464
       MSS_POD_NAME: lab-control
-      MSS_RTPENGINE_NODE: 172.31.99.10:22222
+      MSS_RTPENGINE_NODE: ${MSS_RTPENGINE_NODE:-172.31.99.10:22222}
       MSS_TAP_TRANSCODE: ${MSS_TAP_TRANSCODE:-on}
       MSS_TAP_LOCAL_IP: 172.31.99.31
       MSS_KAFKA_BROKERS: 172.31.99.60:9092
@@ -252,6 +257,8 @@ services:
       MSS_MEDIA_ADVERTISE_IP: ${MSS_MEDIA_ADVERTISE_IP:-}
       MSS_DRAIN_TIMEOUT_SECS: ${MSS_DRAIN_TIMEOUT_SECS:-}
       MSS_HEALTH_PROBE_INTERVAL_SECS: ${MSS_HEALTH_PROBE_INTERVAL_SECS:-}
+      MSS_DISCOVERY_REDIS_KEY_PREFIX: ${MSS_DISCOVERY_REDIS_KEY_PREFIX:-}
+      MSS_DISCOVERY_REDIS_URL: ${MSS_DISCOVERY_REDIS_URL:-}
     ports:
       - "50551:50551"
       - "9464:9464"
@@ -286,7 +293,7 @@ services:
       MSS_CONTROL_LISTEN: 0.0.0.0:50551
       MSS_METRICS_LISTEN: 0.0.0.0:9464
       MSS_POD_NAME: lab-control-b
-      MSS_RTPENGINE_NODE: 172.31.99.10:22222
+      MSS_RTPENGINE_NODE: ${MSS_RTPENGINE_NODE:-172.31.99.10:22222}
       MSS_TAP_TRANSCODE: ${MSS_TAP_TRANSCODE:-on}
       MSS_TAP_LOCAL_IP: 172.31.99.32
       MSS_KAFKA_BROKERS: 172.31.99.60:9092
@@ -303,6 +310,8 @@ services:
       MSS_MEDIA_ADVERTISE_IP: ${MSS_MEDIA_ADVERTISE_IP:-}
       MSS_DRAIN_TIMEOUT_SECS: ${MSS_DRAIN_TIMEOUT_SECS:-}
       MSS_HEALTH_PROBE_INTERVAL_SECS: ${MSS_HEALTH_PROBE_INTERVAL_SECS:-}
+      MSS_DISCOVERY_REDIS_KEY_PREFIX: ${MSS_DISCOVERY_REDIS_KEY_PREFIX:-}
+      MSS_DISCOVERY_REDIS_URL: ${MSS_DISCOVERY_REDIS_URL:-}
     ports:
       - "50552:50551"
       - "9465:9464"
@@ -330,7 +339,7 @@ services:
       MSS_CONTROL_LISTEN: 0.0.0.0:50551
       MSS_METRICS_LISTEN: 0.0.0.0:9464
       MSS_POD_NAME: lab-control-c
-      MSS_RTPENGINE_NODE: 172.31.99.10:22222
+      MSS_RTPENGINE_NODE: ${MSS_RTPENGINE_NODE:-172.31.99.10:22222}
       MSS_TAP_TRANSCODE: ${MSS_TAP_TRANSCODE:-on}
       MSS_TAP_LOCAL_IP: 172.31.99.33
       MSS_KAFKA_BROKERS: 172.31.99.60:9092
@@ -347,6 +356,8 @@ services:
       MSS_MEDIA_ADVERTISE_IP: ${MSS_MEDIA_ADVERTISE_IP:-}
       MSS_DRAIN_TIMEOUT_SECS: ${MSS_DRAIN_TIMEOUT_SECS:-}
       MSS_HEALTH_PROBE_INTERVAL_SECS: ${MSS_HEALTH_PROBE_INTERVAL_SECS:-}
+      MSS_DISCOVERY_REDIS_KEY_PREFIX: ${MSS_DISCOVERY_REDIS_KEY_PREFIX:-}
+      MSS_DISCOVERY_REDIS_URL: ${MSS_DISCOVERY_REDIS_URL:-}
     ports:
       - "50553:50551"
       - "9466:9464"
