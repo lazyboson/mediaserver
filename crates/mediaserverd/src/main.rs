@@ -2,6 +2,7 @@
 
 mod conference;
 mod consumer_ws;
+mod drain;
 mod event_pump;
 mod hub;
 mod inline_leg;
@@ -18,11 +19,15 @@ mod tap_plane;
 mod tap_session;
 mod tap_spike;
 
+use control_api::proto;
+use control_api::proto::media_control_server::MediaControl;
+use control_api::tonic::Request;
 use control_api::{AuthPolicy, ObservationSink, SessionController};
+use drain::{DrainSteps, SessionsClosed};
 use media_core::AudioFormat;
 use ng_transport::{NgTransport, NgTransportConfig};
 use std::net::{IpAddr, SocketAddr};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tap_plane::{TapPlane, TapPlaneConfig};
 use tracing::{error, info, warn};
@@ -43,7 +48,6 @@ const OPUS_DECODE_RATE_DEFAULT_HZ: u32 = 16000;
 const AUTH_TOKEN_ENV: &str = "MSS_AUTH_TOKEN";
 const RECORDING_BUCKET_ENV: &str = "MSS_RECORDING_BUCKET";
 const DEFAULT_POD_NAME: &str = "mediaserverd";
-const EVENT_FLUSH_WINDOW: std::time::Duration = std::time::Duration::from_secs(10);
 
 fn main() {
     tracing_subscriber::fmt()
@@ -103,10 +107,8 @@ fn main() {
                     env = CONTROL_LISTEN_ENV,
                     "no control plane listen address configured; idling"
                 );
-                tokio::signal::ctrl_c()
-                    .await
-                    .expect("failed to listen for shutdown signal");
-                info!("shutdown signal received");
+                let signal = drain::next_shutdown_signal().await;
+                info!(signal = signal.name(), "shutdown signal received");
             }
         }
     });
@@ -304,6 +306,8 @@ async fn serve_control_plane(
     capabilities: Arc<rtpengine_capability::NodeCapabilityLog>,
 ) {
     let owner = std::env::var(POD_NAME_ENV).unwrap_or_else(|_| DEFAULT_POD_NAME.to_string());
+    let drain_state = drain::DrainState::shared();
+    let drain_budget = drain::drain_timeout();
     let recording = match recorder::RecordingSupport::from_env(&owner) {
         Ok(recording) => recording,
         Err(error) => {
@@ -375,15 +379,18 @@ async fn serve_control_plane(
     let controller = Arc::new(controller);
     observing.observe_through(Arc::downgrade(&controller) as std::sync::Weak<dyn ObservationSink>);
     let mut keeper_counters = None;
+    let mut keeper_handles = None;
     match session_store_from_env().await {
         Ok(Some(store)) => {
-            let keeper =
+            let keeper = Arc::new(
                 registry_keeper::RegistryKeeper::new(Arc::clone(&controller), store, owner.clone())
                     .with_subscriptions(
                         Arc::clone(&observing) as Arc<dyn registry_keeper::TapSubscriptions>
-                    );
+                    ),
+            );
             keeper_counters = Some(keeper.counters());
-            tokio::spawn(keeper.run());
+            let renewing = tokio::spawn(Arc::clone(&keeper).run());
+            keeper_handles = Some(KeeperHandles { keeper, renewing });
         }
         Ok(None) => info!(
             env = REDIS_URL_ENV,
@@ -405,6 +412,7 @@ async fn serve_control_plane(
                         .as_ref()
                         .map(|(_, counters)| Arc::clone(counters)),
                     keeper: keeper_counters.clone(),
+                    drain: Arc::clone(&drain_state),
                 };
                 tokio::spawn(metrics::serve(metrics_listener, sources));
             }
@@ -428,19 +436,37 @@ async fn serve_control_plane(
     }
 
     let auth = auth_policy_from_env();
-    let served = control_api::serve_authenticated_until(controller, auth, listener, async {
-        tokio::signal::ctrl_c()
-            .await
-            .expect("failed to listen for shutdown signal");
-        info!(
-            live_taps = draining.live_sessions(),
-            "shutdown signal received; draining the control plane"
-        );
-    })
-    .await;
-    if let Err(error) = served {
-        warn!(%error, "the control plane stopped with an error");
-    }
+    let mut until_draining = controller.drain_watch();
+    let serving = tokio::spawn(control_api::serve_authenticated_until(
+        Arc::clone(&controller),
+        auth,
+        listener,
+        async move {
+            let _ = until_draining.wait_for(|draining| *draining).await;
+        },
+    ));
+
+    let signal = drain::next_shutdown_signal().await;
+    info!(
+        signal = signal.name(),
+        live_taps = draining.live_sessions(),
+        drain_budget_secs = drain_budget.as_secs(),
+        "shutdown signal received; draining the control plane"
+    );
+    drain::exit_on_second_signal();
+
+    let steps = ControlPlaneDrain {
+        drain: Arc::clone(&drain_state),
+        controller: Arc::clone(&controller),
+        plane: Arc::clone(&draining),
+        keeper: keeper_handles,
+        serving: Mutex::new(Some(serving)),
+        events: pump_worker
+            .as_ref()
+            .map(|(_, counters)| Arc::clone(counters)),
+    };
+    drain::run_drain(&steps, drain_budget).await;
+
     if let Some(counters) = keeper_counters {
         info!(
             persisted = counters
@@ -448,13 +474,18 @@ async fn serve_control_plane(
                 .load(std::sync::atomic::Ordering::Relaxed),
             adopted = counters.adopted.load(std::sync::atomic::Ordering::Relaxed),
             released = counters.released.load(std::sync::atomic::Ordering::Relaxed),
+            handed_off = counters
+                .handed_off
+                .load(std::sync::atomic::Ordering::Relaxed),
             lost = counters.lost.load(std::sync::atomic::Ordering::Relaxed),
             failed = counters.failed.load(std::sync::atomic::Ordering::Relaxed),
             "session registry totals at shutdown"
         );
     }
     if let Some((worker, counters)) = pump_worker {
-        let unsent = event_pump::await_empty_backlog(&counters, EVENT_FLUSH_WINDOW).await;
+        let unsent = counters
+            .retry_depth
+            .load(std::sync::atomic::Ordering::Relaxed);
         if unsent > 0 {
             warn!(
                 unsent,
@@ -475,6 +506,93 @@ async fn serve_control_plane(
             unsent,
             "event bus totals at shutdown"
         );
+    }
+}
+
+struct KeeperHandles {
+    keeper: Arc<registry_keeper::RegistryKeeper>,
+    renewing: tokio::task::JoinHandle<()>,
+}
+
+type ServingControlPlane =
+    tokio::task::JoinHandle<Result<(), control_api::tonic::transport::Error>>;
+
+struct ControlPlaneDrain {
+    drain: Arc<drain::DrainState>,
+    controller: Arc<SessionController>,
+    plane: Arc<TapPlane>,
+    keeper: Option<KeeperHandles>,
+    serving: Mutex<Option<ServingControlPlane>>,
+    events: Option<Arc<event_pump::PumpCounters>>,
+}
+
+#[control_api::async_trait]
+impl DrainSteps for ControlPlaneDrain {
+    fn stop_accepting(&self) {
+        self.drain.begin();
+        self.controller.begin_drain();
+        info!(
+            live_taps = self.plane.live_sessions(),
+            "readiness is off and no new session or attachment will be taken here"
+        );
+    }
+
+    async fn hand_off_leases(&self) -> usize {
+        let Some(handles) = self.keeper.as_ref() else {
+            return 0;
+        };
+        handles.renewing.abort();
+        handles.keeper.hand_off_leases().await
+    }
+
+    async fn close_sessions(&self) -> SessionsClosed {
+        let mut closed = SessionsClosed::default();
+        for (session, _) in self.controller.snapshot() {
+            let external_id = session.external_id.clone();
+            let ended = self
+                .controller
+                .destroy_session(Request::new(proto::SessionRef {
+                    id: Some(proto::session_ref::Id::ExternalId(external_id.clone())),
+                }))
+                .await;
+            match ended {
+                Ok(_) => {
+                    closed.closed += 1;
+                    info!(
+                        %external_id,
+                        "session closed for shutdown: consumers stopped, recording finished, tap unsubscribed"
+                    );
+                }
+                Err(error) => {
+                    closed.failed += 1;
+                    warn!(
+                        %external_id,
+                        %error,
+                        "this session could not be closed cleanly; rtpengine keeps its subscription"
+                    );
+                }
+            }
+        }
+        closed
+    }
+
+    async fn await_control_plane_idle(&self) {
+        let serving = self.serving.lock().ok().and_then(|mut held| held.take());
+        let Some(serving) = serving else {
+            return;
+        };
+        match serving.await {
+            Ok(Ok(())) => info!("the control plane listener closed"),
+            Ok(Err(error)) => warn!(%error, "the control plane stopped with an error"),
+            Err(error) => warn!(%error, "the control plane task did not end cleanly"),
+        }
+    }
+
+    async fn flush_events(&self) -> u64 {
+        let Some(counters) = self.events.as_ref() else {
+            return 0;
+        };
+        event_pump::await_empty_backlog(counters, drain::EVENT_FLUSH_WINDOW).await
     }
 }
 
