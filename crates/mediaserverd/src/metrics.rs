@@ -379,6 +379,16 @@ pub fn render(sources: &MetricsSources) -> String {
         snapshot.recording_segment_spill_failures,
     );
     counter(
+        "mss_recording_spill_lost_ownership_total",
+        "Closed segments not spilled because another pod had adopted the spill journal",
+        snapshot.recording_spill_lost_ownership,
+    );
+    counter(
+        "mss_recording_spill_foreign_manifests",
+        "Spill journals left alone on this pod's start because another pod owns them",
+        snapshot.recording_spill_foreign_manifests,
+    );
+    counter(
         "mss_recording_salvaged_total",
         "Recordings uploaded from segments an earlier life of this pod left on disk",
         snapshot.recording_salvaged,
@@ -976,6 +986,8 @@ mod tests {
             "mss_recording_groups_live",
             "mss_recording_group_members_live",
             "mss_recording_group_joins_refused_total",
+            "mss_recording_spill_lost_ownership_total",
+            "mss_recording_spill_foreign_manifests",
         ] {
             assert!(text.contains(name), "missing {name} in:\n{text}");
         }

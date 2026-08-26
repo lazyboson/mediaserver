@@ -168,7 +168,31 @@ Events are **at-least-once** since defect D5: a consumer must dedupe by
 | `MSS_RECORDING_S3_ACCESS_KEY_ID` / `…_SECRET_ACCESS_KEY` | unset | Static credentials. Leave **both** out to let the object store client pick up an instance/IRSA/workload-identity role instead; a half-set pair is the failure that looks like a bug | prefer a role; use keys where there is none | M5 |
 | `MSS_RECORDING_SPILL_DIR` | unset (memory only) | Closed segments spill here so a container restart does not lose them (defect D9), and this pod's leftovers are salvaged on its next start — never over an object that already exists | always set it, to a writable volume. The root filesystem is read-only and the process runs as uid 65532, so it must be a mount | [item 30](tasks.md) |
 | `MSS_RECORDING_UPLOAD_CONCURRENCY` | `4` | How many finished recordings upload at once. `Detach`/`StopRecording` never waits for an upload ([item 50](tasks.md), D11): it returns as soon as the segment is closed and `RecordingStopped` is published, and the upload runs on in the background. This bounds how many run at a time — and therefore the memory, since each holds one rendered WAV. Empty = unset = the default | raise it only if `mss_recording_uploads_in_flight` sits at the cap while calls end faster than uploads finish; lower it to protect a slow object store | [item 50](tasks.md) |
-| `MSS_RECORDING_SPILL_SECONDS` | `30` | How often a live recording spills. This **is** the worst-case audio loss when a container dies mid-call on the same pod | lower for shorter worst-case loss, at more IO | [item 30](tasks.md) |
+| `MSS_RECORDING_SPILL_SECONDS` | `30` | How often a live recording spills. This **is** the worst-case audio loss when a pod dies mid-call — on the same pod always, and on **any** pod with `MSS_RECORDING_SPILL_TO=s3` | lower for shorter worst-case loss, at more IO | [item 30](tasks.md), [item 53](tasks.md) |
+| `MSS_RECORDING_SPILL_TO` | `disk` | Where the segment journal lives. `disk` is per-pod local disk (`MSS_RECORDING_SPILL_DIR`; unset there still means "no spill"), so a **cross-pod** adopter reads nothing. `s3` puts the journal in the recording bucket itself under `MSS_RECORDING_SPILL_PREFIX`, so any pod can finish a recording a dead pod started. Anything else logs a warning and means `disk` | set `s3` whenever you run more than one pod and care about recordings surviving a node loss | [item 53](tasks.md) |
+| `MSS_RECORDING_SPILL_PREFIX` | `_spill/` | The **reserved** key prefix inside the recording bucket that `MSS_RECORDING_SPILL_TO=s3` writes journals under (a missing trailing `/` is added). Nothing but MSS may write there, and nothing outside it is ever written by the spill | change it only if `_spill/` collides with keys you already have | [item 53](tasks.md) |
+
+**The bucket holds two namespaces, and only one of them is a contract.**
+`${accountID}/${recordingID}.${format}` (and
+`${accountID}/${recordingID}/${participant}.${format}` for a recording group) is
+the frozen recording identity — Constitution, Article VII. Everything under
+`MSS_RECORDING_SPILL_PREFIX` (`_spill/` by default) is MSS's own scratch space:
+raw little-endian PCM chunks and a `manifest.json` per unfinished recording, of
+no use to a consumer, deleted by MSS as soon as the recording reaches its real
+key. Two operational consequences:
+
+- **Do not point a downstream consumer at the whole bucket.** Filter to the
+  identity scheme, or give `_spill/` its own exclusion, or your pipeline will
+  try to play headerless `.pcm` files.
+- **Give `_spill/` a lifecycle rule: expire objects after 7 days.** MSS deletes a
+  journal when its recording lands and skips a foreign one on startup salvage, so
+  what accumulates is only the journals of recordings that never finished on any
+  pod. **MSS implements no retention of its own** — this rule is the retention
+  policy, and it is yours to configure. On S3 it is one lifecycle
+  configuration with `Filter.Prefix: _spill/` and `Expiration.Days: 7`; on MinIO,
+  `mc ilm rule add --expire-days 7 --prefix _spill/ lab/<bucket>`. Seven days is
+  the number to start from: it is far past any `MAX_RECORDING` (2 h) and short
+  enough that a bad week does not become a storage bill.
 
 ### Lifecycle
 
@@ -258,7 +282,7 @@ Two deliberate choices in that block:
   not as a slow API. Bound the pod with requests and node-level allocation.
 - **The spill volume is an `emptyDir`, not a PVC.** It only has to survive a
   container restart: a cross-pod adopter cannot read another pod's disk either
-  way. Size it at (spill interval) × (concurrent recordings) × 16 kB/s per
+  way, which is what `MSS_RECORDING_SPILL_TO=s3` is for. Size it at (spill interval) × (concurrent recordings) × 16 kB/s per
   8 kHz 16-bit channel — about 1 MB per channel-minute — with headroom for a
   bucket outage.
 
@@ -492,7 +516,7 @@ simply ask again. Nothing else in the system has that property.
 | **Attachments that dial into MSS** (`GRPC_STREAM`) | no, by construction | the consumer's HTTP/2 connection died with the pod; it must reattach. This is why the Service is headless — a client resolving all pod IPs notices |
 | **Inline legs** (Phase 3) | **no** | the peer's SDP points at a socket that no longer exists. This fails like any media endpoint failure and needs recovery at call-control level |
 | **Conferences** (Phase 4) | **no** | the mixer is pod-local; a room does not move. Defect D16 — pod-local groups — is open pending a placement decision |
-| **Recordings** | **partly** | closed segments spill to per-pod local disk, so a **same-pod** restart loses at most `MSS_RECORDING_SPILL_SECONDS`. A **cross-pod** adopter cannot read that disk: it recovers what it can, pads the rest, and counts it in `mss_recording_frames_lost_on_adopt_total`. Defect D9's residual |
+| **Recordings** | **yes, with `MSS_RECORDING_SPILL_TO=s3`** | closed segments spill every `MSS_RECORDING_SPILL_SECONDS` into the recording bucket, the adopting pod reads them back and pads only what the dead pod had not spilled yet, so the worst case is one spill interval on **any** pod (`mss_recording_frames_lost_on_adopt_total` says how much). With the default `disk` that guarantee holds only for a **same-pod** restart, because a cross-pod adopter cannot read the dead pod's disk — it recovers nothing and pads the whole recording. Either way the journals of recordings that never finished need a bucket lifecycle rule on `_spill/`: MSS implements no retention. Never measured on a live pod kill with a recorder attached — see [item 53](tasks.md) |
 | **Events** | yes | at-least-once with a bounded retry backlog; a pod death or an overfull backlog still loses events, and the gapless per-session `seq` makes the hole visible |
 
 Run at least two pods, spread across nodes (the base prefers it; both overlays
@@ -592,6 +616,19 @@ windows and anything slower makes a short drop burst invisible. It selects by
 silently ignored. No operator? Drop both files and scrape
 `mediaserverd-scrape:9464/metrics` however you already scrape things; nothing in
 mediaserverd depends on the operator.
+
+### Recording spill series (item 53)
+
+Read these three together when a pod dies mid-recording:
+
+| Series | Meaning |
+| --- | --- |
+| `mss_recording_spill_segments_total` | closed segments written to the journal while the call was still up. **Zero on a pod that is recording is the alarm**: nothing is spilling, so a pod death costs the whole recording |
+| `mss_recording_spill_failures_total` | segments the journal refused (disk full, bucket unreachable, past the 10 s spill timeout). The audio stays in memory and the next tick retries, so a few are survivable and a rising rate is not |
+| `mss_recording_frames_lost_on_adopt_total` | recorded frames an adopting pod could read from neither memory nor the journal, and turned into silence. With `MSS_RECORDING_SPILL_TO=s3` this should stay under one spill interval per adoption; with `disk` a cross-pod adoption shows up here as the whole recording |
+| `mss_recording_spill_lost_ownership_total` | closed segments **not** spilled because another pod had already adopted the journal. Non-zero means a partitioned-but-alive pod was still recording a call it no longer owns — the registry's `mss_registry_lost_total` should say the same thing |
+| `mss_recording_spill_foreign_manifests` | journals this pod's startup salvage left alone because their manifest names another owner. Expected and healthy after a rolling restart; a number that only grows means journals nobody is finishing, which is what the `_spill/` lifecycle rule is for |
+| `mss_recording_salvaged_total` / `…_salvage_skipped_total` / `…_salvage_failures_total` | what this pod's start did with its *own* leftover journals: uploaded, left alone because the object already existed, or failed |
 
 ### rtpengine node series (item 57)
 
@@ -812,9 +849,11 @@ capacity plan. The full read-only checklist is
 object landed at exactly `${accountID}/${recordingID}.${format}` — that identity
 is frozen, and anything reading recordings downstream depends on it. Then pause
 and resume mid-call and confirm the segmenting. Then kill the container mid-call
-and confirm the spill salvage on restart. Note the residual honestly: a
-**cross-pod** adopter cannot read the dead pod's spill directory (defect D9), and
-byte-parity against a FreeSWITCH recording is handoff **H6**.
+and confirm the spill salvage on restart. Then, with
+`MSS_RECORDING_SPILL_TO=s3`, kill a pod mid-recording and confirm another pod
+finishes the object with at most `MSS_RECORDING_SPILL_SECONDS` missing — that is
+the cross-pod half of D9, and it has never been measured on real gear or in the
+lab. Byte-parity against a FreeSWITCH recording is handoff **H6**.
 
 **5. Drain and adopt, on purpose, before it happens by accident.** With a tapped
 call up: `kubectl -n mediaserver delete pod <pod>`. Expect the drain sequence in
