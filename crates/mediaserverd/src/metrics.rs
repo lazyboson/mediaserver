@@ -1,5 +1,6 @@
 use crate::drain::DrainState;
 use crate::event_pump::PumpCounters;
+use crate::health::{Readiness, HEALTHZ_PATH, READYZ_PATH};
 use crate::media_ports::MediaPortAllocator;
 use crate::registry_keeper::KeeperCounters;
 use crate::tap_plane::TapPlaneMetrics;
@@ -12,6 +13,9 @@ use tokio::net::TcpListener;
 use tracing::{info, warn};
 
 const REQUEST_READ_LIMIT: usize = 8 * 1024;
+const METRICS_PATH: &str = "/metrics";
+const EXPOSITION_CONTENT_TYPE: &str = "text/plain; version=0.0.4; charset=utf-8";
+const PLAIN_CONTENT_TYPE: &str = "text/plain; charset=utf-8";
 const REQUEST_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 #[derive(Clone)]
@@ -22,6 +26,66 @@ pub struct MetricsSources {
     pub keeper: Option<Arc<KeeperCounters>>,
     pub drain: Arc<DrainState>,
     pub ports: Arc<MediaPortAllocator>,
+    pub readiness: Arc<Readiness>,
+}
+
+pub struct HttpResponse {
+    pub status: &'static str,
+    pub content_type: &'static str,
+    pub body: String,
+}
+
+pub fn route(request: &[u8], sources: &MetricsSources) -> HttpResponse {
+    let Some(line) = std::str::from_utf8(request)
+        .ok()
+        .and_then(|text| text.lines().next())
+    else {
+        return HttpResponse {
+            status: "400 Bad Request",
+            content_type: PLAIN_CONTENT_TYPE,
+            body: "the request line is not readable\n".to_string(),
+        };
+    };
+    let mut words = line.split_whitespace();
+    let method = words.next().unwrap_or_default();
+    let target = words.next().unwrap_or_default();
+    let path = target.split(['?', '#']).next().unwrap_or(target);
+    if !matches!(method, "GET" | "HEAD") {
+        return HttpResponse {
+            status: "405 Method Not Allowed",
+            content_type: PLAIN_CONTENT_TYPE,
+            body: format!("{METRICS_PATH}, {HEALTHZ_PATH} and {READYZ_PATH} answer GET\n"),
+        };
+    }
+    match path {
+        METRICS_PATH => HttpResponse {
+            status: "200 OK",
+            content_type: EXPOSITION_CONTENT_TYPE,
+            body: render(sources),
+        },
+        HEALTHZ_PATH => HttpResponse {
+            status: "200 OK",
+            content_type: PLAIN_CONTENT_TYPE,
+            body: "alive\n".to_string(),
+        },
+        READYZ_PATH => {
+            let verdict = sources.readiness.verdict();
+            HttpResponse {
+                status: if verdict.ready {
+                    "200 OK"
+                } else {
+                    "503 Service Unavailable"
+                },
+                content_type: PLAIN_CONTENT_TYPE,
+                body: verdict.body,
+            }
+        }
+        _ => HttpResponse {
+            status: "404 Not Found",
+            content_type: PLAIN_CONTENT_TYPE,
+            body: format!("{METRICS_PATH}\n{HEALTHZ_PATH}\n{READYZ_PATH}\n"),
+        },
+    }
 }
 
 pub fn render(sources: &MetricsSources) -> String {
@@ -610,6 +674,31 @@ pub fn render(sources: &MetricsSources) -> String {
         u8::from(sources.drain.is_draining())
     );
 
+    let readiness = sources.readiness.snapshot();
+    let _ = writeln!(
+        out,
+        "# HELP mss_ready Whether this pod answers its readiness probe with 200"
+    );
+    let _ = writeln!(out, "# TYPE mss_ready gauge");
+    let _ = writeln!(out, "mss_ready {}", u8::from(readiness.ready));
+    let _ = writeln!(
+        out,
+        "# HELP mss_dependency_ready Whether a configured dependency answered its last probe"
+    );
+    let _ = writeln!(out, "# TYPE mss_dependency_ready gauge");
+    for dependency in readiness
+        .dependencies
+        .iter()
+        .filter(|dependency| dependency.configured)
+    {
+        let _ = writeln!(
+            out,
+            "mss_dependency_ready{{dependency=\"{}\"}} {}",
+            dependency.label,
+            u8::from(dependency.ready)
+        );
+    }
+
     let _ = writeln!(
         out,
         "# HELP mss_build_info Version of this mediaserverd binary"
@@ -660,14 +749,16 @@ pub async fn serve(listener: TcpListener, sources: MetricsSources) {
             if !complete {
                 return;
             }
-            let body = render(&sources);
+            let answered = route(&request[..read], &sources);
             let response = format!(
-                "HTTP/1.1 200 OK\r\n\
-                 Content-Type: text/plain; version=0.0.4; charset=utf-8\r\n\
+                "HTTP/1.1 {}\r\n\
+                 Content-Type: {}\r\n\
                  Content-Length: {}\r\n\
                  Connection: close\r\n\r\n{}",
-                body.len(),
-                body
+                answered.status,
+                answered.content_type,
+                answered.body.len(),
+                answered.body
             );
             if let Err(error) = socket.write_all(response.as_bytes()).await {
                 warn!(%peer, %error, "could not write a metrics response");
@@ -685,6 +776,7 @@ mod tests {
     use std::net::IpAddr;
 
     fn sources() -> MetricsSources {
+        let drain = DrainState::shared();
         let plane = TapPlane::new(TapPlaneConfig {
             default_node: None,
             local_media_address: IpAddr::from([127, 0, 0, 1]),
@@ -703,8 +795,9 @@ mod tests {
             controller: Arc::new(SessionController::new("test-pod")),
             pump: Some(Arc::new(PumpCounters::default())),
             keeper: Some(Arc::new(KeeperCounters::default())),
-            drain: DrainState::shared(),
+            drain: Arc::clone(&drain),
             ports: crate::media_ports::MediaPortAllocator::ephemeral(),
+            readiness: crate::health::Readiness::shared(drain),
         }
     }
 
@@ -809,6 +902,103 @@ mod tests {
         assert!(render(&sources).contains("mss_draining 1"));
     }
 
+    fn probed_sources() -> MetricsSources {
+        let sources = sources();
+        for dependency in crate::health::DEPENDENCIES {
+            sources.readiness.record_ready(dependency);
+        }
+        sources
+    }
+
+    fn get(path: &str, sources: &MetricsSources) -> HttpResponse {
+        route(
+            format!("GET {path} HTTP/1.1\r\nHost: test\r\n\r\n").as_bytes(),
+            sources,
+        )
+    }
+
+    #[test]
+    fn liveness_answers_while_the_process_runs_whatever_the_dependencies_do() {
+        let sources = sources();
+        let answered = get(HEALTHZ_PATH, &sources);
+        assert_eq!(answered.status, "200 OK");
+        assert_eq!(answered.body, "alive\n");
+        sources.drain.begin();
+        sources
+            .readiness
+            .record_failure(crate::health::Dependency::Redis, "connection refused");
+        assert_eq!(get(HEALTHZ_PATH, &sources).status, "200 OK");
+    }
+
+    #[test]
+    fn readiness_waits_for_the_first_probe_of_every_dependency() {
+        let answered = get(READYZ_PATH, &sources());
+        assert_eq!(answered.status, "503 Service Unavailable");
+        assert!(
+            answered.body.contains("not probed yet"),
+            "{}",
+            answered.body
+        );
+        assert_eq!(get(READYZ_PATH, &probed_sources()).status, "200 OK");
+    }
+
+    #[test]
+    fn readiness_names_the_dependency_that_stopped_answering() {
+        let sources = probed_sources();
+        sources
+            .readiness
+            .record_failure(crate::health::Dependency::Redis, "connection refused");
+        let answered = get(READYZ_PATH, &sources);
+        assert_eq!(answered.status, "503 Service Unavailable");
+        let first = answered.body.lines().next().unwrap();
+        assert!(first.contains("redis"), "{first}");
+        assert!(first.contains("connection refused"), "{first}");
+    }
+
+    #[test]
+    fn readiness_turns_away_traffic_the_moment_a_drain_begins() {
+        let sources = probed_sources();
+        assert_eq!(get(READYZ_PATH, &sources).status, "200 OK");
+        sources.drain.begin();
+        let answered = get(READYZ_PATH, &sources);
+        assert_eq!(answered.status, "503 Service Unavailable");
+        assert!(answered.body.contains("draining"), "{}", answered.body);
+    }
+
+    #[test]
+    fn the_exposition_says_whether_the_pod_is_ready_and_which_dependency_is_not() {
+        let sources = probed_sources();
+        sources
+            .readiness
+            .record_not_configured(crate::health::Dependency::Kafka);
+        sources
+            .readiness
+            .record_failure(crate::health::Dependency::Redis, "connection refused");
+        let text = render(&sources);
+        assert!(text.contains("mss_ready 0"), "{text}");
+        assert!(
+            text.contains("mss_dependency_ready{dependency=\"redis\"} 0"),
+            "{text}"
+        );
+        assert!(
+            text.contains("mss_dependency_ready{dependency=\"rtpengine\"} 1"),
+            "{text}"
+        );
+        assert!(!text.contains("dependency=\"kafka\""), "{text}");
+    }
+
+    #[test]
+    fn only_the_three_documented_paths_answer_and_only_to_a_get() {
+        let sources = probed_sources();
+        assert_eq!(get(METRICS_PATH, &sources).status, "200 OK");
+        assert_eq!(get("/metrics?collect=all", &sources).status, "200 OK");
+        let unknown = get("/", &sources);
+        assert_eq!(unknown.status, "404 Not Found");
+        assert!(unknown.body.contains(READYZ_PATH), "{}", unknown.body);
+        let refused = route(b"POST /metrics HTTP/1.1\r\n\r\n", &sources);
+        assert_eq!(refused.status, "405 Method Not Allowed");
+    }
+
     #[tokio::test]
     async fn the_endpoint_answers_a_plain_http_get() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -825,5 +1015,42 @@ mod tests {
         assert!(response.starts_with("HTTP/1.1 200 OK"));
         assert!(response.contains("mss_sessions_live 0"));
         assert!(response.contains("text/plain"));
+    }
+
+    #[tokio::test]
+    async fn the_probe_paths_answer_over_the_wire_with_their_own_status_codes() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let sources = probed_sources();
+        let readiness = Arc::clone(&sources.readiness);
+        tokio::spawn(serve(listener, sources));
+
+        assert!(fetch(address, HEALTHZ_PATH)
+            .await
+            .starts_with("HTTP/1.1 200 OK"));
+        assert!(fetch(address, READYZ_PATH)
+            .await
+            .starts_with("HTTP/1.1 200 OK"));
+        readiness.record_failure(crate::health::Dependency::Redis, "connection refused");
+        let refused = fetch(address, READYZ_PATH).await;
+        assert!(
+            refused.starts_with("HTTP/1.1 503 Service Unavailable"),
+            "{refused}"
+        );
+        assert!(
+            refused.contains("redis unreachable: connection refused"),
+            "{refused}"
+        );
+    }
+
+    async fn fetch(address: std::net::SocketAddr, path: &str) -> String {
+        let mut socket = tokio::net::TcpStream::connect(address).await.unwrap();
+        socket
+            .write_all(format!("GET {path} HTTP/1.1\r\nHost: test\r\n\r\n").as_bytes())
+            .await
+            .unwrap();
+        let mut response = String::new();
+        socket.read_to_string(&mut response).await.unwrap();
+        response
     }
 }

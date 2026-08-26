@@ -78,6 +78,8 @@ impl PersistedSession {
 
 #[control_api::async_trait]
 pub trait SessionStore: Send + Sync + 'static {
+    async fn ping(&self) -> Result<(), StoreError>;
+
     async fn upsert(&self, session: &PersistedSession) -> Result<(), StoreError>;
 
     async fn forget(&self, external_id: &str) -> Result<(), StoreError>;
@@ -142,6 +144,15 @@ impl RedisSessionStore {
 
 #[control_api::async_trait]
 impl SessionStore for RedisSessionStore {
+    async fn ping(&self) -> Result<(), StoreError> {
+        let mut connection = self.connection().await?;
+        redis::cmd("PING")
+            .query_async::<String>(&mut connection)
+            .await
+            .map(|_| ())
+            .map_err(|error| StoreError::Backend(error.to_string()))
+    }
+
     async fn upsert(&self, session: &PersistedSession) -> Result<(), StoreError> {
         let body = serde_json::to_string(session)
             .map_err(|error| StoreError::Encoding(error.to_string()))?;
@@ -278,10 +289,16 @@ impl SessionStore for RedisSessionStore {
 pub struct MemorySessionStore {
     sessions: std::sync::Mutex<BTreeMap<String, PersistedSession>>,
     leases: std::sync::Mutex<BTreeMap<String, String>>,
+    unreachable: std::sync::atomic::AtomicBool,
 }
 
 #[cfg(test)]
 impl MemorySessionStore {
+    pub fn set_unreachable(&self, unreachable: bool) {
+        self.unreachable
+            .store(unreachable, std::sync::atomic::Ordering::SeqCst);
+    }
+
     pub fn expire_lease(&self, external_id: &str) {
         self.leases.lock().unwrap().remove(external_id);
     }
@@ -298,6 +315,13 @@ impl MemorySessionStore {
 #[cfg(test)]
 #[control_api::async_trait]
 impl SessionStore for MemorySessionStore {
+    async fn ping(&self) -> Result<(), StoreError> {
+        if self.unreachable.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(StoreError::Backend("connection refused".to_string()));
+        }
+        Ok(())
+    }
+
     async fn upsert(&self, session: &PersistedSession) -> Result<(), StoreError> {
         self.sessions
             .lock()

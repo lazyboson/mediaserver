@@ -1129,7 +1129,9 @@ which is why item 20's `MSS_TAP_TRANSCODE=off` is the kernel-eligible mode.
   "no".
 - **`mediaserverd/rtpengine_capability.rs`** — a first-contact-per-node
   capability log, called from both the startup NG probe and
-  `TapPlane::open_session`. It logs the version (or why it cannot be had), the
+  `TapPlane::open_session` (since **item 44** that startup probe *repeats* on
+  `MSS_HEALTH_PROBE_INTERVAL_SECS` and a node is forgotten on any failure, so a
+  restarted rtpengine is re-learned instead of keeping the dead node's verdict). It logs the version (or why it cannot be had), the
   relay split, live sessions, the active transcoder chains, and a plain-English
   kernel verdict; when transcoding is on it says at **WARN** that transcoded
   taps are processed in rtpengine userspace and the kernel module cannot help
@@ -2493,6 +2495,111 @@ and needs a NAT/hostNetwork deployment to see live. Exhaustion is unit- and
 in-process-verified (an inline session refused on a one-port range, then served
 after a close), never hit live. No hostPort/hostNetwork manifest yet — that is
 G6.
+
+### 44. Liveness and readiness probes (G4) — ✅ DONE (2026-08-26)
+
+**The gap this closes.** The metrics listener answered `/metrics` (and, in fact,
+*any* path) and nothing else. A Kubernetes Deployment therefore had no probe to
+point at: no liveness endpoint, and no readiness endpoint — so a pod took traffic
+while its rtpengine node was unreachable, while Redis or Kafka were down, and
+**for the whole drain**, because nothing outside the process could see the
+`mss_draining` gauge flip. Item 23 also left the rtpengine capability probe as a
+one-shot at startup: a node that restarted kept its stale verdict for the life of
+the pod.
+
+**What landed.** A new `crates/mediaserverd/src/health.rs` plus two routes on the
+existing dependency-free listener (`metrics.rs`):
+
+- `GET /healthz` → **200 `alive`** while the process runs. It never consults a
+  dependency: liveness must not restart a pod for someone else's outage.
+- `GET /readyz` → **200** only when the pod is not draining *and* every
+  configured dependency answered its last probe; **503** otherwise, with a
+  plain-text body whose first line names the reasons and whose remaining lines
+  report each dependency. An **unconfigured** dependency (no `MSS_RTPENGINE_NODE`,
+  no `MSS_REDIS_URL`, no `MSS_KAFKA_BROKERS`) counts as ready and says
+  `not configured`.
+- `GET /metrics` unchanged, plus two new series: `mss_ready` and
+  `mss_dependency_ready{dependency="rtpengine"|"redis"|"kafka"}` (configured
+  dependencies only — an unconfigured one leaves its series out rather than
+  lying).
+- Any other path is now **404** and a non-GET is **405**; every lab script and
+  the alert rules already ask for `/metrics` by name.
+- `Readiness` is a cached snapshot behind one mutex: the request path reads state
+  and **never** makes a network call. Background watchers (`health::watch`, one
+  per dependency) do the probing — `PING` on the Redis connection
+  (`SessionStore::ping`), a partition-offset fetch on the Kafka topic
+  (`EventTransport::reachable`), and NG `ping` on the rtpengine node. Each waits
+  `MSS_HEALTH_PROBE_INTERVAL_SECS` (default **10**) after a success and backs off
+  1 s → 2 → 4 → 8 → interval while failing, so a restarted dependency is noticed
+  fast; a probe that hangs is a failure after 15 s.
+- The rtpengine watcher also calls `NodeCapabilityLog::forget` on failure, so the
+  next success re-runs `report_first_contact` — **item 23's open re-probe**.
+- Drain needs no new wiring: `DrainSteps::stop_accepting` already calls
+  `DrainState::begin`, and the readiness verdict reads that flag, so `/readyz`
+  turns 503 on the *first* step of the drain.
+
+**Measured live in the lab (2026-08-26)**, pod recreated with
+`MSS_HEALTH_PROBE_INTERVAL_SECS=5`:
+
+```
+$ curl -i 127.0.0.1:9464/healthz        -> HTTP/1.1 200 OK   "alive"
+$ curl -i 127.0.0.1:9464/readyz         -> HTTP/1.1 200 OK
+ready
+rtpengine 172.31.99.10:22222: ready (last ok 0s ago)
+redis: ready (last ok 0s ago)
+kafka: ready (last ok 0s ago)
+draining: no
+$ curl -o /dev/null -w %{http_code} 127.0.0.1:9464/  -> 404      (POST /metrics -> 405)
+mss_ready 1 / mss_dependency_ready{dependency="redis"} 1  in /metrics
+
+$ docker stop mss-microsip-redis-1
+/readyz -> 503 after 8 s:
+not ready: redis unreachable: session store: timed out
+rtpengine 172.31.99.10:22222: ready (last ok 0s ago)
+redis: unreachable: session store: timed out (2 consecutive failures, last ok 10s ago)
+kafka: ready (last ok 3s ago)
+draining: no
+   /healthz stayed 200 throughout; mss_ready 0, mss_dependency_ready{redis} 0
+$ docker start mss-microsip-redis-1     -> /readyz 200 again after 3 s
+   log: "this dependency answered again; readiness is back on"
+
+$ docker restart mss-microsip-rtpengine-1
+   "rtpengine node capabilities on first contact" logged 1 -> 2 times: the
+   restarted node was re-probed and re-learned (item 23's gap)
+
+$ docker stop -t 60 mss-microsip-mss-control-1   (SIGTERM), /readyz polled ~5 ms
+t+0.028 s  200 ready
+t+0.035 s  503 "not ready: draining ... draining: yes"
+t+0.042 s  connection refused (listener gone), exit code 0 at t+0.404 s
+```
+
+**Decisions** (defaults preserve today's behavior):
+
+- **A dependency nobody has probed yet is *not* ready.** A pod that has not yet
+  learned its state must not take traffic. In practice the window is nil: Redis
+  and Kafka are recorded ready at connect (they already refuse to start
+  otherwise) and rtpengine at its first-contact ping, all before the listener
+  binds.
+- **Liveness is not "all my dependencies are up".** Restarting a pod because
+  Redis is down would turn one outage into a crash-loop; `/healthz` is
+  deliberately dumb.
+- **Kafka's probe is a partition-offset read, not a produce.** A produce would
+  put probe records on `mss.events`. A transport that cannot be probed is
+  assumed reachable (`EventTransport::reachable` defaults to `Ok`), so the fakes
+  in the tests keep meaning what they meant.
+- **Readiness is one cached snapshot, never a network call in the request path.**
+  A kubelet probe with a 1 s timeout must not be able to block on a hung Redis.
+- **`MSS_RTPENGINE_NODE` empty or whitespace now means unset**, matching item
+  43's rule, and a *malformed* value is a permanent 503 rather than a silent
+  "no node configured".
+- **The reason body is plain text, not JSON.** `kubectl describe` shows the
+  first line of a failed probe's body, so that line carries the reasons.
+
+**What it does not prove:** no Kubernetes — the endpoints were driven by `curl`
+and `docker stop`, not by a kubelet (the manifests with `readinessProbe`/
+`livenessProbe` wired to these paths are G6); the Kafka probe was never watched
+failing live (Redpanda stayed up; the failure path is unit-tested only); and a
+readiness flap under load has not been soaked.
 
 ## Open defects and soft spots
 

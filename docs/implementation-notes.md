@@ -2236,6 +2236,66 @@ process holds, and asserts: sockets inside the range while tapping, ingest
 datagrams climbing, nothing inside the range once the session is destroyed, and
 `in_use` back to `capacity`.
 
+### health.rs — the readiness snapshot behind /readyz (item 44, G4, 2026-08-26)
+
+`Readiness` is the whole design in one sentence: a `Mutex<[DependencyHealth; 3]>`
+that background tasks write and the HTTP handler only reads. Nothing on the
+request path touches a socket, so a kubelet probe with a 1 s timeout cannot be
+made to hang by a wedged Redis — the worst it can read is a stale verdict, which
+is bounded by `MSS_HEALTH_PROBE_INTERVAL_SECS` (default 10).
+
+The three dependencies are fixed (`Dependency::{Rtpengine, Redis, Kafka}`) and
+indexed by `slot()` into the array — a fixed array rather than a map because the
+set is not extensible at runtime and the exposition wants a stable order. Each
+entry carries a `Condition` (`NotConfigured`, `NotProbedYet`, `Ready`,
+`Failing(reason)`), the optional address to name in the report, the last `Instant`
+it answered, and its consecutive-failure count. `NotProbedYet` is deliberately
+**not ready**: a pod that has not learned its state must not take traffic. In
+practice nobody sees it, because `main.rs` records `Ready` or `NotConfigured` for
+Redis and Kafka at connect time and for rtpengine at its first-contact ping — all
+before the metrics listener binds.
+
+`snapshot()` derives everything the two consumers need (the `/readyz` body and the
+`mss_ready` / `mss_dependency_ready` series) in one lock pass; `verdict()` renders
+the body. Its first line is the machine-readable part — `ready`, or `not ready: `
+followed by the reasons joined with `; ` — because `kubectl describe` shows only
+the first line of a failed probe's body. The rest is one line per dependency plus
+`draining: yes|no`. Draining is read live off `DrainState`, not recorded, which is
+why `/readyz` flips 503 on the *first* drain step (`stop_accepting`) with no new
+wiring: the live check caught the transition 7 ms before the listener went away.
+
+`watch(readiness, probe, interval)` is the only loop. It sleeps
+`next_probe_delay(interval, consecutive_failures)` — the interval on success, and
+1 s → 2 → 4 → 8 → capped at the interval while failing — then runs the probe under
+a 15 s timeout, a timeout being a failure like any other. The backoff runs
+*upward from short*, the opposite of a retry backoff: a failing dependency is
+re-probed sooner than a healthy one, because the pod wants back into service as
+soon as the outage ends. The three `HealthProbe` impls are thin:
+`SessionStoreProbe` → `SessionStore::ping` (Redis `PING` on a fresh multiplexed
+connection), `EventBusProbe` → `EventTransport::reachable` (a partition-offset
+fetch, never a produce, so probes leave no records on `mss.events`; the trait
+method defaults to `Ok` so test transports keep meaning what they meant), and
+`NgNodeProbe` → NG `ping`, which on success calls
+`NodeCapabilityLog::report_first_contact` and on failure calls the new
+`NodeCapabilityLog::forget`. That pair is what closes item 23's open re-probe: a
+node's capabilities are re-learned the first time it answers after any failure,
+instead of the pod keeping a dead node's verdict forever.
+
+Routing lives in `metrics.rs::route`, a pure function over the request bytes so
+every status code is a unit test rather than a socket test. It reads only the
+request line, splits the query/fragment off the path, answers `/metrics`,
+`/healthz` and `/readyz`, and returns **404** for anything else and **405** for a
+non-GET. That last part is a behavior change: the listener used to serve the
+exposition for *any* path. Every lab script, `soak.py` and the alert rules ask for
+`/metrics` by name, so nothing in the repo depended on it — but an operator with a
+scrape config pointing at `/` will now get a 404.
+
+`MetricsSources` gained `readiness`, and `main.rs` passes the same `Arc` to the
+listener and the watchers. `probe_configured_rtpengine_node` grew from a one-shot
+into "probe once inline, then spawn the watcher", and now also treats an empty or
+whitespace `MSS_RTPENGINE_NODE` as unset (item 43's rule) and a malformed one as a
+permanent failure rather than as "no node configured".
+
 ### hub.rs — the fan-out core (M3), first increment
 The per-session pub/sub the roadmap calls the fan-out hub. Two-worlds
 shape: the capture thread owns the consumer list and is the only thing
