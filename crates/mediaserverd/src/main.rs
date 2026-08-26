@@ -2,6 +2,7 @@
 
 mod conference;
 mod consumer_ws;
+mod digits;
 mod drain;
 mod event_pump;
 mod health;

@@ -306,6 +306,18 @@ Two consequences worth knowing before a pilot:
   `.customer.wav` will not find it. That is the intended failure: better a
   missing file than a confidently mislabelled speaker.
 
+## Digit menus — drive them from the event bus
+
+Every DTMF press on a tapped or inline leg is published to `mss.events` as a
+`Dtmf` payload carrying `digit`, `track`, `duration_ms` and the event's
+`rtp_timestamp`, **with no consumer attached and no capability required** — one
+event per press, whatever the endpoint's end-packet retransmissions. So an
+integrator can map `*6` to an `UpdateAttachment` call, or drive any in-call menu,
+straight off the bus; a media stream is no longer needed just to hear a digit.
+MSS interprets no digit itself: no menu state, no collection, no inter-digit
+timer. Track names follow the attribution above, so an unattributed session's
+digits arrive on `leg_a`/`leg_b`.
+
 ## High availability: what is adoptable and what is not
 
 Ownership is a TTL'd lease in Redis, renewed by heartbeat. On pod loss another

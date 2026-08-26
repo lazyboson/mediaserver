@@ -523,7 +523,17 @@ That is what makes `offered_format` in `rtpengine-ng` a safe question to ask.
 
 ### dtmf.rs — complete for RFC 4733 digit reporting
 - Reports once per press on end-bit, deduped by (digit, RTP timestamp);
-  events ≥16 (flash-hook etc.) deliberately ignored.
+  events ≥16 (flash-hook etc.) deliberately ignored. That dedupe is what makes
+  RFC 4733's three end retransmissions **one** press, and since item 48 it has a
+  test of its own rather than being an implicit property.
+- `push` returns a `DigitPress { digit, duration_ms, rtp_timestamp }`, not a bare
+  `char` (item 48, D21): the bus needs the press length and a timestamp that
+  lines a digit up with recorded audio. **`duration_ms` is converted through the
+  detector's own clock rate**, which `StreamPipeline` gives it from
+  `PipelineConfig::clock_rate_hz` — the *negotiated* RTP clock, not a hardcoded
+  8000. RFC 4733 §2.4.1 has the event stream share the audio stream's clock, so
+  an 800-tick press reads 100 ms on a G.711 call and 16 ms on a 48 kHz Opus one.
+  A zero clock rate yields 0 ms rather than dividing by zero.
 
 ### frame.rs — complete
 - `samples_per_packet` returns `None` on zero ptime/rate rather than
@@ -747,6 +757,42 @@ read from documentation:
 - and the probe itself must randomise its cookie prefix: rtpengine replays a
   cached reply for a repeated cookie, so a fixed prefix makes consecutive runs
   answer with the *previous* run's call (the D12 shape, seen again here).
+
+### DTMF digits on the event bus, and why they need no capability (item 48, D21)
+
+`crates/mediaserverd/src/digits.rs` is the whole bridge: a bounded
+`ArrayQueue<Digit>` plus a `Notify`. `TapLeg::drain` — on the real-time capture
+thread — calls `publish`, which pushes or counts a refusal and returns; it never
+blocks, never allocates and never touches the registry. One Tokio task per
+session drains the queue and calls `ObservationSink::observe`, which is the same
+`Weak<dyn ObservationSink>` the recorder uses. `close_session` closes the queue,
+the publisher drains what is left and ends on its own — it is deliberately **not**
+aborted like the SSRC watcher, because a digit pressed just before the hangup is
+still a fact about the call.
+
+**The gating decision, and why it differs from `SpeechReport`.** A digit is
+published at **session level**, whenever the session exists: no attachment, no
+`CAPABILITY_EVENTS`, no consumer needed. MSS decoded it from the call's own RTP,
+so there is nothing to authenticate — the same footing as `RecordingStarted` and
+`LegsAttributed`, which also go through `Registry::observe`. `SpeechReport`
+(item 28, D19) is gated because it is the mirror image: a *consumer* claiming
+something it inferred, where the attachment is the claimant and must be
+privileged to speak for the call. Reading the attachment-level EVENTS capability
+here would mean a call with no consumer produced no digits, which is exactly the
+integration this closes — a recording-only or bus-only integrator building a digit
+menu. Do not "harmonise" the two paths; the asymmetry is the point.
+
+- capacity is 64 presses. Digits are rare (item 40 chose not to rate-limit
+  them), so a drop means something is wrong, and it is visible:
+  `mss_dtmf_events_dropped_total`, accumulated per session at close;
+- **both** tap legs and inline legs carry the sink, so digits pressed into a bot
+  leg reach the bus too;
+- the payload's `track` goes through `convert::track_name_under`, so an
+  `attribution=unknown` session's digits arrive on `leg_a`/`leg_b` — item 47's
+  rule, unchanged, applied to digits;
+- `proto.Dtmf` gained `duration_ms = 3` and `rtp_timestamp = 4`. Additive: the
+  `MediaEvent` payload oneof tag stays **14**, and an old consumer decoding the
+  message simply sees the two new fields defaulted.
 
 ## crates/protocol — frozen wire contracts
 - `twilio.rs` and `fork_events.rs` serialization tests are the contract
@@ -1746,8 +1792,9 @@ setup then fails reverts the same way. Two INJECT attachments on one leg share
 one injector — last writer wins, documented, not enforced.
 
 Events: `EventKind::MixRouted{target, monitor_audible}` →
-`MediaEvent.mix_routed` (oneof tag 25; item 40 then took 26, so the next free
-payload tag is 27) on the
+`MediaEvent.mix_routed` (oneof tag 25; item 40 then took 26 and item 47's
+`legs_attributed` took 27, so **the next free payload tag is 28** — item 48 added
+fields to the existing `Dtmf` message rather than a new payload) on the
 attach that declares a route and on every change, so an integrator can audit who
 whispered to whom and whether it was on the record. `mss_ctl mix <attachment-id>
 <own|all|member-id> [include|exclude]` is the lab handle. New metrics:

@@ -300,6 +300,11 @@ pub fn render(sources: &MetricsSources) -> String {
         snapshot.ssrc_requeries,
     );
     counter(
+        "mss_dtmf_events_dropped_total",
+        "DTMF presses dropped before reaching the event bus because its queue was full",
+        snapshot.dtmf_events_dropped,
+    );
+    counter(
         "mss_ingest_stalls_total",
         "Times a tap leg stopped receiving datagrams for the watchdog window",
         snapshot.totals.stalls,
