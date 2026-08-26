@@ -41,6 +41,7 @@ fn event(external_id: &str, seq: u64) -> MediaEvent {
         attachment: None,
         seq,
         legacy_eligible: true,
+        attribution: session_core::Attribution::Explicit,
         kind: EventKind::SessionEnded {
             reason: "outage-drill".to_string(),
         },

@@ -1,8 +1,8 @@
 use crate::proto;
 use media_core::{AudioFormat, Encoding, Track};
 use session_core::{
-    AttachmentId, Capabilities, ConsumerEvent, ControlError, EventKind, MediaEvent, PlaybackId,
-    SessionId, SessionKind, TrackSelector, Transport,
+    AttachmentId, Attribution, Capabilities, ConsumerEvent, ControlError, EventKind, MediaEvent,
+    PlaybackId, SessionId, SessionKind, TrackSelector, Transport,
 };
 use std::str::FromStr;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -112,8 +112,8 @@ pub fn capabilities_wire(granted: Capabilities) -> Vec<i32> {
 
 pub fn track(name: &str) -> Result<Track, Status> {
     match name {
-        "customer" | "inbound" => Ok(Track::Customer),
-        "agent" | "outbound" => Ok(Track::Agent),
+        "customer" | "inbound" | "leg_a" => Ok(Track::Customer),
+        "agent" | "outbound" | "leg_b" => Ok(Track::Agent),
         "mixed" => Ok(Track::Mixed),
         _ => Err(Status::invalid_argument(format!("unknown track {name}"))),
     }
@@ -124,6 +124,27 @@ pub fn track_name(track: Track) -> &'static str {
         Track::Customer => "customer",
         Track::Agent => "agent",
         Track::Mixed => "mixed",
+    }
+}
+
+pub fn track_name_under(track: Track, attribution: Attribution) -> &'static str {
+    if attribution.names_a_direction() {
+        return track_name(track);
+    }
+    match track {
+        Track::Customer => "leg_a",
+        Track::Agent => "leg_b",
+        Track::Mixed => "mixed",
+    }
+}
+
+pub fn tracks_under(selector: TrackSelector, attribution: Attribution) -> Vec<String> {
+    match selector {
+        TrackSelector::All => vec![
+            track_name_under(Track::Customer, attribution).to_string(),
+            track_name_under(Track::Agent, attribution).to_string(),
+        ],
+        TrackSelector::Only(track) => vec![track_name_under(track, attribution).to_string()],
     }
 }
 
@@ -202,6 +223,7 @@ pub fn event_from_bytes(bytes: &[u8]) -> Result<proto::MediaEvent, String> {
 pub fn event_wire(event: MediaEvent) -> proto::MediaEvent {
     let legacy_eligible = event.legacy_eligible;
     let session_kind = session_kind_wire(event.session_kind);
+    let attribution = event.attribution;
     proto::MediaEvent {
         session_id: event.session.to_string(),
         external_id: event.external_id,
@@ -213,22 +235,23 @@ pub fn event_wire(event: MediaEvent) -> proto::MediaEvent {
         seq: event.seq,
         at: Some(now()),
         legacy_eligible,
-        payload: Some(payload_wire(event.kind)),
+        attribution: attribution.as_str().to_string(),
+        payload: Some(payload_wire(event.kind, attribution)),
     }
 }
 
-fn payload_wire(kind: EventKind) -> proto::media_event::Payload {
+fn payload_wire(kind: EventKind, attribution: Attribution) -> proto::media_event::Payload {
     use proto::media_event::Payload;
     match kind {
         EventKind::SpeechStarted { track } => Payload::SpeechStarted(proto::SpeechStarted {
-            track: track_name(track).to_string(),
+            track: track_name_under(track, attribution).to_string(),
         }),
         EventKind::Partial {
             track,
             text,
             confidence,
         } => Payload::Partial(proto::PartialTranscript {
-            track: track_name(track).to_string(),
+            track: track_name_under(track, attribution).to_string(),
             text,
             confidence: f64::from(confidence),
         }),
@@ -238,19 +261,19 @@ fn payload_wire(kind: EventKind) -> proto::media_event::Payload {
             confidence,
             first_final,
         } => Payload::Final(proto::FinalTranscript {
-            track: track_name(track).to_string(),
+            track: track_name_under(track, attribution).to_string(),
             text,
             confidence: f64::from(confidence),
             first_final,
         }),
         EventKind::EndOfUtterance { track } => Payload::EndOfUtterance(proto::EndOfUtterance {
-            track: track_name(track).to_string(),
+            track: track_name_under(track, attribution).to_string(),
         }),
         EventKind::EndOfInteraction { reason } => {
             Payload::EndOfInteraction(proto::EndOfInteraction { reason })
         }
         EventKind::Dtmf { track, digit } => Payload::Dtmf(proto::Dtmf {
-            track: track_name(track).to_string(),
+            track: track_name_under(track, attribution).to_string(),
             digit: digit.to_string(),
         }),
         EventKind::RecordingStarted {
@@ -293,6 +316,13 @@ fn payload_wire(kind: EventKind) -> proto::media_event::Payload {
             })
         }
         EventKind::AttachmentUp { label } => Payload::AttachmentUp(proto::AttachmentUp { label }),
+        EventKind::LegsAttributed {
+            attribution,
+            tracks,
+        } => Payload::LegsAttributed(proto::LegsAttributed {
+            attribution: attribution.as_str().to_string(),
+            tracks,
+        }),
         EventKind::MixRouted {
             target,
             monitor_audible,
@@ -596,5 +626,88 @@ mod tests {
             tonic::Code::InvalidArgument
         );
         assert!(playback_id(&PlaybackId::from_raw(3).to_string()).is_ok());
+    }
+
+    fn event_of(attribution: Attribution, kind: EventKind) -> MediaEvent {
+        MediaEvent {
+            session: SessionId::from_raw(1),
+            external_id: "req-1".to_string(),
+            session_kind: SessionKind::Tap,
+            attachment: None,
+            seq: 0,
+            legacy_eligible: true,
+            attribution,
+            kind,
+        }
+    }
+
+    #[test]
+    fn an_events_track_names_follow_the_sessions_attribution() {
+        let speaking = |attribution| {
+            let wire = event_wire(event_of(
+                attribution,
+                EventKind::SpeechStarted {
+                    track: Track::Customer,
+                },
+            ));
+            match wire.payload {
+                Some(proto::media_event::Payload::SpeechStarted(started)) => {
+                    (wire.attribution, started.track)
+                }
+                other => panic!("unexpected payload {other:?}"),
+            }
+        };
+        assert_eq!(
+            speaking(Attribution::Explicit),
+            ("explicit".to_string(), "customer".to_string())
+        );
+        assert_eq!(
+            speaking(Attribution::Inferred),
+            ("inferred".to_string(), "customer".to_string())
+        );
+        assert_eq!(
+            speaking(Attribution::Unknown),
+            ("unknown".to_string(), "leg_a".to_string())
+        );
+    }
+
+    #[test]
+    fn the_attribution_event_carries_the_names_a_consumer_will_actually_see() {
+        let wire = event_wire(event_of(
+            Attribution::Unknown,
+            EventKind::LegsAttributed {
+                attribution: Attribution::Unknown,
+                tracks: tracks_under(TrackSelector::All, Attribution::Unknown),
+            },
+        ));
+        match wire.payload {
+            Some(proto::media_event::Payload::LegsAttributed(attributed)) => {
+                assert_eq!(attributed.attribution, "unknown");
+                assert_eq!(attributed.tracks, vec!["leg_a", "leg_b"]);
+            }
+            other => panic!("unexpected payload {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_leg_names_are_accepted_back_as_track_selectors() {
+        assert_eq!(track("leg_a").unwrap(), Track::Customer);
+        assert_eq!(track("leg_b").unwrap(), Track::Agent);
+    }
+
+    #[test]
+    fn a_single_track_selector_is_renamed_too_when_nothing_is_known() {
+        assert_eq!(
+            tracks_under(TrackSelector::Only(Track::Agent), Attribution::Unknown),
+            vec!["leg_b".to_string()]
+        );
+        assert_eq!(
+            tracks_under(TrackSelector::Only(Track::Agent), Attribution::Explicit),
+            vec!["agent".to_string()]
+        );
+        assert_eq!(
+            tracks_under(TrackSelector::All, Attribution::Inferred),
+            vec!["customer".to_string(), "agent".to_string()]
+        );
     }
 }

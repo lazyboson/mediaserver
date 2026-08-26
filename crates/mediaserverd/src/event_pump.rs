@@ -488,6 +488,7 @@ mod tests {
             attachment: None,
             seq,
             legacy_eligible: true,
+            attribution: session_core::Attribution::Explicit,
             kind: EventKind::SessionEnded {
                 reason: "test".to_string(),
             },

@@ -720,6 +720,34 @@ copying it. Nothing in `InlineOffer` talks to rtpengine.
   emit is legal SDP by our own reading of it. No real SIP peer has parsed it
   yet (item 33 is replay + fake socket only).
 
+### Leg attribution: what a `query` reply does and does not carry (item 47)
+
+`NgReply::tags_created()` returns each participant's `created` alongside its
+tag, preserving the reply's own order. What that field is, **measured** with
+`lab/ng_tag_created_probe.py` against the lab's rtpengine 14.1.1.8 rather than
+read from documentation:
+
+- a tag entry's only scalar fields are `tag` and **`created`** — an integer of
+  whole **seconds**. The sub-second companions `created_ts` (microseconds since
+  epoch) and `created_us` exist **only at the top level** of the reply, next to
+  the call's own `created`; there is no per-tag equivalent;
+- `created` is stamped **per dialogue**, not per participant. An offer and an
+  answer 4 s apart both came back `1787737315`. A second offer/answer pair on
+  the *same* call-id 12 s later came back `1787737395` for both of its tags
+  (legA/legB `…383`, legC/legD `…395`);
+- therefore creation time can separate B2B dialogues sharing one call-id and
+  **can never** separate the two legs of one dialogue. `MSS`'s
+  `order_participants()` returns `Attribution::Inferred` only when the first two
+  participants carry strictly different seconds, which for a two-party call on
+  this version never happens;
+- the reply's own tag order is **not** rtpengine's insertion order by the time
+  MSS sees it: `bencode::Value::Dict` is a `BTreeMap`, so `tags()` is
+  lexicographic by tag bytes. That, not any creation order, is what inverted the
+  labels in the two-node drill (D17);
+- and the probe itself must randomise its cookie prefix: rtpengine replays a
+  cached reply for a repeated cookie, so a fixed prefix makes consecutive runs
+  answer with the *previous* run's call (the D12 shape, seen again here).
+
 ## crates/protocol — frozen wire contracts
 - `twilio.rs` and `fork_events.rs` serialization tests are the contract
   (Constitution VII). Do not change shapes; add new versioned surfaces.
@@ -743,6 +771,20 @@ copying it. Nothing in `InlineOffer` talks to rtpengine.
   migrates (architecture.md risk #4).
 
 ## crates/session-core — the control-plane state machine (M4), sans-IO
+
+`attribution.rs` holds `Attribution` (`Explicit` / `Inferred` / `Unknown`,
+default `Explicit`) — how a session's track names were arrived at (item 47,
+D17). `SessionRecord` carries it, `SessionView` exposes it, and **every**
+`MediaEvent` is stamped with the record's value at `push_event` time, so a
+consumer of `mss.events` can tell a named direction from a guess without asking
+the API. It is set at `create_session` (a TAP with no `from_tags` is `Unknown`;
+everything else, including every INLINE leg, is `Explicit` — MSS answered an
+inline leg itself, so its capture is unambiguous) and rewritten by
+`Observation::LegsAttributed` from the media plane, which is also the event that
+reaches the bus. `record_attribution()` is the direct setter for callers that
+have no observation to make. It is deliberately **not** persisted in
+`PersistedSession`: a session with no `from_tags` is not rebuildable, and one
+with them re-derives `Explicit` on the adopting pod.
 
 `SessionRegistry` is the MediaControl API of architecture.md §5.1 as a pure
 state machine: no sockets, no async, no clock of its own. The tonic service
@@ -2030,6 +2072,24 @@ into something that actually taps calls.
   leg keeps its positional default. Acceptance: two consecutive live calls,
   caller's voice on `inbound` (rms 564) and silence on `outbound` (rms 6),
   independent of stream order.
+- **Which participant is the *customer* is a separate question, and MSS refuses
+  to guess it (D17, item 47).** SSRC correlation answers "which stream carries
+  which participant's voice"; it says nothing about which participant called.
+  That came from `from_tags[0]`, and when the caller's tag was not supplied
+  `complete_from_tags` filled `from_tags` from `NgReply::tags()` — a `BTreeMap`,
+  so **lexicographic by tag**. `order_participants()` (pure, in `tap_plane.rs`)
+  now sorts the participants by their `created` stamp (stable, unstamped last)
+  and yields `Attribution::Inferred` only when the first two differ strictly;
+  otherwise `Unknown`. Under `Unknown`, `convert::track_name_under` /
+  `tracks_under` rename the gRPC stream tracks, the gRPC media/DTMF frames, the
+  event payload tracks and the recording group's object keys to
+  **`leg_a`/`leg_b`**; `consumer_ws::track_name` is untouched, because the
+  Twilio dialect is frozen (Article VII). `LiveSession` and `SessionHandles`
+  carry the verdict so every attachment opened later names itself consistently,
+  and `Observation::LegsAttributed` reports it back to the registry, which is
+  what puts `attribution` on `DescribeSession` and on the bus. See the
+  rtpengine-ng section for why `created` cannot separate a two-party call's legs,
+  and `lab/leg_attribution_drill.sh` for the live proof in both directions.
 - **Mid-call SSRC re-resolution (D1, 2026-08-22).** A leg no longer decides
   its speaker once and for all. `reresolve_speakers` is the control-world
   half: a per-session task that wakes every `SSRC_WATCH_INTERVAL` (500 ms),

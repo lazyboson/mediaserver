@@ -33,8 +33,8 @@ use rtpengine_ng::{
 };
 use session_core::mix::{MemberControl, MixRoute, MIX_TARGET_EVERYONE, MIX_TARGET_OWN};
 use session_core::{
-    AttachmentId, AttachmentView, Capabilities, Observation, SessionId, SessionKind, SessionView,
-    TrackSelector, Transport,
+    AttachmentId, AttachmentView, Attribution, Capabilities, Observation, SessionId, SessionKind,
+    SessionView, TrackSelector, Transport,
 };
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
@@ -81,10 +81,12 @@ struct SessionHandles {
     call_id: String,
     hub: HubClient,
     external_id: String,
+    attribution: Attribution,
 }
 
 struct LiveSession {
     kind: SessionKind,
+    attribution: Attribution,
     media_ports: Vec<PortLease>,
     transport: Option<Arc<NgTransport>>,
     external_id: String,
@@ -488,14 +490,15 @@ impl TapPlane {
         mut view: SessionView,
     ) -> Result<SessionView, MediaPlaneError> {
         if view.from_tags.len() >= MAX_TAPPED_LEGS {
+            view.attribution = Attribution::Explicit;
             return Ok(view);
         }
         let reply = transport
             .query(&view.call_id)
             .await
             .map_err(|error| MediaPlaneError(format!("query for {}: {error}", view.call_id)))?;
-        let known = reply.tags();
-        if known.is_empty() {
+        let stamped = reply.tags_created();
+        if stamped.is_empty() {
             return Err(MediaPlaneError(format!(
                 "rtpengine knows no participants for call {}; \
                  it is not anchoring that call",
@@ -503,7 +506,8 @@ impl TapPlane {
             )));
         }
         let caller_known = !view.from_tags.is_empty();
-        for tag in known {
+        let ordered = order_participants(&stamped);
+        for tag in ordered.tags {
             if view.from_tags.len() >= MAX_TAPPED_LEGS {
                 break;
             }
@@ -511,22 +515,35 @@ impl TapPlane {
                 view.from_tags.push(tag);
             }
         }
-        if caller_known {
-            info!(
+        view.attribution = if caller_known {
+            Attribution::Explicit
+        } else {
+            ordered.attribution
+        };
+        match view.attribution {
+            Attribution::Explicit => info!(
                 call_id = %view.call_id,
                 from_tags = ?view.from_tags,
                 "resolved this call's participants; the caller was named so the \
                  customer leg is known"
-            );
-        } else {
-            warn!(
+            ),
+            Attribution::Inferred => info!(
                 call_id = %view.call_id,
                 from_tags = ?view.from_tags,
+                ?stamped,
+                "nobody named the caller, but rtpengine's participant creation times \
+                 order these legs, so the earliest created leg is the customer"
+            ),
+            Attribution::Unknown => warn!(
+                call_id = %view.call_id,
+                from_tags = ?view.from_tags,
+                ?stamped,
                 caller_tag_key = telcompat_caller_tag_key(),
-                "resolved this call's participants but nobody named the caller, so \
-                 customer and agent are assigned by tag order and may be swapped; \
-                 pass the caller's sip from-tag to fix it"
-            );
+                "nobody named the caller and rtpengine stamped these legs with the \
+                 same creation second, so this tap will not claim a direction: its \
+                 tracks are leg_a and leg_b. Pass the caller's sip from-tag to get \
+                 customer and agent"
+            ),
         }
         Ok(view)
     }
@@ -668,7 +685,10 @@ impl TapPlane {
             ));
         }
         let SessionHandles {
-            hub, external_id, ..
+            hub,
+            external_id,
+            attribution,
+            ..
         } = self.session_handles(view.session)?;
         let selection = recording_selection_of(view.selector);
         let conferenced = self.conference_of(view.session).is_ok();
@@ -686,7 +706,7 @@ impl TapPlane {
             None
         } else {
             let participant = participant_of(&view, &external_id)?;
-            let targets = participant_targets(&identity, &participant, view.selector);
+            let targets = participant_targets(&identity, &participant, view.selector, attribution);
             let key = GroupKey {
                 account_id: identity.account_id.clone(),
                 group: view.group.clone(),
@@ -1186,6 +1206,7 @@ impl TapPlane {
             view.id,
             LiveSession {
                 kind: SessionKind::Tap,
+                attribution: view.attribution,
                 media_ports: port_leases,
                 transport: Some(transport),
                 external_id: view.external_id.clone(),
@@ -1203,6 +1224,13 @@ impl TapPlane {
         );
         drop(held);
         self.metrics.register_session(view.id, shared_stats);
+        self.observe(
+            view.id,
+            Observation::LegsAttributed {
+                attribution: view.attribution,
+                tracks: control_api::convert::tracks_under(TrackSelector::All, view.attribution),
+            },
+        );
         Ok(OpenedSession::default())
     }
 
@@ -1302,6 +1330,7 @@ impl TapPlane {
                 view.id,
                 LiveSession {
                     kind: SessionKind::Inline,
+                    attribution: view.attribution,
                     media_ports: port_leases,
                     transport: None,
                     external_id: view.external_id.clone(),
@@ -1406,6 +1435,7 @@ impl TapPlane {
             view.id,
             LiveSession {
                 kind: SessionKind::Inline,
+                attribution: view.attribution,
                 media_ports: port_leases,
                 transport: None,
                 external_id: view.external_id.clone(),
@@ -1740,6 +1770,7 @@ impl TapPlane {
             call_id: live.call_id.clone(),
             hub: live.hub.clone(),
             external_id: live.external_id.clone(),
+            attribution: live.attribution,
         })
     }
 
@@ -2119,7 +2150,9 @@ impl MediaPlane for TapPlane {
             }
         };
 
-        let SessionHandles { hub, .. } = self.session_handles(session)?;
+        let SessionHandles {
+            hub, attribution, ..
+        } = self.session_handles(session)?;
         let subscription = hub
             .attach(CONSUMER_QUEUE_FRAMES, selection)
             .ok_or_else(|| {
@@ -2134,6 +2167,7 @@ impl MediaPlane for TapPlane {
             frames.clone(),
             self.session_format(session)?,
             target_format,
+            attribution,
         ));
 
         let mut held = self
@@ -2288,6 +2322,7 @@ async fn pump_frames(
     frames: mpsc::Sender<StreamFrame>,
     source: AudioFormat,
     target: AudioFormat,
+    attribution: Attribution,
 ) {
     let mut encoders: HashMap<Track, ConsumerEncoder> = HashMap::new();
     while let Some(event) = subscription.next().await {
@@ -2312,7 +2347,7 @@ async fn pump_frames(
                 };
                 match encoder.encode(&samples[..len]) {
                     Ok(payload) => StreamFrame::Media {
-                        track: control_api::convert::track_name(track),
+                        track: control_api::convert::track_name_under(track, attribution),
                         pts_ms: timestamp_ms,
                         payload: payload.to_vec(),
                     },
@@ -2323,7 +2358,7 @@ async fn pump_frames(
                 }
             }
             TapEvent::Dtmf { track, digit } => StreamFrame::Dtmf {
-                track: control_api::convert::track_name(track),
+                track: control_api::convert::track_name_under(track, attribution),
                 digit,
             },
         };
@@ -2546,6 +2581,33 @@ fn offered_tap_format(
     settled.ok_or_else(|| MediaPlaneError("rtpengine offered no streams".to_string()))
 }
 
+struct OrderedParticipants {
+    tags: Vec<String>,
+    attribution: Attribution,
+}
+
+fn order_participants(stamped: &[(String, Option<i64>)]) -> OrderedParticipants {
+    let mut ordered: Vec<(String, Option<i64>)> = stamped.to_vec();
+    ordered.sort_by(|left, right| match (left.1, right.1) {
+        (Some(one), Some(other)) => one.cmp(&other),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => std::cmp::Ordering::Equal,
+    });
+    let separated = match (ordered.first(), ordered.get(1)) {
+        (Some((_, Some(first))), Some((_, Some(second)))) => first < second,
+        _ => false,
+    };
+    OrderedParticipants {
+        tags: ordered.into_iter().map(|(tag, _)| tag).collect(),
+        attribution: if separated {
+            Attribution::Inferred
+        } else {
+            Attribution::Unknown
+        },
+    }
+}
+
 fn telcompat_caller_tag_key() -> &'static str {
     control_api::telcompat::CALLER_TAG_KEY
 }
@@ -2591,6 +2653,7 @@ fn participant_targets(
     identity: &RecordingIdentity,
     participant: &str,
     selector: TrackSelector,
+    attribution: Attribution,
 ) -> Vec<RecordingTarget> {
     match selector {
         TrackSelector::Only(track) => vec![RecordingTarget {
@@ -2602,7 +2665,7 @@ fn participant_targets(
             .map(|track| RecordingTarget {
                 key: identity.participant_key(&format!(
                     "{participant}.{}",
-                    control_api::convert::track_name(track)
+                    control_api::convert::track_name_under(track, attribution)
                 )),
                 layout: Layout::Mono(track),
             })
@@ -2896,6 +2959,7 @@ mod tests {
             kind,
             call_id: "call-abc".to_string(),
             from_tags: vec!["from-a".to_string()],
+            attribution: Attribution::Explicit,
             rtpengine_node: node.to_string(),
             sdp_offer: None,
             sdp_answer: None,
@@ -4697,14 +4761,24 @@ m=audio 41000 RTP/AVP 111\r\na=rtpmap:111 opus/48000/2\r\n",
     fn a_group_member_writes_one_mono_object_per_track_it_selected() {
         let identity = identity("acct-42/rec-99.wav");
         assert_eq!(
-            participant_targets(&identity, "alice", TrackSelector::Only(Track::Customer)),
+            participant_targets(
+                &identity,
+                "alice",
+                TrackSelector::Only(Track::Customer),
+                Attribution::Explicit
+            ),
             vec![RecordingTarget {
                 key: "acct-42/rec-99/alice.wav".to_string(),
                 layout: Layout::Mono(Track::Customer),
             }]
         );
         assert_eq!(
-            participant_targets(&identity, "alice", TrackSelector::All),
+            participant_targets(
+                &identity,
+                "alice",
+                TrackSelector::All,
+                Attribution::Explicit
+            ),
             vec![
                 RecordingTarget {
                     key: "acct-42/rec-99/alice.customer.wav".to_string(),
@@ -4737,8 +4811,13 @@ m=audio 41000 RTP/AVP 111\r\na=rtpmap:111 opus/48000/2\r\n",
             account_id: identity.account_id.clone(),
             group: "conf-9".to_string(),
         };
-        let alice = participant_targets(&identity, "alice", TrackSelector::All);
-        let bob = participant_targets(&identity, "bob", TrackSelector::All);
+        let alice = participant_targets(
+            &identity,
+            "alice",
+            TrackSelector::All,
+            Attribution::Explicit,
+        );
+        let bob = participant_targets(&identity, "bob", TrackSelector::All, Attribution::Explicit);
 
         let opened = plane
             .join_group(&key, AttachmentId::from_raw(2), &identity, &alice)
@@ -4782,7 +4861,7 @@ m=audio 41000 RTP/AVP 111\r\na=rtpmap:111 opus/48000/2\r\n",
                 &key,
                 AttachmentId::from_raw(2),
                 &first,
-                &participant_targets(&first, "alice", TrackSelector::All),
+                &participant_targets(&first, "alice", TrackSelector::All, Attribution::Explicit),
             )
             .unwrap();
         let error = plane
@@ -4790,7 +4869,7 @@ m=audio 41000 RTP/AVP 111\r\na=rtpmap:111 opus/48000/2\r\n",
                 &key,
                 AttachmentId::from_raw(3),
                 &second,
-                &participant_targets(&second, "bob", TrackSelector::All),
+                &participant_targets(&second, "bob", TrackSelector::All, Attribution::Explicit),
             )
             .unwrap_err();
 
@@ -4820,6 +4899,7 @@ m=audio 41000 RTP/AVP 111\r\na=rtpmap:111 opus/48000/2\r\n",
                         &identity,
                         &format!("caller-{index}"),
                         TrackSelector::Only(Track::Customer),
+                        Attribution::Explicit,
                     ),
                 )
                 .unwrap();
@@ -4840,7 +4920,12 @@ m=audio 41000 RTP/AVP 111\r\na=rtpmap:111 opus/48000/2\r\n",
                 &key,
                 members[0],
                 &identity,
-                &participant_targets(&identity, "caller-0", TrackSelector::Only(Track::Customer)),
+                &participant_targets(
+                    &identity,
+                    "caller-0",
+                    TrackSelector::Only(Track::Customer),
+                    Attribution::Explicit,
+                ),
             )
             .expect("the same group name is free once the last member has gone");
         assert_eq!(counters.groups_live.load(Ordering::Relaxed), 1);
@@ -5184,6 +5269,7 @@ m=audio 41000 RTP/AVP 111\r\na=rtpmap:111 opus/48000/2\r\n",
             frames,
             AudioFormat::pcmu_8k_20ms(),
             AudioFormat::l16_16k_20ms(),
+            Attribution::Explicit,
         ));
 
         hub.publish(crate::hub::TapEvent::media(
@@ -5346,6 +5432,7 @@ m=audio 41000 RTP/AVP 111\r\na=rtpmap:111 opus/48000/2\r\n",
             frames.clone(),
             AudioFormat::pcmu_8k_20ms(),
             AudioFormat::pcmu_8k_20ms(),
+            Attribution::Explicit,
         ));
 
         hub.publish(TapEvent::media(Track::Customer, 0, &[0i16; 160]));
@@ -5470,5 +5557,114 @@ mod leg_naming_tests {
         assert!(!requeries.note(&[0]));
         assert!(requeries.note(&[u32::MAX]));
         assert!(requeries.note(&[0]));
+    }
+
+    fn stamped(pairs: &[(&str, Option<i64>)]) -> Vec<(String, Option<i64>)> {
+        pairs
+            .iter()
+            .map(|(tag, created)| ((*tag).to_string(), *created))
+            .collect()
+    }
+
+    #[test]
+    fn creation_times_that_separate_two_legs_make_the_earliest_one_the_customer() {
+        let ordered = order_participants(&stamped(&[
+            ("fs-side", Some(1787737395)),
+            ("carrier-side", Some(1787737383)),
+        ]));
+        assert_eq!(ordered.attribution, Attribution::Inferred);
+        assert_eq!(ordered.tags, vec!["carrier-side", "fs-side"]);
+    }
+
+    #[test]
+    fn one_creation_second_for_both_legs_claims_no_direction_at_all() {
+        let ordered = order_participants(&stamped(&[
+            ("fs-side", Some(1787737383)),
+            ("carrier-side", Some(1787737383)),
+        ]));
+        assert_eq!(ordered.attribution, Attribution::Unknown);
+        assert_eq!(ordered.tags, vec!["fs-side", "carrier-side"]);
+    }
+
+    #[test]
+    fn a_participant_rtpengine_never_stamped_sorts_last_and_settles_nothing() {
+        let ordered = order_participants(&stamped(&[("late", None), ("early", None)]));
+        assert_eq!(ordered.attribution, Attribution::Unknown);
+        assert_eq!(ordered.tags, vec!["late", "early"]);
+        let half = order_participants(&stamped(&[("unstamped", None), ("stamped", Some(9))]));
+        assert_eq!(half.attribution, Attribution::Unknown);
+        assert_eq!(half.tags, vec!["stamped", "unstamped"]);
+    }
+
+    #[test]
+    fn a_second_dialogue_on_one_call_id_sorts_after_the_first_two_legs() {
+        let ordered = order_participants(&stamped(&[
+            ("legC", Some(1787737395)),
+            ("legD", Some(1787737395)),
+            ("legA", Some(1787737383)),
+            ("legB", Some(1787737383)),
+        ]));
+        assert_eq!(ordered.tags, vec!["legA", "legB", "legC", "legD"]);
+        assert_eq!(ordered.attribution, Attribution::Unknown);
+    }
+
+    #[test]
+    fn only_unknown_attribution_renames_the_grpc_and_recording_tracks() {
+        use control_api::convert::track_name_under;
+        for settled in [Attribution::Explicit, Attribution::Inferred] {
+            assert_eq!(track_name_under(Track::Customer, settled), "customer");
+            assert_eq!(track_name_under(Track::Agent, settled), "agent");
+        }
+        assert_eq!(
+            track_name_under(Track::Customer, Attribution::Unknown),
+            "leg_a"
+        );
+        assert_eq!(
+            track_name_under(Track::Agent, Attribution::Unknown),
+            "leg_b"
+        );
+        assert_eq!(
+            track_name_under(Track::Mixed, Attribution::Unknown),
+            "mixed"
+        );
+    }
+
+    #[test]
+    fn an_unattributed_recording_names_its_objects_leg_a_and_leg_b() {
+        let identity = RecordingIdentity::parse("acct-42/rec-99.wav").unwrap();
+        let guessing =
+            participant_targets(&identity, "alice", TrackSelector::All, Attribution::Unknown);
+        let keys: Vec<String> = guessing.iter().map(|target| target.key.clone()).collect();
+        assert_eq!(
+            keys,
+            vec![
+                "acct-42/rec-99/alice.leg_a.wav".to_string(),
+                "acct-42/rec-99/alice.leg_b.wav".to_string()
+            ]
+        );
+        let told = participant_targets(
+            &identity,
+            "alice",
+            TrackSelector::All,
+            Attribution::Explicit,
+        );
+        let keys: Vec<String> = told.iter().map(|target| target.key.clone()).collect();
+        assert_eq!(
+            keys,
+            vec![
+                "acct-42/rec-99/alice.customer.wav".to_string(),
+                "acct-42/rec-99/alice.agent.wav".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn the_frozen_twilio_track_names_never_move_however_the_legs_were_labelled() {
+        assert_eq!(
+            tracks_of(TrackSelector::All),
+            vec!["inbound".to_string(), "outbound".to_string()]
+        );
+        assert_eq!(consumer_ws::track_name(Track::Customer), "inbound");
+        assert_eq!(consumer_ws::track_name(Track::Agent), "outbound");
     }
 }

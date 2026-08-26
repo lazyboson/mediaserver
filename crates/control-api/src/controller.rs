@@ -345,6 +345,7 @@ impl SessionController {
             attachments,
             sdp_answer: view.sdp_answer.unwrap_or_default(),
             group: view.group,
+            attribution: view.attribution.as_str().to_string(),
         })
     }
 }
