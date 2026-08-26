@@ -950,3 +950,143 @@ async fn an_unprivileged_inline_inject_is_refused_before_it_reaches_the_egress()
     let _ = wire.stop.send(());
     wire.serving.await.unwrap();
 }
+
+#[tokio::test]
+async fn a_session_nobody_named_the_caller_of_streams_leg_a_and_leg_b() {
+    let wire = listening(AuthPolicy::open()).await;
+    let mut control = MediaControlClient::connect(wire.endpoint.clone())
+        .await
+        .unwrap();
+    let session = control
+        .create_session(proto::CreateSessionRequest {
+            external_id: "req-unattributed".to_string(),
+            kind: proto::SessionKind::Tap as i32,
+            call_id: "call-unattributed".to_string(),
+            from_tags: Vec::new(),
+            rtpengine_node: "rtpengine-1".to_string(),
+            mix: false,
+            idempotency_key: String::new(),
+            sdp_offer: String::new(),
+            group: String::new(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(session.attribution, "unknown");
+
+    let attachment = control
+        .attach(proto::AttachRequest {
+            session: Some(proto::SessionRef {
+                id: Some(proto::session_ref::Id::SessionId(
+                    session.session_id.clone(),
+                )),
+            }),
+            transport: proto::Transport::GrpcStream as i32,
+            capabilities: vec![proto::Capability::Sink as i32],
+            selector: None,
+            format: None,
+            authoritative: false,
+            label: "grpc-consumer".to_string(),
+            endpoint: String::new(),
+            group: String::new(),
+            metadata: Default::default(),
+            idempotency_key: String::new(),
+        })
+        .await
+        .unwrap()
+        .into_inner()
+        .attachment_id;
+
+    let mut client = MediaStreamClient::connect(wire.endpoint.clone())
+        .await
+        .unwrap();
+    let (to_server, outbound) = mpsc::channel(8);
+    to_server.send(hello(&attachment, "")).await.unwrap();
+    let mut inbound = client
+        .subscribe(ReceiverStream::new(outbound))
+        .await
+        .unwrap()
+        .into_inner();
+    let start = inbound.message().await.unwrap().unwrap();
+    match start.msg {
+        Some(server_to_consumer::Msg::Start(start)) => assert_eq!(
+            start.tracks,
+            vec!["leg_a".to_string(), "leg_b".to_string()],
+            "an unattributed session must not claim a direction"
+        ),
+        other => panic!("expected the start frame first, got {other:?}"),
+    }
+
+    let described = control
+        .describe_session(proto::SessionRef {
+            id: Some(proto::session_ref::Id::SessionId(session.session_id)),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(described.attribution, "unknown");
+}
+
+#[tokio::test]
+async fn a_session_told_its_caller_tag_keeps_streaming_customer_and_agent() {
+    let wire = listening(AuthPolicy::open()).await;
+    let mut control = MediaControlClient::connect(wire.endpoint.clone())
+        .await
+        .unwrap();
+    let session = control
+        .create_session(proto::CreateSessionRequest {
+            external_id: "req-attributed".to_string(),
+            kind: proto::SessionKind::Tap as i32,
+            call_id: "call-attributed".to_string(),
+            from_tags: vec!["caller-tag".to_string()],
+            rtpengine_node: "rtpengine-1".to_string(),
+            mix: false,
+            idempotency_key: String::new(),
+            sdp_offer: String::new(),
+            group: String::new(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(session.attribution, "explicit");
+
+    let attachment = control
+        .attach(proto::AttachRequest {
+            session: Some(proto::SessionRef {
+                id: Some(proto::session_ref::Id::SessionId(session.session_id)),
+            }),
+            transport: proto::Transport::GrpcStream as i32,
+            capabilities: vec![proto::Capability::Sink as i32],
+            selector: None,
+            format: None,
+            authoritative: false,
+            label: "grpc-consumer".to_string(),
+            endpoint: String::new(),
+            group: String::new(),
+            metadata: Default::default(),
+            idempotency_key: String::new(),
+        })
+        .await
+        .unwrap()
+        .into_inner()
+        .attachment_id;
+
+    let mut client = MediaStreamClient::connect(wire.endpoint.clone())
+        .await
+        .unwrap();
+    let (to_server, outbound) = mpsc::channel(8);
+    to_server.send(hello(&attachment, "")).await.unwrap();
+    let mut inbound = client
+        .subscribe(ReceiverStream::new(outbound))
+        .await
+        .unwrap()
+        .into_inner();
+    let start = inbound.message().await.unwrap().unwrap();
+    match start.msg {
+        Some(server_to_consumer::Msg::Start(start)) => assert_eq!(
+            start.tracks,
+            vec!["customer".to_string(), "agent".to_string()]
+        ),
+        other => panic!("expected the start frame first, got {other:?}"),
+    }
+}

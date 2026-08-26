@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot, OwnedSemaphorePermit, Semaphore};
 use tracing::{info, warn};
 
 pub const IDENTITY_SCHEME: &str = "${accountID}/${recordingID}.${format}";
@@ -17,7 +17,8 @@ pub const RESUME_MS_METADATA_KEY: &str = "mss.recording.resumeMs";
 pub const SPILL_OWNER_METADATA_KEY: &str = "mss.recording.spillOwner";
 pub const MAX_RECORDING: Duration = Duration::from_secs(2 * 3600);
 pub const UPLOAD_TIMEOUT: Duration = Duration::from_secs(60);
-pub const FINISH_TIMEOUT: Duration = Duration::from_secs(90);
+pub const STOP_TIMEOUT: Duration = Duration::from_secs(5);
+pub const DEFAULT_UPLOAD_CONCURRENCY: usize = 4;
 pub const SPILL_EVERY: Duration = Duration::from_secs(30);
 pub const MAX_ADOPT_LEAD: Duration = Duration::from_secs(300);
 pub const CONFERENCE_SHAPE_PREFIX: &str = "conference-";
@@ -31,6 +32,7 @@ const ACCESS_KEY_ENV: &str = "MSS_RECORDING_S3_ACCESS_KEY_ID";
 const SECRET_KEY_ENV: &str = "MSS_RECORDING_S3_SECRET_ACCESS_KEY";
 const SPILL_DIR_ENV: &str = "MSS_RECORDING_SPILL_DIR";
 const SPILL_SECONDS_ENV: &str = "MSS_RECORDING_SPILL_SECONDS";
+pub const UPLOAD_CONCURRENCY_ENV: &str = "MSS_RECORDING_UPLOAD_CONCURRENCY";
 const DEFAULT_REGION: &str = "us-east-1";
 const UPLOAD_RETRIES: usize = 3;
 
@@ -644,6 +646,9 @@ pub struct RecorderCounters {
     pub pauses: AtomicU64,
     pub uploaded: AtomicU64,
     pub upload_failures: AtomicU64,
+    pub uploads_in_flight: AtomicU64,
+    pub uploads_backgrounded: AtomicU64,
+    pub upload_settle_timeouts: AtomicU64,
     pub spilled: AtomicU64,
     pub segments_spilled: AtomicU64,
     pub segment_spill_failures: AtomicU64,
@@ -667,6 +672,7 @@ pub struct RecordingSupport {
     pub spill_every: Duration,
     pub counters: Arc<RecorderCounters>,
     pub owner: String,
+    pub upload_permits: Arc<Semaphore>,
 }
 
 impl Default for RecordingSupport {
@@ -677,12 +683,48 @@ impl Default for RecordingSupport {
             spill_every: SPILL_EVERY,
             counters: Arc::new(RecorderCounters::default()),
             owner: String::new(),
+            upload_permits: Arc::new(Semaphore::new(DEFAULT_UPLOAD_CONCURRENCY)),
+        }
+    }
+}
+
+pub fn upload_concurrency_from_env() -> usize {
+    let configured = std::env::var(UPLOAD_CONCURRENCY_ENV)
+        .ok()
+        .filter(|value| !value.trim().is_empty());
+    let Some(configured) = configured else {
+        info!(
+            env = UPLOAD_CONCURRENCY_ENV,
+            value = "unset",
+            uploads = DEFAULT_UPLOAD_CONCURRENCY,
+            "recording uploads run in the background, this many at a time"
+        );
+        return DEFAULT_UPLOAD_CONCURRENCY;
+    };
+    match configured.trim().parse::<usize>() {
+        Ok(uploads) if uploads > 0 => {
+            info!(
+                env = UPLOAD_CONCURRENCY_ENV,
+                uploads, "recording uploads run in the background, this many at a time"
+            );
+            uploads
+        }
+        _ => {
+            warn!(
+                env = UPLOAD_CONCURRENCY_ENV,
+                configured = %configured,
+                uploads = DEFAULT_UPLOAD_CONCURRENCY,
+                "the background upload concurrency must be a whole number above zero; \
+                 falling back to the default"
+            );
+            DEFAULT_UPLOAD_CONCURRENCY
         }
     }
 }
 
 impl RecordingSupport {
     pub fn from_env(owner: &str) -> Result<RecordingSupport, UploadError> {
+        let upload_permits = Arc::new(Semaphore::new(upload_concurrency_from_env()));
         let spill_dir = std::env::var(SPILL_DIR_ENV).ok().map(PathBuf::from);
         let spill_every = std::env::var(SPILL_SECONDS_ENV)
             .ok()
@@ -697,6 +739,7 @@ impl RecordingSupport {
                 spill_every,
                 counters: Arc::new(RecorderCounters::default()),
                 owner: owner.to_string(),
+                upload_permits,
             });
         };
         if bucket.is_empty() {
@@ -727,6 +770,7 @@ impl RecordingSupport {
             spill_every,
             counters: Arc::new(RecorderCounters::default()),
             owner: owner.to_string(),
+            upload_permits,
         })
     }
 }
@@ -796,8 +840,57 @@ impl RecordingProgress {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StopReport {
+    pub duration_ms: u64,
+    pub frames: usize,
+    pub stats: SegmenterStats,
+}
+
+pub struct FinishedCapture {
+    pub session: SessionId,
+    pub recording_id: String,
+    pub stopped: Option<StopReport>,
+    upload: tokio::task::JoinHandle<RecordingOutcome>,
+}
+
+#[cfg(test)]
+pub const FINISH_TIMEOUT: Duration = Duration::from_secs(90);
+
+impl FinishedCapture {
+    pub fn into_upload(self) -> tokio::task::JoinHandle<RecordingOutcome> {
+        self.upload
+    }
+
+    #[cfg(test)]
+    pub async fn settle(self) -> Option<RecordingOutcome> {
+        let recording_id = self.recording_id.clone();
+        let upload = self.upload;
+        let aborter = upload.abort_handle();
+        match tokio::time::timeout(FINISH_TIMEOUT, upload).await {
+            Ok(Ok(outcome)) => Some(outcome),
+            Ok(Err(error)) => {
+                warn!(%recording_id, %error, "a recorder task ended without an outcome");
+                None
+            }
+            Err(_) => {
+                aborter.abort();
+                warn!(
+                    %recording_id,
+                    timeout_ms = FINISH_TIMEOUT.as_millis() as u64,
+                    "a recording upload did not finish in time; its audio is lost"
+                );
+                None
+            }
+        }
+    }
+}
+
 pub struct RecorderHandle {
+    session: SessionId,
+    recording_id: String,
     commands: mpsc::Sender<RecorderCommand>,
+    stopped: oneshot::Receiver<StopReport>,
     task: tokio::task::JoinHandle<RecordingOutcome>,
     progress: Arc<RecordingProgress>,
 }
@@ -816,23 +909,41 @@ impl RecorderHandle {
         self.commands.try_send(command).is_ok()
     }
 
-    pub async fn finish(self) -> Option<RecordingOutcome> {
-        let _ = self.commands.try_send(RecorderCommand::Finish);
-        let aborter = self.task.abort_handle();
-        match tokio::time::timeout(FINISH_TIMEOUT, self.task).await {
-            Ok(Ok(outcome)) => Some(outcome),
-            Ok(Err(error)) => {
-                warn!(%error, "a recorder task ended without an outcome");
-                None
-            }
-            Err(_) => {
-                aborter.abort();
+    pub async fn finish(self) -> FinishedCapture {
+        let RecorderHandle {
+            session,
+            recording_id,
+            commands,
+            stopped,
+            task,
+            ..
+        } = self;
+        let _ = commands.try_send(RecorderCommand::Finish);
+        drop(commands);
+        let stopped = match tokio::time::timeout(STOP_TIMEOUT, stopped).await {
+            Ok(Ok(report)) => Some(report),
+            Ok(Err(_)) => {
                 warn!(
-                    timeout_ms = FINISH_TIMEOUT.as_millis() as u64,
-                    "a recorder did not finish in time; its audio is lost"
+                    %recording_id,
+                    "a recorder ended before it reported its stop; its upload is watched anyway"
                 );
                 None
             }
+            Err(_) => {
+                warn!(
+                    %recording_id,
+                    timeout_ms = STOP_TIMEOUT.as_millis() as u64,
+                    "a recorder did not close its segment in time; the detach is answered \
+                     without a stop report and the upload is watched anyway"
+                );
+                None
+            }
+        };
+        FinishedCapture {
+            session,
+            recording_id,
+            stopped,
+            upload: task,
         }
     }
 }
@@ -844,7 +955,10 @@ pub fn spawn(
     observer: Option<Weak<dyn ObservationSink>>,
 ) -> RecorderHandle {
     let (commands, inbox) = mpsc::channel(COMMAND_DEPTH);
+    let (reporter, stopped) = oneshot::channel();
     let progress = Arc::new(RecordingProgress::default());
+    let session = spec.session;
+    let recording_id = spec.recording_id.clone();
     let task = tokio::spawn(run(
         spec,
         subscription,
@@ -852,9 +966,13 @@ pub fn spawn(
         support,
         observer,
         Arc::clone(&progress),
+        reporter,
     ));
     RecorderHandle {
+        session,
+        recording_id,
         commands,
+        stopped,
         task,
         progress,
     }
@@ -867,6 +985,7 @@ async fn run(
     support: RecordingSupport,
     observer: Option<Weak<dyn ObservationSink>>,
     progress: Arc<RecordingProgress>,
+    reporter: oneshot::Sender<StopReport>,
 ) -> RecordingOutcome {
     let counters = Arc::clone(&support.counters);
     counters.live.fetch_add(1, Ordering::Relaxed);
@@ -1005,6 +1124,20 @@ async fn run(
             duration_ms,
         },
     );
+    if reporter
+        .send(StopReport {
+            duration_ms,
+            frames,
+            stats,
+        })
+        .is_err()
+    {
+        info!(
+            %recording_id,
+            "nobody waited for this recording's stop report; its upload runs on regardless"
+        );
+    }
+    let permit = acquire_upload_slot(&support, &recording_id).await;
 
     let rate = spec.sample_rate_hz;
     let content_type = spec.format.content_type();
@@ -1037,6 +1170,15 @@ async fn run(
                     %error,
                     "this recording could not be encoded as wav"
                 );
+                observe(
+                    &observer,
+                    spec.session,
+                    Observation::UploadFailed {
+                        recording_id: recording_id.clone(),
+                        key: target.key.clone(),
+                        error: error.to_string(),
+                    },
+                );
                 continue;
             }
         };
@@ -1055,25 +1197,38 @@ async fn run(
             "recording closed; uploading"
         );
         let uri = upload(&support, &target.key, content_type, bytes, &recording_id).await;
-        if let Some(uri) = uri {
-            counters.uploaded.fetch_add(1, Ordering::Relaxed);
-            counters
-                .bytes_uploaded
-                .fetch_add(size as u64, Ordering::Relaxed);
-            total += size;
-            observe(
-                &observer,
-                spec.session,
-                Observation::UploadCompleted {
-                    recording_id: recording_id.clone(),
-                    uri: uri.clone(),
-                },
-            );
-            uris.push(uri);
-        } else {
-            uploaded_all = false;
+        match uri {
+            Ok(uri) => {
+                counters.uploaded.fetch_add(1, Ordering::Relaxed);
+                counters
+                    .bytes_uploaded
+                    .fetch_add(size as u64, Ordering::Relaxed);
+                total += size;
+                observe(
+                    &observer,
+                    spec.session,
+                    Observation::UploadCompleted {
+                        recording_id: recording_id.clone(),
+                        uri: uri.clone(),
+                    },
+                );
+                uris.push(uri);
+            }
+            Err(error) => {
+                uploaded_all = false;
+                observe(
+                    &observer,
+                    spec.session,
+                    Observation::UploadFailed {
+                        recording_id: recording_id.clone(),
+                        key: target.key.clone(),
+                        error,
+                    },
+                );
+            }
         }
     }
+    drop(permit);
     if let Some(held) = journal {
         if uploaded_all {
             held.discard().await;
@@ -1095,13 +1250,42 @@ async fn run(
     }
 }
 
+async fn acquire_upload_slot(
+    support: &RecordingSupport,
+    recording_id: &str,
+) -> Option<OwnedSemaphorePermit> {
+    let waited = Instant::now();
+    let permit = Arc::clone(&support.upload_permits).acquire_owned().await;
+    match permit {
+        Ok(permit) => {
+            let waited_ms = waited.elapsed().as_millis() as u64;
+            if waited_ms > 0 {
+                info!(
+                    %recording_id,
+                    waited_ms,
+                    env = UPLOAD_CONCURRENCY_ENV,
+                    "this upload queued behind the ones already running"
+                );
+            }
+            Some(permit)
+        }
+        Err(_) => {
+            warn!(
+                %recording_id,
+                "the upload slots are closed; this upload runs without one"
+            );
+            None
+        }
+    }
+}
+
 async fn upload(
     support: &RecordingSupport,
     key: &str,
     content_type: &'static str,
     bytes: Vec<u8>,
     recording_id: &str,
-) -> Option<String> {
+) -> Result<String, String> {
     let Some(sink) = support.sink.as_ref() else {
         support
             .counters
@@ -1114,7 +1298,7 @@ async fn upload(
             "no recording storage is configured; this recording is lost"
         );
         spill(support, key, bytes, recording_id).await;
-        return None;
+        return Err(format!("{BUCKET_ENV} names no recording storage"));
     };
     let keep = support.spill_dir.as_ref().map(|_| bytes.clone());
     let attempt = tokio::time::timeout(UPLOAD_TIMEOUT, sink.put(key, content_type, bytes)).await;
@@ -1125,7 +1309,7 @@ async fn upload(
     match outcome {
         Ok(uri) => {
             info!(%recording_id, %uri, "recording uploaded");
-            Some(uri)
+            Ok(uri)
         }
         Err(error) => {
             support
@@ -1136,7 +1320,7 @@ async fn upload(
             if let Some(bytes) = keep {
                 spill(support, key, bytes, recording_id).await;
             }
-            None
+            Err(error.to_string())
         }
     }
 }
@@ -1277,6 +1461,7 @@ mod tests {
         puts: Mutex<Vec<(String, Vec<u8>)>>,
         refuse: bool,
         stall: bool,
+        slow_by: Duration,
     }
 
     impl MemorySink {
@@ -1285,6 +1470,7 @@ mod tests {
                 puts: Mutex::new(Vec::new()),
                 refuse: false,
                 stall: false,
+                slow_by: Duration::ZERO,
             }
         }
 
@@ -1293,6 +1479,16 @@ mod tests {
                 puts: Mutex::new(Vec::new()),
                 refuse: true,
                 stall: false,
+                slow_by: Duration::ZERO,
+            }
+        }
+
+        fn slow(slow_by: Duration) -> MemorySink {
+            MemorySink {
+                puts: Mutex::new(Vec::new()),
+                refuse: false,
+                stall: false,
+                slow_by,
             }
         }
 
@@ -1329,6 +1525,9 @@ mod tests {
             body: Vec<u8>,
         ) -> Result<String, UploadError> {
             assert_eq!(content_type, "audio/wav");
+            if !self.slow_by.is_zero() {
+                tokio::time::sleep(self.slow_by).await;
+            }
             if self.stall {
                 tokio::time::sleep(UPLOAD_TIMEOUT * 3).await;
             }
@@ -1569,6 +1768,7 @@ mod tests {
             spill_every: SPILL_EVERY,
             counters: Arc::new(RecorderCounters::default()),
             owner: "pod-a".to_string(),
+            upload_permits: Arc::new(Semaphore::new(DEFAULT_UPLOAD_CONCURRENCY)),
         }
     }
 
@@ -1687,7 +1887,12 @@ mod tests {
         hub.publish(TapEvent::media(Track::Customer, 0, &tone(5)));
         wait_for_segments(&counters, 1).await;
         hub.publish(TapEvent::media(Track::Customer, 20, &tone(6)));
-        let outcome = handle.finish().await.expect("the recorder had no outcome");
+        let outcome = handle
+            .finish()
+            .await
+            .settle()
+            .await
+            .expect("the recorder had no outcome");
         drop(hub);
 
         assert_eq!(outcome.frames, 2 * FRAME, "{outcome:?}");
@@ -1842,7 +2047,12 @@ mod tests {
         );
 
         hub.publish(TapEvent::media(Track::Customer, 0, &tone(5)));
-        let outcome = handle.finish().await.expect("the recorder had no outcome");
+        let outcome = handle
+            .finish()
+            .await
+            .settle()
+            .await
+            .expect("the recorder had no outcome");
         drop(hub);
 
         assert_eq!(
@@ -1909,7 +2119,12 @@ mod tests {
         );
 
         hub.publish(TapEvent::media(Track::Customer, 0, &tone(5)));
-        let outcome = handle.finish().await.expect("the recorder had no outcome");
+        let outcome = handle
+            .finish()
+            .await
+            .settle()
+            .await
+            .expect("the recorder had no outcome");
         drop(hub);
 
         assert_eq!(
@@ -2008,7 +2223,12 @@ mod tests {
             hub.publish(TapEvent::media(Track::Mixed, at * 20, &tone(700)));
         }
 
-        let outcome = handle.finish().await.expect("the recorder had no outcome");
+        let outcome = handle
+            .finish()
+            .await
+            .settle()
+            .await
+            .expect("the recorder had no outcome");
         drop(hub);
 
         assert_eq!(outcome.duration_ms, 100);
@@ -2061,7 +2281,12 @@ mod tests {
             hub.publish(TapEvent::media(Track::Mixed, at * 20, &tone(-700)));
         }
 
-        let outcome = handle.finish().await.expect("the recorder had no outcome");
+        let outcome = handle
+            .finish()
+            .await
+            .settle()
+            .await
+            .expect("the recorder had no outcome");
         drop(hub);
 
         assert_eq!(
@@ -2106,7 +2331,12 @@ mod tests {
         wait_for_segments(&counters, 1).await;
         hub.publish(TapEvent::media(Track::Mixed, 20, &tone(6)));
 
-        let outcome = handle.finish().await.expect("the recorder had no outcome");
+        let outcome = handle
+            .finish()
+            .await
+            .settle()
+            .await
+            .expect("the recorder had no outcome");
         drop(hub);
 
         assert_eq!(outcome.frames, 2 * FRAME, "{outcome:?}");
@@ -2180,7 +2410,12 @@ mod tests {
             hub.publish(TapEvent::media(Track::Agent, at * 20, &tone(-32)));
         }
 
-        let outcome = handle.finish().await.expect("the recorder had no outcome");
+        let outcome = handle
+            .finish()
+            .await
+            .settle()
+            .await
+            .expect("the recorder had no outcome");
         drop(hub);
 
         assert_eq!(outcome.duration_ms, 200);
@@ -2246,7 +2481,12 @@ mod tests {
         }
         drop(hub);
 
-        let outcome = handle.finish().await.expect("the recorder had no outcome");
+        let outcome = handle
+            .finish()
+            .await
+            .settle()
+            .await
+            .expect("the recorder had no outcome");
         assert_eq!(outcome.duration_ms, 60);
         assert_eq!(outcome.uris.len(), 1);
         assert!(matches!(
@@ -2277,22 +2517,138 @@ mod tests {
         let handle = spawn(spec(), subscription, support, Some(observer));
 
         hub.publish(TapEvent::media(Track::Customer, 0, &tone(5)));
-        let outcome = handle.finish().await.expect("the recorder had no outcome");
+        let outcome = handle
+            .finish()
+            .await
+            .settle()
+            .await
+            .expect("the recorder had no outcome");
         drop(hub);
 
         assert!(outcome.uris.is_empty());
         assert_eq!(
             seen.seen(),
-            vec![Observation::RecordingStopped {
-                recording_id: "rec-99".to_string(),
-                duration_ms: 20,
-            }]
+            vec![
+                Observation::RecordingStopped {
+                    recording_id: "rec-99".to_string(),
+                    duration_ms: 20,
+                },
+                Observation::UploadFailed {
+                    recording_id: "rec-99".to_string(),
+                    key: "acct-42/rec-99.wav".to_string(),
+                    error: "the object store refused the upload: the bucket said no".to_string(),
+                }
+            ],
+            "a recording that never reached storage says so, so an integrator does not wait \
+             forever for an upload event that is never coming"
         );
         assert_eq!(counters.upload_failures.load(Ordering::Relaxed), 1);
         assert_eq!(counters.spilled.load(Ordering::Relaxed), 1);
         let spilled = directory.join("acct-42/rec-99.wav");
         assert!(spilled.is_file(), "{} is missing", spilled.display());
         let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_stop_is_reported_before_the_upload_starts_and_the_upload_runs_on_alone() {
+        let (mut hub, client) = Hub::new();
+        let subscription = client.attach(64, TrackSelection::All).unwrap();
+        hub.poll_commands();
+        let sink = Arc::new(MemorySink::slow(Duration::from_millis(1_500)));
+        let seen = Arc::new(Collected::default());
+        let strong: Arc<dyn ObservationSink> = seen.clone();
+        let observer = Arc::downgrade(&strong);
+        let support = support(Arc::clone(&sink) as Arc<dyn RecordingSink>, None);
+        let counters = Arc::clone(&support.counters);
+        let handle = spawn(spec(), subscription, support, Some(observer));
+
+        for at in 0..5u64 {
+            hub.publish(TapEvent::media(Track::Customer, at * 20, &tone(111)));
+        }
+
+        let asked = Instant::now();
+        let finished = handle.finish().await;
+        let answered = asked.elapsed();
+
+        assert!(
+            answered < Duration::from_millis(100),
+            "closing the segment took {answered:?}, so a detach would have waited for the upload"
+        );
+        let stopped = finished.stopped.clone().expect("a stop report");
+        assert_eq!(stopped.duration_ms, 100);
+        assert_eq!(stopped.frames, 5 * FRAME);
+        assert_eq!(
+            seen.seen(),
+            vec![Observation::RecordingStopped {
+                recording_id: "rec-99".to_string(),
+                duration_ms: 100,
+            }],
+            "the stop is published before the caller is released, the upload is not"
+        );
+        assert_eq!(counters.uploaded.load(Ordering::Relaxed), 0);
+
+        let outcome = finished
+            .settle()
+            .await
+            .expect("the recorder had no outcome");
+        drop(hub);
+
+        assert!(
+            asked.elapsed() >= Duration::from_millis(1_500),
+            "the slow upload did not actually take its time"
+        );
+        assert_eq!(outcome.uris.len(), 1);
+        assert_eq!(
+            seen.seen().last(),
+            Some(&Observation::UploadCompleted {
+                recording_id: "rec-99".to_string(),
+                uri: format!("s3:{URI_SCHEME_SEPARATOR}lab-recordings/acct-42/rec-99.wav"),
+            }),
+            "the upload reports itself once it lands, long after the stop"
+        );
+        assert_eq!(counters.uploaded.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn background_uploads_run_no_wider_than_their_configured_concurrency() {
+        const SLOW_BY: Duration = Duration::from_millis(400);
+        let sink = Arc::new(MemorySink::slow(SLOW_BY));
+        let mut support = support(Arc::clone(&sink) as Arc<dyn RecordingSink>, None);
+        support.upload_permits = Arc::new(Semaphore::new(1));
+
+        let mut hubs = Vec::new();
+        let mut finishing = Vec::new();
+        for _ in 0..2 {
+            let (mut hub, client) = Hub::new();
+            let subscription = client.attach(64, TrackSelection::All).unwrap();
+            hub.poll_commands();
+            let handle = spawn(spec(), subscription, support.clone(), None);
+            hub.publish(TapEvent::media(Track::Customer, 0, &tone(9)));
+            hubs.push(hub);
+            finishing.push(handle);
+        }
+
+        let asked = Instant::now();
+        let mut settling = Vec::new();
+        for handle in finishing {
+            settling.push(handle.finish().await);
+        }
+        assert!(
+            asked.elapsed() < Duration::from_millis(100),
+            "both recorders must be released before either upload starts"
+        );
+        let uploads = settling.into_iter().map(FinishedCapture::settle);
+        for outcome in futures_util::future::join_all(uploads).await {
+            assert_eq!(outcome.expect("a recorder had no outcome").uris.len(), 1);
+        }
+        drop(hubs);
+
+        assert!(
+            asked.elapsed() >= SLOW_BY * 2,
+            "one permit means one upload at a time; these two overlapped in {:?}",
+            asked.elapsed()
+        );
+        assert_eq!(support.counters.uploaded.load(Ordering::Relaxed), 2);
     }
 
     #[test]
@@ -2352,7 +2708,12 @@ mod tests {
             hub.publish(TapEvent::media(Track::Customer, at * 20, &tone(300)));
             hub.publish(TapEvent::media(Track::Agent, at * 20, &tone(-300)));
         }
-        let outcome = handle.finish().await.expect("the recorder had no outcome");
+        let outcome = handle
+            .finish()
+            .await
+            .settle()
+            .await
+            .expect("the recorder had no outcome");
         drop(hub);
 
         assert_eq!(outcome.duration_ms, 60);
@@ -2533,7 +2894,12 @@ mod tests {
         for at in 0..5u64 {
             hub.publish(TapEvent::media(Track::Customer, at * 20, &tone(500)));
         }
-        let outcome = handle.finish().await.expect("the recorder had no outcome");
+        let outcome = handle
+            .finish()
+            .await
+            .settle()
+            .await
+            .expect("the recorder had no outcome");
         drop(hub);
 
         let lead = outcome.stats.lead_silence_frames as usize;

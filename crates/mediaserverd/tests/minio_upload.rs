@@ -143,6 +143,9 @@ async fn a_recording_group_lands_one_object_per_participant_in_a_real_bucket() {
         spill_every: recorder::SPILL_EVERY,
         counters: Arc::new(RecorderCounters::default()),
         owner: "drill".to_string(),
+        upload_permits: std::sync::Arc::new(tokio::sync::Semaphore::new(
+            recorder::DEFAULT_UPLOAD_CONCURRENCY,
+        )),
     };
     let counters = Arc::clone(&support.counters);
 
@@ -253,7 +256,14 @@ async fn a_recording_group_lands_one_object_per_participant_in_a_real_bucket() {
 
     let mut outcomes = Vec::new();
     for handle in handles {
-        outcomes.push(handle.finish().await.expect("a member had no outcome"));
+        outcomes.push(
+            handle
+                .finish()
+                .await
+                .settle()
+                .await
+                .expect("a member had no outcome"),
+        );
     }
     drop(hubs);
 
@@ -342,6 +352,9 @@ async fn a_paused_recording_lands_in_a_real_bucket_under_the_frozen_identity() {
         spill_every: recorder::SPILL_EVERY,
         counters: Arc::new(RecorderCounters::default()),
         owner: "drill".to_string(),
+        upload_permits: std::sync::Arc::new(tokio::sync::Semaphore::new(
+            recorder::DEFAULT_UPLOAD_CONCURRENCY,
+        )),
     };
     let counters = Arc::clone(&support.counters);
 
@@ -388,7 +401,12 @@ async fn a_paused_recording_lands_in_a_real_bucket_under_the_frozen_identity() {
         live.publish(TapEvent::media(Track::Agent, at * 20, &[AGENT_TONE; FRAME]));
     }
 
-    let outcome = handle.finish().await.expect("the recorder had no outcome");
+    let outcome = handle
+        .finish()
+        .await
+        .settle()
+        .await
+        .expect("the recorder had no outcome");
     drop(live);
     let expected_ms = (SPOKEN_FRAMES + SPOKEN_FRAMES) * 20;
     assert_eq!(outcome.duration_ms, expected_ms);

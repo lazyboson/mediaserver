@@ -1,4 +1,8 @@
+use crate::discovery::DiscoveryCounters;
+use crate::drain::DrainState;
 use crate::event_pump::PumpCounters;
+use crate::health::{Readiness, HEALTHZ_PATH, READYZ_PATH};
+use crate::media_ports::MediaPortAllocator;
 use crate::registry_keeper::KeeperCounters;
 use crate::tap_plane::TapPlaneMetrics;
 use control_api::SessionController;
@@ -10,6 +14,9 @@ use tokio::net::TcpListener;
 use tracing::{info, warn};
 
 const REQUEST_READ_LIMIT: usize = 8 * 1024;
+const METRICS_PATH: &str = "/metrics";
+const EXPOSITION_CONTENT_TYPE: &str = "text/plain; version=0.0.4; charset=utf-8";
+const PLAIN_CONTENT_TYPE: &str = "text/plain; charset=utf-8";
 const REQUEST_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 #[derive(Clone)]
@@ -18,6 +25,69 @@ pub struct MetricsSources {
     pub controller: Arc<SessionController>,
     pub pump: Option<Arc<PumpCounters>>,
     pub keeper: Option<Arc<KeeperCounters>>,
+    pub discovery: Option<Arc<DiscoveryCounters>>,
+    pub drain: Arc<DrainState>,
+    pub ports: Arc<MediaPortAllocator>,
+    pub readiness: Arc<Readiness>,
+}
+
+pub struct HttpResponse {
+    pub status: &'static str,
+    pub content_type: &'static str,
+    pub body: String,
+}
+
+pub fn route(request: &[u8], sources: &MetricsSources) -> HttpResponse {
+    let Some(line) = std::str::from_utf8(request)
+        .ok()
+        .and_then(|text| text.lines().next())
+    else {
+        return HttpResponse {
+            status: "400 Bad Request",
+            content_type: PLAIN_CONTENT_TYPE,
+            body: "the request line is not readable\n".to_string(),
+        };
+    };
+    let mut words = line.split_whitespace();
+    let method = words.next().unwrap_or_default();
+    let target = words.next().unwrap_or_default();
+    let path = target.split(['?', '#']).next().unwrap_or(target);
+    if !matches!(method, "GET" | "HEAD") {
+        return HttpResponse {
+            status: "405 Method Not Allowed",
+            content_type: PLAIN_CONTENT_TYPE,
+            body: format!("{METRICS_PATH}, {HEALTHZ_PATH} and {READYZ_PATH} answer GET\n"),
+        };
+    }
+    match path {
+        METRICS_PATH => HttpResponse {
+            status: "200 OK",
+            content_type: EXPOSITION_CONTENT_TYPE,
+            body: render(sources),
+        },
+        HEALTHZ_PATH => HttpResponse {
+            status: "200 OK",
+            content_type: PLAIN_CONTENT_TYPE,
+            body: "alive\n".to_string(),
+        },
+        READYZ_PATH => {
+            let verdict = sources.readiness.verdict();
+            HttpResponse {
+                status: if verdict.ready {
+                    "200 OK"
+                } else {
+                    "503 Service Unavailable"
+                },
+                content_type: PLAIN_CONTENT_TYPE,
+                body: verdict.body,
+            }
+        }
+        _ => HttpResponse {
+            status: "404 Not Found",
+            content_type: PLAIN_CONTENT_TYPE,
+            body: format!("{METRICS_PATH}\n{HEALTHZ_PATH}\n{READYZ_PATH}\n"),
+        },
+    }
 }
 
 pub fn render(sources: &MetricsSources) -> String {
@@ -232,6 +302,11 @@ pub fn render(sources: &MetricsSources) -> String {
         snapshot.ssrc_requeries,
     );
     counter(
+        "mss_dtmf_events_dropped_total",
+        "DTMF presses dropped before reaching the event bus because its queue was full",
+        snapshot.dtmf_events_dropped,
+    );
+    counter(
         "mss_ingest_stalls_total",
         "Times a tap leg stopped receiving datagrams for the watchdog window",
         snapshot.totals.stalls,
@@ -275,6 +350,16 @@ pub fn render(sources: &MetricsSources) -> String {
         "mss_recording_upload_failures_total",
         "Recordings that did not reach object storage",
         snapshot.recording_upload_failures,
+    );
+    counter(
+        "mss_recording_uploads_backgrounded_total",
+        "Recording uploads handed to a background task so the detach could be answered",
+        snapshot.recording_uploads_backgrounded,
+    );
+    counter(
+        "mss_recording_upload_settle_timeouts_total",
+        "Backgrounded recording uploads that never settled inside their watch window",
+        snapshot.recording_upload_settle_timeouts,
     );
     counter(
         "mss_recording_spills_total",
@@ -407,6 +492,11 @@ pub fn render(sources: &MetricsSources) -> String {
         "mss_consumer_queue_depth_frames_max",
         "Deepest single consumer queue",
         snapshot.consumer_queue_depth_max,
+    );
+    gauge(
+        "mss_recording_uploads_in_flight",
+        "Recording uploads still running after the detach that stopped them was answered",
+        snapshot.recording_uploads_in_flight,
     );
     gauge(
         "mss_recordings_live",
@@ -550,6 +640,103 @@ pub fn render(sources: &MetricsSources) -> String {
             "Sessions this pod gave up because another pod holds their lease",
             keeper.surrendered.load(Ordering::Relaxed),
         );
+        counter(
+            "mss_registry_handed_off_total",
+            "Leases released at shutdown so an adopter does not wait for the ttl",
+            keeper.handed_off.load(Ordering::Relaxed),
+        );
+    }
+
+    if let Some(discovery) = &sources.discovery {
+        counter(
+            "mss_discovery_hits_total",
+            "Calls whose rtpengine node came from the discovery map",
+            discovery.hits.load(Ordering::Relaxed),
+        );
+        counter(
+            "mss_discovery_misses_total",
+            "Calls the discovery map held no node for; the default node was used",
+            discovery.misses.load(Ordering::Relaxed),
+        );
+        counter(
+            "mss_discovery_errors_total",
+            "Discovery lookups that failed or returned something unreadable",
+            discovery.errors.load(Ordering::Relaxed),
+        );
+    }
+
+    let ports = sources.ports.counters();
+    for (name, help, kind, value) in [
+        (
+            "mss_media_ports_exhausted_total",
+            "Media socket binds refused because the configured port range had nothing free",
+            "counter",
+            ports.exhausted,
+        ),
+        (
+            "mss_media_ports_bind_conflicts_total",
+            "Ports in the configured media range that another process already held",
+            "counter",
+            ports.bind_conflicts,
+        ),
+        (
+            "mss_media_ports_in_use",
+            "Media sockets this pod holds open",
+            "gauge",
+            ports.in_use,
+        ),
+        (
+            "mss_media_ports_free",
+            "Ports left in the configured media range; 0 when no range is configured",
+            "gauge",
+            ports.free,
+        ),
+        (
+            "mss_media_ports_capacity",
+            "Rtp sockets the configured media range can serve; 0 when no range is configured",
+            "gauge",
+            ports.capacity,
+        ),
+    ] {
+        let _ = writeln!(out, "# HELP {name} {help}");
+        let _ = writeln!(out, "# TYPE {name} {kind}");
+        let _ = writeln!(out, "{name} {value}");
+    }
+
+    let _ = writeln!(
+        out,
+        "# HELP mss_draining Whether this pod is draining and refusing new sessions"
+    );
+    let _ = writeln!(out, "# TYPE mss_draining gauge");
+    let _ = writeln!(
+        out,
+        "mss_draining {}",
+        u8::from(sources.drain.is_draining())
+    );
+
+    let readiness = sources.readiness.snapshot();
+    let _ = writeln!(
+        out,
+        "# HELP mss_ready Whether this pod answers its readiness probe with 200"
+    );
+    let _ = writeln!(out, "# TYPE mss_ready gauge");
+    let _ = writeln!(out, "mss_ready {}", u8::from(readiness.ready));
+    let _ = writeln!(
+        out,
+        "# HELP mss_dependency_ready Whether a configured dependency answered its last probe"
+    );
+    let _ = writeln!(out, "# TYPE mss_dependency_ready gauge");
+    for dependency in readiness
+        .dependencies
+        .iter()
+        .filter(|dependency| dependency.configured)
+    {
+        let _ = writeln!(
+            out,
+            "mss_dependency_ready{{dependency=\"{}\"}} {}",
+            dependency.label,
+            u8::from(dependency.ready)
+        );
     }
 
     let _ = writeln!(
@@ -602,14 +789,16 @@ pub async fn serve(listener: TcpListener, sources: MetricsSources) {
             if !complete {
                 return;
             }
-            let body = render(&sources);
+            let answered = route(&request[..read], &sources);
             let response = format!(
-                "HTTP/1.1 200 OK\r\n\
-                 Content-Type: text/plain; version=0.0.4; charset=utf-8\r\n\
+                "HTTP/1.1 {}\r\n\
+                 Content-Type: {}\r\n\
                  Content-Length: {}\r\n\
                  Connection: close\r\n\r\n{}",
-                body.len(),
-                body
+                answered.status,
+                answered.content_type,
+                answered.body.len(),
+                answered.body
             );
             if let Err(error) = socket.write_all(response.as_bytes()).await {
                 warn!(%peer, %error, "could not write a metrics response");
@@ -627,9 +816,12 @@ mod tests {
     use std::net::IpAddr;
 
     fn sources() -> MetricsSources {
+        let drain = DrainState::shared();
         let plane = TapPlane::new(TapPlaneConfig {
             default_node: None,
             local_media_address: IpAddr::from([127, 0, 0, 1]),
+            advertised_media_address: IpAddr::from([127, 0, 0, 1]),
+            media_ports: crate::media_ports::MediaPortAllocator::ephemeral(),
             format: AudioFormat::pcmu_8k_20ms(),
             transcode_at_tap: true,
             opus_decode_rate_hz: 16000,
@@ -643,6 +835,10 @@ mod tests {
             controller: Arc::new(SessionController::new("test-pod")),
             pump: Some(Arc::new(PumpCounters::default())),
             keeper: Some(Arc::new(KeeperCounters::default())),
+            discovery: Some(Arc::new(DiscoveryCounters::default())),
+            drain: Arc::clone(&drain),
+            ports: crate::media_ports::MediaPortAllocator::ephemeral(),
+            readiness: crate::health::Readiness::shared(drain),
         }
     }
 
@@ -689,6 +885,9 @@ mod tests {
             "mss_recordings_stopped_total",
             "mss_recording_pauses_total",
             "mss_recording_uploads_total",
+            "mss_recording_uploads_backgrounded_total",
+            "mss_recording_uploads_in_flight",
+            "mss_recording_upload_settle_timeouts_total",
             "mss_recording_bytes_uploaded_total",
             "mss_recording_seconds_total",
             "mss_recordings_live",
@@ -728,15 +927,135 @@ mod tests {
     }
 
     #[test]
+    fn the_discovery_counters_are_exposed_when_a_node_map_is_configured() {
+        let sources = sources();
+        let discovery = sources.discovery.as_ref().expect("a map is configured");
+        discovery.hits.fetch_add(3, Ordering::Relaxed);
+        discovery.misses.fetch_add(2, Ordering::Relaxed);
+        discovery.errors.fetch_add(1, Ordering::Relaxed);
+        let text = render(&sources);
+        assert!(text.contains("mss_discovery_hits_total 3"));
+        assert!(text.contains("mss_discovery_misses_total 2"));
+        assert!(text.contains("mss_discovery_errors_total 1"));
+    }
+
+    #[test]
     fn absent_optional_sources_leave_their_series_out_rather_than_lying_zero() {
         let mut sources = sources();
         sources.pump = None;
         sources.keeper = None;
+        sources.discovery = None;
         let text = render(&sources);
+        assert!(!text.contains("mss_discovery_hits_total"));
         assert!(!text.contains("mss_events_published_total"));
         assert!(!text.contains("mss_events_retry_depth"));
         assert!(!text.contains("mss_registry_persisted_total"));
         assert!(text.contains("mss_sessions_live"));
+    }
+
+    #[test]
+    fn the_drain_gauge_follows_the_flag_a_readiness_probe_will_read() {
+        let sources = sources();
+        assert!(render(&sources).contains("mss_draining 0"));
+        sources.drain.begin();
+        assert!(render(&sources).contains("mss_draining 1"));
+    }
+
+    fn probed_sources() -> MetricsSources {
+        let sources = sources();
+        for dependency in crate::health::DEPENDENCIES {
+            sources.readiness.record_ready(dependency);
+        }
+        sources
+    }
+
+    fn get(path: &str, sources: &MetricsSources) -> HttpResponse {
+        route(
+            format!("GET {path} HTTP/1.1\r\nHost: test\r\n\r\n").as_bytes(),
+            sources,
+        )
+    }
+
+    #[test]
+    fn liveness_answers_while_the_process_runs_whatever_the_dependencies_do() {
+        let sources = sources();
+        let answered = get(HEALTHZ_PATH, &sources);
+        assert_eq!(answered.status, "200 OK");
+        assert_eq!(answered.body, "alive\n");
+        sources.drain.begin();
+        sources
+            .readiness
+            .record_failure(crate::health::Dependency::Redis, "connection refused");
+        assert_eq!(get(HEALTHZ_PATH, &sources).status, "200 OK");
+    }
+
+    #[test]
+    fn readiness_waits_for_the_first_probe_of_every_dependency() {
+        let answered = get(READYZ_PATH, &sources());
+        assert_eq!(answered.status, "503 Service Unavailable");
+        assert!(
+            answered.body.contains("not probed yet"),
+            "{}",
+            answered.body
+        );
+        assert_eq!(get(READYZ_PATH, &probed_sources()).status, "200 OK");
+    }
+
+    #[test]
+    fn readiness_names_the_dependency_that_stopped_answering() {
+        let sources = probed_sources();
+        sources
+            .readiness
+            .record_failure(crate::health::Dependency::Redis, "connection refused");
+        let answered = get(READYZ_PATH, &sources);
+        assert_eq!(answered.status, "503 Service Unavailable");
+        let first = answered.body.lines().next().unwrap();
+        assert!(first.contains("redis"), "{first}");
+        assert!(first.contains("connection refused"), "{first}");
+    }
+
+    #[test]
+    fn readiness_turns_away_traffic_the_moment_a_drain_begins() {
+        let sources = probed_sources();
+        assert_eq!(get(READYZ_PATH, &sources).status, "200 OK");
+        sources.drain.begin();
+        let answered = get(READYZ_PATH, &sources);
+        assert_eq!(answered.status, "503 Service Unavailable");
+        assert!(answered.body.contains("draining"), "{}", answered.body);
+    }
+
+    #[test]
+    fn the_exposition_says_whether_the_pod_is_ready_and_which_dependency_is_not() {
+        let sources = probed_sources();
+        sources
+            .readiness
+            .record_not_configured(crate::health::Dependency::Kafka);
+        sources
+            .readiness
+            .record_failure(crate::health::Dependency::Redis, "connection refused");
+        let text = render(&sources);
+        assert!(text.contains("mss_ready 0"), "{text}");
+        assert!(
+            text.contains("mss_dependency_ready{dependency=\"redis\"} 0"),
+            "{text}"
+        );
+        assert!(
+            text.contains("mss_dependency_ready{dependency=\"rtpengine\"} 1"),
+            "{text}"
+        );
+        assert!(!text.contains("dependency=\"kafka\""), "{text}");
+    }
+
+    #[test]
+    fn only_the_three_documented_paths_answer_and_only_to_a_get() {
+        let sources = probed_sources();
+        assert_eq!(get(METRICS_PATH, &sources).status, "200 OK");
+        assert_eq!(get("/metrics?collect=all", &sources).status, "200 OK");
+        let unknown = get("/", &sources);
+        assert_eq!(unknown.status, "404 Not Found");
+        assert!(unknown.body.contains(READYZ_PATH), "{}", unknown.body);
+        let refused = route(b"POST /metrics HTTP/1.1\r\n\r\n", &sources);
+        assert_eq!(refused.status, "405 Method Not Allowed");
     }
 
     #[tokio::test]
@@ -755,5 +1074,42 @@ mod tests {
         assert!(response.starts_with("HTTP/1.1 200 OK"));
         assert!(response.contains("mss_sessions_live 0"));
         assert!(response.contains("text/plain"));
+    }
+
+    #[tokio::test]
+    async fn the_probe_paths_answer_over_the_wire_with_their_own_status_codes() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let sources = probed_sources();
+        let readiness = Arc::clone(&sources.readiness);
+        tokio::spawn(serve(listener, sources));
+
+        assert!(fetch(address, HEALTHZ_PATH)
+            .await
+            .starts_with("HTTP/1.1 200 OK"));
+        assert!(fetch(address, READYZ_PATH)
+            .await
+            .starts_with("HTTP/1.1 200 OK"));
+        readiness.record_failure(crate::health::Dependency::Redis, "connection refused");
+        let refused = fetch(address, READYZ_PATH).await;
+        assert!(
+            refused.starts_with("HTTP/1.1 503 Service Unavailable"),
+            "{refused}"
+        );
+        assert!(
+            refused.contains("redis unreachable: connection refused"),
+            "{refused}"
+        );
+    }
+
+    async fn fetch(address: std::net::SocketAddr, path: &str) -> String {
+        let mut socket = tokio::net::TcpStream::connect(address).await.unwrap();
+        socket
+            .write_all(format!("GET {path} HTTP/1.1\r\nHost: test\r\n\r\n").as_bytes())
+            .await
+            .unwrap();
+        let mut response = String::new();
+        socket.read_to_string(&mut response).await.unwrap();
+        response
     }
 }

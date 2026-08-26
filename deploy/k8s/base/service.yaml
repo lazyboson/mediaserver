@@ -1,0 +1,57 @@
+# The control plane is gRPC: one long-lived HTTP/2 connection per client would
+# pin every session to one pod behind a normal ClusterIP. Two Services on
+# purpose:
+#   mediaserverd        -- headless, so a gRPC client resolves all pod IPs and
+#                          load-balances requests itself (round_robin), which is
+#                          also what makes placement across pods even.
+#   mediaserverd-scrape -- headless too, for the ServiceMonitor; nothing should
+#                          reach /metrics through a virtual IP.
+# If your clients cannot do client-side balancing, add a third, ordinary
+# ClusterIP Service in front of `control` and accept the pinning.
+#
+# Media is deliberately absent from both. rtpengine sends the tap copy straight
+# to the address MSS advertised in its subscribe answer -- a pod IP, a node IP,
+# or whatever MSS_MEDIA_ADVERTISE_IP says. A Service in that path would rewrite
+# the destination and break symmetric RTP.
+apiVersion: v1
+kind: Service
+metadata:
+  name: mediaserverd
+  labels:
+    app.kubernetes.io/name: mediaserver
+    app.kubernetes.io/component: media-plane
+spec:
+  clusterIP: None
+  # Publish addresses before the pod is ready so a gRPC client's resolver sees
+  # a pod coming up; readiness still gates whether MSS accepts a session.
+  publishNotReadyAddresses: false
+  selector:
+    app.kubernetes.io/name: mediaserver
+    app.kubernetes.io/component: media-plane
+  ports:
+    - name: control
+      port: 50051
+      targetPort: control
+      protocol: TCP
+    - name: metrics
+      port: 9464
+      targetPort: metrics
+      protocol: TCP
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mediaserverd-scrape
+  labels:
+    app.kubernetes.io/name: mediaserver
+    app.kubernetes.io/component: metrics
+spec:
+  clusterIP: None
+  selector:
+    app.kubernetes.io/name: mediaserver
+    app.kubernetes.io/component: media-plane
+  ports:
+    - name: metrics
+      port: 9464
+      targetPort: metrics
+      protocol: TCP

@@ -1,3 +1,4 @@
+use crate::attribution::Attribution;
 use crate::ids::{AttachmentId, PlaybackId, SessionId};
 use crate::registry::SessionKind;
 use media_core::Track;
@@ -30,6 +31,8 @@ pub enum Observation {
     Dtmf {
         track: Track,
         digit: char,
+        duration_ms: u32,
+        rtp_timestamp: u32,
     },
     RecordingStarted {
         recording_id: String,
@@ -48,6 +51,15 @@ pub enum Observation {
     UploadCompleted {
         recording_id: String,
         uri: String,
+    },
+    UploadFailed {
+        recording_id: String,
+        key: String,
+        error: String,
+    },
+    LegsAttributed {
+        attribution: Attribution,
+        tracks: Vec<String>,
     },
 }
 
@@ -76,6 +88,8 @@ pub enum EventKind {
     Dtmf {
         track: Track,
         digit: char,
+        duration_ms: u32,
+        rtp_timestamp: u32,
     },
     RecordingStarted {
         recording_id: String,
@@ -95,6 +109,11 @@ pub enum EventKind {
         recording_id: String,
         uri: String,
     },
+    UploadFailed {
+        recording_id: String,
+        key: String,
+        error: String,
+    },
     PlaybackStarted {
         playback: PlaybackId,
     },
@@ -104,6 +123,10 @@ pub enum EventKind {
     },
     AttachmentUp {
         label: String,
+    },
+    LegsAttributed {
+        attribution: Attribution,
+        tracks: Vec<String>,
     },
     MixRouted {
         target: String,
@@ -149,6 +172,7 @@ pub struct MediaEvent {
     pub attachment: Option<AttachmentId>,
     pub seq: u64,
     pub legacy_eligible: bool,
+    pub attribution: Attribution,
     pub kind: EventKind,
 }
 
@@ -220,6 +244,11 @@ mod tests {
                 recording_id: recording_id.clone(),
                 uri: "s3:".to_string(),
             },
+            EventKind::UploadFailed {
+                recording_id: recording_id.clone(),
+                key: "acct-1/rec-1.wav".to_string(),
+                error: "the object store refused the upload".to_string(),
+            },
         ] {
             assert_eq!(kind.legacy_name(), None, "{kind:?} claimed a legacy name");
         }
@@ -234,6 +263,7 @@ mod tests {
             attachment: Some(AttachmentId::from_raw(2)),
             seq: 7,
             legacy_eligible: false,
+            attribution: Attribution::Explicit,
             kind: EventKind::Partial {
                 track: Track::Customer,
                 text: "hel".to_string(),

@@ -1002,6 +1002,48 @@ Also worth knowing for item 19's soak: D13 reproduces here on every run —
 the start frame advertises `["inbound","outbound"]` and a silent `mixed`
 track arrives anyway, which is why the gap consumer reports three tracks.
 
+## drain_drill.sh — the same pod stopped politely (SIGTERM, 2026-08-26)
+
+`pod_kill_drill.sh`'s sibling, and the reason to read them together: identical
+setup — a live 150 s MicroSIP call, tapped by pod A with a WS `gap_consumer.py`
+attached, pod B idle on the same Redis — but pod A is **stopped** rather than
+killed:
+
+```sh
+DOCKER_API_VERSION=1.43 docker compose -f lab/docker-compose.microsip.yml \
+  -f lab/docker-compose.webrtc.yml up -d rtpengine opensips freeswitch \
+  call-watcher redpanda redis minio minio-init llm-bridge mss-control \
+  mss-control-b
+./lab/drain_drill.sh
+# pod A is only stopped; bring it back with
+DOCKER_API_VERSION=1.43 docker compose -f lab/docker-compose.microsip.yml up -d mss-control
+```
+
+`docker stop -t 60`, because docker's default grace period is 10 s and the drain
+window is 30 s — a shorter `-t` than `MSS_DRAIN_TIMEOUT_SECS` measures the
+runtime's SIGKILL, not MSS's drain. The drill first asserts pod A's PID 1 is
+`mediaserverd` (`cargo run` exec-replaces itself on Unix); if that ever changes,
+the signal lands on cargo and the whole run means nothing.
+
+### The run (stamp 1787732824, 2026-08-26)
+
+| | SIGKILL (item 11) | SIGTERM drain (item 42) |
+| --- | --- | --- |
+| exit code | 137 | **0** |
+| consumer audio gap | 14.41 s | **1.96 s** |
+| adopted by the survivor | 14.4 s after the kill | **2.7 s after the signal** |
+| lease | expired on its 15 s TTL | **released explicitly** |
+| consumer close | socket dropped | Twilio `stop` frame after 2022 frames |
+| rtpengine subscription | orphaned (D14) | unsubscribed |
+
+`docker stop` returned in **0.44 s**; the drain itself logged
+`elapsed_ms=30` against its 30 000 ms budget, so the timeout is a ceiling and
+not a cost. Both tap legs finished with `jitter_lost=0`, `recv_errors=0`. The
+consumer's two connections — 2022 frames, then 12752 after pod B re-dialed the
+same endpoint — span one artifact, so the 1.96 s is measured on the wav, the
+same way item 11 measured its 14.41 s. The full step-by-step log is in
+[tasks.md item 42](tasks.md).
+
 ## soak.py — N calls for the better part of an hour (2026-08-22)
 
 Item 19. Every drill above answers "does this work once". `lab/soak.py` answers
@@ -2070,3 +2112,156 @@ assertions are measuring their own distortion.
   from item 40 only.
 - Only PCMU at 8 kHz/20 ms. No per-leg resampler exists, and a conference
   refuses a rate/ptime mismatch by name.
+
+## preflight.sh — the environment check, tried on the lab (2026-08-26)
+
+`lab/preflight.sh` (item 45, G5) is not a drill: it is the tool an operator runs
+on a jump host *before* deploying mediaserverd, and the lab is simply the first
+environment it was pointed at. The check table, every flag and both run
+transcripts live in [deploy.md](deploy.md#preflight--check-the-environment-before-deploying-into-it);
+what belongs here is how to run it against this lab and what the lab could not
+exercise.
+
+The NG port is not published to the WSL host, so run it inside the lab network:
+
+```sh
+DOCKER_API_VERSION=1.43 docker run --rm --network mss-microsip_lab \
+  -v "$PWD/lab":/lab:ro -w /lab python:3-slim sh /lab/preflight.sh \
+  --ng 172.31.99.10:22222 --redis redis://172.31.99.61:6379 \
+  --kafka 172.31.99.60:9092 --s3-endpoint http://172.31.99.62:9000 \
+  --bucket lab-recordings --access-key minioadmin --secret-key minioadmin \
+  --media-ports 40100-40139 --rtpengine-version 14.1.1.8
+```
+
+**10 PASS, 0 FAIL, 3 SKIP, exit 0.** The interesting line is `ng_tap_media`: the
+tool fabricates its own two-legged call through rtpengine, subscribes to the
+caller's from-tag, pumps ~1 s of PCMU into both legs and counted **49 datagrams**
+arriving on its subscription socket — the same mechanism `tap_live_call.sh` uses,
+compressed into a check that needs no lab and no mediaserverd. Then it
+unsubscribes, deletes, and `query` answers *Unknown call-id*.
+
+Pointing it at the wrong NG port and a bucket that does not exist turned it red
+(`3 PASS, 3 FAIL, 6 SKIP`, exit 1) with `NoSuchBucket` quoted from MinIO's own
+error body.
+
+### What the lab container cannot exercise, and what was done about it
+
+- **No kafka client library** in `python:3-slim`, so `kafka_topic` SKIPs by
+  design. A third run with `pip install kafka-python-ng` produced a probe record
+  to `mss.preflight.probe` and read it back at partition 0 offset 0 — then the
+  topic was deleted again, because a preflight should not litter a broker.
+- **No ssh, and no second host to ssh to.** `media_udp` was proved through a
+  shim on `PATH` named `ssh` that runs the command locally: the listener, the
+  remote sender snippet and the argument passing are real, the ssh hop is not.
+- **No chrony, no timedatectl** in a container — `clock` SKIPs and says so. That
+  check is only meaningful on the host mediaserverd will run on.
+
+## detach_latency_drill.sh — a detach that does not wait for its upload (2026-08-26)
+
+Item 50 (defect D11) made `Detach`/`StopRecording` answer as soon as the
+recording's segment is closed, with the upload running on behind it. Proving that
+needs a slow object store, so the drill *makes* one: it runs beside the live lab
+against the ordinary `mss-control` pod and, for its second phase, `docker pause`s
+MinIO — a paused container's network stack is frozen, so the upload hangs inside
+its 60 s window instead of failing fast.
+
+```sh
+DOCKER_API_VERSION=1.43 docker compose -f lab/docker-compose.microsip.yml \
+  -f lab/docker-compose.webrtc.yml up -d rtpengine redis redpanda minio \
+  minio-init mss-control
+./lab/detach_latency_drill.sh
+```
+
+Two fabricated calls (`lab/call_driver.py`, no SIP), one tap each, one `FILE_S3`
+recording each. The run of stamp 1787745041:
+
+| | phase A (MinIO healthy) | phase B (MinIO paused) |
+| --- | --- | --- |
+| `Detach` RPC | **49 ms** | **11 ms** |
+| `DestroySession` RPC | — | **10 ms** |
+| upload took | 29 ms | **12.07 s** (11:51:25.339 → 11:51:37.405) |
+| during the upload | — | `mss_recording_uploads_in_flight 1` with `mss_sessions_live 0` |
+| terminal event | `UploadCompleted` seq **13** | `UploadCompleted` seq **10**, after `SessionEnded` seq 9 |
+| the whole sequence | gapless `0..14` | gapless `0..10` |
+| object in the bucket | 469 KiB | 252 KiB |
+
+Both RPC times are measured around the `mss_ctl` **process**, so they include its
+start and its gRPC connect; the server-side figure is smaller. Before this item
+the phase-B detach would have returned only when the upload did — 12 s later, by
+construction.
+
+Phase B is the interesting half, because the session is **destroyed while the
+upload is stalled**. The pod's own words, in order: `recording stopped; its
+upload runs in the background` → `this session will be remembered until its
+recording upload settles, so the upload's own event keeps its place in the
+session's sequence` → (12 s later, after `docker unpause`) `recording uploaded`
+→ `a backgrounded recording upload settled` → `the last upload of this ended
+session settled; forgotten`. That is the finishing-session design working on real
+sockets: the session is gone from `mss_sessions_live` and from every listing the
+instant `DestroySession` returns, yet its `seq` continues for exactly one more
+event.
+
+### What this does not prove
+
+- **No live `UploadFailed`.** The drill makes storage slow, then lets it
+  recover. The failure event is proved in-process only (a refusing sink, and the
+  registry sequence test); a live run against permanently broken storage would
+  have to wait out the 60 s `UPLOAD_TIMEOUT`.
+- **Nothing about a pod dying mid-upload.** The retention is per-pod state, so a
+  `kill -9` between the detach and the upload still loses the event; the audio is
+  recovered by D9's salvage pass on that pod's next start, silently.
+- **The concurrency bound is not exercised here** — one recording at a time. That
+  is `background_uploads_run_no_wider_than_their_configured_concurrency`, in
+  process.
+
+## node_discovery_drill.sh — the proxy tells MSS which rtpengine to ask (2026-08-26)
+
+Item 51 (G11) lets a `CreateSession` that names no rtpengine node read the node
+out of Redis, where the proxy published it. The lab proxy publishes it for real
+— through `exec.so` + `lab/opensips/discovery_publish.py`, because
+`opensips/opensips:3.4` ships **no `cachedb_redis.so`** and apt.opensips.org no
+longer carries a 3.4 component for bullseye. The bytes written are identical to
+the `cache_store` snippet in [deploy.md](deploy.md).
+
+The trick that makes the drill a proof rather than a coincidence: the pod's
+**default** node is pointed at a black hole, so a tap can only work if the node
+came from the map.
+
+```sh
+export DOCKER_API_VERSION=1.43 DISCOVERY=on
+export MSS_DISCOVERY_REDIS_KEY_PREFIX=mss:call-node:
+export MSS_RTPENGINE_NODE=172.31.99.199:22222
+docker compose -f lab/docker-compose.microsip.yml \
+  -f lab/docker-compose.webrtc.yml up -d --force-recreate \
+  rtpengine opensips freeswitch redis redpanda minio minio-init \
+  call-watcher mss-control
+./lab/node_discovery_drill.sh
+```
+
+A real SIP call through OpenSIPS (`lab/host_test_caller.py`), then:
+
+| | |
+| --- | --- |
+| `redis-cli GET mss:call-node:<call-id>` | `{"node":"172.31.99.10:22222","caller_tag":"hosttest","from_tags":["hosttest","y3HmFyeQae04N"]}` |
+| `mss_ctl create <id> <call-id> -` (no node, no from-tags) | **1192 ingest datagrams in 12 s**, `attribution=explicit` |
+| counters | `mss_discovery_hits_total 1`, misses 0, errors 0 |
+| a call-id nobody published | one **miss**, then `Unavailable: no reply from rtpengine at 172.31.99.199:22222 after 3 attempts` |
+| after the BYE | `GET` → `(nil)` |
+
+Both tags came from the map, so that tap issued **no `query`** — visible as the
+absence of a query line in the pod log, and the reason `from_tags` is in the
+value format at all.
+
+The toggle is **off by default**: `DISCOVERY` unset renders `$var(discovery) =
+"off"` into `/tmp/opensips.cfg` and `MSS_DISCOVERY_REDIS_KEY_PREFIX` unset makes
+the pod expose no `mss_discovery_` series at all. Both were checked after the
+run, so every other drill sees the lab it has always seen.
+
+### What this does not prove
+
+- **Nothing ran against a real `cachedb_redis`.** The lab image cannot load the
+  module, so the OpenSIPS snippet in deploy.md is documentation; what was tested
+  is the key, the value and MSS's half.
+- **No multi-node placement.** The map named the one rtpengine the lab anchors
+  calls on. A deployment with several instances is the case the map exists for,
+  and it is still deployment-gated.

@@ -4,7 +4,7 @@ Living work list. [roadmap.md](roadmap.md) holds the *why* and the phase exit
 criteria; this file holds the *what next*, ordered, with a definition of done
 for each item. Update it in the same PR that changes the state of an item.
 
-Status as of **2026-08-24**.
+Status as of **2026-08-26**.
 
 ## Milestones
 
@@ -1129,7 +1129,9 @@ which is why item 20's `MSS_TAP_TRANSCODE=off` is the kernel-eligible mode.
   "no".
 - **`mediaserverd/rtpengine_capability.rs`** — a first-contact-per-node
   capability log, called from both the startup NG probe and
-  `TapPlane::open_session`. It logs the version (or why it cannot be had), the
+  `TapPlane::open_session` (since **item 44** that startup probe *repeats* on
+  `MSS_HEALTH_PROBE_INTERVAL_SECS` and a node is forgotten on any failure, so a
+  restarted rtpengine is re-learned instead of keeping the dead node's verdict). It logs the version (or why it cannot be had), the
   relay split, live sessions, the active transcoder chains, and a plain-English
   kernel verdict; when transcoding is on it says at **WARN** that transcoded
   taps are processed in rtpengine userspace and the kernel module cannot help
@@ -1471,13 +1473,14 @@ object. `join_group` also asserts every member gets the same instant.
 5) and was run against the live lab — bob joined 5 s late, the pod logged
 `lead_silence_ms=5016`, and the object read back off MinIO opens with **40128
 zero samples = 5016 ms**. Lengths: alice 25.030 s vs bob 25.116 s, an **86 ms**
-difference where the stagger was 5 s. The residual 86 ms is the *tail*: `Detach`
-waits for the upload (D11) and the drill detaches the members one after the
-other. Numbers in lab.md.
+difference where the stagger was 5 s. The residual 86 ms is the *tail*: at the
+time `Detach` waited for the upload (D11, closed by item 50 on 2026-08-26) and
+the drill detaches the members one after the other. Numbers in lab.md.
 
 **Residual.** Head alignment is exact; equal length still assumes the members
-stop together, and D11 (blocking detach) and D16 (a group is one pod's memory,
-so the anchor is one pod's monotonic clock) are unchanged.
+stop together, and D16 (a group is one pod's memory, so the anchor is one pod's
+monotonic clock) is unchanged. D11's blocking detach — the 86 ms tail measured
+here — is closed by item 50.
 
 ### 30. Recording durability across pod death (defect D9) — 🔶 **partly closed (2026-08-23)**
 
@@ -2219,7 +2222,9 @@ and localization out of the media plane.
 MSS delivers digits to consumers (WS `dtmf` frames, gRPC `DtmfFrame`) and
 interprets none of them; an integrator that wants `*6` to mute maps the digit to
 an `UpdateAttachment` call. Gap found while documenting it: those digits never
-reach `mss.events` — D21.
+reached `mss.events` — D21, closed by item 48; the mapping is still the
+integrator's, but it can now be driven from the bus instead of from a media
+stream.
 
 **`mix_source=leg`.** A `mix_target` now picks its source: `inject` (default,
 item 38) or `leg`, the member's own RTP. `leg` + a member target is the **coach**
@@ -2250,10 +2255,11 @@ hearing everybody; and the refusals (a flag that is not `on`/`off`, a member ver
 off a conference, a from-tag-shaped playback target on an inline leg). Plus the
 mix-metadata parser tests and a registry audit test for `MemberControlled`.
 
-**Residuals.** (a) Member state has no owner and no lease, and no API reads it
-back — D22. (b) One prompt source per room: overlapping prompts queue.
-(c) Enter/exit sounds and DTMF menus are integrator work by design, and D21 says
-the digit half is not on the bus yet. (d) Per-member volume/energy, member
+**Residuals.** (a) Member state has no owner and no lease — D22; since item 49
+`DescribeSession` reads it back on the member's own session, but nothing reclaims
+it. (b) One prompt source per room: overlapping prompts queue.
+(c) Enter/exit sounds and DTMF menus are integrator work by design; since item 48
+the digits themselves are on the bus (D21), but nothing in MSS interprets them. (d) Per-member volume/energy, member
 enumeration, room lock and moderator roles are not built (architecture.md
 Appendix B lists them with recommendations). (e) Everything here is pod-local,
 like the conference itself.
@@ -2292,7 +2298,8 @@ Full tables in [lab.md](lab.md).
   carrying all three tones, and a group's `party-<stamp>/{a,b,c}.wav` at
   71.96 / 72.02 / 72.10 s carrying **only** their own tone (cross-talk 0–8
   against 3000), with C's file opening on **10.66 s** of the P2-1 anchor pad.
-  The three group files agree to 140 ms (D11's sequential detaches).
+  The three group files agree to 140 ms (sequential detaches, each of which
+  waited for its upload before item 50 closed D11).
 - `mss_conference_clipped_samples_total` = **0**, deliberately: all four sources
   run at `TONE_AMPLITUDE=6000`. At the peers' default 24000 the mix clips, and
   clipping intermodulates onto exactly the harmonics being measured — the
@@ -2310,6 +2317,918 @@ the monitor and the room object both hang off one member's session (D20);
 `deaf` and `hold` have item 40's socket tests only; PCMU 8 kHz/20 ms only.
 
 
+### 42. SIGTERM: drain on the signal Kubernetes actually sends (G1) — ✅ DONE (2026-08-26)
+
+**The bug this closes.** `main.rs` waited on `tokio::signal::ctrl_c()` only, so
+the only signal that started a shutdown was **SIGINT**. Kubernetes sends
+**SIGTERM**, and mediaserverd runs as PID 1 in its container, where an unhandled
+signal is *ignored* — so every rollout, scale-down and eviction ended in SIGKILL
+after `terminationGracePeriodSeconds`, exit 137: no lease release, no consumer
+stop frame, no recording upload, no unsubscribe. That is the pod-loss path of
+item 11 (a **14.41 s** consumer gap, plus the D14 orphan subscription) running on
+*every planned* restart.
+
+**What landed.** A new `crates/mediaserverd/src/drain.rs`:
+
+- `next_shutdown_signal()` selects over `ctrl_c()` and
+  `SignalKind::terminate()`, and names which arrived; both the control-plane and
+  the idle mode use it.
+- `DrainState` is the readiness `AtomicBool` (**G4 wires `/readyz` to it**),
+  exported now as the gauge `mss_draining`.
+- `run_drain(steps, budget)` runs the sequence against a `DrainSteps` trait, so
+  it is unit-testable with fakes, and bounds every step against one deadline:
+  **`MSS_DRAIN_TIMEOUT_SECS` (default 30)**. `exit_on_second_signal()` makes a
+  second signal an immediate `exit(0)`.
+
+The sequence, and who does the work:
+
+| Step | What it does |
+| --- | --- |
+| `stop-accepting` | `DrainState::begin()` (readiness off) + `SessionController::begin_drain()`: `CreateSession` and `Attach` answer `UNAVAILABLE: this pod is draining`, `MediaStream` refuses new streams and sends `Stop` to live ones, `WatchEvents` ends, and the tonic listener stops accepting |
+| `hand-off-leases` | aborts the keeper's renew task, then `RegistryKeeper::hand_off_leases()` → the new `SessionStore::release_lease` (DEL the lease key, **keep** the session record) so an adopter takes the call on its next sweep instead of after the 15 s TTL. Counter `mss_registry_handed_off_total` |
+| `close-sessions` | `destroy_session` per live session, which is the existing polite path: consumers get their WS `stop` frame / gRPC `Stop` (D3), recordings are finished — uploaded, or spilled for the next boot's salvage (D9) — and the tap is unsubscribed |
+| `control-plane-idle` | awaits the tonic server task, so in-flight RPCs and streams end before the process does |
+| `flush-events` | the existing 10 s `await_empty_backlog` window on the Kafka pump |
+
+**Measured live (2026-08-26), `lab/drain_drill.sh`** — a real MicroSIP call
+through OpenSIPS/rtpengine/FreeSWITCH, tapped by pod A with a WS consumer, pod B
+idle on the same Redis, then `docker stop -t 60` (SIGTERM; `-t 60` because
+docker's default 10 s is shorter than the drain window). Pod A's PID 1 is
+`mediaserverd` itself — `cargo run` exec-replaces itself — which is what makes
+the measurement about the daemon and not about cargo; the drill asserts it.
+
+```
+08:27:33.448 INFO shutdown signal received; draining the control plane signal=SIGTERM live_taps=1 drain_budget_secs=30
+08:27:33.448 INFO readiness is off and no new session or attachment will be taken here live_taps=1
+08:27:33.449 INFO drain step finished step=stop-accepting elapsed_ms=0
+08:27:33.450 INFO lease released for adoption ... external_id=draindrill-1787732824 owner=lab-control
+08:27:33.450 INFO drain step finished step=hand-off-leases elapsed_ms=1
+08:27:33.450 INFO the consumer websocket was closed after its stop frame media_sent=2022
+08:27:33.452 INFO tap leg finished track=Customer datagrams=1007 jitter_lost=0 recv_errors=0
+08:27:33.452 INFO tap leg finished track=Agent datagrams=1017 jitter_lost=0 recv_errors=0
+08:27:33.452 INFO session closed for shutdown: consumers stopped, recording finished, tap unsubscribed
+08:27:33.452 INFO drain step finished step=close-sessions elapsed_ms=2
+08:27:33.452 INFO the control plane listener closed
+08:27:33.452 INFO drain step finished step=control-plane-idle elapsed_ms=0
+08:27:33.478 INFO drain step finished step=flush-events elapsed_ms=25
+08:27:33.478 INFO drain complete elapsed_ms=30 leases_handed_off=1 sessions_closed=1 unsent_events=0
+08:27:33.478 INFO session registry totals at shutdown persisted=4 handed_off=1 lost=0 failed=0
+08:27:33.479 INFO event bus totals at shutdown published=3 failed=0 dropped=0 unsent=0
+08:27:33.483 INFO mediaserverd stopped
+```
+
+- **exit code 0**, `docker stop` returned in **0.44 s** — the whole drain took
+  **30 ms** of its 30 s budget, so the budget is a ceiling, not a cost.
+- **pod B adopted 2.7 s after the signal** (2.2 s after pod A exited) and
+  re-dialed the same WS endpoint; the lease moved `lab-control` →
+  `lab-control-b`.
+- the consumer's **audio gap was 1.96 s**, against **14.41 s** for the same
+  drill's SIGKILL sibling (item 11) — the same instrument, `lab/gap_consumer.py`,
+  and one artifact spanning the handover (2022 frames, then 12752).
+
+**Found and fixed on the way.** `SessionController::begin_drain` used
+`watch::Sender::send`, which is a **no-op when no receiver is alive** — a pod
+with no active `MediaStream` could be told to drain and stay `draining=false`.
+Now `send_replace`, which always updates. Caught by the new control-api test,
+not by the lab.
+
+**Decisions** (defaults preserve today's behavior exactly):
+
+- **Leases are handed off before taps are unsubscribed.** That allows a brief
+  double subscription (the adopter subscribes with its own to-tag while ours is
+  still up) and rules out a *gap*, which is the worse of the two; our
+  unsubscribe names our own to-tag, so it cannot disturb the adopter's.
+- **Budget shares:** lease hand-off is capped at `budget/4` and the event flush
+  keeps a reserve of `min(10 s, budget/3)`, so a hung Redis cannot eat the window
+  that closes consumers and finishes recordings. Unit-tested with fakes.
+- **Exit is always 0**, including when the window expires and when a second
+  signal cuts the drain short: a rollout must not read a shutdown as a crash
+  loop, and an unfinished recording upload is already covered by the spill +
+  next-boot salvage (D9).
+- **Spilling is not its own step.** `close-sessions` finishes each recording,
+  which uploads or spills on failure; a separate "spill everything" step would
+  duplicate `recorder.rs`'s own fallback.
+- `MSS_DRAIN_TIMEOUT_SECS=0` is legal and means "stop accepting and exit".
+
+**What it does not prove:** one pod stopped, not a rolling replace of many; no
+Kubernetes (the `terminationGracePeriodSeconds >= MSS_DRAIN_TIMEOUT_SECS`
+manifest is G6's); the timeout-expiry branches are fake-verified only, since the
+live drain finished in 30 ms.
+
+### 43. Media port range + advertised address (G2 + G3) — ✅ DONE (2026-08-26)
+
+**The bug this closes.** Every media socket bound `local_media_address:0` — an
+ephemeral port from the kernel's whole range. No firewall can be written for
+that: the operator must open UDP from the rtpengine hosts to the port MSS
+receives the tap copy on, and MSS could not say which ports those would be.
+The same code put the *bind* address into every SDP it hands a peer, so a pod
+that binds a private address and is reached on a different one (NAT, a
+hostNetwork node with a routed VIP, a cloud load balancer) told rtpengine to
+send audio to an address that does not route back.
+
+**What landed.** A new `crates/mediaserverd/src/media_ports.rs`:
+
+- `MediaPortAllocator` — a free list of **even ports only** over
+  `[MSS_MEDIA_PORT_MIN, MSS_MEDIA_PORT_MAX]`. `bind(local_ip)` returns the
+  socket, its port and a `PortLease`; the lease's `Drop` returns the port. A
+  port another process already holds is skipped and counted, not fatal.
+  Exhaustion is a refused session with the range named in the error.
+- `MSS_MEDIA_ADVERTISE_IP` — `media_ports::advertise_address()`. The tap's
+  subscribe answer and the inline SDP answer are now built by
+  `tap_answer_sdp` / `inline_answer_sdp` from the **advertised** address, while
+  the socket still binds the **local** one. Symmetric RTP is unchanged: inline
+  egress still sends from the receive socket.
+- Metrics: `mss_media_ports_in_use`, `mss_media_ports_free`,
+  `mss_media_ports_capacity` (gauges), `mss_media_ports_exhausted_total`,
+  `mss_media_ports_bind_conflicts_total` (counters).
+
+All three variables default to today's behavior exactly: no range means
+ephemeral binds, no advertise IP means the bind address is advertised.
+
+**Measured live (2026-08-26), `lab/media_port_drill.sh`** — a real MicroSIP call
+through OpenSIPS/rtpengine/FreeSWITCH, tapped by a pod started with
+`MSS_MEDIA_PORT_MIN=40100 MSS_MEDIA_PORT_MAX=40139` (20 RTP sockets) and
+`MSS_MEDIA_ADVERTISE_IP=172.31.99.31`:
+
+```
+drill: the pod reports capacity=20 free=20 in_use=0
+drill: udp sockets inside the range before the call: [none]
+drill: udp sockets inside the range while tapping: [40100 40102]
+drill: udp sockets outside the range (ng control sockets, by design): [45745 46345]
+drill: in_use=2 free=18 exhausted=0 conflicts=0
+drill: ingest datagrams 0 -> 1503 over 15s
+drill: udp sockets inside the range after the session closed: [none]
+drill: in_use=0 free=20
+drill: PASS
+```
+
+Two tapped legs took the first two **even** ports; audio flowed at the expected
+~50 pkt/s per leg; both ports came back to the range when the session was
+destroyed. `ss` is not in the lab's rust image, so the drill reads
+`/proc/net/udp` inside the container — which is also why the NG control sockets
+are visible and worth stating: they are **outside** the range on purpose.
+
+**Decisions** (defaults preserve today's behavior exactly):
+
+- **The allocator lives in `mediaserverd`, not `media-core`.** It is I/O-adjacent
+  bookkeeping (it binds sockets), and `media-core` stays sans-IO.
+- **Even ports only.** The odd successor of every allocated port is never handed
+  out, so a peer that wants RTCP on `port+1` can have it without a second
+  allocator. A 40-port range therefore serves **20** sockets, and the
+  `capacity` gauge says so rather than leaving the operator to divide.
+- **The NG control socket keeps an ephemeral port.** The range exists so a
+  firewall can admit *inbound* media from the rtpengine hosts; the NG socket is
+  an outbound control flow to rtpengine's 22222, and spending range ports on it
+  would halve the tap capacity for no gain.
+- **A port held by another process is skipped, up to 64 tries per bind**, and
+  counted in `mss_media_ports_bind_conflicts_total`. Refusing the session
+  because one port in the range is squatted would be worse than moving on.
+- **Ports are returned on `Drop`, after the capture thread joins.**
+  `close_session` joins the media thread, then releases the leases and logs
+  `released_ports`, so a port is never re-handed-out while a socket still holds
+  it. Drain closes sessions the same way, so a drained pod frees its range.
+- **An empty string means unset** for all three variables (and now for
+  `MSS_DRAIN_TIMEOUT_SECS` too): a compose/Kubernetes passthrough of an unset
+  variable arrives as `""`, and that must mean the default, not a warning.
+
+**What it does not prove:** the advertised address is the same as the bind
+address in the lab, because rtpengine sends the tap copy to whatever MSS
+advertised — a genuinely different address is proved only by the SDP tests
+(`a_tap_answer_carries_the_advertised_address_not_the_bind_address`,
+`an_inline_answer_carries_the_advertised_address_while_the_socket_binds_locally`)
+and needs a NAT/hostNetwork deployment to see live. Exhaustion is unit- and
+in-process-verified (an inline session refused on a one-port range, then served
+after a close), never hit live. No hostPort/hostNetwork manifest yet — that is
+G6.
+
+### 44. Liveness and readiness probes (G4) — ✅ DONE (2026-08-26)
+
+**The gap this closes.** The metrics listener answered `/metrics` (and, in fact,
+*any* path) and nothing else. A Kubernetes Deployment therefore had no probe to
+point at: no liveness endpoint, and no readiness endpoint — so a pod took traffic
+while its rtpengine node was unreachable, while Redis or Kafka were down, and
+**for the whole drain**, because nothing outside the process could see the
+`mss_draining` gauge flip. Item 23 also left the rtpengine capability probe as a
+one-shot at startup: a node that restarted kept its stale verdict for the life of
+the pod.
+
+**What landed.** A new `crates/mediaserverd/src/health.rs` plus two routes on the
+existing dependency-free listener (`metrics.rs`):
+
+- `GET /healthz` → **200 `alive`** while the process runs. It never consults a
+  dependency: liveness must not restart a pod for someone else's outage.
+- `GET /readyz` → **200** only when the pod is not draining *and* every
+  configured dependency answered its last probe; **503** otherwise, with a
+  plain-text body whose first line names the reasons and whose remaining lines
+  report each dependency. An **unconfigured** dependency (no `MSS_RTPENGINE_NODE`,
+  no `MSS_REDIS_URL`, no `MSS_KAFKA_BROKERS`) counts as ready and says
+  `not configured`.
+- `GET /metrics` unchanged, plus two new series: `mss_ready` and
+  `mss_dependency_ready{dependency="rtpengine"|"redis"|"kafka"}` (configured
+  dependencies only — an unconfigured one leaves its series out rather than
+  lying).
+- Any other path is now **404** and a non-GET is **405**; every lab script and
+  the alert rules already ask for `/metrics` by name.
+- `Readiness` is a cached snapshot behind one mutex: the request path reads state
+  and **never** makes a network call. Background watchers (`health::watch`, one
+  per dependency) do the probing — `PING` on the Redis connection
+  (`SessionStore::ping`), a partition-offset fetch on the Kafka topic
+  (`EventTransport::reachable`), and NG `ping` on the rtpengine node. Each waits
+  `MSS_HEALTH_PROBE_INTERVAL_SECS` (default **10**) after a success and backs off
+  1 s → 2 → 4 → 8 → interval while failing, so a restarted dependency is noticed
+  fast; a probe that hangs is a failure after 15 s.
+- The rtpengine watcher also calls `NodeCapabilityLog::forget` on failure, so the
+  next success re-runs `report_first_contact` — **item 23's open re-probe**.
+- Drain needs no new wiring: `DrainSteps::stop_accepting` already calls
+  `DrainState::begin`, and the readiness verdict reads that flag, so `/readyz`
+  turns 503 on the *first* step of the drain.
+
+**Measured live in the lab (2026-08-26)**, pod recreated with
+`MSS_HEALTH_PROBE_INTERVAL_SECS=5`:
+
+```
+$ curl -i 127.0.0.1:9464/healthz        -> HTTP/1.1 200 OK   "alive"
+$ curl -i 127.0.0.1:9464/readyz         -> HTTP/1.1 200 OK
+ready
+rtpengine 172.31.99.10:22222: ready (last ok 0s ago)
+redis: ready (last ok 0s ago)
+kafka: ready (last ok 0s ago)
+draining: no
+$ curl -o /dev/null -w %{http_code} 127.0.0.1:9464/  -> 404      (POST /metrics -> 405)
+mss_ready 1 / mss_dependency_ready{dependency="redis"} 1  in /metrics
+
+$ docker stop mss-microsip-redis-1
+/readyz -> 503 after 8 s:
+not ready: redis unreachable: session store: timed out
+rtpengine 172.31.99.10:22222: ready (last ok 0s ago)
+redis: unreachable: session store: timed out (2 consecutive failures, last ok 10s ago)
+kafka: ready (last ok 3s ago)
+draining: no
+   /healthz stayed 200 throughout; mss_ready 0, mss_dependency_ready{redis} 0
+$ docker start mss-microsip-redis-1     -> /readyz 200 again after 3 s
+   log: "this dependency answered again; readiness is back on"
+
+$ docker restart mss-microsip-rtpengine-1
+   "rtpengine node capabilities on first contact" logged 1 -> 2 times: the
+   restarted node was re-probed and re-learned (item 23's gap)
+
+$ docker stop -t 60 mss-microsip-mss-control-1   (SIGTERM), /readyz polled ~5 ms
+t+0.028 s  200 ready
+t+0.035 s  503 "not ready: draining ... draining: yes"
+t+0.042 s  connection refused (listener gone), exit code 0 at t+0.404 s
+```
+
+**Decisions** (defaults preserve today's behavior):
+
+- **A dependency nobody has probed yet is *not* ready.** A pod that has not yet
+  learned its state must not take traffic. In practice the window is nil: Redis
+  and Kafka are recorded ready at connect (they already refuse to start
+  otherwise) and rtpengine at its first-contact ping, all before the listener
+  binds.
+- **Liveness is not "all my dependencies are up".** Restarting a pod because
+  Redis is down would turn one outage into a crash-loop; `/healthz` is
+  deliberately dumb.
+- **Kafka's probe is a partition-offset read, not a produce.** A produce would
+  put probe records on `mss.events`. A transport that cannot be probed is
+  assumed reachable (`EventTransport::reachable` defaults to `Ok`), so the fakes
+  in the tests keep meaning what they meant.
+- **Readiness is one cached snapshot, never a network call in the request path.**
+  A kubelet probe with a 1 s timeout must not be able to block on a hung Redis.
+- **`MSS_RTPENGINE_NODE` empty or whitespace now means unset**, matching item
+  43's rule, and a *malformed* value is a permanent 503 rather than a silent
+  "no node configured".
+- **The reason body is plain text, not JSON.** `kubectl describe` shows the
+  first line of a failed probe's body, so that line carries the reasons.
+
+**What it does not prove:** no Kubernetes — the endpoints were driven by `curl`
+and `docker stop`, not by a kubelet (the manifests with `readinessProbe`/
+`livenessProbe` wired to these paths are G6); the Kafka probe was never watched
+failing live (Redpanda stayed up; the failure path is unit-tested only); and a
+readiness flap under load has not been soaked.
+
+### 45. Preflight — check a target environment before deploying (G5) — ✅ DONE (2026-08-26)
+
+**The gap this closes.** Everything MSS needs from a deployment — an rtpengine
+that supports `subscribe request`, a media range rtpengine can actually reach, a
+Redis that expires keys, a Kafka topic, a writable bucket, a synchronised clock —
+was discoverable only by deploying mediaserverd and reading its logs when a call
+failed. The first session on real gear would have spent itself on someone else's
+firewall.
+
+**What landed.** `lab/preflight.sh`: POSIX sh front end (arg parsing, `MSS_*`
+defaults) plus one python3 **standard-library** engine, because a jump host has no
+`pip`. It calls `lab/kernel_probe.sh` for the kernel verdict and reuses the
+bencode/NG patterns from `ng_probe.py` / `ng_subscribe_probe.py` / `call_driver.py`
+rather than growing a second copy of them.
+
+Thirteen lines, each `PASS`/`FAIL`/`SKIP` with one sentence of why; non-zero exit
+on any `FAIL`; `--json` for a machine-readable report. The full table, both run
+transcripts and every flag are in [deploy.md](deploy.md#preflight--check-the-environment-before-deploying-into-it).
+
+- `ng_ping`, `ng_subscribe`, `ng_tap_media`, `ng_cleanup` — the tap handshake is
+  performed, not inferred: the tool **fabricates its own throwaway call**
+  (`offer`/`answer`, call-id `mss-preflight-<pid>-<epoch>`), subscribes to it,
+  pumps ~1 s of PCMU and counts what comes back on the subscription socket, then
+  `unsubscribe`/`delete` and a `query` that must answer *Unknown call-id*. Unique
+  cookie prefix per run and per command (defect D12).
+- `rtpengine_version` — SKIP by default, saying in one line that it **cannot be
+  asked over NG** and naming the three places to read it on the host (H2 stays
+  open, but is now self-explaining).
+- `redis` — `SET NX EX 30` / `TTL` / `DEL` over raw RESP; that *is* the registry
+  lease. `kafka` — TCP to each broker. `s3` — put/head/delete of a probe object
+  with SigV4 signed in `hmac`/`hashlib`, then a HEAD proving it is gone.
+- `media_ports` — the range's real capacity (even ports only) and a bind test.
+  `media_udp` — with `--ssh <rtpengine-host>`, a datagram sent *from* rtpengine's
+  host into the range. `clock` — chrony/timedatectl, 100 ms tolerance.
+
+**Measured live in the lab (2026-08-26)**, run inside `mss-microsip_lab` from a
+`python:3-slim` container because the NG port is not published to the WSL host:
+
+```
+green (exit 0):  10 PASS, 0 FAIL, 3 SKIP
+   ng_tap_media  49 tapped RTP datagrams arrived at 172.31.99.2:36965 of 98 pumped
+   s3            put/head/delete on MinIO via stdlib SigV4, HEAD -> 404 afterwards
+   redis         SET NX / TTL 30s / DEL round-tripped
+red (exit 1):    3 PASS, 3 FAIL, 6 SKIP  (--ng ...:22223, --bucket wrong-bucket-name)
+   FAIL ng_ping            no reply in 3 tries over 6 s
+   FAIL kernel_forwarding  kernel_probe.sh could not reach rtpengine
+   FAIL s3                 PUT -> HTTP 404 NoSuchBucket
+third run:       kafka_topic PASS (probe record produced to a topic and read back,
+                 with kafka-python-ng installed) and media_udp PASS (datagram from
+                 the "rtpengine host" arrived on 40100, via an ssh shim)
+after all three: rtpengine answered "Unknown call-id" for every fabricated call-id
+                 and the bucket held no probe object
+```
+
+**Decisions** (recorded here so nobody relitigates them from the code):
+
+- **Userspace-only forwarding is a PASS**, not a FAIL. MSS taps a userspace relay
+  just as well; the difference is rtpengine's CPU per call (architecture §8.1).
+  `kernel_probe.sh` exit 2 ("cannot tell") is a SKIP, exit 3 (unreachable) a FAIL.
+- **A SKIP always names the command that would answer the question.** "Probably
+  fine" is not a preflight result; the summary line says every SKIP is an
+  unchecked assumption.
+- **The Kafka wire protocol is not hand-rolled.** `kafka_topic` produces and reads
+  back only if a `kafka` client is importable; otherwise it SKIPs pointing at
+  `rpk topic describe` on a broker host. A second implementation of what rskafka
+  already does would be a liability, not a check.
+- **S3 is SigV4 in the standard library**, ~60 lines, because it is the only way
+  to check a bucket from a host with no boto3 and no CLI; `aws` is the fallback
+  when no keys are passed (it can read a role or a profile) and the line always
+  says which path was used.
+- **The version check is advisory and `ng_subscribe` is the authority.** Doing the
+  handshake beats reading a number, and rtpengine will not give the number anyway.
+- **The tap check pumps real RTP.** A subscription that is accepted but delivers
+  nothing is the exact failure a firewall or a wrong `MSS_MEDIA_ADVERTISE_IP`
+  produces, and it is invisible to a handshake-only probe.
+
+**What it does not prove:** no real deployment — every run was against the lab
+(one rtpengine, MinIO, Redpanda, Redis on one Docker network); the `--ssh`
+transport itself was exercised through a **shim** that ran the remote command
+locally, so argument passing and the sender snippet are proven but a real
+`ssh` hop is not; `clock` has never run anywhere with chrony present; the `aws`
+and `mc` fallbacks are code-reviewed, not run; and a probe record on the
+configured topic is the one side effect the tool cannot take back.
+
+### 46. Deploy manifests + the operator guide (G6) — ✅ DONE (2026-08-26)
+
+**The gap this closes.** Everything MSS needs to be deployed existed only as
+knowledge in this repository's history: there were no manifests, and
+`docs/deploy.md` was a stub holding the rows items 42–45 had added. The first
+session on real gear would have written a Deployment from scratch and guessed at
+the grace period, the port range, the advertised address and the probe paths —
+the four things the previous four items had just made measurable.
+
+**What landed.** `deploy/k8s/`, a Kustomize tree with no Helm and no templating
+language, so what you read is what gets applied:
+
+- `base/` — Deployment, ConfigMap (**every** non-secret `MSS_*` variable with its
+  meaning), Secret **template** (every value the literal `REPLACE_ME`, behind a
+  banner saying so, documenting the key names), two headless Services (gRPC needs
+  client-side balancing or every session pins to one pod), PDB
+  (`maxUnavailable: 1`), ServiceAccount (no RBAC — mediaserverd calls no
+  Kubernetes API), ServiceMonitor and PrometheusRule.
+- `overlays/hostport/` — pod network, an enumerated `hostPort` range,
+  `MSS_MEDIA_ADVERTISE_IP` from `status.hostIP`, and a NetworkPolicy that is the
+  firewall matrix in machine-readable form. `regenerate.sh <min> <max>` rewrites
+  the port entries and the ConfigMap range **together**.
+- `overlays/hostnetwork/` — `hostNetwork: true`,
+  `dnsPolicy: ClusterFirstWithHostNet`, both `MSS_MEDIA_ADVERTISE_IP` and
+  `MSS_TAP_LOCAL_IP` from `status.hostIP`, and a 1000-port range.
+- `sync-alerts.sh` — wraps `deploy/prometheus-alerts.yaml` into the
+  PrometheusRule, so the operator manifest and the plain-Prometheus rule file
+  cannot drift. Verified: the generated `spec` is byte-identical to the alert
+  document (16 rules in 4 groups).
+- `validate.sh` + `validate_fields.py` — the check that runs without a cluster.
+
+`docs/deploy.md` is now the whole guide: what MSS needs and never needs, the
+manifests and the hostPort/hostNetwork trade-off table, **every** `MSS_*`
+variable in six grouped tables (name / default / meaning / when to change / which
+item added it) plus the lab-only spike variables and the warning that
+`MSS_TAP_CALL_ID` silently turns the daemon into a one-shot tap, the port and
+firewall matrix (including the two flows people forget: NG **egress** to 22222,
+and the **outbound** dial to a `WS_TWILIO` consumer), media-range sizing, pod
+sizing from architecture §8 with an explicit "these are estimates", the HA table
+of what adopts and what does not, the drain sequence, alerts, the §8.1 kernel
+pointer, the preflight, and a six-step "first day on real gear" runbook.
+
+**Validation — no cluster was available, so three layers, honestly labelled:**
+
+```
+PASS  render      base (9 objects, kubectl kustomize v1.25.9 / kustomize v4.5.7)
+PASS  render      overlays/hostport (10 objects)
+PASS  render      overlays/hostnetwork (9 objects)
+SKIP  schema      no kubeconform on PATH
+PASS  fields      72 assertions over 3 rendered overlays
+```
+
+`kubectl apply --dry-run=client` is **not** one of the layers and never will be:
+it fetches its schemas from a live API server, so with no cluster it fails with a
+connection error and proves nothing. The 72 assertions were **negative-tested** —
+shortening `terminationGracePeriodSeconds` to 20 and breaking the readiness path
+made 6 of them fail with exit 1 — so the layer is known to bite.
+
+**Decisions** (recorded here so nobody relitigates them from the YAML):
+
+- **Both network shapes ship, neither is blessed.** The choice belongs to whoever
+  owns the cluster, and the manifests state the cost of each: a `hostPort` cannot
+  express a range, so a wide range costs one manifest entry per port and one pod
+  per node; `hostNetwork` buys any range at the price of pod isolation and
+  invisible port collisions. Both set the advertised address from `status.hostIP`
+  through the downward API, because in both cases the address a peer must reach
+  is the node's and only the node knows it.
+- **No `preStop` hook.** The drain is signal-driven (item 42) and its *first* step
+  flips `/readyz` to 503 — exactly what a `preStop: sleep` exists to emulate.
+  Adding one would delay the SIGTERM and eat the grace period. Said in the
+  manifest, not just here.
+- **No CPU limit, and the reason is in the file.** The packet path runs on
+  dedicated real-time threads; CFS throttling there is pacing jitter and consumer
+  underruns, not a slow API. Requests carry a "MEASURE THIS" note pointing at
+  architecture §8's estimate.
+- **`emptyDir` for the spill dir, not a PVC.** It only has to survive a container
+  restart: a cross-pod adopter cannot read another pod's disk either way (D9's
+  residual), so a PVC would buy nothing and add a scheduling constraint.
+- **Headless Services.** One long-lived HTTP/2 connection per gRPC client behind
+  a ClusterIP would pin every session on that client to one pod. The file names
+  the fallback for clients that cannot balance themselves.
+- **The Secret is a template, and loudly.** Every value is `REPLACE_ME`, because
+  the failure it prevents is real: the control plane would trust the token
+  `REPLACE_ME` from any caller.
+- **The alert rules are generated, not copied.** `deploy/prometheus-alerts.yaml`
+  stays the source of truth and usable by a plain Prometheus; the diff
+  `sync-alerts.sh` produces is the drift check.
+
+**What it does not prove:** nothing here has been applied to a Kubernetes
+cluster — not once. Every object is rendered and field-checked, and the values in
+it are the ones measured live in the lab by items 42–45, but the manifests
+themselves are unexercised: the probes have never been called by a kubelet, the
+`hostPort` mapping has never carried a packet, `status.hostIP` has never been
+substituted by a real API server, and no rollout has ever drained a pod under a
+Deployment controller. Steps 1, 5 and 6 of the runbook are where that gets
+found out.
+
+### 47. Leg labels that do not depend on rtpengine's query order (G7, D17) — ✅ DONE (2026-08-26)
+
+**The gap this closes.** With `from_tags` unspecified (`-`), `TapPlane` labelled
+the two legs in the order `NgReply::tags()` returned them — and that order is a
+`BTreeMap`'s, i.e. **lexicographic by tag string**. The two-node drill (item 24)
+hit exactly that: FreeSWITCH's tag sorted first, so `customer` and `agent` were
+swapped in the recording and in the `tracks` a consumer sees, silently, with no
+signal to the integrator that the names were a coin flip.
+
+**What we measured before writing any code** (`lab/ng_tag_created_probe.py`, new,
+against the lab's rtpengine **14.1.1.8**; the fix's whole shape turns on it):
+
+- a participant entry in a `query` reply carries exactly **two** scalar fields of
+  its own: `tag` and **`created`** (integer, whole seconds). There is no
+  microsecond field per tag — `created_ts` and `created_us` exist only at the
+  **call** level, next to the top-level `created`;
+- **`created` is stamped per dialogue, not per participant.** An offer and an
+  answer **4 s apart** produced two tags with the *same* `created`
+  (`1787737315`). A third and fourth leg offered/answered on the same call-id
+  12 s later shared a *different* one (legA/legB `…383`, legC/legD `…395`). So
+  creation time separates B2B dialogues on one call-id and **can never separate
+  the two legs of one dialogue** — which is the only case leg labelling cares
+  about;
+- so "order the participants by creation time" — the shape D17 proposed, and what
+  `call_watcher.py` was believed to do — is **not implementable** against this
+  vendor. (`call_watcher.py` orders *calls* by `created`; for tags it uses the
+  lab-only trick of recognising FreeSWITCH's media IP, and its own docstring says
+  `created` "ties on a fast answer".)
+- one lab gotcha found on the way, worth the line: rtpengine replays a **cached
+  reply for a repeated cookie**, so a probe with a fixed cookie prefix reads the
+  *previous* run's call. The probe now randomises its prefix (the D12 shape).
+
+**What shipped.** `Attribution` (`session-core/src/attribution.rs`) —
+`explicit | inferred | unknown` — threaded from resolution to every consumer-
+facing name:
+
+- `NgReply::tags_created()` exposes the per-tag `created`; the pure
+  `order_participants()` in `tap_plane.rs` sorts by it (stable, so ties keep the
+  reply's own order, and unstamped tags sort last) and returns `Inferred` **only**
+  when the first two participants carry *strictly different* seconds — otherwise
+  `Unknown`. It never guesses;
+- `explicit` when the caller's from-tag was supplied (any non-empty `from_tags`),
+  and for every INLINE session by construction — MSS answered that leg, so its
+  own capture is unambiguous;
+- under `unknown` the gRPC `StreamStart.tracks`, every gRPC media/DTMF frame's
+  `track`, every event payload's `track` and the recording group's object keys
+  are named **`leg_a` / `leg_b`** instead of `customer` / `agent`. `convert::track()`
+  accepts the new names back, so a selector still round-trips;
+- **the frozen WS Twilio vocabulary does not move** (Article VII):
+  `inbound`/`outbound` regardless of attribution. A WS consumer's only warning
+  that its names are a guess is the event below, which is why interactive
+  attribution-sensitive work belongs on gRPC;
+- the verdict is auditable three ways: `Session.attribution` on `DescribeSession`,
+  a `string attribution` on **every** `MediaEvent` envelope, and a
+  `LegsAttributed { attribution, tracks }` event emitted once per tap naming the
+  track names a consumer will actually see. All three are additive proto fields;
+- and the daemon logs it: INFO when the caller was named or creation times
+  separated the legs, **WARN** naming the tags, their stamps and
+  `callerFromTag` when they tie.
+
+**Verified.** 14 new replay tests (three attribution states through
+`order_participants`, the naming, the recording keys, the frozen WS names, the
+registry write-back and event stamping) plus two over-the-wire tests on the real
+gRPC surface. Then **live** (`lab/leg_attribution_drill.sh`, new), on a fabricated
+two-leg call built to reproduce the inversion — caller `zz-caller`, callee
+`aa-callee`, so the callee sorts **first**:
+
+- rtpengine reported both legs with `created=1787738648` — identical, as the probe
+  predicted;
+- **from-tags `-`**: `DescribeSession` → `attribution: "unknown"`; the gRPC start
+  frame → `tracks=["leg_a", "leg_b"]`; MinIO received
+  `rec-…/alice.leg_a.wav` and `alice.leg_b.wav`; the WARN line above appeared with
+  both stamps in it; `mss.events` carried the `LegsAttributed` record and every
+  later event for that session was stamped `unknown`. The old code would have
+  called `aa-callee` the customer — the drill shows the callee's DTMF digit `2`
+  arriving on `leg_a`, honestly unnamed instead of falsely `customer`;
+- **from-tags `zz-caller`**: `attribution: "explicit"`, `tracks=["customer",
+  "agent"]`, objects `alice.customer.wav` / `alice.agent.wav`, and digit `1` on
+  `customer` — correct.
+
+**Decisions.** (1) Event payload track names follow attribution too, so nothing
+in MSS's own vocabulary claims a direction the session cannot back up; the frozen
+WS dialect and the legacy `streamfsm` event names are unaffected (they carry no
+track). (2) `Attribution` is **not** persisted in the session store: a session
+created without from-tags is not rebuildable (`is_rebuildable()` requires them),
+and one created with them re-derives `explicit` on the adopting pod. (3) The
+`inferred` state is real code with a real test but is **unreachable for a
+two-party call on this rtpengine version** — it can only fire where a call-id
+carries participants from more than one dialogue. It is kept rather than
+collapsed into `explicit`/`unknown` because the honest thing to record is that
+the vendor, not MSS, is what makes creation order useless.
+
+**What it does not prove:** nothing here recovers attribution from SIP. The only
+way to get `customer`/`agent` on a tap is to pass the caller's from-tag —
+`docs/deploy.md` now says so under "Leg attribution", and the integrator's
+control plane is where that has to come from.
+
+### 48. DTMF digits on the event bus (G8, D21) — ✅ DONE (2026-08-26)
+
+**The gap this closes.** MSS decoded every RFC 4733 press (`DtmfDetector`,
+counted in `mss_ingest_dtmf_digits_total`) and handed it to *consumers* — the
+Twilio WS `dtmf` frame and the gRPC `DtmfFrame` — and to nobody else. `mss.events`
+carried no digit, so the integrator who wants `*6` to mute (item 40's decision:
+conference control is API-first, MSS interprets no digit) had to hold a media
+stream open just to hear one, and a recording-only or bus-only integration could
+not build a digit menu at all.
+
+**Gating decision: session level, no capability, no consumer needed.** A digit is
+a property of the **call**, not of a consumer: MSS decodes it from the call's own
+RTP, so there is no attachment to authenticate and nothing for an EVENTS
+capability to authorise. Digits therefore go through `Registry::observe` — the
+session-level path that `RecordingStarted` and `LegsAttributed` already use — and
+are published whenever the session exists, with `attachment: none`. This is
+deliberately **unlike** `SpeechReport` (D19/item 28), which originates *from* a
+consumer reporting inference it made and is gated on `CAPABILITY_EVENTS`: there
+the attachment is the claimant and must be privileged to speak for the call. The
+attachment-level EVENTS capability is irrelevant to a digit; an attachment with
+it gets no extra digits, and a session with no attachment at all still gets them
+all. (Proven both ways: `a_digit_is_published_with_no_consumer_attached_at_all`
+in `registry.rs`, and the live drill below runs with no consumer attached.)
+
+**What shipped.**
+
+- `media_core::dtmf::DigitPress { digit, duration_ms, rtp_timestamp }` replaces
+  the bare `char` in `IngestOutcome::Dtmf`. The **dedupe was already right** and
+  is now guarded by its own test: the detector reports on the end bit and keys on
+  `(digit, rtp_timestamp)`, so RFC 4733's three end retransmissions are one
+  press. `duration_ms` converts the reported duration through the **negotiated
+  RTP clock rate** (`PipelineConfig::clock_rate_hz`, per RFC 4733 §2.4.1 the
+  event stream shares the audio clock), so an 800-tick press reads 100 ms at
+  8 kHz and 16 ms at 48 kHz rather than being hardcoded to narrowband;
+- `crates/mediaserverd/src/digits.rs` (new): a bounded `ArrayQueue<Digit>` + a
+  `Notify`, the only bridge between the capture thread and the control plane. The
+  media thread's `publish` never blocks, never allocates and counts a refusal
+  (`mss_dtmf_events_dropped_total`) instead of waiting; a per-session Tokio task
+  drains it and calls `observe`. Capacity 64, which at "digits are rare" is a
+  drop that means something is wrong rather than a routine loss;
+- every tap leg **and** every inline leg carries the sink, so a digit pressed into
+  an inline (bot) leg is published too; `close_session` closes the queue, the
+  publisher drains what is queued and ends;
+- `Observation::Dtmf` / `EventKind::Dtmf` / `proto.Dtmf` gained `duration_ms` and
+  `rtp_timestamp` (fields 3 and 4 — **additive**, the payload oneof tag stays 14).
+  Track names honour item 47's attribution, so an unattributed session's digits
+  arrive on `leg_a`/`leg_b`, never a guessed `customer`.
+
+**Verified.** Replay/in-process: the detector's duration and clock-rate maths, the
+queue (cross-thread order, a full queue counting instead of blocking, close
+draining), the wire payload under `explicit` and `unknown` attribution, the
+registry's no-attachment publish, and an **end-to-end** test that opens a real
+inline leg on a UDP socket, sends one digit-start plus three end packets, and
+asserts exactly one `Observation::Dtmf { customer, '1', 100 ms, ts 160 }` reached
+the sink. Then **live** (`lab/dtmf_event_drill.sh`, new) on a fabricated tapped
+call with **no consumer attached at all**, `lab/call_driver.py` pressing `1` on
+the caller and `2` on the callee every 6 s and repeating each end packet three
+times — `mss.events` carried, one per press:
+
+```
+payload=Some(Dtmf(Dtmf { track: "customer", digit: "1", duration_ms: 100, rtp_timestamp: 79200 }))
+payload=Some(Dtmf(Dtmf { track: "agent",    digit: "2", duration_ms: 100, rtp_timestamp: 79200 }))
+payload=Some(Dtmf(Dtmf { track: "customer", digit: "1", duration_ms: 100, rtp_timestamp: 127040 }))
+payload=Some(Dtmf(Dtmf { track: "agent",    digit: "2", duration_ms: 100, rtp_timestamp: 127040 }))
+```
+
+`mss_dtmf_events_dropped_total 0`; `mss_ingest_dtmf_digits_total` leads the bus
+count only because it keeps counting after the tail window closes. `seq` is
+gapless and every record is `attachment: none`.
+
+**What it does not do.** MSS still interprets no digit — no menu, no collection,
+no inter-digit timer, no `#` terminator, and the frozen `firstDtmf`/`dtmfResult`
+`streamfsm` events remain a consumer-side concern. An integrator building a menu
+consumes `mss.events` and calls the API, which is item 40's decision unchanged.
+Nothing rate-limits digits: a stuck endpoint blasting end packets at distinct
+timestamps would publish one event each, bounded only by the queue's drop
+counter.
+
+### 49. Member state read-back (G9, D22) — ✅ DONE (2026-08-26)
+
+**The gap this closes.** Item 40 made `member_mute` / `member_deaf` /
+`member_hold` deliberately outlive the attachment that set them, and then no API
+reported them. A controller that muted a member and died left that member muted
+with no way to find out: the only evidence was the aggregate gauges
+(`mss_conference_{muted,deaf,held}_members`), which say *how many*, never *who*.
+Nor could an integrator enumerate a room — the member list lived only inside the
+mixing thread.
+
+**Decision — no new RPC, and no new noun either.** `DescribeSession` on a member
+session now answers with that member's own state and, in the same message, the
+room it is seated in. There is no `DescribeConference`: a conference is not an
+addressable object in this API, it is a name that member sessions share (item 37),
+so the read-back follows the same rule as the write path — member verbs ride on
+the member's own session, and so does the read.
+
+**Decision — read the control-world mirror, never the mixing thread.**
+`Conference` (the control-plane handle) now holds a `MirroredMember` per seated
+session — external id, `mute`/`deaf`/`hold`, its `MixRoute` and the attachment
+that asked for it — written by exactly the calls that enqueue the media-thread
+command (`seat`, `route`, `control`, `unseat`). `Describe` reads that mirror under
+the conference table's lock. The alternative, asking the mixing thread, would put
+a request/response round trip into the packet path for a read that the control
+world already knows the answer to; the mirror is also why a read-back is
+immediate rather than eventually consistent with the command queue.
+
+**What shipped.**
+
+- `session_core::mix::MemberStateView` / `MemberRouteView`: the plane-agnostic
+  shape (conference name, member external ids, the three flags, the mix source
+  and the live routes);
+- `MediaPlane::member_state(session)` — a **synchronous** trait method defaulting
+  to `None`, like `inline_egress_sink`, so a media plane with no conferences is
+  unchanged. `TapPlane` answers it from `conference_of` + the conference table;
+  `SessionController::session_message` calls it **before** taking the registry
+  lock, so the two locks are never nested;
+- proto `Session.member = 13` and `Session.conference = 14` (**additive**; the
+  next free `Session` field is 15, and no payload tag was taken — the next free
+  `MediaEvent` payload tag is still 28), carrying the new `MemberState`,
+  `MemberRoute` and `ConferenceView` messages. `mss_ctl describe` prints them
+  already, since it renders the whole message.
+
+**What a reader sees.** `member` is absent unless the session is seated in a
+conference on this pod. `routes` is empty for a plain member — its injected audio
+reaches its own ear only and the mixed track does not carry it — and holds one
+entry the moment anything is routed, including `own` with
+`mix_monitor=include`; each entry names the `target`, the `source`
+(`inject`|`leg`), whether the recording feed carries it (`monitor_audible`) and
+the `attachment_id` that owns it. Being whispered *at* is not a route of one's
+own, so the addressee reports none. `conference` lists the room even after the
+member it names has left, which is what makes a stale whisper auditable rather
+than invisible.
+
+**Verified over the wire** (`describing_a_member_reads_back_its_own_state_and_
+enumerates_the_room` in `tap_plane.rs`): a real `TapPlane` behind a real
+`SessionController` on a real TCP socket, driven by a generated
+`MediaControlClient` — three inline legs seated in `sales-standup`, B muted
+through `UpdateAttachment` metadata, A whispering to C through the same channel.
+Describe on A reports the whisper (`target carol`, `source inject`,
+`monitor_audible`, the owning attachment id) and enumerates
+`[alice, bob, carol]`; Describe on B reports `mute` with no routes; Describe on C
+reports neither. C is then destroyed: the room reads back as `[alice, bob]` with
+`member_count 2`, A's route still names `carol`, and B is **still muted** — the
+lease residual, demonstrated rather than described.
+
+**Residual — no lease (the other half of D22).** Member state still has no owner
+and no expiry: nothing reclaims a mute when the controller that set it dies. The
+read-back makes that recoverable (an integrator can now reconcile a room on
+reconnect) but not automatic. A lease would have to decide whose it is — the
+attachment that set it, which item 40 explicitly rejected, or the API caller,
+which this API does not model — so it is left open deliberately and stays on the
+defect list.
+
+### 50. Non-blocking StopRecording/Detach (G10, D11) — ✅ DONE (2026-08-26)
+
+**The gap this closes.** `Detach`/`StopRecording` used to block for as long as
+the upload took (bounded 60 s per object, 90 s overall), because the recorder
+task did the upload before its `JoinHandle` resolved and the RPC awaited that
+handle. The reason it was written that way is the real difficulty: `push_event`
+takes an event's `seq` from the session record and **silently drops** an event
+whose session is gone, so a backgrounded upload would lose `UploadCompleted` on
+every hangup — which is every recording that ends with the call.
+
+**Decision — keep the session record, do not reserve a seq.** Two designs were
+weighed and the choice is recorded in `docs/implementation-notes.md`
+("The gapless-sequence problem"). Reserving a terminal `seq` at detach keeps the
+sequence gapless but **not monotonic**: when the session lives on past the
+recording, later events take higher numbers and the reserved one lands after
+them, so a consumer with a low-water mark stalls on a hole that is already
+spoken for. Keeping the record alive in a `finishing` state costs one
+`BTreeMap` entry per settling upload and keeps both properties. So:
+
+- `SessionRecord` gained `pending_uploads` + `finishing`;
+  `retain_for_upload`/`release_after_upload` bracket the background upload, and
+  `destroy_session` marks the record `finishing` rather than removing it while
+  an upload is still owed. The last release removes it.
+- A finishing session is **not adoptable and not listable**: `session_ids()`,
+  `session_count()` and therefore `snapshot()`, the registry keeper and the
+  drain all skip it, and the new `live()` guard makes `attach`,
+  `start_playback` and a second `destroy_session` refuse it by name.
+- Its `external_index` entry **is** dropped at destroy, so the external id is
+  free again immediately. The trade-off, deliberate and documented:
+  `DescribeSession` by session id still answers a finishing session, by
+  external id does not.
+- **New rule for consumers of `mss.events`:** `UploadCompleted`/`UploadFailed`
+  may arrive after `SessionEnded` for the same session, and is then the last
+  event of that session's sequence.
+
+**The recorder is now two phases.** Phase one is the capture loop; it publishes
+`RecordingStopped`, sends a `StopReport` (duration, frames, segmenter stats)
+down a oneshot and goes on. `RecorderHandle::finish()` awaits only that report,
+bounded by the new `STOP_TIMEOUT` (5 s — a segment close, no I/O), and hands the
+still-running task back as a `FinishedCapture`. Phase two takes an upload permit
+from `MSS_RECORDING_UPLOAD_CONCURRENCY` (default **4**), renders, encodes,
+uploads and publishes the result. `FINISH_TIMEOUT` (90 s) is now a test-only
+helper; the production bounds are `STOP_TIMEOUT`, `UPLOAD_TIMEOUT` (60 s per
+object) and `UPLOAD_SETTLE_TIMEOUT` (10 min, after which a stuck upload is
+aborted, counted and its retention released rather than pinning a session
+record forever — the audio is on the spill disk for D9's salvage).
+
+**A failed upload now says so.** `UploadFailed { recording_id, key, error }`
+(proto payload tag **28**, the next free one) is published for a refused upload,
+a timed-out upload and a wav-encoding failure. Before this a recording that
+never reached storage produced `RecordingStopped` and then silence, so an
+integrator waiting for `UploadCompleted` waited forever.
+
+**New: `recording_uploads.rs`.** `UploadTracker` retains the session, counts the
+hand-off (`mss_recording_uploads_backgrounded_total`), holds the gauge
+(`mss_recording_uploads_in_flight`), watches each upload and releases the
+retention when it settles. `drain.rs` gained an **`await-uploads`** step between
+`close-sessions` and `control-plane-idle` — an upload that settles after
+`flush-events` would strand its own event in the outbox at exit.
+
+**Verified — replay/in-process.** `a_stop_is_reported_before_the_upload_starts_and_the_upload_runs_on_alone`
+(a 1.5 s fake sink: `finish()` returns in under 100 ms with the stop already
+published and the upload not; `UploadCompleted` lands afterwards),
+`background_uploads_run_no_wider_than_their_configured_concurrency` (one permit
+serialises two uploads while both detaches return at once),
+`a_refused_upload_still_reports_the_stop_and_keeps_the_audio_on_disk` (now
+asserts `UploadFailed` with the store's message), two registry tests for the
+sequence (`a_recording_upload_holds_a_session_record_open_so_its_own_event_keeps_the_sequence`,
+`a_failed_upload_is_the_last_event_of_the_session_it_belonged_to`), the drain
+step order, and **over the wire** in
+`a_detach_is_answered_before_the_upload_and_the_upload_event_ends_the_sequence`
+— a real `TapPlane` + `SessionController` on a socket, two recordings on one
+session, `Detach` and `DestroySession` both answered in under 100 ms against a
+sink that sleeps 1.5 s, and the eleven events read off the watcher come back
+`seq 0..10` with both `UploadCompleted`s after `SessionEnded`.
+
+**Verified — live lab** (`lab/detach_latency_drill.sh`, new, 2026-08-26):
+
+| | phase A (MinIO healthy) | phase B (MinIO `docker pause`d) |
+| --- | --- | --- |
+| `Detach` RPC | **49 ms** | **11 ms** |
+| `DestroySession` RPC | — | **10 ms** |
+| upload took | 29 ms | **12.07 s** (11:51:25 → 11:51:37) |
+| while it ran | — | `mss_recording_uploads_in_flight 1` with `mss_sessions_live 0` |
+| terminal event | `UploadCompleted` seq **13** | `UploadCompleted` seq **10**, i.e. *after* `SessionEnded` seq 9 |
+| sequence | gapless `0..14` | gapless `0..10` |
+| object | 469 KiB | 252 KiB |
+
+The pod's own words in phase B: `recording stopped; its upload runs in the
+background` → `this session will be remembered until its recording upload
+settles` → (12 s later) `recording uploaded` → `a backgrounded recording upload
+settled` → `the last upload of this ended session settled; forgotten`. Both RPC
+times include `mss_ctl`'s process start and gRPC connect, so the server-side
+figure is smaller still; before this item the same detach would have returned
+only after the upload, which phase B held for 12 s deliberately.
+
+**Residual.** `UploadFailed` is proved in-process and replay-only — the live
+drill made storage *slow*, not permanently broken, so no live `UploadFailed` was
+observed. The retention is per-pod state: a pod killed with `-9` between the
+detach and the upload still loses the event (D9's salvage recovers the audio on
+that pod's next start, without an event). And `MSS_RECORDING_UPLOAD_CONCURRENCY`
+bounds concurrency, not memory: N uploads in flight hold N rendered WAVs.
+
+### 51. rtpengine node discovery — the optional Redis map (G11) — ✅ DONE (2026-08-26)
+
+**The gap this closes.** `CreateSession` takes an `rtpengine_node`, and a caller
+that knows it is fine. A caller that knows only the SIP Call-ID is not: it lands
+on `MSS_RTPENGINE_NODE`, and with more than one rtpengine that is a guess.
+`TelCompat` is exactly such a caller — `StartStream` carries `sipCallId` and no
+node — so the façade that exists to need no changes in cigol was the one surface
+that could not pick a node. This is the discovery map decided in Phase 0
+(architecture §4) and demoted to an optimisation on 2026-08-17, now built as
+one.
+
+**Decision — pull, not push, and nothing cached.** One Redis `GET` per
+`CreateSession` that names no node, on the create path only. No cache, no
+watcher, no invalidation: a call is created once, so a per-create read is the
+same order of cost as the `query` MSS already does, and a stale cache is a class
+of bug this cannot have. Resolution order is **request node → map → default
+node**, and the map is only consulted when the request named nothing.
+
+**Decision — plain `host:port` first, JSON when the proxy knows more.** The
+minimum an integrator writes is `10.0.0.5:22222`. The richer form is
+`{"node":"…","caller_tag":"…","from_tags":["…","…"]}`, and it earns two things:
+both tags let MSS subscribe the tap **without a `query`**, and `caller_tag`
+makes the attribution `explicit`. A tag list *without* `caller_tag` stays
+**`unknown`** (tracks `leg_a`/`leg_b`, item 47's rule) — the map may not decide
+who called by accident of ordering. That is the one D17 interaction, and it is
+documented in `docs/deploy.md`.
+
+**Decision — a lookup failure is never a session failure.** Redis unreachable, no
+key, or a value that is not an address: WARN, count it, use the default node. The
+create proceeds and fails or succeeds on its own merits. `MSS_DISCOVERY_REDIS_URL`
+that cannot be connected at startup switches discovery **off** with a WARN rather
+than refusing to start, unlike `MSS_REDIS_URL` (the registry is a promise of HA;
+the map is an optimisation).
+
+**What shipped.**
+
+- `crates/mediaserverd/src/discovery.rs` — `parse_mapped_node` (pure, 6 tests),
+  the `NodeMap` trait, `NodeDiscovery::resolve`, `DiscoveryCounters`. Redis
+  access reuses `RedisSessionStore` through its new `read_key`, so there is one
+  Redis client type in this daemon and one place that handles its connections;
+- `TapPlane::discover_through` + `resolve_node`, which replaces the direct
+  `node_for` call in `open_tap_session`. `node_for` still answers the two ends of
+  the order (a named node, the default); the map sits between them.
+  `complete_from_tags` now takes `caller_named` instead of inferring it from
+  "from_tags is non-empty", which is what keeps a map-supplied tag list honest;
+- env `MSS_DISCOVERY_REDIS_KEY_PREFIX` (unset = off) and
+  `MSS_DISCOVERY_REDIS_URL` (unset = the registry's Redis), read and logged in
+  `main.rs`, passed through all three lab `mss-control` pods;
+- metrics `mss_discovery_hits_total` / `_misses_total` / `_errors_total`, exposed
+  **only when discovery is configured** (an absent series beats a lying zero);
+- the proxy side: `lab/opensips/opensips.cfg` gained a templated block, **off by
+  default** (`__DISCOVERY__` → `off`, with `__DISCOVERY_PREFIX__`,
+  `__DISCOVERY_TTL__`, `__DISCOVERY_NODE__` beside it), and `docs/deploy.md`
+  carries the `cachedb_redis` `cache_store`/`cache_remove` snippet an integrator
+  copies.
+
+**A packaging finding worth keeping.** `opensips/opensips:3.4` ships
+`cachedb_local.so` and `cachedb_sql.so` but **no `cachedb_redis.so`**, and
+`apt.opensips.org` no longer publishes a 3.4 component for bullseye (only
+3.6/4.0 and devel), so the module cannot be installed into that image. The lab
+proxy therefore writes the map through `exec.so` + `lab/opensips/
+discovery_publish.py` (a 90-line RESP client). The key and the value are
+byte-identical to what the documented `cache_store` writes; only the writer
+differs. Check `ls /usr/lib/x86_64-linux-gnu/opensips/modules | grep cachedb` on
+your own image before copying the snippet.
+
+**Verified — live lab** (`lab/node_discovery_drill.sh`, new, 2026-08-26). The
+pod's default node was pointed at a **black hole** (`172.31.99.199:22222`) so
+nothing but the map could work:
+
+| | |
+| --- | --- |
+| the proxy published | `{"node":"172.31.99.10:22222","caller_tag":"hosttest","from_tags":["hosttest","y3HmFyeQae04N"]}` |
+| `mss_ctl create <id> <call-id> -` (no node, no tags) | tapped **1192 datagrams in 12 s**, `attribution=explicit` |
+| counters | `mss_discovery_hits_total 1`, misses 0, errors 0 |
+| an unmapped call-id | one **miss**, then refused: `no reply from rtpengine at 172.31.99.199:22222 after 3 attempts` — the fallback, not a guess |
+| the BYE | `cache_remove` equivalent ran; `GET` → `(nil)` |
+
+Both legs came from the map, so that tap issued **no `query` at all** — the
+optimisation the Phase-0 decision was after.
+
+**Residual.** The resolved node is not written back into the session registry, so
+a pod that adopts an orphaned session re-reads the map (fine while the call is up
+and the key's TTL holds) and falls back to the default node if the map is gone by
+then. A deployment whose calls outlive the key's TTL should either lengthen the
+TTL or name the node on `CreateSession`. Nothing here is proved on a **real**
+`cachedb_redis` proxy — the lab image cannot load the module — so the snippet in
+`deploy.md` is documentation, not a tested artifact; the key/value it writes is
+what was tested.
+
 ## Open defects and soft spots
 
 | # | Item | Where | Severity |
@@ -2319,7 +3238,7 @@ the monitor and the room object both hang off one member's session (D20);
 | ~~D3~~ | ~~`close_attachment` **aborts** the consumer task instead of closing the websocket politely (no `stop` frame)~~ — **fixed 2026-08-23 (item 27)**: `TapPlane::end_attachment` ends the hub subscription and lets the consumer finish, so a WS consumer sends its Twilio `stop` frame and a gRPC consumer gets a `StreamStop` naming the reason ("the attachment was detached" / "the call ended"); a consumer that will not finish inside `POLITE_CLOSE` (2 s) is still aborted, with a warning. `close_session` takes the same path, so an ordinary hangup is polite too. Replay-verified (the task runs to completion instead of being aborted; the `Stop` frame reaches a real gRPC consumer over the wire); not observed against a live consumer | `tap_plane.rs` | closed |
 | ~~D4~~ | ~~`WS_TWILIO` and `GRPC_STREAM` attachments are served; `FILE_S3` (phase 2) and `RTP_INLINE` (phase 3) are refused by name~~ — **`FILE_S3` now served (2026-08-22, item 15)**: the recorder is a hub consumer with the frozen identity, pause-segmenting and `object_store` upload. `RTP_INLINE` is still refused by name as an **attachment transport**, and item 33 (2026-08-23) did not change that: an inline leg is a session *kind*, and a consumer reaches one over `GRPC_STREAM`/`WS_TWILIO` like any other — the INJECT direction is P3-3. `RTP_INLINE` may end up never being needed | `tap_plane.rs` | partly closed — the transport stays unused |
 | 🔶 D9 | ~~A recording lives in the recording pod's memory until the call ends: a pod death loses the buffered audio and no upload is resumed~~ — **partly closed 2026-08-23 (item 30)**: closed segments now spill to `MSS_RECORDING_SPILL_DIR` every `MSS_RECORDING_SPILL_SECONDS` (default 30) and on pause, the final upload stitches spill + memory tail into the one frozen key, this pod's leftovers are salvaged on its next start (never over an object that already exists), and an adopter recovers what it can read while padding and counting the rest (`mss_recording_frames_lost_on_adopt_total`). **Residual, by construction:** the spill dir is per-pod local disk, so a **cross-pod** adopter still cannot read the dead pod's segments — worst-case loss falls from the whole call to the spill interval *on the same pod*, and stays the whole prefix across pods until the spill lives somewhere every pod can read (same fix as D16). No retention policy on the spill dir. Replay/fake-verified only; no live pod-kill drill with a recorder attached. `MAX_RECORDING` (2 h) is unchanged | `recorder.rs`, `recording_spill.rs`, `registry_keeper.rs` | medium — cross-pod half open |
-| D11 | `StopRecording`/`Detach` **blocks until the upload finishes** (bounded 60 s/90 s), because `observe` needs a live session and a backgrounded upload would lose `UploadCompleted` on every hangup. A pilot may find the latency unacceptable; the fix is a session-independent event path | `tap_plane.rs`, `recorder.rs` | medium — watch it in the pilot |
+| ~~D11~~ | ~~`StopRecording`/`Detach` **blocks until the upload finishes** (bounded 60 s/90 s), because `observe` needs a live session and a backgrounded upload would lose `UploadCompleted` on every hangup~~ — **fixed 2026-08-26 (item 50)**: the recorder splits into a capture phase that publishes `RecordingStopped` and releases the caller (bounded by `STOP_TIMEOUT`, 5 s, no I/O) and a background upload phase bounded by `MSS_RECORDING_UPLOAD_CONCURRENCY` (default 4). The event is not lost because the registry keeps the session record in a `finishing` state until its uploads settle — not adoptable, not listable, external id freed at once — so the late `UploadCompleted`/the new `UploadFailed` gets the next `seq` in that session's own sequence, gaplessly and in order. Live: `Detach` **11 ms** and `DestroySession` **10 ms** against a `docker pause`d MinIO that held the upload **12.07 s**, `uploads_in_flight 1` with `sessions_live 0`, then `UploadCompleted` at seq 10 after `SessionEnded` at seq 9. **Residual:** `UploadFailed` is replay-proved only, and a `kill -9` between detach and upload still loses the event (the audio is salvaged, per D9) | `recorder.rs`, `recording_uploads.rs`, `registry.rs` | closed (residual documented) |
 | ~~D10~~ | ~~Pause is honoured by the recorder only; a paused `WS_TWILIO`/`GRPC_STREAM` attachment keeps receiving media~~ — **fixed 2026-08-23 (item 27)**: the hub checks a per-subscription pause flag before every frame, so `StreamPause` really stops feeding an ASR; skipped frames are counted (`mss_consumer_suppressed_while_paused_total`) and resume starts at the current tap position rather than replaying a backlog. A gRPC attachment paused before its consumer subscribes stays paused when the stream opens. Recorder pause behaviour is unchanged. Replay-verified through `update_attachment`; not observed live | `tap_plane.rs`, `hub.rs` | closed |
 | ~~D5~~ | ~~Event delivery is **at-most-once**; a broker outage drops events~~ — **fixed 2026-08-22 (item 13)**: bounded retry backlog, order preserved, drop-oldest counted. Now **at-least-once**, so the translator must dedupe by `(external_id, seq)`; a backlog past its 8192 cap or a pod death still loses events | `event_pump.rs` | closed |
 | D6 | `play media` `from-tag` semantics are **unmeasured** — architecture §6's claim was retracted after the instrument turned out to be broken (see lab.md correction) | docs + lab | low, but §6 must not be trusted until re-probed |
@@ -2330,12 +3249,12 @@ the monitor and the room object both hang off one member's session (D20);
 | ~~D14~~ | ~~**A dead pod's rtpengine subscription is never torn down.**~~ — **fixed 2026-08-23 (item 25)**: `PersistedSession` now carries the tap's `to-tag` (`subscription_tag`, `serde(default)` so older records still decode), the adopter sends NG `unsubscribe` for it **before** re-subscribing (after winning the atomic claim), and a pod that loses its lease destroys the session locally so a partitioned-but-alive owner unsubscribes its own tap instead of double-tapping. `upsert` also stopped rewriting the lease key unconditionally (now `SET NX`) — it had made a lease unloseable, so the partitioned case could never be detected. New counters `mss_registry_orphans_unsubscribed_total`, `mss_registry_orphans_still_subscribed_total`, `mss_registry_surrendered_total`. **Verified in unit tests, against a fake rtpengine socket (the `unsubscribe` bytes) and against the lab's real Redis — not re-measured on a live pod kill**; the residual is that a refused `unsubscribe` still leaks one tap, counted rather than retried | `session_store.rs`, `registry_keeper.rs`, `tap_plane.rs` | closed |
 | ~~D23~~ | ~~**A padded recording-group member lost its pad's worth of audio off the tail.** `Segmenter::close_segment` subtracted the closed frames from `segment_start` (the lead-silence offset) *and* advanced `anchor_ms` by the same frames, so every spill moved a late joiner's timeline forward by the pad twice~~ — **found and fixed 2026-08-24 (item 41)**: the anchor now advances only by `frames - segment_start`. Invisible to every earlier test because an ungrouped recording has `segment_start == 0` and item 29's group drill (5 s stagger, 20 s run) never reached the 30 s spill. Live in the conference drill: `party-c.wav` **55.88 s against 66.16/66.24** before, **72.10 against 71.96/72.02** after, with the 10.66 s pad still at the front. Guarded by `a_padded_member_keeps_its_whole_tail_across_a_spill`, which fails by exactly the lead if the fix is reverted | `recorder.rs` | closed |
 | D20 | **A room recording belongs to a member, not to the conference.** The mixed-track `FILE_S3` attachment hangs off one member session, so the object ends when *that* member leaves even though the conference keeps mixing — and its t=0 is its attach moment, not the conference's open, so it aligns with the per-participant objects only if both are attached together. Fix shape: a conference-scoped recording owner (an attachment on the conference rather than on a leg) with the conference's `opened_at` as its anchor | `tap_plane.rs`, `conference.rs` | medium once a tenant records conferences whose members come and go |
-| D21 | **DTMF digits never reach the event bus.** A tapped or inline leg's digits are delivered to consumers (WS `dtmf` frames, gRPC `DtmfFrame`) and counted in `mss_ingest_dtmf_digits_total`, but nothing publishes `Observation::Dtmf`, so `mss.events` carries no digit. Conference control is API-first by design (item 40), and an integrator mapping digits to API calls therefore needs a consumer stream rather than the bus. Fix shape: publish the observation from the capture path, capability-gated like the speech report | `tap_spike.rs`, `tap_plane.rs`, `registry.rs` | medium for anyone wanting an in-call digit menu |
-| D22 | **Member state has no owner, no lease and no read-back.** `member_mute`/`member_deaf`/`member_hold` deliberately outlive the attachment that set them (item 40), so a controller that dies between `on` and `off` leaves a member muted for the life of the conference, and there is no API that reports a room's member state — only the aggregate gauges. Fix shape: expose member state on `DescribeSession` (and consider an optional lease on it, mirroring the session lease) | `conference.rs`, `tap_plane.rs`, `registry.rs` | medium once a tenant drives mute from a UI |
+| ~~D21~~ | ~~**DTMF digits never reach the event bus.** A tapped or inline leg's digits are delivered to consumers (WS `dtmf` frames, gRPC `DtmfFrame`) and counted in `mss_ingest_dtmf_digits_total`, but nothing publishes `Observation::Dtmf`, so `mss.events` carries no digit~~ — **fixed 2026-08-26 (item 48)**: every press on a tap leg or an inline leg is published as a session-level `MediaEvent` carrying `digit`, `track` (attribution-aware, so `leg_a`/`leg_b` when unproven), `duration_ms` (through the negotiated RTP clock) and the event's `rtp_timestamp`. **No capability and no consumer**: unlike `SpeechReport`, which a consumer *claims* and which is gated on `CAPABILITY_EVENTS`, a digit is a property of the call MSS decoded itself, so it goes out whenever the session exists. RFC 4733's three end retransmissions stay one event. The capture thread hands presses to the control plane over a bounded lock-free queue that counts refusals (`mss_dtmf_events_dropped_total`) rather than blocking the media path. Live-proved with no consumer attached (`lab/dtmf_event_drill.sh`). **Residual, by design:** MSS interprets no digit — no menu, no collection, no inter-digit timer (item 40: conference control is API-first) — and nothing rate-limits presses beyond the queue's drop counter | `digits.rs`, `tap_spike.rs`, `tap_plane.rs`, `registry.rs` | closed |
+| D22 | 🔶 **Member state has no owner and no lease** — read-back landed (item 49, 2026-08-26): `DescribeSession` on a member session reports its `mute`/`deaf`/`hold`, its mix routes and the room's members, read from the control-world mirror. What remains: `member_mute`/`member_deaf`/`member_hold` still outlive the attachment that set them (item 40) with no expiry, so a controller that dies between `on` and `off` leaves a member muted for the life of the conference — recoverable now by reconciling the room on reconnect, but nothing reclaims it. A lease needs an owner this API does not model (item 40 rejected the attachment as owner) | `conference.rs`, `tap_plane.rs`, `registry.rs` | medium once a tenant drives mute from a UI |
 | D16 | **A recording group is one pod's memory.** `TapPlane` holds the group, so every member of a conference recording must attach to the same pod: there is no placement that guarantees it (D8), a member whose session is adopted elsewhere is **refused** rather than restored (`grouped_not_adopted`, so the participant's file simply ends at the pod that died — the D9 shape per participant), and a group name reused on a second pod silently produces a second half-recording under the same prefix. Fix shape: schedule a group's sessions onto one pod, or move the group into shared storage so any pod can serve a member | `tap_plane.rs`, `registry_keeper.rs` | medium once a tenant records conferences across pods |
 | ~~D13~~ | ~~`StreamStart` (and the Twilio `start` frame's `tracks`) advertises `["customer","agent"]` for `TrackSelector::All`, but a silent `mixed` track is delivered too~~ — **fixed 2026-08-23 (item 27)**: the hub selection split into `All` (every track, including `mixed`) and `Speakers` (customer + agent). Consumers get `Speakers`, so delivery matches the advertisement exactly; the **recorder keeps `All`** because injected bot speech belongs in the recording. The frozen Twilio start frame and `StreamStart.tracks` were not touched — the delivery was brought in line with them. A consumer that wants the injected track can still ask for it by name (`TrackSelector::Only(Mixed)`). Replay-verified | `hub.rs`, `tap_plane.rs` | closed |
-| D17 | **Leg labels invert when the caller's from-tag is not given.** With `from_tags` unspecified (`-`), `TapPlane` labels the two legs in the order rtpengine's `query` returns them, and in the two-node drill that put **FreeSWITCH's** tag first — so `customer` and `agent` were swapped in the recording and in the `tracks` a consumer sees. Speaker attribution is only trustworthy when the caller's from-tag is passed explicitly. Fix shape: refuse to name tracks by direction when no from-tag was supplied (label them `leg_a`/`leg_b`, or resolve the caller from the SIP call-id), rather than guessing an order | `tap_plane.rs` | medium — an ASR or a QA review reads the wrong speaker |
-| ~~D18~~ | ~~**Recording-group members are not time-aligned.** Each member's file anchored on **its own first frame**, so a late joiner's file started at its join moment and two members of one group differed in length (90.32 s vs 90.26 s in the two-node drill), leaving reassembly to the event timeline~~ — **fixed 2026-08-23 (item 29)**: a recording group stamps `opened_at` when its first member joins and every later member's segmenter pads its first segment with silence from that anchor to its own first frame (`Segmenter::lead_with_silence`, reported as `lead_silence_frames`), padded once per recording so pause/resume cannot double-count it. Replay-verified (late joiner padded, two members equal length, the pause interaction, and a WAV read back out of a fake sink) **and live**: the drill's staggered re-run had bob join 5 s late and his object came back opening with 5016 ms of zeros, 25.116 s against alice's 25.030 s. **Residual:** equal length still assumes the members stop together — the 86 ms here is D11's blocking detach, and D16 keeps the anchor inside one pod's clock | `recorder.rs`, `tap_plane.rs` | closed (residual documented) |
+| ~~D17~~ | ~~**Leg labels invert when the caller's from-tag is not given.** With `from_tags` unspecified (`-`), `TapPlane` labels the two legs in the order rtpengine's `query` returns them, and in the two-node drill that put **FreeSWITCH's** tag first — so `customer` and `agent` were swapped in the recording and in the `tracks` a consumer sees~~ — **fixed 2026-08-26 (item 47)**: the order was in fact `BTreeMap` order, i.e. lexicographic by tag. MSS now refuses to name a direction it cannot back up: `attribution=explicit` when a from-tag was supplied (and for every inline leg), `inferred` when rtpengine's per-participant `created` seconds strictly order the legs, `unknown` otherwise — and under `unknown` the gRPC tracks, the event payload tracks and the recording object keys are `leg_a`/`leg_b`, with a WARN log, a `LegsAttributed` event and `attribution` on `DescribeSession` and on every event envelope. The frozen WS Twilio names never move. Live-proved on a call built to invert (callee tag sorting first): `unknown` + `leg_a`/`leg_b` with no from-tag, `explicit` + `customer`/`agent` with one. **Residual, and it is the vendor's:** `created` is stamped per *dialogue*, so the two legs of one call always tie — `inferred` cannot fire for a two-party call on rtpengine 14.1.1.8, and an integrator who needs speaker attribution **must** pass the caller's from-tag (`docs/deploy.md`, "Leg attribution") | `tap_plane.rs`, `attribution.rs` | closed (residual is the vendor's) |
+| ~~D18~~ | ~~**Recording-group members are not time-aligned.** Each member's file anchored on **its own first frame**, so a late joiner's file started at its join moment and two members of one group differed in length (90.32 s vs 90.26 s in the two-node drill), leaving reassembly to the event timeline~~ — **fixed 2026-08-23 (item 29)**: a recording group stamps `opened_at` when its first member joins and every later member's segmenter pads its first segment with silence from that anchor to its own first frame (`Segmenter::lead_with_silence`, reported as `lead_silence_frames`), padded once per recording so pause/resume cannot double-count it. Replay-verified (late joiner padded, two members equal length, the pause interaction, and a WAV read back out of a fake sink) **and live**: the drill's staggered re-run had bob join 5 s late and his object came back opening with 5016 ms of zeros, 25.116 s against alice's 25.030 s. **Residual:** equal length still assumes the members stop together — the 86 ms here was D11's blocking detach, closed by item 50, and D16 keeps the anchor inside one pod's clock | `recorder.rs`, `tap_plane.rs` | closed (residual documented) |
 | ~~D19~~ | ~~A consumer cannot tell MSS that the caller started speaking: `Registry::report` had no caller outside tests~~ — **fixed 2026-08-23 (item 28)**: `ConsumerToServer.SpeechReport` on the gRPC `MediaStream` stream (kind `STARTED`/`PARTIAL`/`FINAL`/`END_OF_UTTERANCE`/`END_OF_INTERACTION`, track, text, confidence, the consumer's own `observed_at`) reaches `Registry::report`, gated on `CAPABILITY_EVENTS` — an attachment without it gets `PERMISSION_DENIED` and the stream ends, the same protocol-violation shape as an unprivileged `inject`. Proven on a live tapped call: `lab/barge_drill.sh` now triggers on a real `SpeechReport` and measures cut-through p50 3.54–3.98 ms (item 5). **Residual, accepted:** the `WS_TWILIO` dialect cannot report speech — its bytes are frozen (Article VII) and it carries no such message, so a WS consumer's only barge stays the `clear` message's direct rtpengine `stop media` (unevented; the D2 shape). Interactive voice-AI on WS should attach over gRPC instead | `stream.rs`, `convert.rs`, `session-core/registry.rs` | closed |
 
 ## Integration handoffs (deployment-gated)
@@ -2353,13 +3272,13 @@ the worked example of each handoff.
 | # | Handoff | What MSS already provides | What the integrator owes |
 | --- | --- | --- | --- |
 | H1 | **An event consumer for `mss.events`** | typed `MediaEvent` on one Kafka topic, keyed by `external_id`, gapless per-session `seq`, at-least-once since D5 (so dedupe by `(external_id, seq)`), `legacy_eligible` marking the authoritative attachment | a consumer that renders those events onto whatever the existing control plane already understands. *Worked example:* the reference deployment's translator, which maps them onto its legacy positional `eventTopic` format — written, awaiting review and merge in its own repository (item 1) |
-| H2 | **The deployed rtpengine version check** | `subscribe` verified against lab rtpengine 14.1.1.8; `lab/kernel_probe.sh` prints the finding on any host | read the version from the process, the package or rtpengine's CLI interface (`--listen-cli`) on the target host. **It cannot be asked over NG** — rtpengine has no NG `version` command, in this build or upstream (item 23). If the deployed build lacks `subscribe`, the ingest model needs an upgrade path first |
-| H3 | **rtpengine-side per-tap cost on the target metal** | the MSS-side cost is measured; `lab/kernel_probe.sh` plus the read-only checklist in architecture §8.1 is the instrument | run it on the real box: `relayedpackets_kernel` vs `_user` and `media_kernel` vs `media_userspace` across baseline / taps-with-transcode / taps-without-transcode. This sets the rtpengine capacity plan. D14 is fixed (item 25), so a pod restart mid-probe no longer pollutes the numbers |
-| H4 | **End-to-end barge-in through the integrator's stack** | every MSS-owned hop is measured: consumer `SpeechReport` → bus → `StopPlayback` at **p50 3.5 ms** (item 5), and inline `Clear` → silence at the peer's ear at **p50 12.2 ms**, one ptime (item 35) | the tail is theirs: their event consumer (H1) and their prompt player. Measure the whole path against their perceptual budget |
-| H5 | **The SIP proxy's B2B integration for inline legs** | `CreateSession{kind=INLINE, sdp_offer}` returns a real SDP answer and the leg speaks and listens on real sockets; a `group` seats it in a conference | offer/answer plumbing from their proxy or B2BUA into that API. No inline leg in this repository has met a **SIP** endpoint — every inline and conference measurement is against an RTP peer with no signalling |
-| H6 | **FS byte-parity against real production recordings** | item 31 measured a live call recorded both ways: container, channel layout and rms agree exactly, and a re-aligned 2 s window agrees on 1.0000 of samples at mean diff 0.6/32768. It also established that **byte-parity at a fixed offset is not an achievable bar** — the two recorders conceal independently, so the inter-file offset wanders | a **two-party** comparison on their FreeSWITCH, with their codec, their pause contract, and a human listen. The lab's write side plays silence, so only one channel was truly compared |
+| H2 | **The deployed rtpengine version check** | `subscribe` verified against lab rtpengine 14.1.1.8; `lab/kernel_probe.sh` prints the finding on any host, and `lab/preflight.sh` prints it as one `rtpengine_version` line, and [deploy.md](deploy.md#first-day-on-real-gear--an-ordered-runbook) step 0 makes reading it the stopping condition when `ng_subscribe` fails | read the version from the process, the package or rtpengine's CLI interface (`--listen-cli`) on the target host. **It cannot be asked over NG** — rtpengine has no NG `version` command, in this build or upstream (item 23). If the deployed build lacks `subscribe`, the ingest model needs an upgrade path first |
+| H3 | **rtpengine-side per-tap cost on the target metal** | the MSS-side cost is measured; `lab/kernel_probe.sh` plus the read-only checklist in architecture §8.1 is the instrument, sequenced as [deploy.md](deploy.md#first-day-on-real-gear--an-ordered-runbook) step 3 | run it on the real box: `relayedpackets_kernel` vs `_user` and `media_kernel` vs `media_userspace` across baseline / taps-with-transcode / taps-without-transcode. This sets the rtpengine capacity plan. D14 is fixed (item 25), so a pod restart mid-probe no longer pollutes the numbers |
+| H4 | **End-to-end barge-in through the integrator's stack** | every MSS-owned hop is measured: consumer `SpeechReport` → bus → `StopPlayback` at **p50 3.5 ms** (item 5), and inline `Clear` → silence at the peer's ear at **p50 12.2 ms**, one ptime (item 35); [deploy.md](deploy.md#first-day-on-real-gear--an-ordered-runbook) step 6 says to measure the whole path while the inline leg is first bridged | the tail is theirs: their event consumer (H1) and their prompt player. Measure the whole path against their perceptual budget |
+| H5 | **The SIP proxy's B2B integration for inline legs** | `CreateSession{kind=INLINE, sdp_offer}` returns a real SDP answer and the leg speaks and listens on real sockets; a `group` seats it in a conference; [deploy.md](deploy.md#high-availability-what-is-adoptable-and-what-is-not) records that an inline leg does **not** survive a pod loss, so recovery is call-control's | offer/answer plumbing from their proxy or B2BUA into that API. No inline leg in this repository has met a **SIP** endpoint — every inline and conference measurement is against an RTP peer with no signalling |
+| H6 | **FS byte-parity against real production recordings** | item 31 measured a live call recorded both ways: container, channel layout and rms agree exactly, and a re-aligned 2 s window agrees on 1.0000 of samples at mean diff 0.6/32768; [deploy.md](deploy.md#first-day-on-real-gear--an-ordered-runbook) step 4 walks the recording checks, frozen identity first. It also established that **byte-parity at a fixed offset is not an achievable bar** — the two recorders conceal independently, so the inter-file offset wanders | a **two-party** comparison on their FreeSWITCH, with their codec, their pause contract, and a human listen. The lab's write side plays silence, so only one channel was truly compared |
 | H7 | **Retiring the legacy media path** | the workloads are served: fan-out, recording, inline legs, conferences, monitor/whisper/barge | the tenant decision to turn the old media bugs off (`record_session`, the audio fork, the conference-per-AI-interaction dummy leg), and to decommission whatever gateway service they run today. Rollback stays config-only while both paths are installed |
-| H8 | **A pilot, a stability period and UX sign-off** | metrics on `MSS_METRICS_LISTEN` with alert rules in `deploy/`, a soak harness (`lab/soak.py`) and an impairment matrix | run flagged tenants for the agreed period; watch D11 (blocking detach), D17 (leg labels without an explicit from-tag) and the conference defects D16/D20/D21/D22 in the field; get a human to judge audio quality, which no automated assertion in this repository claims to have done |
+| H8 | **A pilot, a stability period and UX sign-off** | metrics on `MSS_METRICS_LISTEN` with alert rules in `deploy/`, a soak harness (`lab/soak.py`) and an impairment matrix, plus deployable manifests: `deploy/k8s/` with both network shapes, probes, a drain-safe grace period and a `ServiceMonitor`/`PrometheusRule` generated from those alert rules (item 46) | run flagged tenants for the agreed period; watch the conference defects D16/D20/D21/D22 in the field, and confirm that the integrator's control plane really passes the caller's from-tag — without it every tap is `attribution=unknown` and its tracks are `leg_a`/`leg_b` (item 47); get a human to judge audio quality, which no automated assertion in this repository claims to have done |
 
 ## Waiting on other people (M2 close-out)
 
@@ -2382,13 +3301,20 @@ once as a milestone blocker and once as an integration handoff:
    taps-without-transcode is the measurement, and architecture §8.1 has the
    full read-only checklist. D14 is fixed (item 25), so a pod restart during the probe no longer
    pollutes it — though the fix has not been re-measured live.
-3. **OpenSIPS → Redis call→node discovery** — **no longer a blocker
-   (2026-08-17).** MSS now resolves a call's participants itself: cigol passes
-   the SIP call-id and the caller's from-tag (both already on the channel as
-   `Variable_sip_call_id` and `Variable_sip_full_from`) and `TapPlane` asks
-   rtpengine's `query` for the rest. The map remains the better long-term
-   answer — it avoids a `query` per tap and works when MSS never sees the
-   channel — but it is now an optimisation, not a prerequisite for a pilot.
+3. **OpenSIPS → Redis call→node discovery** — **MSS's half is built
+   (item 51, 2026-08-26); what is left is one config block on someone else's
+   proxy.** Set `MSS_DISCOVERY_REDIS_KEY_PREFIX` and a `CreateSession` that
+   names no node reads `<prefix><Call-ID>` from Redis before falling back to
+   `MSS_RTPENGINE_NODE`; hits/misses/errors are counted and a lookup failure is
+   always a fallback, never a refused session. The proxy side is a
+   `cache_store`/`cache_remove` pair (`cachedb_redis`) copy-pasteable from
+   [deploy.md](deploy.md) — and the lab proved the whole path live with the
+   pod's default node pointed at a black hole. It stays listed here because
+   **only the integrator can add it to a production proxy**, and because the
+   pinned `opensips/opensips:3.4` image ships no `cachedb_redis.so`, so the
+   module must be present on whatever build the deployment runs. Still an
+   optimisation, not a prerequisite: MSS resolves participants itself through
+   rtpengine's `query` when nobody publishes the map.
 
 ## Later phases
 
@@ -2437,4 +3363,5 @@ Appendix B. Item 41 judged all of it on **real sockets**: three container peers
 at 440/880/1320 Hz in one conference, **twenty tone-per-phase assertions green**
 at a ≥30:1 margin, and both recording shapes in MinIO at once. What the phase
 owes is deployment-gated (a SIP proxy's B2B leg into a conference, a pilot) plus
-the four defects it left open: D16, D20, D21 and D22.
+the defects it left open: D16 and D20, with D21 closed by item 48 and D22 half
+closed by item 49 (read-back landed, no lease).
