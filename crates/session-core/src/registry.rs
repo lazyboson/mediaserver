@@ -1,3 +1,4 @@
+use crate::attribution::Attribution;
 use crate::capability::{Capabilities, Transport};
 use crate::event::{ConsumerEvent, EventKind, MediaEvent, Observation};
 use crate::ids::{AttachmentId, PlaybackId, SessionId};
@@ -170,6 +171,7 @@ pub struct SessionView {
     pub kind: SessionKind,
     pub call_id: String,
     pub from_tags: Vec<String>,
+    pub attribution: Attribution,
     pub rtpengine_node: String,
     pub sdp_offer: Option<String>,
     pub sdp_answer: Option<String>,
@@ -200,6 +202,7 @@ struct SessionRecord {
     kind: SessionKind,
     call_id: String,
     from_tags: Vec<String>,
+    attribution: Attribution,
     rtpengine_node: String,
     sdp_offer: Option<String>,
     sdp_answer: Option<String>,
@@ -305,6 +308,11 @@ impl SessionRegistry {
                 external_id: request.external_id.clone(),
                 kind: request.kind,
                 call_id: request.call_id.clone(),
+                attribution: if request.kind == SessionKind::Tap && request.from_tags.is_empty() {
+                    Attribution::Unknown
+                } else {
+                    Attribution::Explicit
+                },
                 from_tags: request.from_tags.clone(),
                 rtpengine_node: request.rtpengine_node.clone(),
                 sdp_offer: request.sdp_offer.clone(),
@@ -380,6 +388,7 @@ impl SessionRegistry {
             kind: record.kind,
             call_id: record.call_id.clone(),
             from_tags: record.from_tags.clone(),
+            attribution: record.attribution,
             rtpengine_node: record.rtpengine_node.clone(),
             sdp_offer: record.sdp_offer.clone(),
             sdp_answer: record.sdp_answer.clone(),
@@ -786,9 +795,34 @@ impl SessionRegistry {
             Observation::UploadCompleted { recording_id, uri } => {
                 EventKind::UploadCompleted { recording_id, uri }
             }
+            Observation::LegsAttributed {
+                attribution,
+                tracks,
+            } => {
+                if let Some(record) = self.sessions.get_mut(&session) {
+                    record.attribution = attribution;
+                }
+                EventKind::LegsAttributed {
+                    attribution,
+                    tracks,
+                }
+            }
         };
         self.push_event(session, None, true, kind);
         Ok(())
+    }
+
+    pub fn record_attribution(
+        &mut self,
+        session: SessionId,
+        attribution: Attribution,
+    ) -> Result<SessionView, ControlError> {
+        let record = self
+            .sessions
+            .get_mut(&session)
+            .ok_or(ControlError::UnknownSession(session))?;
+        record.attribution = attribution;
+        self.session_view(session)
     }
 
     pub fn drain_events(&mut self) -> Vec<MediaEvent> {
@@ -837,11 +871,16 @@ impl SessionRegistry {
         legacy_eligible: bool,
         kind: EventKind,
     ) {
-        let (external_id, session_kind, seq) = match self.sessions.get_mut(&session) {
+        let (external_id, session_kind, attribution, seq) = match self.sessions.get_mut(&session) {
             Some(record) => {
                 let seq = record.next_seq;
                 record.next_seq += 1;
-                (record.external_id.clone(), record.kind, seq)
+                (
+                    record.external_id.clone(),
+                    record.kind,
+                    record.attribution,
+                    seq,
+                )
             }
             None => return,
         };
@@ -856,6 +895,7 @@ impl SessionRegistry {
             attachment,
             seq,
             legacy_eligible,
+            attribution,
             kind,
         });
     }
@@ -1736,5 +1776,95 @@ mod tests {
             })
         );
         assert_eq!(registry.authorize_send_text(talker), Ok(()));
+    }
+
+    #[test]
+    fn a_session_told_its_caller_tag_starts_out_explicitly_attributed() {
+        let mut registry = SessionRegistry::default();
+        let view = registry.create_session(tap("req-explicit")).unwrap();
+        assert_eq!(view.attribution, Attribution::Explicit);
+    }
+
+    #[test]
+    fn an_inline_leg_is_attributed_by_construction_however_it_was_created() {
+        let mut registry = SessionRegistry::default();
+        let mut request = tap("req-inline");
+        request.kind = SessionKind::Inline;
+        request.from_tags.clear();
+        request.sdp_offer = Some("v=0".to_string());
+        let view = registry.create_session(request).unwrap();
+        assert_eq!(view.attribution, Attribution::Explicit);
+    }
+
+    #[test]
+    fn a_session_with_no_from_tags_claims_nothing_until_the_media_plane_resolves_it() {
+        let mut registry = SessionRegistry::default();
+        let mut request = tap("req-quiet");
+        request.from_tags.clear();
+        let view = registry.create_session(request).unwrap();
+        assert_eq!(view.attribution, Attribution::Unknown);
+    }
+
+    #[test]
+    fn the_media_planes_verdict_reaches_describe_and_every_later_event() {
+        let mut registry = SessionRegistry::default();
+        let mut request = tap("req-resolved");
+        request.from_tags.clear();
+        let session = registry.create_session(request).unwrap().id;
+        registry
+            .observe(
+                session,
+                Observation::LegsAttributed {
+                    attribution: Attribution::Inferred,
+                    tracks: vec!["customer".to_string(), "agent".to_string()],
+                },
+            )
+            .unwrap();
+
+        assert_eq!(
+            registry.session_view(session).unwrap().attribution,
+            Attribution::Inferred
+        );
+        let events = registry.drain_events();
+        assert_eq!(
+            events.last().map(|event| event.kind.clone()),
+            Some(EventKind::LegsAttributed {
+                attribution: Attribution::Inferred,
+                tracks: vec!["customer".to_string(), "agent".to_string()],
+            })
+        );
+        registry.destroy_session(session, "done").unwrap();
+        assert!(registry
+            .drain_events()
+            .iter()
+            .all(|event| event.attribution == Attribution::Inferred));
+    }
+
+    #[test]
+    fn an_unresolved_session_stamps_unknown_on_the_events_it_emits() {
+        let mut registry = SessionRegistry::default();
+        let mut request = tap("req-guessing");
+        request.from_tags.clear();
+        let session = registry.create_session(request).unwrap().id;
+        registry.destroy_session(session, "done").unwrap();
+        let events = registry.drain_events();
+        assert!(!events.is_empty());
+        assert!(events
+            .iter()
+            .all(|event| event.attribution == Attribution::Unknown));
+    }
+
+    #[test]
+    fn record_attribution_overwrites_a_stale_verdict_on_the_same_session() {
+        let mut registry = SessionRegistry::default();
+        let session = registry.create_session(tap("req-rewrite")).unwrap().id;
+        let view = registry
+            .record_attribution(session, Attribution::Unknown)
+            .unwrap();
+        assert_eq!(view.attribution, Attribution::Unknown);
+        assert_eq!(
+            registry.record_attribution(SessionId::from_raw(999), Attribution::Explicit),
+            Err(ControlError::UnknownSession(SessionId::from_raw(999)))
+        );
     }
 }

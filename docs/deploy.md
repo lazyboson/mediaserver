@@ -263,6 +263,49 @@ Scale on active session count (and CPU) rather than requests per second. Calls
 are minutes long, so **scale-in is slow by nature**: a pod cannot leave until its
 calls end or are adopted. Plan for it.
 
+## Leg attribution — pass the caller's from-tag
+
+**If you want a tap's two tracks named `customer` and `agent`, your control
+plane must tell MSS which from-tag is the caller's.** `CreateSession.from_tags`
+takes it (the `telcompat` façade reads it from `callerFromTag`). This is the one
+piece of a call's identity MSS cannot recover on its own, and the reason is
+rtpengine's, measured on 14.1.1.8 (item 47):
+
+- a `query` reply gives each participant a `created` stamp of **whole seconds**,
+  and it is stamped **per dialogue** — the offering and the answering leg of one
+  call carry the *same* value even when the answer came seconds later. Only
+  legs from *different* dialogues on one call-id differ;
+- so ordering the participants by creation time cannot tell the caller from the
+  callee, and neither can the order the reply lists them in (it is
+  lexicographic by tag).
+
+MSS therefore refuses to guess. Every session reports an **`attribution`** on
+`DescribeSession` and on every `MediaEvent`:
+
+| `attribution` | When | What a consumer sees |
+| --- | --- | --- |
+| `explicit` | `from_tags` was supplied — and always for an inline leg | `customer` / `agent` |
+| `inferred` | rtpengine's `created` seconds strictly ordered the participants (only possible when one call-id carries more than one dialogue) | `customer` / `agent` |
+| `unknown` | nothing separated them | **`leg_a` / `leg_b`** — no direction is claimed |
+
+Under `unknown` the daemon logs a WARN naming both tags and their stamps, and
+publishes one `LegsAttributed` event carrying the track names the consumer will
+actually see. Audit it in one line:
+
+```sh
+mss_ctl "$CONTROL" describe "$EXTERNAL_ID" | grep -o 'attribution: "[a-z]*"'
+```
+
+Two consequences worth knowing before a pilot:
+
+- the **WS Twilio** dialect is frozen: its tracks stay `inbound`/`outbound`
+  whatever the attribution says, so a WS consumer's only warning is the event.
+  Attach over `GRPC_STREAM` where speaker identity matters;
+- recording object keys follow the same names, so an unattributed recording
+  group writes `…/<participant>.leg_a.wav` — a downstream job keyed on
+  `.customer.wav` will not find it. That is the intended failure: better a
+  missing file than a confidently mislabelled speaker.
+
 ## High availability: what is adoptable and what is not
 
 Ownership is a TTL'd lease in Redis, renewed by heartbeat. On pod loss another

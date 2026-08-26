@@ -95,6 +95,14 @@ message Session {
   // INLINE only: the conference this leg is mixed into, empty when it is a
   // plain two-party leg.
   string group = 11;
+  // How this session's track names were arrived at: "explicit" (the caller's
+  // from-tag was supplied), "inferred" (rtpengine's participant creation times
+  // ordered them) or "unknown" (they tie, so no direction is claimed and the
+  // tracks are named leg_a / leg_b). D17: rtpengine stamps both legs of one
+  // dialogue with the same second, so "unknown" is the normal outcome of not
+  // passing a from-tag and an integrator that needs speaker attribution must
+  // pass the caller's tag.
+  string attribution = 12;
 }
 
 message SessionRef {
@@ -273,6 +281,10 @@ message MediaEvent {
   // Which kind of session emitted this: a consumer of mss.events can tell a
   // tap's events from an inline leg's without asking the API.
   SessionKind session_kind = 7;
+  // How the track names in this event's payload were arrived at: "explicit",
+  // "inferred" or "unknown" (D17). Under "unknown" the tracks are named leg_a
+  // and leg_b and no event claims a direction.
+  string attribution = 8;
 
   oneof payload {
     SpeechStarted speech_started = 10;
@@ -292,6 +304,7 @@ message MediaEvent {
     RecordingPaused recording_paused = 24;
     MixRouted mix_routed = 25;
     MemberControlled member_controlled = 26;
+    LegsAttributed legs_attributed = 27;
   }
 }
 
@@ -329,6 +342,13 @@ message RecordingPaused { string recording_id = 1; bool paused = 2; uint64 durat
 message RecordingStopped { string recording_id = 1; uint64 duration_ms = 2; }
 message UploadCompleted { string recording_id = 1; string uri = 2; }
 message AttachmentUp { string label = 1; }
+// Emitted once per session when MSS settles who is who, so an integrator can
+// audit speaker attribution instead of trusting it. attribution is "explicit",
+// "inferred" or "unknown"; tracks are the names this session's gRPC frames and
+// recording objects carry (leg_a / leg_b when unknown). The frozen WS Twilio
+// dialect keeps inbound / outbound whatever this says, so a WS consumer's only
+// warning that its track names are a guess is this event.
+message LegsAttributed { string attribution = 1; repeated string tracks = 2; }
 // Where an INJECT attachment's audio lands in its conference's mix: "own" is
 // private playback into its own leg (the default), a member's external id is a
 // whisper heard only by that member, "all" is the barge flip. monitor_audible

@@ -1,13 +1,13 @@
 use crate::auth::AuthPolicy;
 use crate::controller::{InlineEgressSink, SessionController, StreamFrame};
 use crate::convert::{
-    attachment_id, format, format_wire, observed_lag_ms, speech_report, track_name,
+    attachment_id, format, format_wire, observed_lag_ms, speech_report, tracks_under,
 };
 use crate::proto;
 use crate::proto::media_control_server::MediaControl;
 use crate::proto::media_stream_server::{MediaStream, MediaStreamServer};
-use media_core::{g711, Encoding, Track};
-use session_core::{AttachmentView, SessionKind, SessionView, TrackSelector, Transport};
+use media_core::{g711, Encoding};
+use session_core::{AttachmentView, SessionKind, SessionView, Transport};
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::Duration;
@@ -442,13 +442,7 @@ fn wav_blob(sample_rate_hz: u32, pcm: &[i16]) -> Result<Vec<u8>, Status> {
 }
 
 fn start_message(session: &SessionView, view: &AttachmentView) -> proto::ServerToConsumer {
-    let tracks = match view.selector {
-        TrackSelector::All => vec![
-            track_name(Track::Customer).to_string(),
-            track_name(Track::Agent).to_string(),
-        ],
-        TrackSelector::Only(track) => vec![track_name(track).to_string()],
-    };
+    let tracks = tracks_under(view.selector, session.attribution);
     proto::ServerToConsumer {
         msg: Some(proto::server_to_consumer::Msg::Start(proto::StreamStart {
             session_id: session.id.to_string(),

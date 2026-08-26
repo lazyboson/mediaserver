@@ -2782,6 +2782,103 @@ substituted by a real API server, and no rollout has ever drained a pod under a
 Deployment controller. Steps 1, 5 and 6 of the runbook are where that gets
 found out.
 
+### 47. Leg labels that do not depend on rtpengine's query order (G7, D17) — ✅ DONE (2026-08-26)
+
+**The gap this closes.** With `from_tags` unspecified (`-`), `TapPlane` labelled
+the two legs in the order `NgReply::tags()` returned them — and that order is a
+`BTreeMap`'s, i.e. **lexicographic by tag string**. The two-node drill (item 24)
+hit exactly that: FreeSWITCH's tag sorted first, so `customer` and `agent` were
+swapped in the recording and in the `tracks` a consumer sees, silently, with no
+signal to the integrator that the names were a coin flip.
+
+**What we measured before writing any code** (`lab/ng_tag_created_probe.py`, new,
+against the lab's rtpengine **14.1.1.8**; the fix's whole shape turns on it):
+
+- a participant entry in a `query` reply carries exactly **two** scalar fields of
+  its own: `tag` and **`created`** (integer, whole seconds). There is no
+  microsecond field per tag — `created_ts` and `created_us` exist only at the
+  **call** level, next to the top-level `created`;
+- **`created` is stamped per dialogue, not per participant.** An offer and an
+  answer **4 s apart** produced two tags with the *same* `created`
+  (`1787737315`). A third and fourth leg offered/answered on the same call-id
+  12 s later shared a *different* one (legA/legB `…383`, legC/legD `…395`). So
+  creation time separates B2B dialogues on one call-id and **can never separate
+  the two legs of one dialogue** — which is the only case leg labelling cares
+  about;
+- so "order the participants by creation time" — the shape D17 proposed, and what
+  `call_watcher.py` was believed to do — is **not implementable** against this
+  vendor. (`call_watcher.py` orders *calls* by `created`; for tags it uses the
+  lab-only trick of recognising FreeSWITCH's media IP, and its own docstring says
+  `created` "ties on a fast answer".)
+- one lab gotcha found on the way, worth the line: rtpengine replays a **cached
+  reply for a repeated cookie**, so a probe with a fixed cookie prefix reads the
+  *previous* run's call. The probe now randomises its prefix (the D12 shape).
+
+**What shipped.** `Attribution` (`session-core/src/attribution.rs`) —
+`explicit | inferred | unknown` — threaded from resolution to every consumer-
+facing name:
+
+- `NgReply::tags_created()` exposes the per-tag `created`; the pure
+  `order_participants()` in `tap_plane.rs` sorts by it (stable, so ties keep the
+  reply's own order, and unstamped tags sort last) and returns `Inferred` **only**
+  when the first two participants carry *strictly different* seconds — otherwise
+  `Unknown`. It never guesses;
+- `explicit` when the caller's from-tag was supplied (any non-empty `from_tags`),
+  and for every INLINE session by construction — MSS answered that leg, so its
+  own capture is unambiguous;
+- under `unknown` the gRPC `StreamStart.tracks`, every gRPC media/DTMF frame's
+  `track`, every event payload's `track` and the recording group's object keys
+  are named **`leg_a` / `leg_b`** instead of `customer` / `agent`. `convert::track()`
+  accepts the new names back, so a selector still round-trips;
+- **the frozen WS Twilio vocabulary does not move** (Article VII):
+  `inbound`/`outbound` regardless of attribution. A WS consumer's only warning
+  that its names are a guess is the event below, which is why interactive
+  attribution-sensitive work belongs on gRPC;
+- the verdict is auditable three ways: `Session.attribution` on `DescribeSession`,
+  a `string attribution` on **every** `MediaEvent` envelope, and a
+  `LegsAttributed { attribution, tracks }` event emitted once per tap naming the
+  track names a consumer will actually see. All three are additive proto fields;
+- and the daemon logs it: INFO when the caller was named or creation times
+  separated the legs, **WARN** naming the tags, their stamps and
+  `callerFromTag` when they tie.
+
+**Verified.** 14 new replay tests (three attribution states through
+`order_participants`, the naming, the recording keys, the frozen WS names, the
+registry write-back and event stamping) plus two over-the-wire tests on the real
+gRPC surface. Then **live** (`lab/leg_attribution_drill.sh`, new), on a fabricated
+two-leg call built to reproduce the inversion — caller `zz-caller`, callee
+`aa-callee`, so the callee sorts **first**:
+
+- rtpengine reported both legs with `created=1787738648` — identical, as the probe
+  predicted;
+- **from-tags `-`**: `DescribeSession` → `attribution: "unknown"`; the gRPC start
+  frame → `tracks=["leg_a", "leg_b"]`; MinIO received
+  `rec-…/alice.leg_a.wav` and `alice.leg_b.wav`; the WARN line above appeared with
+  both stamps in it; `mss.events` carried the `LegsAttributed` record and every
+  later event for that session was stamped `unknown`. The old code would have
+  called `aa-callee` the customer — the drill shows the callee's DTMF digit `2`
+  arriving on `leg_a`, honestly unnamed instead of falsely `customer`;
+- **from-tags `zz-caller`**: `attribution: "explicit"`, `tracks=["customer",
+  "agent"]`, objects `alice.customer.wav` / `alice.agent.wav`, and digit `1` on
+  `customer` — correct.
+
+**Decisions.** (1) Event payload track names follow attribution too, so nothing
+in MSS's own vocabulary claims a direction the session cannot back up; the frozen
+WS dialect and the legacy `the legacy stream fsm` event names are unaffected (they carry no
+track). (2) `Attribution` is **not** persisted in the session store: a session
+created without from-tags is not rebuildable (`is_rebuildable()` requires them),
+and one created with them re-derives `explicit` on the adopting pod. (3) The
+`inferred` state is real code with a real test but is **unreachable for a
+two-party call on this rtpengine version** — it can only fire where a call-id
+carries participants from more than one dialogue. It is kept rather than
+collapsed into `explicit`/`unknown` because the honest thing to record is that
+the vendor, not MSS, is what makes creation order useless.
+
+**What it does not prove:** nothing here recovers attribution from SIP. The only
+way to get `customer`/`agent` on a tap is to pass the caller's from-tag —
+`docs/deploy.md` now says so under "Leg attribution", and the integrator's
+control plane is where that has to come from.
+
 ## Open defects and soft spots
 
 | # | Item | Where | Severity |
@@ -2806,7 +2903,7 @@ found out.
 | D22 | **Member state has no owner, no lease and no read-back.** `member_mute`/`member_deaf`/`member_hold` deliberately outlive the attachment that set them (item 40), so a controller that dies between `on` and `off` leaves a member muted for the life of the conference, and there is no API that reports a room's member state — only the aggregate gauges. Fix shape: expose member state on `DescribeSession` (and consider an optional lease on it, mirroring the session lease) | `conference.rs`, `tap_plane.rs`, `registry.rs` | medium once a tenant drives mute from a UI |
 | D16 | **A recording group is one pod's memory.** `TapPlane` holds the group, so every member of a conference recording must attach to the same pod: there is no placement that guarantees it (D8), a member whose session is adopted elsewhere is **refused** rather than restored (`grouped_not_adopted`, so the participant's file simply ends at the pod that died — the D9 shape per participant), and a group name reused on a second pod silently produces a second half-recording under the same prefix. Fix shape: schedule a group's sessions onto one pod, or move the group into shared storage so any pod can serve a member | `tap_plane.rs`, `registry_keeper.rs` | medium once a tenant records conferences across pods |
 | ~~D13~~ | ~~`StreamStart` (and the Twilio `start` frame's `tracks`) advertises `["customer","agent"]` for `TrackSelector::All`, but a silent `mixed` track is delivered too~~ — **fixed 2026-08-23 (item 27)**: the hub selection split into `All` (every track, including `mixed`) and `Speakers` (customer + agent). Consumers get `Speakers`, so delivery matches the advertisement exactly; the **recorder keeps `All`** because injected bot speech belongs in the recording. The frozen Twilio start frame and `StreamStart.tracks` were not touched — the delivery was brought in line with them. A consumer that wants the injected track can still ask for it by name (`TrackSelector::Only(Mixed)`). Replay-verified | `hub.rs`, `tap_plane.rs` | closed |
-| D17 | **Leg labels invert when the caller's from-tag is not given.** With `from_tags` unspecified (`-`), `TapPlane` labels the two legs in the order rtpengine's `query` returns them, and in the two-node drill that put **FreeSWITCH's** tag first — so `customer` and `agent` were swapped in the recording and in the `tracks` a consumer sees. Speaker attribution is only trustworthy when the caller's from-tag is passed explicitly. Fix shape: refuse to name tracks by direction when no from-tag was supplied (label them `leg_a`/`leg_b`, or resolve the caller from the SIP call-id), rather than guessing an order | `tap_plane.rs` | medium — an ASR or a QA review reads the wrong speaker |
+| ~~D17~~ | ~~**Leg labels invert when the caller's from-tag is not given.** With `from_tags` unspecified (`-`), `TapPlane` labels the two legs in the order rtpengine's `query` returns them, and in the two-node drill that put **FreeSWITCH's** tag first — so `customer` and `agent` were swapped in the recording and in the `tracks` a consumer sees~~ — **fixed 2026-08-26 (item 47)**: the order was in fact `BTreeMap` order, i.e. lexicographic by tag. MSS now refuses to name a direction it cannot back up: `attribution=explicit` when a from-tag was supplied (and for every inline leg), `inferred` when rtpengine's per-participant `created` seconds strictly order the legs, `unknown` otherwise — and under `unknown` the gRPC tracks, the event payload tracks and the recording object keys are `leg_a`/`leg_b`, with a WARN log, a `LegsAttributed` event and `attribution` on `DescribeSession` and on every event envelope. The frozen WS Twilio names never move. Live-proved on a call built to invert (callee tag sorting first): `unknown` + `leg_a`/`leg_b` with no from-tag, `explicit` + `customer`/`agent` with one. **Residual, and it is the vendor's:** `created` is stamped per *dialogue*, so the two legs of one call always tie — `inferred` cannot fire for a two-party call on rtpengine 14.1.1.8, and an integrator who needs speaker attribution **must** pass the caller's from-tag (`docs/deploy.md`, "Leg attribution") | `tap_plane.rs`, `attribution.rs` | closed (residual is the vendor's) |
 | ~~D18~~ | ~~**Recording-group members are not time-aligned.** Each member's file anchored on **its own first frame**, so a late joiner's file started at its join moment and two members of one group differed in length (90.32 s vs 90.26 s in the two-node drill), leaving reassembly to the event timeline~~ — **fixed 2026-08-23 (item 29)**: a recording group stamps `opened_at` when its first member joins and every later member's segmenter pads its first segment with silence from that anchor to its own first frame (`Segmenter::lead_with_silence`, reported as `lead_silence_frames`), padded once per recording so pause/resume cannot double-count it. Replay-verified (late joiner padded, two members equal length, the pause interaction, and a WAV read back out of a fake sink) **and live**: the drill's staggered re-run had bob join 5 s late and his object came back opening with 5016 ms of zeros, 25.116 s against alice's 25.030 s. **Residual:** equal length still assumes the members stop together — the 86 ms here is D11's blocking detach, and D16 keeps the anchor inside one pod's clock | `recorder.rs`, `tap_plane.rs` | closed (residual documented) |
 | ~~D19~~ | ~~A consumer cannot tell MSS that the caller started speaking: `Registry::report` had no caller outside tests~~ — **fixed 2026-08-23 (item 28)**: `ConsumerToServer.SpeechReport` on the gRPC `MediaStream` stream (kind `STARTED`/`PARTIAL`/`FINAL`/`END_OF_UTTERANCE`/`END_OF_INTERACTION`, track, text, confidence, the consumer's own `observed_at`) reaches `Registry::report`, gated on `CAPABILITY_EVENTS` — an attachment without it gets `PERMISSION_DENIED` and the stream ends, the same protocol-violation shape as an unprivileged `inject`. Proven on a live tapped call: `lab/barge_drill.sh` now triggers on a real `SpeechReport` and measures cut-through p50 3.54–3.98 ms (item 5). **Residual, accepted:** the `WS_TWILIO` dialect cannot report speech — its bytes are frozen (Article VII) and it carries no such message, so a WS consumer's only barge stays the `clear` message's direct rtpengine `stop media` (unevented; the D2 shape). Interactive voice-AI on WS should attach over gRPC instead | `stream.rs`, `convert.rs`, `session-core/registry.rs` | closed |
 
@@ -2831,7 +2928,7 @@ the worked example of each handoff.
 | H5 | **The SIP proxy's B2B integration for inline legs** | `CreateSession{kind=INLINE, sdp_offer}` returns a real SDP answer and the leg speaks and listens on real sockets; a `group` seats it in a conference; [deploy.md](deploy.md#high-availability-what-is-adoptable-and-what-is-not) records that an inline leg does **not** survive a pod loss, so recovery is call-control's | offer/answer plumbing from their proxy or B2BUA into that API. No inline leg in this repository has met a **SIP** endpoint — every inline and conference measurement is against an RTP peer with no signalling |
 | H6 | **FS byte-parity against real production recordings** | item 31 measured a live call recorded both ways: container, channel layout and rms agree exactly, and a re-aligned 2 s window agrees on 1.0000 of samples at mean diff 0.6/32768; [deploy.md](deploy.md#first-day-on-real-gear--an-ordered-runbook) step 4 walks the recording checks, frozen identity first. It also established that **byte-parity at a fixed offset is not an achievable bar** — the two recorders conceal independently, so the inter-file offset wanders | a **two-party** comparison on their FreeSWITCH, with their codec, their pause contract, and a human listen. The lab's write side plays silence, so only one channel was truly compared |
 | H7 | **Retiring the legacy media path** | the workloads are served: fan-out, recording, inline legs, conferences, monitor/whisper/barge | the tenant decision to turn the old media bugs off (`record_session`, the audio fork, the conference-per-AI-interaction dummy leg), and to decommission whatever gateway service they run today. Rollback stays config-only while both paths are installed |
-| H8 | **A pilot, a stability period and UX sign-off** | metrics on `MSS_METRICS_LISTEN` with alert rules in `deploy/`, a soak harness (`lab/soak.py`) and an impairment matrix, plus deployable manifests: `deploy/k8s/` with both network shapes, probes, a drain-safe grace period and a `ServiceMonitor`/`PrometheusRule` generated from those alert rules (item 46) | run flagged tenants for the agreed period; watch D11 (blocking detach), D17 (leg labels without an explicit from-tag) and the conference defects D16/D20/D21/D22 in the field; get a human to judge audio quality, which no automated assertion in this repository claims to have done |
+| H8 | **A pilot, a stability period and UX sign-off** | metrics on `MSS_METRICS_LISTEN` with alert rules in `deploy/`, a soak harness (`lab/soak.py`) and an impairment matrix, plus deployable manifests: `deploy/k8s/` with both network shapes, probes, a drain-safe grace period and a `ServiceMonitor`/`PrometheusRule` generated from those alert rules (item 46) | run flagged tenants for the agreed period; watch D11 (blocking detach) and the conference defects D16/D20/D21/D22 in the field, and confirm that the integrator's control plane really passes the caller's from-tag — without it every tap is `attribution=unknown` and its tracks are `leg_a`/`leg_b` (item 47); get a human to judge audio quality, which no automated assertion in this repository claims to have done |
 
 ## Waiting on other people (M2 close-out)
 
