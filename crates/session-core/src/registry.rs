@@ -210,6 +210,8 @@ struct SessionRecord {
     attachments: Vec<AttachmentId>,
     authoritative: Option<AttachmentId>,
     next_seq: u64,
+    pending_uploads: u32,
+    finishing: bool,
 }
 
 struct AttachmentRecord {
@@ -321,6 +323,8 @@ impl SessionRegistry {
                 attachments: Vec::new(),
                 authoritative: None,
                 next_seq: 0,
+                pending_uploads: 0,
+                finishing: false,
             },
         );
         self.remember(
@@ -336,10 +340,7 @@ impl SessionRegistry {
         session: SessionId,
         reason: &str,
     ) -> Result<(), ControlError> {
-        let record = self
-            .sessions
-            .get(&session)
-            .ok_or(ControlError::UnknownSession(session))?;
+        let record = self.live(session)?;
         let attachments = record.attachments.clone();
         let external_id = record.external_id.clone();
 
@@ -365,9 +366,49 @@ impl SessionRegistry {
                 reason: reason.to_string(),
             },
         );
-        self.sessions.remove(&session);
         self.external_index.remove(&external_id);
+        match self.sessions.get_mut(&session) {
+            Some(record) if record.pending_uploads > 0 => record.finishing = true,
+            _ => {
+                self.sessions.remove(&session);
+            }
+        }
         Ok(())
+    }
+
+    pub fn retain_for_upload(&mut self, session: SessionId) -> Result<u32, ControlError> {
+        let record = self
+            .sessions
+            .get_mut(&session)
+            .ok_or(ControlError::UnknownSession(session))?;
+        record.pending_uploads = record.pending_uploads.saturating_add(1);
+        Ok(record.pending_uploads)
+    }
+
+    pub fn release_after_upload(&mut self, session: SessionId) -> bool {
+        let Some(record) = self.sessions.get_mut(&session) else {
+            return false;
+        };
+        record.pending_uploads = record.pending_uploads.saturating_sub(1);
+        if record.pending_uploads > 0 || !record.finishing {
+            return false;
+        }
+        self.sessions.remove(&session);
+        true
+    }
+
+    pub fn is_finishing(&self, session: SessionId) -> bool {
+        self.sessions
+            .get(&session)
+            .map(|record| record.finishing)
+            .unwrap_or(false)
+    }
+
+    pub fn finishing_count(&self) -> usize {
+        self.sessions
+            .values()
+            .filter(|record| record.finishing)
+            .count()
     }
 
     pub fn resolve(&self, external_id: &str) -> Result<SessionId, ControlError> {
@@ -418,10 +459,7 @@ impl SessionRegistry {
             return self.attachment_view(existing);
         }
 
-        let record = self
-            .sessions
-            .get(&spec.session)
-            .ok_or(ControlError::UnknownSession(spec.session))?;
+        let record = self.live(spec.session)?;
 
         if spec.capabilities.is_empty() {
             return Err(ControlError::NoCapabilityDeclared);
@@ -651,9 +689,7 @@ impl SessionRegistry {
         {
             return Ok(existing);
         }
-        if !self.sessions.contains_key(&spec.session) {
-            return Err(ControlError::UnknownSession(spec.session));
-        }
+        self.live(spec.session)?;
         let authoritative = match spec.requested_by {
             Some(attachment) => {
                 let record = self.require(attachment, Capabilities::INJECT)?;
@@ -805,6 +841,15 @@ impl SessionRegistry {
             Observation::UploadCompleted { recording_id, uri } => {
                 EventKind::UploadCompleted { recording_id, uri }
             }
+            Observation::UploadFailed {
+                recording_id,
+                key,
+                error,
+            } => EventKind::UploadFailed {
+                recording_id,
+                key,
+                error,
+            },
             Observation::LegsAttributed {
                 attribution,
                 tracks,
@@ -844,15 +889,29 @@ impl SessionRegistry {
     }
 
     pub fn session_ids(&self) -> Vec<SessionId> {
-        self.sessions.keys().copied().collect()
+        self.sessions
+            .values()
+            .filter(|record| !record.finishing)
+            .map(|record| record.id)
+            .collect()
     }
 
     pub fn session_count(&self) -> usize {
-        self.sessions.len()
+        self.sessions
+            .values()
+            .filter(|record| !record.finishing)
+            .count()
     }
 
     pub fn attachment_count(&self) -> usize {
         self.attachments.len()
+    }
+
+    fn live(&self, session: SessionId) -> Result<&SessionRecord, ControlError> {
+        match self.sessions.get(&session) {
+            Some(record) if !record.finishing => Ok(record),
+            _ => Err(ControlError::UnknownSession(session)),
+        }
     }
 
     fn require(
@@ -964,6 +1023,8 @@ fn member_controlled(control: &MemberControl) -> EventKind {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const URI_SCHEME_SEPARATOR: &str = "\x2f\x2f";
 
     fn tap(external_id: &str) -> CreateSession {
         CreateSession {
@@ -1354,6 +1415,134 @@ mod tests {
         assert!(events
             .iter()
             .all(|event| event.external_id.starts_with("req-")));
+    }
+
+    #[test]
+    fn a_recording_upload_holds_a_session_record_open_so_its_own_event_keeps_the_sequence() {
+        let mut registry = SessionRegistry::default();
+        let session = registry.create_session(tap("req-1")).unwrap().id;
+        let recorder = registry.attach(rtt(session)).unwrap().id;
+        registry.drain_events();
+
+        assert_eq!(registry.retain_for_upload(session), Ok(1));
+        registry.detach(recorder, "stop requested").unwrap();
+        registry.destroy_session(session, "the call ended").unwrap();
+        assert!(registry.is_finishing(session));
+        assert_eq!(
+            registry.session_ids(),
+            Vec::new(),
+            "a finishing session is nobody's to adopt, close or list"
+        );
+        assert_eq!(registry.session_count(), 0);
+        assert!(
+            registry.resolve("req-1").is_err(),
+            "the external id is free again the moment the call ends"
+        );
+        assert!(
+            registry.session_view(session).is_ok(),
+            "describing a finishing session still answers"
+        );
+        assert_eq!(
+            registry.destroy_session(session, "again"),
+            Err(ControlError::UnknownSession(session)),
+            "a finishing session must never be ended twice"
+        );
+        assert_eq!(
+            registry.attach(rtt(session)).unwrap_err(),
+            ControlError::UnknownSession(session)
+        );
+
+        registry
+            .observe(
+                session,
+                Observation::UploadCompleted {
+                    recording_id: "rec-99".to_string(),
+                    uri: format!("s3:{URI_SCHEME_SEPARATOR}bucket/acct-42/rec-99.wav"),
+                },
+            )
+            .expect("the upload of an ended session still has somewhere to land");
+        assert!(registry.release_after_upload(session));
+        assert!(!registry.is_finishing(session));
+        assert_eq!(registry.finishing_count(), 0);
+        assert_eq!(
+            registry.observe(
+                session,
+                Observation::UploadCompleted {
+                    recording_id: "rec-99".to_string(),
+                    uri: format!("s3:{URI_SCHEME_SEPARATOR}bucket/again.wav"),
+                },
+            ),
+            Err(ControlError::UnknownSession(session)),
+            "once its uploads settle the session is forgotten for good"
+        );
+
+        let events = registry.drain_events();
+        let sequence: Vec<(u64, &EventKind)> = events
+            .iter()
+            .map(|event| (event.seq, &event.kind))
+            .collect();
+        assert!(
+            matches!(
+                sequence.as_slice(),
+                [
+                    (1, EventKind::AttachmentDown { .. }),
+                    (2, EventKind::SessionEnded { .. }),
+                    (3, EventKind::UploadCompleted { .. })
+                ]
+            ),
+            "{sequence:?}"
+        );
+        assert!(events
+            .iter()
+            .all(|event| event.external_id == "req-1" && event.session == session));
+    }
+
+    #[test]
+    fn a_failed_upload_is_the_last_event_of_the_session_it_belonged_to() {
+        let mut registry = SessionRegistry::default();
+        let session = registry.create_session(tap("req-1")).unwrap().id;
+        registry.drain_events();
+
+        assert_eq!(registry.retain_for_upload(session), Ok(1));
+        assert_eq!(registry.retain_for_upload(session), Ok(2));
+        registry.destroy_session(session, "the call ended").unwrap();
+        registry
+            .observe(
+                session,
+                Observation::UploadFailed {
+                    recording_id: "rec-99".to_string(),
+                    key: "acct-42/rec-99.wav".to_string(),
+                    error: "the object store refused the upload".to_string(),
+                },
+            )
+            .unwrap();
+        assert!(
+            !registry.release_after_upload(session),
+            "a session with a second upload still running is not forgotten yet"
+        );
+        assert!(registry.is_finishing(session));
+        registry
+            .observe(
+                session,
+                Observation::UploadCompleted {
+                    recording_id: "rec-99".to_string(),
+                    uri: format!("s3:{URI_SCHEME_SEPARATOR}bucket/acct-42/rec-99-b.wav"),
+                },
+            )
+            .unwrap();
+        assert!(registry.release_after_upload(session));
+
+        let events = registry.drain_events();
+        let seqs: Vec<u64> = events.iter().map(|event| event.seq).collect();
+        assert_eq!(seqs, vec![0, 1, 2], "the sequence has no gap and no reuse");
+        assert!(matches!(
+            events[1].kind,
+            EventKind::UploadFailed {
+                ref key,
+                ..
+            } if key == "acct-42/rec-99.wav"
+        ));
+        assert!(matches!(events[2].kind, EventKind::UploadCompleted { .. }));
     }
 
     #[test]

@@ -350,6 +350,16 @@ pub fn render(sources: &MetricsSources) -> String {
         snapshot.recording_upload_failures,
     );
     counter(
+        "mss_recording_uploads_backgrounded_total",
+        "Recording uploads handed to a background task so the detach could be answered",
+        snapshot.recording_uploads_backgrounded,
+    );
+    counter(
+        "mss_recording_upload_settle_timeouts_total",
+        "Backgrounded recording uploads that never settled inside their watch window",
+        snapshot.recording_upload_settle_timeouts,
+    );
+    counter(
         "mss_recording_spills_total",
         "Recordings written to local disk because their upload failed",
         snapshot.recording_spills,
@@ -480,6 +490,11 @@ pub fn render(sources: &MetricsSources) -> String {
         "mss_consumer_queue_depth_frames_max",
         "Deepest single consumer queue",
         snapshot.consumer_queue_depth_max,
+    );
+    gauge(
+        "mss_recording_uploads_in_flight",
+        "Recording uploads still running after the detach that stopped them was answered",
+        snapshot.recording_uploads_in_flight,
     );
     gauge(
         "mss_recordings_live",
@@ -849,6 +864,9 @@ mod tests {
             "mss_recordings_stopped_total",
             "mss_recording_pauses_total",
             "mss_recording_uploads_total",
+            "mss_recording_uploads_backgrounded_total",
+            "mss_recording_uploads_in_flight",
+            "mss_recording_upload_settle_timeouts_total",
             "mss_recording_bytes_uploaded_total",
             "mss_recording_seconds_total",
             "mss_recordings_live",

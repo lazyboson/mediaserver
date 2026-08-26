@@ -24,6 +24,15 @@ pub trait EventSink: Send + Sync + 'static {
 
 pub trait ObservationSink: Send + Sync + 'static {
     fn observe(&self, session: SessionId, observation: Observation);
+
+    fn retain_for_upload(&self, session: SessionId) -> bool {
+        let _ = session;
+        false
+    }
+
+    fn release_after_upload(&self, session: SessionId) {
+        let _ = session;
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -253,6 +262,10 @@ impl SessionController {
         (registry.session_count(), registry.attachment_count())
     }
 
+    pub fn sessions_finishing(&self) -> usize {
+        self.lock().finishing_count()
+    }
+
     pub fn events_dropped(&self) -> u64 {
         self.lock().events_dropped()
     }
@@ -369,6 +382,35 @@ impl ObservationSink for SessionController {
                 %status,
                 "an observation had nowhere to land; the session is already gone"
             );
+        }
+    }
+
+    fn retain_for_upload(&self, session: SessionId) -> bool {
+        match self.lock().retain_for_upload(session) {
+            Ok(pending) => {
+                tracing::info!(
+                    %session,
+                    pending,
+                    "this session will be remembered until its recording upload settles, so the \
+                     upload's own event keeps its place in the session's sequence"
+                );
+                true
+            }
+            Err(error) => {
+                tracing::warn!(
+                    %session,
+                    %error,
+                    "this session cannot be held open for an upload; the upload's event will be \
+                     dropped if the session ends first"
+                );
+                false
+            }
+        }
+    }
+
+    fn release_after_upload(&self, session: SessionId) {
+        if self.lock().release_after_upload(session) {
+            tracing::info!(%session, "the last upload of this ended session settled; forgotten");
         }
     }
 }

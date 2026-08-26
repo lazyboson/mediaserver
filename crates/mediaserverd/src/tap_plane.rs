@@ -15,6 +15,7 @@ use crate::recorder::{
     self, Layout, RecorderCounters, RecorderHandle, RecorderSpec, RecordingFormat,
     RecordingIdentity, RecordingProgress, RecordingSupport, RecordingTarget,
 };
+use crate::recording_uploads::UploadTracker;
 use crate::registry_keeper::TapSubscriptions;
 use crate::rtpengine_capability::NodeCapabilityLog;
 use crate::session_store::PersistedRecording;
@@ -242,6 +243,9 @@ pub struct IngestSnapshot {
     pub recording_pauses: u64,
     pub recording_uploads: u64,
     pub recording_upload_failures: u64,
+    pub recording_uploads_in_flight: u64,
+    pub recording_uploads_backgrounded: u64,
+    pub recording_upload_settle_timeouts: u64,
     pub recording_spills: u64,
     pub recording_segments_spilled: u64,
     pub recording_segment_spill_failures: u64,
@@ -376,6 +380,9 @@ impl TapPlaneMetrics {
             recording_pauses: read(&recorder.pauses),
             recording_uploads: read(&recorder.uploaded),
             recording_upload_failures: read(&recorder.upload_failures),
+            recording_uploads_in_flight: read(&recorder.uploads_in_flight),
+            recording_uploads_backgrounded: read(&recorder.uploads_backgrounded),
+            recording_upload_settle_timeouts: read(&recorder.upload_settle_timeouts),
             recording_spills: read(&recorder.spilled),
             recording_segments_spilled: read(&recorder.segments_spilled),
             recording_segment_spill_failures: read(&recorder.segment_spill_failures),
@@ -434,11 +441,13 @@ pub struct TapPlane {
     conferences: Mutex<HashMap<String, Conference>>,
     metrics: TapPlaneMetrics,
     observations: OnceLock<Weak<dyn ObservationSink>>,
+    uploads: Arc<UploadTracker>,
 }
 
 impl TapPlane {
     pub fn new(config: TapPlaneConfig) -> Self {
         let metrics = TapPlaneMetrics::with_recorder(Arc::clone(&config.recording.counters));
+        let uploads = UploadTracker::new(Arc::clone(&config.recording.counters));
         TapPlane {
             config,
             sessions: Mutex::new(HashMap::new()),
@@ -447,7 +456,16 @@ impl TapPlane {
             conferences: Mutex::new(HashMap::new()),
             metrics,
             observations: OnceLock::new(),
+            uploads,
         }
+    }
+
+    pub fn uploads_in_flight(&self) -> u64 {
+        self.uploads.in_flight()
+    }
+
+    pub async fn await_uploads(&self) -> usize {
+        self.uploads.wait_idle().await as usize
     }
 
     pub fn observe_through(&self, sink: Weak<dyn ObservationSink>) {
@@ -964,19 +982,20 @@ impl TapPlane {
             return None;
         };
         let handle = handle.take()?;
-        let outcome = handle.finish().await;
+        let finished = handle.finish().await;
         info!(
             %attachment,
             session = %session,
             %recording_id,
             group = ?member_of.as_ref().map(GroupKey::to_string),
-            duration_ms = outcome.as_ref().map(|done| done.duration_ms),
-            uris = ?outcome.as_ref().map(|done| done.uris.clone()),
-            "recording finished"
+            duration_ms = finished.stopped.as_ref().map(|stop| stop.duration_ms),
+            frames = finished.stopped.as_ref().map(|stop| stop.frames),
+            "recording stopped; its upload runs in the background"
         );
         if let Some(key) = member_of.as_ref() {
             self.leave_group(key, attachment);
         }
+        self.uploads.adopt(finished, self.observer());
         Some(())
     }
 
@@ -2935,9 +2954,17 @@ mod tests {
     #[derive(Default)]
     struct BucketSink {
         puts: Mutex<Vec<(String, Vec<u8>)>>,
+        slow_by: Duration,
     }
 
     impl BucketSink {
+        fn slow(slow_by: Duration) -> BucketSink {
+            BucketSink {
+                puts: Mutex::new(Vec::new()),
+                slow_by,
+            }
+        }
+
         fn keys(&self) -> Vec<String> {
             self.puts
                 .lock()
@@ -2948,13 +2975,14 @@ mod tests {
         }
 
         fn body(&self, key: &str) -> Vec<u8> {
-            self.puts
+            let held = self
+                .puts
                 .lock()
                 .unwrap()
                 .iter()
                 .find(|(held, _)| held == key)
-                .map(|(_, body)| body.clone())
-                .unwrap_or_else(|| panic!("{key} was never uploaded; got {:?}", self.keys()))
+                .map(|(_, body)| body.clone());
+            held.unwrap_or_else(|| panic!("{key} was never uploaded; got {:?}", self.keys()))
         }
     }
 
@@ -2966,6 +2994,9 @@ mod tests {
             _content_type: &'static str,
             body: Vec<u8>,
         ) -> Result<String, recorder::UploadError> {
+            if !self.slow_by.is_zero() {
+                tokio::time::sleep(self.slow_by).await;
+            }
             self.puts.lock().unwrap().push((key.to_string(), body));
             Ok(format!("s3:/{}/{key}", "/lab-recordings"))
         }
@@ -3080,6 +3111,9 @@ mod tests {
             spill_every: recorder::SPILL_EVERY,
             counters: Arc::new(RecorderCounters::default()),
             owner: "pod-a".to_string(),
+            upload_permits: std::sync::Arc::new(tokio::sync::Semaphore::new(
+                recorder::DEFAULT_UPLOAD_CONCURRENCY,
+            )),
         }
     }
 
@@ -3606,6 +3640,9 @@ m=audio {peer_port} RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\na=ptime:{ptime_ms}\r\n"
             spill_every: recorder::SPILL_EVERY,
             counters: Arc::new(RecorderCounters::default()),
             owner: "pod-a".to_string(),
+            upload_permits: std::sync::Arc::new(tokio::sync::Semaphore::new(
+                recorder::DEFAULT_UPLOAD_CONCURRENCY,
+            )),
         })
     }
 
@@ -3679,6 +3716,7 @@ m=audio {peer_port} RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\na=ptime:{ptime_ms}\r\n"
                 .await
                 .expect("a recording attachment closes and uploads");
         }
+        plane.await_uploads().await;
 
         let mut keys = bucket.keys();
         keys.sort();
@@ -3774,6 +3812,7 @@ m=audio {peer_port} RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\na=ptime:{ptime_ms}\r\n"
             .close_attachment(bob.session, AttachmentId::from_raw(11))
             .await
             .expect("the stereo object uploads");
+        plane.await_uploads().await;
 
         let (channels, samples) = recorded_wav(&bucket.body("acct-7/late.wav"));
         assert_eq!(channels, 2);
@@ -4872,6 +4911,9 @@ m=audio 41000 RTP/AVP 111\r\na=rtpmap:111 opus/48000/2\r\n",
             spill_every: recorder::SPILL_EVERY,
             counters: Arc::new(RecorderCounters::default()),
             owner: "pod-a".to_string(),
+            upload_permits: std::sync::Arc::new(tokio::sync::Semaphore::new(
+                recorder::DEFAULT_UPLOAD_CONCURRENCY,
+            )),
         });
         let error = plane
             .open_attachment(attachment(Transport::FileS3, "acct-42/rec-99.wav"))
@@ -5703,9 +5745,21 @@ m=audio 41000 RTP/AVP 111\r\na=rtpmap:111 opus/48000/2\r\n",
 
     impl WiredRoom {
         async fn open() -> WiredRoom {
-            let plane: Arc<dyn MediaPlane> = Arc::new(plane());
+            WiredRoom::with_plane(Arc::new(plane())).await.0
+        }
+
+        async fn with_plane(
+            plane: Arc<TapPlane>,
+        ) -> (WiredRoom, Arc<control_api::SessionController>) {
+            let media: Arc<dyn MediaPlane> = Arc::clone(&plane) as Arc<dyn MediaPlane>;
             let controller =
-                Arc::new(control_api::SessionController::new("wire-pod").with_media_plane(plane));
+                Arc::new(control_api::SessionController::new("wire-pod").with_media_plane(media));
+            plane.observe_through(Arc::downgrade(&controller) as Weak<dyn ObservationSink>);
+            let room = WiredRoom::serving(Arc::clone(&controller)).await;
+            (room, controller)
+        }
+
+        async fn serving(controller: Arc<control_api::SessionController>) -> WiredRoom {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
                 .await
                 .expect("a control port");
@@ -5899,6 +5953,173 @@ m=audio 41000 RTP/AVP 111\r\na=rtpmap:111 opus/48000/2\r\n",
         );
 
         room.close().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_detach_is_answered_before_the_upload_and_the_upload_event_ends_the_sequence() {
+        use control_api::proto;
+        use control_api::proto::media_control_client::MediaControlClient;
+
+        const SLOW_BY: Duration = Duration::from_millis(1_500);
+        const ANSWERED_WITHIN: Duration = Duration::from_millis(100);
+
+        let bucket = Arc::new(BucketSink::slow(SLOW_BY));
+        let plane = Arc::new(bucket_plane(&bucket));
+        let counters = Arc::clone(&plane.config.recording.counters);
+        let (room, controller) = WiredRoom::with_plane(Arc::clone(&plane)).await;
+        let mut events = controller.subscribe();
+        let mut client = MediaControlClient::connect(room.endpoint.clone())
+            .await
+            .expect("a client reaches the control port");
+
+        let (_peer, offer) = silent_peer();
+        client
+            .create_session(proto::CreateSessionRequest {
+                external_id: "call-7".to_string(),
+                kind: proto::SessionKind::Inline as i32,
+                call_id: "call-7".to_string(),
+                from_tags: Vec::new(),
+                rtpengine_node: String::new(),
+                mix: false,
+                idempotency_key: String::new(),
+                sdp_offer: offer,
+                group: String::new(),
+            })
+            .await
+            .expect("an inline leg to record");
+
+        let record = |mut client: MediaControlClient<control_api::tonic::transport::Channel>,
+                      endpoint: &'static str| async move {
+            client
+                .attach(proto::AttachRequest {
+                    session: Some(wire_reference("call-7")),
+                    transport: proto::Transport::FileS3 as i32,
+                    capabilities: vec![proto::Capability::Sink as i32],
+                    selector: None,
+                    format: None,
+                    authoritative: false,
+                    label: String::new(),
+                    endpoint: endpoint.to_string(),
+                    group: String::new(),
+                    metadata: Default::default(),
+                    idempotency_key: String::new(),
+                })
+                .await
+                .expect("a recording attachment")
+                .into_inner()
+                .attachment_id
+        };
+
+        let first = record(client.clone(), "acct-42/rec-99.wav").await;
+        let asked = Instant::now();
+        client
+            .detach(proto::AttachmentRef {
+                attachment_id: first.clone(),
+            })
+            .await
+            .expect("the recording is stopped");
+        let answered = asked.elapsed();
+        assert!(
+            answered < ANSWERED_WITHIN,
+            "Detach answered in {answered:?}, so it waited for the upload"
+        );
+        assert_eq!(plane.uploads_in_flight(), 1);
+
+        let second = record(client.clone(), "acct-42/rec-100.wav").await;
+        let asked_again = Instant::now();
+        client
+            .destroy_session(wire_reference("call-7"))
+            .await
+            .expect("the call ends while its recording is still uploading");
+        let ended = asked_again.elapsed();
+        assert!(
+            ended < ANSWERED_WITHIN,
+            "DestroySession answered in {ended:?}, so it waited for the upload"
+        );
+        assert!(
+            client
+                .describe_session(wire_reference("call-7"))
+                .await
+                .is_err(),
+            "an ended session is not describable by its external id, finishing or not"
+        );
+
+        let mut seen: Vec<(u64, session_core::EventKind)> = Vec::new();
+        let deadline = tokio::time::Instant::now() + SLOW_BY * 4;
+        while seen
+            .iter()
+            .filter(|(_, kind)| matches!(kind, session_core::EventKind::UploadCompleted { .. }))
+            .count()
+            < 2
+        {
+            let event = tokio::time::timeout_at(deadline, events.recv())
+                .await
+                .unwrap_or_else(|_| panic!("the upload events never arrived; saw {seen:?}"))
+                .expect("the event watcher stayed open");
+            assert_eq!(event.external_id, "call-7");
+            seen.push((event.seq, event.kind));
+        }
+
+        let seqs: Vec<u64> = seen.iter().map(|(seq, _)| *seq).collect();
+        assert_eq!(
+            seqs,
+            (0..seen.len() as u64).collect::<Vec<u64>>(),
+            "the sequence of a session whose uploads outlive it stays gapless and in order: \
+             {seen:?}"
+        );
+        let names: Vec<&str> = seen.iter().map(|(_, kind)| event_name(kind)).collect();
+        assert_eq!(
+            names,
+            vec![
+                "attachment-up",
+                "recording-started",
+                "attachment-down",
+                "recording-stopped",
+                "attachment-up",
+                "recording-started",
+                "recording-stopped",
+                "attachment-down",
+                "session-ended",
+                "upload-completed",
+                "upload-completed",
+            ],
+            "a stop is always published before its caller is answered, and both uploads report \
+             themselves after the session that owned them has already ended: {seen:?}"
+        );
+        assert!(
+            !second.is_empty() && second != first,
+            "the two recordings were different attachments"
+        );
+        assert_eq!(
+            bucket.keys(),
+            vec![
+                "acct-42/rec-99.wav".to_string(),
+                "acct-42/rec-100.wav".to_string()
+            ]
+        );
+        assert_eq!(counters.uploads_backgrounded.load(Ordering::Relaxed), 2);
+        assert_eq!(counters.uploaded.load(Ordering::Relaxed), 2);
+        plane.await_uploads().await;
+        assert_eq!(plane.uploads_in_flight(), 0);
+        assert_eq!(controller.sessions_finishing(), 0);
+        assert_eq!(controller.counts(), (0, 0));
+
+        room.close().await;
+    }
+
+    fn event_name(kind: &session_core::EventKind) -> &'static str {
+        use session_core::EventKind;
+        match kind {
+            EventKind::AttachmentUp { .. } => "attachment-up",
+            EventKind::AttachmentDown { .. } => "attachment-down",
+            EventKind::RecordingStarted { .. } => "recording-started",
+            EventKind::RecordingStopped { .. } => "recording-stopped",
+            EventKind::RecordingPaused { .. } => "recording-paused",
+            EventKind::UploadCompleted { .. } => "upload-completed",
+            EventKind::UploadFailed { .. } => "upload-failed",
+            EventKind::SessionEnded { .. } => "session-ended",
+            _ => "other",
+        }
     }
 }
 

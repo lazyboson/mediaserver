@@ -2155,3 +2155,61 @@ error body.
   remote sender snippet and the argument passing are real, the ssh hop is not.
 - **No chrony, no timedatectl** in a container — `clock` SKIPs and says so. That
   check is only meaningful on the host mediaserverd will run on.
+
+## detach_latency_drill.sh — a detach that does not wait for its upload (2026-08-26)
+
+Item 50 (defect D11) made `Detach`/`StopRecording` answer as soon as the
+recording's segment is closed, with the upload running on behind it. Proving that
+needs a slow object store, so the drill *makes* one: it runs beside the live lab
+against the ordinary `mss-control` pod and, for its second phase, `docker pause`s
+MinIO — a paused container's network stack is frozen, so the upload hangs inside
+its 60 s window instead of failing fast.
+
+```sh
+DOCKER_API_VERSION=1.43 docker compose -f lab/docker-compose.microsip.yml \
+  -f lab/docker-compose.webrtc.yml up -d rtpengine redis redpanda minio \
+  minio-init mss-control
+./lab/detach_latency_drill.sh
+```
+
+Two fabricated calls (`lab/call_driver.py`, no SIP), one tap each, one `FILE_S3`
+recording each. The run of stamp 1787745041:
+
+| | phase A (MinIO healthy) | phase B (MinIO paused) |
+| --- | --- | --- |
+| `Detach` RPC | **49 ms** | **11 ms** |
+| `DestroySession` RPC | — | **10 ms** |
+| upload took | 29 ms | **12.07 s** (11:51:25.339 → 11:51:37.405) |
+| during the upload | — | `mss_recording_uploads_in_flight 1` with `mss_sessions_live 0` |
+| terminal event | `UploadCompleted` seq **13** | `UploadCompleted` seq **10**, after `SessionEnded` seq 9 |
+| the whole sequence | gapless `0..14` | gapless `0..10` |
+| object in the bucket | 469 KiB | 252 KiB |
+
+Both RPC times are measured around the `mss_ctl` **process**, so they include its
+start and its gRPC connect; the server-side figure is smaller. Before this item
+the phase-B detach would have returned only when the upload did — 12 s later, by
+construction.
+
+Phase B is the interesting half, because the session is **destroyed while the
+upload is stalled**. The pod's own words, in order: `recording stopped; its
+upload runs in the background` → `this session will be remembered until its
+recording upload settles, so the upload's own event keeps its place in the
+session's sequence` → (12 s later, after `docker unpause`) `recording uploaded`
+→ `a backgrounded recording upload settled` → `the last upload of this ended
+session settled; forgotten`. That is the finishing-session design working on real
+sockets: the session is gone from `mss_sessions_live` and from every listing the
+instant `DestroySession` returns, yet its `seq` continues for exactly one more
+event.
+
+### What this does not prove
+
+- **No live `UploadFailed`.** The drill makes storage slow, then lets it
+  recover. The failure event is proved in-process only (a refusing sink, and the
+  registry sequence test); a live run against permanently broken storage would
+  have to wait out the 60 s `UPLOAD_TIMEOUT`.
+- **Nothing about a pod dying mid-upload.** The retention is per-pod state, so a
+  `kill -9` between the detach and the upload still loses the event; the audio is
+  recovered by D9's salvage pass on that pod's next start, silently.
+- **The concurrency bound is not exercised here** — one recording at a time. That
+  is `background_uploads_run_no_wider_than_their_configured_concurrency`, in
+  process.

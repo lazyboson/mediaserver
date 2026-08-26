@@ -165,6 +165,7 @@ Events are **at-least-once** since defect D5: a consumer must dedupe by
 | `MSS_RECORDING_S3_REGION` | `us-east-1` | Region for request signing | match the bucket | M5 |
 | `MSS_RECORDING_S3_ACCESS_KEY_ID` / `…_SECRET_ACCESS_KEY` | unset | Static credentials. Leave **both** out to let the object store client pick up an instance/IRSA/workload-identity role instead; a half-set pair is the failure that looks like a bug | prefer a role; use keys where there is none | M5 |
 | `MSS_RECORDING_SPILL_DIR` | unset (memory only) | Closed segments spill here so a container restart does not lose them (defect D9), and this pod's leftovers are salvaged on its next start — never over an object that already exists | always set it, to a writable volume. The root filesystem is read-only and the process runs as uid 65532, so it must be a mount | [item 30](tasks.md) |
+| `MSS_RECORDING_UPLOAD_CONCURRENCY` | `4` | How many finished recordings upload at once. `Detach`/`StopRecording` never waits for an upload ([item 50](tasks.md), D11): it returns as soon as the segment is closed and `RecordingStopped` is published, and the upload runs on in the background. This bounds how many run at a time — and therefore the memory, since each holds one rendered WAV. Empty = unset = the default | raise it only if `mss_recording_uploads_in_flight` sits at the cap while calls end faster than uploads finish; lower it to protect a slow object store | [item 50](tasks.md) |
 | `MSS_RECORDING_SPILL_SECONDS` | `30` | How often a live recording spills. This **is** the worst-case audio loss when a container dies mid-call on the same pod | lower for shorter worst-case loss, at more IO | [item 30](tasks.md) |
 
 ### Lifecycle
@@ -318,6 +319,40 @@ MSS interprets no digit itself: no menu state, no collection, no inter-digit
 timer. Track names follow the attribution above, so an unattributed session's
 digits arrive on `leg_a`/`leg_b`.
 
+## Recordings — stopping one does not wait for its upload
+
+`Detach` (and the legacy controller's `StopRecording`, and `DestroySession`) answers as soon as
+the recording's last segment is closed and `RecordingStopped` is on the bus. The
+upload then runs in the background, up to
+`MSS_RECORDING_UPLOAD_CONCURRENCY` at a time, and reports itself afterwards with
+`UploadCompleted` — or, new since [item 50](tasks.md), with **`UploadFailed`**
+carrying the object key and the store's own error, so an integrator waiting for a
+recording never waits forever. Measured in the lab: `Detach` **11 ms** and
+`DestroySession` **10 ms** while the object store was frozen and held the upload
+**12 s**.
+
+Two rules follow for whoever consumes `mss.events`:
+
+- **`UploadCompleted`/`UploadFailed` may arrive after `SessionEnded`** for the
+  same session, and is then the last event of that session's sequence. `seq` is
+  still gapless and still in order — MSS keeps the session record in a
+  *finishing* state until its uploads settle, precisely so the event keeps its
+  place. Do not treat `SessionEnded` as "no further events for this session".
+- A finishing session is **gone for every other purpose**: it is not listed, not
+  adoptable, cannot be attached to, and its `external_id` is free again
+  immediately, so re-creating a session with the same external id right after a
+  hangup works. `DescribeSession` by session id still answers it; by external id
+  it does not.
+
+Watch `mss_recording_uploads_in_flight` (should return to 0),
+`mss_recording_uploads_backgrounded_total`,
+`mss_recording_upload_failures_total` and
+`mss_recording_upload_settle_timeouts_total` (a stuck upload abandoned after
+10 minutes — its audio is on the spill disk for the next start's salvage).
+A pod killed with SIGKILL between the detach and the upload loses that event; the
+audio is recovered by the salvage pass, without an event. A **graceful** drain
+does not: it waits for the uploads (step 4 of the rollout sequence below).
+
 ## Conference member state — read it back before you trust it
 
 `DescribeSession` on a conference member's session reports that member's live
@@ -394,9 +429,12 @@ rollout or eviction is graceful. The sequence, in order, all inside
 2. **hand off leases** — the registry lease is released so another pod adopts on
    its next sweep rather than after the 15 s TTL.
 3. **close sessions** — each one politely: consumers get their protocol's own
-   stop frame, recordings are finished and uploaded, taps are unsubscribed.
-4. **control plane idle** — the listener closes once in-flight calls finish.
-5. **flush events** — the backlog is given a 10 s window to reach Kafka.
+   stop frame, recordings are stopped, taps are unsubscribed.
+4. **await uploads** — every recording upload backgrounded by step 3 is waited
+   for. It comes *before* the event flush on purpose: an upload that settles
+   afterwards would strand its own `UploadCompleted` in the outbox at exit.
+5. **control plane idle** — the listener closes once in-flight calls finish.
+6. **flush events** — the backlog is given a 10 s window to reach Kafka.
 
 Then exit **0**, whether or not the window was used up. A **second** signal
 exits at once.

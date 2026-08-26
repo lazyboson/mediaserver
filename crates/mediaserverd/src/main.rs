@@ -14,6 +14,7 @@ mod metrics;
 mod ng_transport;
 mod recorder;
 mod recording_spill;
+mod recording_uploads;
 mod registry_keeper;
 mod rtpengine_capability;
 mod session_store;
@@ -606,6 +607,7 @@ impl DrainSteps for ControlPlaneDrain {
         self.controller.begin_drain();
         info!(
             live_taps = self.plane.live_sessions(),
+            uploads_in_flight = self.plane.uploads_in_flight(),
             "readiness is off and no new session or attachment will be taken here"
         );
     }
@@ -647,6 +649,17 @@ impl DrainSteps for ControlPlaneDrain {
             }
         }
         closed
+    }
+
+    async fn await_uploads(&self) -> usize {
+        let settled = self.plane.await_uploads().await;
+        if settled > 0 {
+            info!(
+                settled,
+                "every recording upload backgrounded by a detach reached storage or its spill disk"
+            );
+        }
+        settled
     }
 
     async fn await_control_plane_idle(&self) {

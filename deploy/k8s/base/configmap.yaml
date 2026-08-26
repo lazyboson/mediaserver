@@ -75,6 +75,10 @@ data:
   # How often a live recording spills, in seconds; default 30. This is the
   # worst-case audio loss when the container dies mid-call.
   MSS_RECORDING_SPILL_SECONDS: "30"
+  # Detach/StopRecording never waits for an upload (defect D11): it answers as
+  # soon as the segment is closed, and this bounds how many of those uploads run
+  # at once -- and so the memory, one rendered WAV each. Default 4.
+  MSS_RECORDING_UPLOAD_CONCURRENCY: "4"
 
   # --- Lifecycle -------------------------------------------------------------
   # Ceiling on the whole shutdown drain. terminationGracePeriodSeconds in the

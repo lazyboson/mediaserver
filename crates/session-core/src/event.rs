@@ -52,6 +52,11 @@ pub enum Observation {
         recording_id: String,
         uri: String,
     },
+    UploadFailed {
+        recording_id: String,
+        key: String,
+        error: String,
+    },
     LegsAttributed {
         attribution: Attribution,
         tracks: Vec<String>,
@@ -103,6 +108,11 @@ pub enum EventKind {
     UploadCompleted {
         recording_id: String,
         uri: String,
+    },
+    UploadFailed {
+        recording_id: String,
+        key: String,
+        error: String,
     },
     PlaybackStarted {
         playback: PlaybackId,
@@ -233,6 +243,11 @@ mod tests {
             EventKind::UploadCompleted {
                 recording_id: recording_id.clone(),
                 uri: "s3:".to_string(),
+            },
+            EventKind::UploadFailed {
+                recording_id: recording_id.clone(),
+                key: "acct-1/rec-1.wav".to_string(),
+                error: "the object store refused the upload".to_string(),
             },
         ] {
             assert_eq!(kind.legacy_name(), None, "{kind:?} claimed a legacy name");
