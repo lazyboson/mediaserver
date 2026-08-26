@@ -1,6 +1,6 @@
 use control_api::convert::event_bytes;
 use control_api::EventSink;
-use rskafka::client::partition::{Compression, PartitionClient, UnknownTopicHandling};
+use rskafka::client::partition::{Compression, OffsetAt, PartitionClient, UnknownTopicHandling};
 use rskafka::client::ClientBuilder;
 use rskafka::record::Record;
 use session_core::{MediaEvent, SessionId};
@@ -26,6 +26,10 @@ const REPLICATION_FACTOR: i16 = 1;
 #[control_api::async_trait]
 pub trait EventTransport: Send + Sync + 'static {
     fn partitions(&self) -> usize;
+
+    async fn reachable(&self) -> Result<(), String> {
+        Ok(())
+    }
 
     async fn send(&self, partition: usize, key: Vec<u8>, payload: Vec<u8>) -> Result<(), String>;
 }
@@ -352,6 +356,18 @@ impl EventTransport for RskafkaTransport {
         self.clients.len()
     }
 
+    async fn reachable(&self) -> Result<(), String> {
+        let client = self
+            .clients
+            .first()
+            .ok_or_else(|| "the event topic has no partitions".to_string())?;
+        client
+            .get_offset(OffsetAt::Latest)
+            .await
+            .map(|_| ())
+            .map_err(|error| format!("kafka offsets: {error}"))
+    }
+
     async fn send(&self, partition: usize, key: Vec<u8>, payload: Vec<u8>) -> Result<(), String> {
         let client = self
             .clients
@@ -472,6 +488,7 @@ mod tests {
             attachment: None,
             seq,
             legacy_eligible: true,
+            attribution: session_core::Attribution::Explicit,
             kind: EventKind::SessionEnded {
                 reason: "test".to_string(),
             },

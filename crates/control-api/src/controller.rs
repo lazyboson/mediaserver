@@ -1,14 +1,14 @@
 use crate::convert::{
-    attachment_id, capabilities, capabilities_wire, event_wire, format, format_wire, playback_id,
-    selector, selector_wire, session_id, session_kind, session_kind_wire, status_of, transport,
-    transport_wire,
+    attachment_id, capabilities, capabilities_wire, conference_wire, event_wire, format,
+    format_wire, member_state_wire, playback_id, selector, selector_wire, session_id, session_kind,
+    session_kind_wire, status_of, transport, transport_wire,
 };
 use crate::proto;
 use crate::proto::media_control_server::{MediaControl, MediaControlServer};
 use session_core::{
     AttachSpec, AttachmentId, AttachmentUpdate, AttachmentView, ConsumerEvent, ControlError,
-    CreateSession, EventKind, MediaEvent, Observation, PlaybackId, PlaybackSpec, SessionId,
-    SessionKind, SessionRegistry, SessionView,
+    CreateSession, EventKind, MediaEvent, MemberStateView, Observation, PlaybackId, PlaybackSpec,
+    SessionId, SessionKind, SessionRegistry, SessionView,
 };
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -24,6 +24,15 @@ pub trait EventSink: Send + Sync + 'static {
 
 pub trait ObservationSink: Send + Sync + 'static {
     fn observe(&self, session: SessionId, observation: Observation);
+
+    fn retain_for_upload(&self, session: SessionId) -> bool {
+        let _ = session;
+        false
+    }
+
+    fn release_after_upload(&self, session: SessionId) {
+        let _ = session;
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -127,6 +136,11 @@ pub trait MediaPlane: Send + Sync + 'static {
         None
     }
 
+    fn member_state(&self, session: SessionId) -> Option<MemberStateView> {
+        let _ = session;
+        None
+    }
+
     async fn open_stream(
         &self,
         session: SessionId,
@@ -170,7 +184,7 @@ impl SessionController {
     }
 
     pub fn begin_drain(&self) {
-        let _ = self.draining.send(true);
+        self.draining.send_replace(true);
     }
 
     pub fn with_media_plane(mut self, media: Arc<dyn MediaPlane>) -> Self {
@@ -248,12 +262,27 @@ impl SessionController {
         (registry.session_count(), registry.attachment_count())
     }
 
+    pub fn sessions_finishing(&self) -> usize {
+        self.lock().finishing_count()
+    }
+
     pub fn events_dropped(&self) -> u64 {
         self.lock().events_dropped()
     }
 
     pub fn drain_watch(&self) -> watch::Receiver<bool> {
         self.draining.subscribe()
+    }
+
+    pub fn is_draining(&self) -> bool {
+        *self.draining.borrow()
+    }
+
+    fn refuse_while_draining(&self) -> Result<(), Status> {
+        if self.is_draining() {
+            return Err(Status::unavailable("this pod is draining"));
+        }
+        Ok(())
     }
 
     pub(crate) async fn open_stream(
@@ -314,6 +343,10 @@ impl SessionController {
     }
 
     fn session_message(&self, session: SessionId) -> Result<proto::Session, Status> {
+        let member = self
+            .media
+            .as_ref()
+            .and_then(|media| media.member_state(session));
         let registry = self.lock();
         let view = registry.session_view(session).map_err(status_of)?;
         let attachments = view
@@ -334,6 +367,9 @@ impl SessionController {
             attachments,
             sdp_answer: view.sdp_answer.unwrap_or_default(),
             group: view.group,
+            attribution: view.attribution.as_str().to_string(),
+            member: member.as_ref().map(member_state_wire),
+            conference: member.as_ref().map(conference_wire),
         })
     }
 }
@@ -346,6 +382,35 @@ impl ObservationSink for SessionController {
                 %status,
                 "an observation had nowhere to land; the session is already gone"
             );
+        }
+    }
+
+    fn retain_for_upload(&self, session: SessionId) -> bool {
+        match self.lock().retain_for_upload(session) {
+            Ok(pending) => {
+                tracing::info!(
+                    %session,
+                    pending,
+                    "this session will be remembered until its recording upload settles, so the \
+                     upload's own event keeps its place in the session's sequence"
+                );
+                true
+            }
+            Err(error) => {
+                tracing::warn!(
+                    %session,
+                    %error,
+                    "this session cannot be held open for an upload; the upload's event will be \
+                     dropped if the session ends first"
+                );
+                false
+            }
+        }
+    }
+
+    fn release_after_upload(&self, session: SessionId) {
+        if self.lock().release_after_upload(session) {
+            tracing::info!(%session, "the last upload of this ended session settled; forgotten");
         }
     }
 }
@@ -454,6 +519,7 @@ impl MediaControl for SessionController {
         &self,
         request: Request<proto::CreateSessionRequest>,
     ) -> Result<Response<proto::Session>, Status> {
+        self.refuse_while_draining()?;
         let message = request.into_inner();
         if message.external_id.is_empty() {
             return Err(Status::invalid_argument("external_id is required"));
@@ -543,6 +609,7 @@ impl MediaControl for SessionController {
         &self,
         request: Request<proto::AttachRequest>,
     ) -> Result<Response<proto::Attachment>, Status> {
+        self.refuse_while_draining()?;
         let message = request.into_inner();
         let session = self.resolve(message.session)?;
         let transport = transport(message.transport)?;

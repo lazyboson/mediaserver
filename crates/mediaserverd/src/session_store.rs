@@ -78,11 +78,15 @@ impl PersistedSession {
 
 #[control_api::async_trait]
 pub trait SessionStore: Send + Sync + 'static {
+    async fn ping(&self) -> Result<(), StoreError>;
+
     async fn upsert(&self, session: &PersistedSession) -> Result<(), StoreError>;
 
     async fn forget(&self, external_id: &str) -> Result<(), StoreError>;
 
     async fn renew(&self, external_id: &str, owner: &str) -> Result<bool, StoreError>;
+
+    async fn release_lease(&self, external_id: &str, owner: &str) -> Result<bool, StoreError>;
 
     async fn claim_unleased(
         &self,
@@ -130,6 +134,15 @@ impl RedisSessionStore {
         format!("{}:sessions", self.namespace)
     }
 
+    pub async fn read_key(&self, key: &str) -> Result<Option<String>, StoreError> {
+        let mut connection = self.connection().await?;
+        redis::cmd("GET")
+            .arg(key)
+            .query_async::<Option<String>>(&mut connection)
+            .await
+            .map_err(|error| StoreError::Backend(error.to_string()))
+    }
+
     async fn connection(&self) -> Result<redis::aio::MultiplexedConnection, StoreError> {
         self.client
             .get_multiplexed_async_connection()
@@ -140,6 +153,15 @@ impl RedisSessionStore {
 
 #[control_api::async_trait]
 impl SessionStore for RedisSessionStore {
+    async fn ping(&self) -> Result<(), StoreError> {
+        let mut connection = self.connection().await?;
+        redis::cmd("PING")
+            .query_async::<String>(&mut connection)
+            .await
+            .map(|_| ())
+            .map_err(|error| StoreError::Backend(error.to_string()))
+    }
+
     async fn upsert(&self, session: &PersistedSession) -> Result<(), StoreError> {
         let body = serde_json::to_string(session)
             .map_err(|error| StoreError::Encoding(error.to_string()))?;
@@ -193,6 +215,24 @@ impl SessionStore for RedisSessionStore {
             .arg("EX")
             .arg(LEASE_TTL.as_secs())
             .query_async::<()>(&mut connection)
+            .await
+            .map_err(|error| StoreError::Backend(error.to_string()))?;
+        Ok(true)
+    }
+
+    async fn release_lease(&self, external_id: &str, owner: &str) -> Result<bool, StoreError> {
+        let mut connection = self.connection().await?;
+        let held: Option<String> = redis::cmd("GET")
+            .arg(self.lease_key(external_id))
+            .query_async(&mut connection)
+            .await
+            .map_err(|error| StoreError::Backend(error.to_string()))?;
+        if held.as_deref() != Some(owner) {
+            return Ok(false);
+        }
+        redis::cmd("DEL")
+            .arg(self.lease_key(external_id))
+            .query_async::<i64>(&mut connection)
             .await
             .map_err(|error| StoreError::Backend(error.to_string()))?;
         Ok(true)
@@ -258,10 +298,16 @@ impl SessionStore for RedisSessionStore {
 pub struct MemorySessionStore {
     sessions: std::sync::Mutex<BTreeMap<String, PersistedSession>>,
     leases: std::sync::Mutex<BTreeMap<String, String>>,
+    unreachable: std::sync::atomic::AtomicBool,
 }
 
 #[cfg(test)]
 impl MemorySessionStore {
+    pub fn set_unreachable(&self, unreachable: bool) {
+        self.unreachable
+            .store(unreachable, std::sync::atomic::Ordering::SeqCst);
+    }
+
     pub fn expire_lease(&self, external_id: &str) {
         self.leases.lock().unwrap().remove(external_id);
     }
@@ -278,6 +324,13 @@ impl MemorySessionStore {
 #[cfg(test)]
 #[control_api::async_trait]
 impl SessionStore for MemorySessionStore {
+    async fn ping(&self) -> Result<(), StoreError> {
+        if self.unreachable.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(StoreError::Backend("connection refused".to_string()));
+        }
+        Ok(())
+    }
+
     async fn upsert(&self, session: &PersistedSession) -> Result<(), StoreError> {
         self.sessions
             .lock()
@@ -300,6 +353,17 @@ impl SessionStore for MemorySessionStore {
     async fn renew(&self, external_id: &str, owner: &str) -> Result<bool, StoreError> {
         match self.leases.lock().unwrap().get(external_id) {
             Some(held) if held == owner => Ok(true),
+            _ => Ok(false),
+        }
+    }
+
+    async fn release_lease(&self, external_id: &str, owner: &str) -> Result<bool, StoreError> {
+        let mut leases = self.leases.lock().unwrap();
+        match leases.get(external_id) {
+            Some(held) if held == owner => {
+                leases.remove(external_id);
+                Ok(true)
+            }
             _ => Ok(false),
         }
     }

@@ -1,0 +1,18 @@
+# mediaserverd on the pod network, with the media range mapped through to the
+# node by hostPort. See deployment-hostport.yaml for the trade-off against
+# ../hostnetwork, and docs/deploy.md for the firewall matrix.
+#
+# EGRESS is unaffected by this choice: MSS opens the NG control socket to
+# rtpengine's 22222/udp itself, and Redis, Kafka and S3 are ordinary outbound
+# TCP. Only the media path needs anything from the node. If you run
+# NetworkPolicy, the policy in this overlay is what says so.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - ../../base
+  - networkpolicy.yaml
+
+patches:
+  - path: deployment-hostport.yaml
+  - path: media-range.yaml

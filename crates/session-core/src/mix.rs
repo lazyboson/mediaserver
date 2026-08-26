@@ -1,4 +1,4 @@
-use crate::Capabilities;
+use crate::{AttachmentId, Capabilities};
 use std::collections::BTreeMap;
 
 pub const MIX_TARGET_METADATA_KEY: &str = "mix_target";
@@ -42,6 +42,23 @@ pub struct MemberControl {
     pub mute: Option<bool>,
     pub deaf: Option<bool>,
     pub hold: Option<bool>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemberRouteView {
+    pub route: MixRoute,
+    pub attachment: Option<AttachmentId>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemberStateView {
+    pub conference: String,
+    pub members: Vec<String>,
+    pub mute: bool,
+    pub deaf: bool,
+    pub hold: bool,
+    pub source: MixSource,
+    pub routes: Vec<MemberRouteView>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]

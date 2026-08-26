@@ -1,0 +1,36 @@
+# The base is deliberately NOT deployable on its own for media: it leaves
+# MSS_MEDIA_PORT_MIN/MAX empty, so every tap socket takes an ephemeral port and
+# no firewall can describe it. Pick an overlay:
+#
+#   ../overlays/hostport     -- pod network, an enumerated hostPort range
+#   ../overlays/hostnetwork  -- the node's own network stack, a wide range
+#
+# See docs/deploy.md for the trade-off. Everything else -- the API, health
+# probes, events, recording -- works from the base as it stands.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: mediaserver
+
+# includeSelectors: false on purpose -- a label that lands in the Deployment's
+# selector cannot be changed later without deleting the Deployment.
+labels:
+  - pairs:
+      app.kubernetes.io/part-of: mediaserver
+    includeSelectors: false
+
+resources:
+  - serviceaccount.yaml
+  - configmap.yaml
+  # Drop this and create the Secret out of band -- see the banner in the file.
+  - secret.yaml
+  - service.yaml
+  - deployment.yaml
+  - pdb.yaml
+  # Both need the Prometheus Operator CRDs. Drop them if you have none.
+  - servicemonitor.yaml
+  - prometheusrule.yaml
+
+images:
+  - name: ghcr.io/lazyboson/mediaserver
+    newTag: v0.1.0

@@ -95,6 +95,57 @@ message Session {
   // INLINE only: the conference this leg is mixed into, empty when it is a
   // plain two-party leg.
   string group = 11;
+  // How this session's track names were arrived at: "explicit" (the caller's
+  // from-tag was supplied), "inferred" (rtpengine's participant creation times
+  // ordered them) or "unknown" (they tie, so no direction is claimed and the
+  // tracks are named leg_a / leg_b). D17: rtpengine stamps both legs of one
+  // dialogue with the same second, so "unknown" is the normal outcome of not
+  // passing a from-tag and an integrator that needs speaker attribution must
+  // pass the caller's tag.
+  string attribution = 12;
+  // Conference members only (INLINE with a group): this member's own state as
+  // the control plane holds it — the mirror the member verbs write, not a
+  // question asked of the mixing thread. Absent when the session is not
+  // seated in a conference on this pod. D22.
+  MemberState member = 13;
+  // Conference members only: the room this member is seated in, so an
+  // integrator can enumerate it from any member without a second RPC.
+  ConferenceView conference = 14;
+}
+
+// One live route of a member's audio inside its conference. A member with no
+// route heard elsewhere reports none: its injected audio reaches its own ear
+// only and the mixed track does not carry it.
+message MemberRoute {
+  // "own", "all", or the external id of the member this audio is addressed to.
+  string target = 1;
+  // "inject" (audio a consumer pushes) or "leg" (the member's own rtp, the
+  // coach shape).
+  string source = 2;
+  // Whether the conference's mixed track — the recording feed — carries it.
+  bool monitor_audible = 3;
+  // The attachment that asked for this route, empty when nothing owns it.
+  string attachment_id = 4;
+}
+
+// A conference member's state, read from the control plane's own mirror.
+// D22 residual: this state has no lease, so it outlives the controller that
+// set it for the life of the conference.
+message MemberState {
+  bool mute = 1;
+  bool deaf = 2;
+  bool hold = 3;
+  // Where this member's routed audio comes from: "inject" or "leg".
+  string mix_source = 4;
+  repeated MemberRoute routes = 5;
+}
+
+// The room a member is seated in, as this pod holds it. A conference is
+// pod-local (D16), so this enumerates the members mixed here.
+message ConferenceView {
+  string group = 1;
+  uint32 member_count = 2;
+  repeated string members = 3;
 }
 
 message SessionRef {
@@ -273,6 +324,10 @@ message MediaEvent {
   // Which kind of session emitted this: a consumer of mss.events can tell a
   // tap's events from an inline leg's without asking the API.
   SessionKind session_kind = 7;
+  // How the track names in this event's payload were arrived at: "explicit",
+  // "inferred" or "unknown" (D17). Under "unknown" the tracks are named leg_a
+  // and leg_b and no event claims a direction.
+  string attribution = 8;
 
   oneof payload {
     SpeechStarted speech_started = 10;
@@ -292,6 +347,8 @@ message MediaEvent {
     RecordingPaused recording_paused = 24;
     MixRouted mix_routed = 25;
     MemberControlled member_controlled = 26;
+    LegsAttributed legs_attributed = 27;
+    UploadFailed upload_failed = 28;
   }
 }
 
@@ -315,7 +372,18 @@ message FinalTranscript {
 }
 
 message EndOfUtterance { string track = 1; }
-message Dtmf { string track = 1; string digit = 2; }
+// One press, published as soon as the RFC 4733 end packet arrives, whether or
+// not any consumer is attached: digits belong to the call, not to a consumer.
+// The three retransmissions of that end packet are one event. duration_ms is
+// the press length the endpoint reported, converted through the negotiated RTP
+// clock rate; rtp_timestamp is the event's start timestamp on that same clock,
+// so digits can be lined up with recorded audio.
+message Dtmf {
+  string track = 1;
+  string digit = 2;
+  uint32 duration_ms = 3;
+  uint32 rtp_timestamp = 4;
+}
 message PlaybackStarted { string playback_id = 1; }
 message PlaybackStopped { string playback_id = 1; string reason = 2; }
 message RecordingStarted { string recording_id = 1; string path = 2; string shape = 3; }
@@ -328,7 +396,19 @@ message RecordingStarted { string recording_id = 1; string path = 2; string shap
 message RecordingPaused { string recording_id = 1; bool paused = 2; uint64 duration_ms = 3; }
 message RecordingStopped { string recording_id = 1; uint64 duration_ms = 2; }
 message UploadCompleted { string recording_id = 1; string uri = 2; }
+// The terminal event of a recording that never reached storage (D11). It is
+// published after the detach that stopped the recording has already been
+// answered, and it is the last event of that session's sequence: the audio is
+// on this pod's spill disk, waiting for the salvage pass on its next start.
+message UploadFailed { string recording_id = 1; string key = 2; string error = 3; }
 message AttachmentUp { string label = 1; }
+// Emitted once per session when MSS settles who is who, so an integrator can
+// audit speaker attribution instead of trusting it. attribution is "explicit",
+// "inferred" or "unknown"; tracks are the names this session's gRPC frames and
+// recording objects carry (leg_a / leg_b when unknown). The frozen WS Twilio
+// dialect keeps inbound / outbound whatever this says, so a WS consumer's only
+// warning that its track names are a guess is this event.
+message LegsAttributed { string attribution = 1; repeated string tracks = 2; }
 // Where an INJECT attachment's audio lands in its conference's mix: "own" is
 // private playback into its own leg (the default), a member's external id is a
 // whisper heard only by that member, "all" is the barge flip. monitor_audible

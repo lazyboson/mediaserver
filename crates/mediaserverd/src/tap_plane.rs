@@ -1,5 +1,7 @@
 use crate::conference::{Conference, ConferenceMember, ConferenceShared, ConferenceTotals};
 use crate::consumer_ws::{self, ConsumerConfig};
+use crate::digits::DigitQueue;
+use crate::discovery::NodeDiscovery;
 use crate::hub::{
     Hub, HubClient, Subscription, SubscriptionControl, SubscriptionMetrics, TapEvent,
     TrackSelection,
@@ -8,11 +10,13 @@ use crate::inline_leg::{
     egress_ssrc, InlineEgress, InlineEgressHandle, InlineEgressShared, InlineEgressTotals,
     EGRESS_CHUNK_MS,
 };
+use crate::media_ports::{MediaPortAllocator, PortLease};
 use crate::ng_transport::{NgTransport, NgTransportConfig};
 use crate::recorder::{
     self, Layout, RecorderCounters, RecorderHandle, RecorderSpec, RecordingFormat,
     RecordingIdentity, RecordingProgress, RecordingSupport, RecordingTarget,
 };
+use crate::recording_uploads::UploadTracker;
 use crate::registry_keeper::TapSubscriptions;
 use crate::rtpengine_capability::NodeCapabilityLog;
 use crate::session_store::PersistedRecording;
@@ -30,13 +34,15 @@ use rtpengine_ng::{
     InlineOffer, NegotiatedCodec, PlayMedia, PlaySource, PlayTarget, SdpError, SubscribeRequest,
     SubscriptionAnswer, SubscriptionOffer,
 };
-use session_core::mix::{MemberControl, MixRoute, MIX_TARGET_EVERYONE, MIX_TARGET_OWN};
+use session_core::mix::{
+    MemberControl, MemberStateView, MixRoute, MIX_TARGET_EVERYONE, MIX_TARGET_OWN,
+};
 use session_core::{
-    AttachmentId, AttachmentView, Capabilities, Observation, SessionId, SessionKind, SessionView,
-    TrackSelector, Transport,
+    AttachmentId, AttachmentView, Attribution, Capabilities, Observation, SessionId, SessionKind,
+    SessionView, TrackSelector, Transport,
 };
 use std::collections::HashMap;
-use std::net::{IpAddr, SocketAddr, UdpSocket};
+use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
@@ -64,6 +70,8 @@ const POLITE_CLOSE: Duration = Duration::from_secs(2);
 pub struct TapPlaneConfig {
     pub default_node: Option<SocketAddr>,
     pub local_media_address: IpAddr,
+    pub advertised_media_address: IpAddr,
+    pub media_ports: Arc<MediaPortAllocator>,
     pub format: AudioFormat,
     pub transcode_at_tap: bool,
     pub opus_decode_rate_hz: u32,
@@ -73,15 +81,24 @@ pub struct TapPlaneConfig {
     pub capabilities: Arc<NodeCapabilityLog>,
 }
 
+struct ResolvedNode {
+    node: SocketAddr,
+    view: SessionView,
+    caller_named: bool,
+}
+
 struct SessionHandles {
     transport: Option<Arc<NgTransport>>,
     call_id: String,
     hub: HubClient,
     external_id: String,
+    attribution: Attribution,
 }
 
 struct LiveSession {
     kind: SessionKind,
+    attribution: Attribution,
+    media_ports: Vec<PortLease>,
     transport: Option<Arc<NgTransport>>,
     external_id: String,
     call_id: String,
@@ -94,6 +111,7 @@ struct LiveSession {
     conference: Option<String>,
     mix_route: Option<AttachmentId>,
     speakers: Option<tokio::task::JoinHandle<()>>,
+    digits: Arc<DigitQueue>,
 }
 
 enum LiveAttachment {
@@ -219,6 +237,7 @@ pub struct IngestSnapshot {
     pub legs_unknown_ssrc: u64,
     pub legs_stalled: u64,
     pub ssrc_requeries: u64,
+    pub dtmf_events_dropped: u64,
     pub consumers_live: u64,
     pub consumer_dropped_oldest: u64,
     pub consumer_delivered: u64,
@@ -231,6 +250,9 @@ pub struct IngestSnapshot {
     pub recording_pauses: u64,
     pub recording_uploads: u64,
     pub recording_upload_failures: u64,
+    pub recording_uploads_in_flight: u64,
+    pub recording_uploads_backgrounded: u64,
+    pub recording_upload_settle_timeouts: u64,
     pub recording_spills: u64,
     pub recording_segments_spilled: u64,
     pub recording_segment_spill_failures: u64,
@@ -262,6 +284,7 @@ struct MetricsInner {
     retired_consumer_delivered: u64,
     retired_consumer_suppressed: u64,
     ssrc_requeries: u64,
+    dtmf_events_dropped: u64,
     legs: HashMap<SessionId, Vec<Arc<SharedLegStats>>>,
     inline: HashMap<SessionId, Arc<InlineEgressShared>>,
     retired_inline: InlineEgressTotals,
@@ -323,6 +346,10 @@ impl TapPlaneMetrics {
         self.lock().ssrc_requeries += 1;
     }
 
+    fn record_digits_dropped(&self, dropped: u64) {
+        self.lock().dtmf_events_dropped += dropped;
+    }
+
     fn register_consumer(&self, attachment: AttachmentId, metrics: SubscriptionMetrics) {
         let mut inner = self.lock();
         if let Some(replaced) = inner.consumers.insert(attachment, metrics) {
@@ -353,12 +380,16 @@ impl TapPlaneMetrics {
             consumer_delivered: inner.retired_consumer_delivered,
             consumer_suppressed_while_paused: inner.retired_consumer_suppressed,
             ssrc_requeries: inner.ssrc_requeries,
+            dtmf_events_dropped: inner.dtmf_events_dropped,
             recordings_live: read(&recorder.live),
             recordings_started: read(&recorder.started),
             recordings_stopped: read(&recorder.stopped),
             recording_pauses: read(&recorder.pauses),
             recording_uploads: read(&recorder.uploaded),
             recording_upload_failures: read(&recorder.upload_failures),
+            recording_uploads_in_flight: read(&recorder.uploads_in_flight),
+            recording_uploads_backgrounded: read(&recorder.uploads_backgrounded),
+            recording_upload_settle_timeouts: read(&recorder.upload_settle_timeouts),
             recording_spills: read(&recorder.spilled),
             recording_segments_spilled: read(&recorder.segments_spilled),
             recording_segment_spill_failures: read(&recorder.segment_spill_failures),
@@ -417,11 +448,14 @@ pub struct TapPlane {
     conferences: Mutex<HashMap<String, Conference>>,
     metrics: TapPlaneMetrics,
     observations: OnceLock<Weak<dyn ObservationSink>>,
+    discovery: OnceLock<Arc<NodeDiscovery>>,
+    uploads: Arc<UploadTracker>,
 }
 
 impl TapPlane {
     pub fn new(config: TapPlaneConfig) -> Self {
         let metrics = TapPlaneMetrics::with_recorder(Arc::clone(&config.recording.counters));
+        let uploads = UploadTracker::new(Arc::clone(&config.recording.counters));
         TapPlane {
             config,
             sessions: Mutex::new(HashMap::new()),
@@ -430,13 +464,36 @@ impl TapPlane {
             conferences: Mutex::new(HashMap::new()),
             metrics,
             observations: OnceLock::new(),
+            discovery: OnceLock::new(),
+            uploads,
         }
+    }
+
+    pub fn uploads_in_flight(&self) -> u64 {
+        self.uploads.in_flight()
+    }
+
+    pub async fn await_uploads(&self) -> usize {
+        self.uploads.wait_idle().await as usize
     }
 
     pub fn observe_through(&self, sink: Weak<dyn ObservationSink>) {
         if self.observations.set(sink).is_err() {
             warn!("this tap plane already reports its observations somewhere");
         }
+    }
+
+    pub fn discover_through(&self, discovery: Arc<NodeDiscovery>) {
+        let prefix = discovery.prefix().to_string();
+        if self.discovery.set(discovery).is_err() {
+            warn!("this tap plane already resolves rtpengine nodes through a discovery map");
+            return;
+        }
+        info!(
+            prefix = %prefix,
+            "a call whose CreateSession names no rtpengine node is looked up in the \
+             discovery map under this key prefix"
+        );
     }
 
     pub fn live_sessions(&self) -> usize {
@@ -478,28 +535,78 @@ impl TapPlane {
         })
     }
 
+    async fn resolve_node(&self, mut view: SessionView) -> Result<ResolvedNode, MediaPlaneError> {
+        let mut caller_named = !view.from_tags.is_empty();
+        if !view.rtpengine_node.is_empty() {
+            let node = self.node_for(&view)?;
+            return Ok(ResolvedNode {
+                node,
+                view,
+                caller_named,
+            });
+        }
+        let discovered = match self.discovery.get() {
+            Some(discovery) => discovery.resolve(&view.call_id).await,
+            None => None,
+        };
+        let Some(discovered) = discovered else {
+            let node = self.node_for(&view)?;
+            return Ok(ResolvedNode {
+                node,
+                view,
+                caller_named,
+            });
+        };
+        if view.from_tags.is_empty() && !discovered.from_tags.is_empty() {
+            view.from_tags = discovered.from_tags;
+            view.from_tags.truncate(MAX_TAPPED_LEGS);
+            caller_named = discovered.caller_named;
+        }
+        Ok(ResolvedNode {
+            node: discovered.node,
+            view,
+            caller_named,
+        })
+    }
+
     async fn complete_from_tags(
         &self,
         transport: &NgTransport,
         mut view: SessionView,
+        caller_named: bool,
     ) -> Result<SessionView, MediaPlaneError> {
+        let seeded = !view.from_tags.is_empty();
         if view.from_tags.len() >= MAX_TAPPED_LEGS {
+            view.attribution = if caller_named {
+                Attribution::Explicit
+            } else {
+                Attribution::Unknown
+            };
+            if !caller_named {
+                warn!(
+                    call_id = %view.call_id,
+                    from_tags = ?view.from_tags,
+                    "both legs of this call are known but not which one called: this tap \
+                     will not claim a direction and its tracks are leg_a and leg_b. Mark the \
+                     caller in the discovery map to get customer and agent"
+                );
+            }
             return Ok(view);
         }
         let reply = transport
             .query(&view.call_id)
             .await
             .map_err(|error| MediaPlaneError(format!("query for {}: {error}", view.call_id)))?;
-        let known = reply.tags();
-        if known.is_empty() {
+        let stamped = reply.tags_created();
+        if stamped.is_empty() {
             return Err(MediaPlaneError(format!(
                 "rtpengine knows no participants for call {}; \
                  it is not anchoring that call",
                 view.call_id
             )));
         }
-        let caller_known = !view.from_tags.is_empty();
-        for tag in known {
+        let ordered = order_participants(&stamped);
+        for tag in ordered.tags {
             if view.from_tags.len() >= MAX_TAPPED_LEGS {
                 break;
             }
@@ -507,22 +614,37 @@ impl TapPlane {
                 view.from_tags.push(tag);
             }
         }
-        if caller_known {
-            info!(
+        view.attribution = if caller_named {
+            Attribution::Explicit
+        } else if seeded {
+            Attribution::Unknown
+        } else {
+            ordered.attribution
+        };
+        match view.attribution {
+            Attribution::Explicit => info!(
                 call_id = %view.call_id,
                 from_tags = ?view.from_tags,
                 "resolved this call's participants; the caller was named so the \
                  customer leg is known"
-            );
-        } else {
-            warn!(
+            ),
+            Attribution::Inferred => info!(
                 call_id = %view.call_id,
                 from_tags = ?view.from_tags,
+                ?stamped,
+                "nobody named the caller, but rtpengine's participant creation times \
+                 order these legs, so the earliest created leg is the customer"
+            ),
+            Attribution::Unknown => warn!(
+                call_id = %view.call_id,
+                from_tags = ?view.from_tags,
+                ?stamped,
                 caller_tag_key = telcompat_caller_tag_key(),
-                "resolved this call's participants but nobody named the caller, so \
-                 customer and agent are assigned by tag order and may be swapped; \
-                 pass the caller's sip from-tag to fix it"
-            );
+                "nobody named the caller and rtpengine stamped these legs with the \
+                 same creation second, so this tap will not claim a direction: its \
+                 tracks are leg_a and leg_b. Pass the caller's sip from-tag to get \
+                 customer and agent"
+            ),
         }
         Ok(view)
     }
@@ -664,7 +786,10 @@ impl TapPlane {
             ));
         }
         let SessionHandles {
-            hub, external_id, ..
+            hub,
+            external_id,
+            attribution,
+            ..
         } = self.session_handles(view.session)?;
         let selection = recording_selection_of(view.selector);
         let conferenced = self.conference_of(view.session).is_ok();
@@ -682,7 +807,7 @@ impl TapPlane {
             None
         } else {
             let participant = participant_of(&view, &external_id)?;
-            let targets = participant_targets(&identity, &participant, view.selector);
+            let targets = participant_targets(&identity, &participant, view.selector, attribution);
             let key = GroupKey {
                 account_id: identity.account_id.clone(),
                 group: view.group.clone(),
@@ -929,19 +1054,20 @@ impl TapPlane {
             return None;
         };
         let handle = handle.take()?;
-        let outcome = handle.finish().await;
+        let finished = handle.finish().await;
         info!(
             %attachment,
             session = %session,
             %recording_id,
             group = ?member_of.as_ref().map(GroupKey::to_string),
-            duration_ms = outcome.as_ref().map(|done| done.duration_ms),
-            uris = ?outcome.as_ref().map(|done| done.uris.clone()),
-            "recording finished"
+            duration_ms = finished.stopped.as_ref().map(|stop| stop.duration_ms),
+            frames = finished.stopped.as_ref().map(|stop| stop.frames),
+            "recording stopped; its upload runs in the background"
         );
         if let Some(key) = member_of.as_ref() {
             self.leave_group(key, attachment);
         }
+        self.uploads.adopt(finished, self.observer());
         Some(())
     }
 
@@ -949,7 +1075,11 @@ impl TapPlane {
         if view.call_id.is_empty() {
             return Err(MediaPlaneError("a tap needs the call-id".to_string()));
         }
-        let node = self.node_for(&view)?;
+        let ResolvedNode {
+            node,
+            view,
+            caller_named,
+        } = self.resolve_node(view).await?;
         let configured = self.config.format;
         let transcoding = self.config.transcode_at_tap;
 
@@ -969,7 +1099,9 @@ impl TapPlane {
             .report_first_contact(node, &transport)
             .await;
 
-        let view = self.complete_from_tags(&transport, view).await?;
+        let view = self
+            .complete_from_tags(&transport, view, caller_named)
+            .await?;
 
         let reply = transport
             .subscribe_request(&SubscribeRequest {
@@ -1031,16 +1163,16 @@ impl TapPlane {
 
         let mut sockets = Vec::with_capacity(offer.streams.len());
         let mut receive_ports = Vec::with_capacity(offer.streams.len());
+        let mut port_leases = Vec::with_capacity(offer.streams.len());
         for _ in &offer.streams {
-            let socket = UdpSocket::bind(SocketAddr::new(self.config.local_media_address, 0))
-                .map_err(|error| MediaPlaneError(format!("media socket: {error}")))?;
-            receive_ports.push(
-                socket
-                    .local_addr()
-                    .map_err(|error| MediaPlaneError(format!("media socket: {error}")))?
-                    .port(),
-            );
-            sockets.push(socket);
+            let bound = self
+                .config
+                .media_ports
+                .bind(self.config.local_media_address)
+                .map_err(|error| MediaPlaneError(error.to_string()))?;
+            receive_ports.push(bound.port);
+            port_leases.push(bound.lease);
+            sockets.push(bound.socket);
         }
 
         let answer_with = if transcoding {
@@ -1055,16 +1187,14 @@ impl TapPlane {
             "answering the subscription with this codec"
         );
 
-        let local_address = self.config.local_media_address.to_string();
-        let answer_sdp = SubscriptionAnswer {
-            session_id: self.config.sdp_session_id,
-            local_address: &local_address,
-            receive_ports: &receive_ports,
+        let answer_sdp = tap_answer_sdp(
+            self.config.sdp_session_id,
+            self.config.advertised_media_address,
+            &receive_ports,
             format,
             answer_with,
-        }
-        .to_sdp(&offer)
-        .map_err(|error| MediaPlaneError(format!("answer sdp: {error}")))?;
+            &offer,
+        )?;
 
         transport
             .subscribe_answer(&view.call_id, &to_tag, &answer_sdp)
@@ -1076,6 +1206,12 @@ impl TapPlane {
         let mut legs = Vec::with_capacity(sockets.len());
         let mut shared_stats = Vec::with_capacity(sockets.len());
         let mut ssrc_publishers = Vec::with_capacity(sockets.len());
+        let digits = DigitQueue::new();
+        tokio::spawn(publish_digits(
+            view.id,
+            Arc::clone(&digits),
+            self.observer(),
+        ));
         for (index, socket) in sockets.into_iter().enumerate() {
             let telephone_event = offer
                 .streams
@@ -1098,6 +1234,7 @@ impl TapPlane {
             )
             .map_err(|error| MediaPlaneError(format!("tap leg: {error}")))?
             .with_ssrc_tracks(ssrc_tracks.clone())
+            .with_digit_sink(Arc::clone(&digits))
             .with_shared_stats(shared, STALL_AFTER, Instant::now());
             ssrc_publishers.push(leg.ssrc_track_publisher());
             legs.push(leg);
@@ -1184,6 +1321,8 @@ impl TapPlane {
             view.id,
             LiveSession {
                 kind: SessionKind::Tap,
+                attribution: view.attribution,
+                media_ports: port_leases,
                 transport: Some(transport),
                 external_id: view.external_id.clone(),
                 call_id: view.call_id.clone(),
@@ -1196,10 +1335,18 @@ impl TapPlane {
                 conference: None,
                 mix_route: None,
                 speakers,
+                digits,
             },
         );
         drop(held);
         self.metrics.register_session(view.id, shared_stats);
+        self.observe(
+            view.id,
+            Observation::LegsAttributed {
+                attribution: view.attribution,
+                tracks: control_api::convert::tracks_under(TrackSelector::All, view.attribution),
+            },
+        );
         Ok(OpenedSession::default())
     }
 
@@ -1222,24 +1369,27 @@ impl TapPlane {
         let peer = SocketAddr::new(peer_address, offer.peer_port);
         let format = offer.format();
 
-        let socket = UdpSocket::bind(SocketAddr::new(self.config.local_media_address, 0))
-            .map_err(|error| MediaPlaneError(format!("media socket: {error}")))?;
+        let bound = self
+            .config
+            .media_ports
+            .bind(self.config.local_media_address)
+            .map_err(|error| MediaPlaneError(error.to_string()))?;
+        let socket = bound.socket;
+        let receive_port = bound.port;
+        let port_leases = vec![bound.lease];
         socket
             .set_nonblocking(true)
             .map_err(|error| MediaPlaneError(format!("media socket: {error}")))?;
-        let receive_port = socket
-            .local_addr()
-            .map_err(|error| MediaPlaneError(format!("media socket: {error}")))?
-            .port();
         let egress_socket = socket
             .try_clone()
             .map_err(|error| MediaPlaneError(format!("egress socket: {error}")))?;
 
-        let local_address = self.config.local_media_address.to_string();
-        let answer_sdp = offer
-            .answer(self.config.sdp_session_id, &local_address, receive_port)
-            .to_sdp()
-            .map_err(|error| MediaPlaneError(format!("inline answer: {error}")))?;
+        let answer_sdp = inline_answer_sdp(
+            self.config.sdp_session_id,
+            self.config.advertised_media_address,
+            receive_port,
+            &offer,
+        )?;
 
         let epoch = Instant::now();
         let (mut egress, egress_handle) = InlineEgress::bind(
@@ -1253,6 +1403,12 @@ impl TapPlane {
         .map_err(|error| MediaPlaneError(format!("inline egress: {error}")))?;
 
         let shared = Arc::new(SharedLegStats::default());
+        let digits = DigitQueue::new();
+        tokio::spawn(publish_digits(
+            view.id,
+            Arc::clone(&digits),
+            self.observer(),
+        ));
         let leg = TapLeg::with_pipeline_config(
             Track::Customer,
             socket,
@@ -1269,6 +1425,7 @@ impl TapPlane {
             RETAIN_NO_LOCAL_AUDIO,
         )
         .map_err(|error| MediaPlaneError(format!("inline leg: {error}")))?
+        .with_digit_sink(Arc::clone(&digits))
         .with_shared_stats(Arc::clone(&shared), STALL_AFTER, epoch);
 
         let (mut hub, hub_client) = Hub::new();
@@ -1296,6 +1453,8 @@ impl TapPlane {
                 view.id,
                 LiveSession {
                     kind: SessionKind::Inline,
+                    attribution: view.attribution,
+                    media_ports: port_leases,
                     transport: None,
                     external_id: view.external_id.clone(),
                     call_id: view.call_id.clone(),
@@ -1308,6 +1467,7 @@ impl TapPlane {
                     conference,
                     mix_route: None,
                     speakers: None,
+                    digits: Arc::clone(&digits),
                 },
             );
             drop(held);
@@ -1399,6 +1559,8 @@ impl TapPlane {
             view.id,
             LiveSession {
                 kind: SessionKind::Inline,
+                attribution: view.attribution,
+                media_ports: port_leases,
                 transport: None,
                 external_id: view.external_id.clone(),
                 call_id: view.call_id.clone(),
@@ -1411,6 +1573,7 @@ impl TapPlane {
                 conference: None,
                 mix_route: None,
                 speakers: None,
+                digits: Arc::clone(&digits),
             },
         );
         drop(held);
@@ -1517,7 +1680,7 @@ impl TapPlane {
                 MediaPlaneError(format!("conference {name} is not running on this pod"))
             })?;
             conference
-                .route(session, route)
+                .route(session, Some(attachment), route)
                 .map_err(|error| MediaPlaneError(format!("conference {name}: {error}")))?;
         }
         if let Ok(mut held) = self.sessions.lock() {
@@ -1644,7 +1807,7 @@ impl TapPlane {
             Err(_) => return,
         };
         if let Some(conference) = held.get_mut(&name) {
-            match conference.route(session, MixRoute::private()) {
+            match conference.route(session, None, MixRoute::private()) {
                 Ok(()) => info!(
                     %session,
                     %attachment,
@@ -1732,6 +1895,7 @@ impl TapPlane {
             call_id: live.call_id.clone(),
             hub: live.hub.clone(),
             external_id: live.external_id.clone(),
+            attribution: live.attribution,
         })
     }
 
@@ -1816,6 +1980,15 @@ impl MediaPlane for TapPlane {
             .map(|handle| Arc::new(handle) as Arc<dyn InlineEgressSink>)
     }
 
+    fn member_state(&self, session: SessionId) -> Option<MemberStateView> {
+        let name = self.conference_of(session).ok()?;
+        self.conferences
+            .lock()
+            .ok()?
+            .get(&name)?
+            .member_state(session)
+    }
+
     async fn open_session(&self, view: SessionView) -> Result<OpenedSession, MediaPlaneError> {
         match view.kind {
             SessionKind::Tap => self.open_tap_session(view).await,
@@ -1847,6 +2020,8 @@ impl MediaPlane for TapPlane {
         }
 
         live.stop.store(true, Ordering::Relaxed);
+        live.digits.close();
+        self.metrics.record_digits_dropped(live.digits.dropped());
         if let Some(speakers) = live.speakers.take() {
             speakers.abort();
         }
@@ -1869,8 +2044,17 @@ impl MediaPlane for TapPlane {
                 warn!(%session, "the capture thread did not join cleanly");
             }
         }
+        let released = std::mem::take(&mut live.media_ports);
+        let released_ports: Vec<u16> = released.iter().map(PortLease::port).collect();
+        drop(released);
         self.metrics.retire_session(session);
-        info!(%session, kind = ?live.kind, call_id = %live.call_id, "session closed");
+        info!(
+            %session,
+            kind = ?live.kind,
+            call_id = %live.call_id,
+            ?released_ports,
+            "session closed"
+        );
         Ok(())
     }
 
@@ -2102,7 +2286,9 @@ impl MediaPlane for TapPlane {
             }
         };
 
-        let SessionHandles { hub, .. } = self.session_handles(session)?;
+        let SessionHandles {
+            hub, attribution, ..
+        } = self.session_handles(session)?;
         let subscription = hub
             .attach(CONSUMER_QUEUE_FRAMES, selection)
             .ok_or_else(|| {
@@ -2117,6 +2303,7 @@ impl MediaPlane for TapPlane {
             frames.clone(),
             self.session_format(session)?,
             target_format,
+            attribution,
         ));
 
         let mut held = self
@@ -2271,6 +2458,7 @@ async fn pump_frames(
     frames: mpsc::Sender<StreamFrame>,
     source: AudioFormat,
     target: AudioFormat,
+    attribution: Attribution,
 ) {
     let mut encoders: HashMap<Track, ConsumerEncoder> = HashMap::new();
     while let Some(event) = subscription.next().await {
@@ -2295,7 +2483,7 @@ async fn pump_frames(
                 };
                 match encoder.encode(&samples[..len]) {
                     Ok(payload) => StreamFrame::Media {
-                        track: control_api::convert::track_name(track),
+                        track: control_api::convert::track_name_under(track, attribution),
                         pts_ms: timestamp_ms,
                         payload: payload.to_vec(),
                     },
@@ -2306,7 +2494,7 @@ async fn pump_frames(
                 }
             }
             TapEvent::Dtmf { track, digit } => StreamFrame::Dtmf {
-                track: control_api::convert::track_name(track),
+                track: control_api::convert::track_name_under(track, attribution),
                 digit,
             },
         };
@@ -2436,6 +2624,39 @@ fn transcoded_tap_codec(
     settled.ok_or_else(|| MediaPlaneError("rtpengine offered no streams".to_string()))
 }
 
+fn tap_answer_sdp(
+    session_id: u64,
+    advertised: IpAddr,
+    receive_ports: &[u16],
+    format: AudioFormat,
+    answer_with: NegotiatedCodec,
+    offer: &SubscriptionOffer,
+) -> Result<String, MediaPlaneError> {
+    let advertised = advertised.to_string();
+    SubscriptionAnswer {
+        session_id,
+        local_address: &advertised,
+        receive_ports,
+        format,
+        answer_with,
+    }
+    .to_sdp(offer)
+    .map_err(|error| MediaPlaneError(format!("answer sdp: {error}")))
+}
+
+fn inline_answer_sdp(
+    session_id: u64,
+    advertised: IpAddr,
+    receive_port: u16,
+    offer: &InlineOffer,
+) -> Result<String, MediaPlaneError> {
+    let advertised = advertised.to_string();
+    offer
+        .answer(session_id, &advertised, receive_port)
+        .to_sdp()
+        .map_err(|error| MediaPlaneError(format!("inline answer: {error}")))
+}
+
 fn negotiated_tap_codec(offer: &SubscriptionOffer) -> Result<NegotiatedCodec, MediaPlaneError> {
     let mut settled: Option<NegotiatedCodec> = None;
     for (index, stream) in offer.streams.iter().enumerate() {
@@ -2496,6 +2717,33 @@ fn offered_tap_format(
     settled.ok_or_else(|| MediaPlaneError("rtpengine offered no streams".to_string()))
 }
 
+struct OrderedParticipants {
+    tags: Vec<String>,
+    attribution: Attribution,
+}
+
+fn order_participants(stamped: &[(String, Option<i64>)]) -> OrderedParticipants {
+    let mut ordered: Vec<(String, Option<i64>)> = stamped.to_vec();
+    ordered.sort_by(|left, right| match (left.1, right.1) {
+        (Some(one), Some(other)) => one.cmp(&other),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => std::cmp::Ordering::Equal,
+    });
+    let separated = match (ordered.first(), ordered.get(1)) {
+        (Some((_, Some(first))), Some((_, Some(second)))) => first < second,
+        _ => false,
+    };
+    OrderedParticipants {
+        tags: ordered.into_iter().map(|(tag, _)| tag).collect(),
+        attribution: if separated {
+            Attribution::Inferred
+        } else {
+            Attribution::Unknown
+        },
+    }
+}
+
 fn telcompat_caller_tag_key() -> &'static str {
     control_api::telcompat::CALLER_TAG_KEY
 }
@@ -2541,6 +2789,7 @@ fn participant_targets(
     identity: &RecordingIdentity,
     participant: &str,
     selector: TrackSelector,
+    attribution: Attribution,
 ) -> Vec<RecordingTarget> {
     match selector {
         TrackSelector::Only(track) => vec![RecordingTarget {
@@ -2552,7 +2801,7 @@ fn participant_targets(
             .map(|track| RecordingTarget {
                 key: identity.participant_key(&format!(
                     "{participant}.{}",
-                    control_api::convert::track_name(track)
+                    control_api::convert::track_name_under(track, attribution)
                 )),
                 layout: Layout::Mono(track),
             })
@@ -2695,6 +2944,47 @@ async fn reresolve_speakers(
     }
 }
 
+async fn publish_digits(
+    session: SessionId,
+    digits: Arc<DigitQueue>,
+    sink: Option<Weak<dyn ObservationSink>>,
+) {
+    while let Some(press) = digits.next().await {
+        info!(
+            %session,
+            digit = %press.digit,
+            track = ?press.track,
+            duration_ms = press.duration_ms,
+            rtp_timestamp = press.rtp_timestamp,
+            "a digit was pressed on this call"
+        );
+        match sink.as_ref().and_then(Weak::upgrade) {
+            Some(sink) => sink.observe(
+                session,
+                Observation::Dtmf {
+                    track: press.track,
+                    digit: press.digit,
+                    duration_ms: press.duration_ms,
+                    rtp_timestamp: press.rtp_timestamp,
+                },
+            ),
+            None => warn!(
+                %session,
+                digit = %press.digit,
+                "no observation sink is wired; this digit reaches nobody"
+            ),
+        }
+    }
+    if digits.dropped() > 0 {
+        warn!(
+            %session,
+            dropped = digits.dropped(),
+            published = digits.published(),
+            "digits arrived faster than the event bus drained them"
+        );
+    }
+}
+
 fn speaker_track(index: usize) -> Track {
     if index == 0 {
         Track::Customer
@@ -2742,9 +3032,17 @@ mod tests {
     #[derive(Default)]
     struct BucketSink {
         puts: Mutex<Vec<(String, Vec<u8>)>>,
+        slow_by: Duration,
     }
 
     impl BucketSink {
+        fn slow(slow_by: Duration) -> BucketSink {
+            BucketSink {
+                puts: Mutex::new(Vec::new()),
+                slow_by,
+            }
+        }
+
         fn keys(&self) -> Vec<String> {
             self.puts
                 .lock()
@@ -2755,13 +3053,14 @@ mod tests {
         }
 
         fn body(&self, key: &str) -> Vec<u8> {
-            self.puts
+            let held = self
+                .puts
                 .lock()
                 .unwrap()
                 .iter()
                 .find(|(held, _)| held == key)
-                .map(|(_, body)| body.clone())
-                .unwrap_or_else(|| panic!("{key} was never uploaded; got {:?}", self.keys()))
+                .map(|(_, body)| body.clone());
+            held.unwrap_or_else(|| panic!("{key} was never uploaded; got {:?}", self.keys()))
         }
     }
 
@@ -2773,6 +3072,9 @@ mod tests {
             _content_type: &'static str,
             body: Vec<u8>,
         ) -> Result<String, recorder::UploadError> {
+            if !self.slow_by.is_zero() {
+                tokio::time::sleep(self.slow_by).await;
+            }
             self.puts.lock().unwrap().push((key.to_string(), body));
             Ok(format!("s3:/{}/{key}", "/lab-recordings"))
         }
@@ -2809,12 +3111,32 @@ mod tests {
         TapPlane::new(TapPlaneConfig {
             default_node: None,
             local_media_address: IpAddr::from([127, 0, 0, 1]),
+            advertised_media_address: IpAddr::from([127, 0, 0, 1]),
+            media_ports: MediaPortAllocator::ephemeral(),
             format: AudioFormat::pcmu_8k_20ms(),
             transcode_at_tap: true,
             opus_decode_rate_hz: 16000,
             cookie_prefix: 1,
             sdp_session_id: 1,
             recording,
+            capabilities: Arc::new(NodeCapabilityLog::new(true)),
+        })
+    }
+
+    use std::net::UdpSocket;
+
+    fn plane_with_media(advertised: IpAddr, ports: Arc<MediaPortAllocator>) -> TapPlane {
+        TapPlane::new(TapPlaneConfig {
+            default_node: None,
+            local_media_address: IpAddr::from([127, 0, 0, 1]),
+            advertised_media_address: advertised,
+            media_ports: ports,
+            format: AudioFormat::pcmu_8k_20ms(),
+            transcode_at_tap: true,
+            opus_decode_rate_hz: 16000,
+            cookie_prefix: 1,
+            sdp_session_id: 1,
+            recording: RecordingSupport::default(),
             capabilities: Arc::new(NodeCapabilityLog::new(true)),
         })
     }
@@ -2826,6 +3148,7 @@ mod tests {
             kind,
             call_id: "call-abc".to_string(),
             from_tags: vec!["from-a".to_string()],
+            attribution: Attribution::Explicit,
             rtpengine_node: node.to_string(),
             sdp_offer: None,
             sdp_answer: None,
@@ -2833,6 +3156,152 @@ mod tests {
             attachments: Vec::new(),
             authoritative: None,
         }
+    }
+
+    fn plane_with_default_node(node: &str) -> TapPlane {
+        TapPlane::new(TapPlaneConfig {
+            default_node: Some(node.parse().expect("a default node")),
+            local_media_address: IpAddr::from([127, 0, 0, 1]),
+            advertised_media_address: IpAddr::from([127, 0, 0, 1]),
+            media_ports: MediaPortAllocator::ephemeral(),
+            format: AudioFormat::pcmu_8k_20ms(),
+            transcode_at_tap: true,
+            opus_decode_rate_hz: 16000,
+            cookie_prefix: 1,
+            sdp_session_id: 1,
+            recording: RecordingSupport::default(),
+            capabilities: Arc::new(NodeCapabilityLog::new(true)),
+        })
+    }
+
+    fn mapped(
+        plane: &TapPlane,
+        map: crate::discovery::FixedNodeMap,
+    ) -> Arc<crate::discovery::DiscoveryCounters> {
+        let counters = Arc::new(crate::discovery::DiscoveryCounters::default());
+        plane.discover_through(Arc::new(crate::discovery::NodeDiscovery::new(
+            Arc::new(map),
+            "mss:call-node:".to_string(),
+            Arc::clone(&counters),
+        )));
+        counters
+    }
+
+    fn tap_without_a_node() -> SessionView {
+        SessionView {
+            from_tags: Vec::new(),
+            attribution: Attribution::Unknown,
+            ..session(SessionKind::Tap, "")
+        }
+    }
+
+    #[tokio::test]
+    async fn a_mapped_call_goes_to_the_mapped_node_not_the_default_one() {
+        let plane = plane_with_default_node("10.0.0.9:22222");
+        let counters = mapped(
+            &plane,
+            crate::discovery::FixedNodeMap::holding(
+                r#"{"node":"10.0.0.5:22222","caller_tag":"caller-tag"}"#,
+            ),
+        );
+        let resolved = plane
+            .resolve_node(tap_without_a_node())
+            .await
+            .expect("the map answers");
+        assert_eq!(resolved.node.to_string(), "10.0.0.5:22222");
+        assert_eq!(resolved.view.from_tags, vec!["caller-tag".to_string()]);
+        assert!(resolved.caller_named);
+        assert_eq!(counters.hits.load(std::sync::atomic::Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn an_unmapped_call_falls_back_to_the_default_node() {
+        let plane = plane_with_default_node("10.0.0.9:22222");
+        let counters = mapped(&plane, crate::discovery::FixedNodeMap::empty());
+        let resolved = plane
+            .resolve_node(tap_without_a_node())
+            .await
+            .expect("the default node answers");
+        assert_eq!(resolved.node.to_string(), "10.0.0.9:22222");
+        assert!(resolved.view.from_tags.is_empty());
+        assert!(!resolved.caller_named);
+        assert_eq!(
+            counters.misses.load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unreachable_map_never_fails_the_session() {
+        let plane = plane_with_default_node("10.0.0.9:22222");
+        let counters = mapped(&plane, crate::discovery::FixedNodeMap::unreachable());
+        let resolved = plane
+            .resolve_node(tap_without_a_node())
+            .await
+            .expect("a broken map is not fatal");
+        assert_eq!(resolved.node.to_string(), "10.0.0.9:22222");
+        assert_eq!(
+            counters.errors.load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn a_caller_that_names_its_node_is_never_looked_up() {
+        let plane = plane_with_default_node("10.0.0.9:22222");
+        let counters = mapped(
+            &plane,
+            crate::discovery::FixedNodeMap::holding("10.0.0.5:22222"),
+        );
+        let resolved = plane
+            .resolve_node(session(SessionKind::Tap, "10.0.0.7:22222"))
+            .await
+            .expect("the named node stands");
+        assert_eq!(resolved.node.to_string(), "10.0.0.7:22222");
+        assert!(resolved.caller_named);
+        assert_eq!(counters.hits.load(std::sync::atomic::Ordering::Relaxed), 0);
+        assert_eq!(
+            counters.misses.load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn the_map_never_overrides_from_tags_the_caller_gave() {
+        let plane = plane_with_default_node("10.0.0.9:22222");
+        mapped(
+            &plane,
+            crate::discovery::FixedNodeMap::holding(
+                r#"{"node":"10.0.0.5:22222","caller_tag":"mapped-tag"}"#,
+            ),
+        );
+        let resolved = plane
+            .resolve_node(session(SessionKind::Tap, ""))
+            .await
+            .expect("the map answers");
+        assert_eq!(resolved.node.to_string(), "10.0.0.5:22222");
+        assert_eq!(resolved.view.from_tags, vec!["from-a".to_string()]);
+        assert!(resolved.caller_named);
+    }
+
+    #[tokio::test]
+    async fn tags_from_a_map_that_names_no_caller_claim_no_direction() {
+        let plane = plane_with_default_node("10.0.0.9:22222");
+        mapped(
+            &plane,
+            crate::discovery::FixedNodeMap::holding(
+                r#"{"node":"10.0.0.5:22222","from_tags":["one","two","three"]}"#,
+            ),
+        );
+        let resolved = plane
+            .resolve_node(tap_without_a_node())
+            .await
+            .expect("the map answers");
+        assert_eq!(
+            resolved.view.from_tags,
+            vec!["one".to_string(), "two".to_string()]
+        );
+        assert!(!resolved.caller_named);
     }
 
     fn inline_session(offer: &str) -> SessionView {
@@ -2866,6 +3335,9 @@ mod tests {
             spill_every: recorder::SPILL_EVERY,
             counters: Arc::new(RecorderCounters::default()),
             owner: "pod-a".to_string(),
+            upload_permits: std::sync::Arc::new(tokio::sync::Semaphore::new(
+                recorder::DEFAULT_UPLOAD_CONCURRENCY,
+            )),
         }
     }
 
@@ -3076,6 +3548,94 @@ a=rtpmap:101 telephone-event/8000\r\na=ptime:20\r\n"
                 "the egress sequence never skips: {sequences:?}"
             );
         }
+
+        plane
+            .close_session(session)
+            .await
+            .expect("the inline leg closes");
+    }
+
+    #[derive(Default)]
+    struct WitnessedObservations(Mutex<Vec<(SessionId, Observation)>>);
+
+    impl WitnessedObservations {
+        fn digits(&self) -> Vec<Observation> {
+            self.0
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(_, seen)| matches!(seen, Observation::Dtmf { .. }))
+                .map(|(_, seen)| seen.clone())
+                .collect()
+        }
+    }
+
+    impl ObservationSink for WitnessedObservations {
+        fn observe(&self, session: SessionId, observation: Observation) {
+            self.0.lock().unwrap().push((session, observation));
+        }
+    }
+
+    fn digit_datagram(sequence: u16, timestamp: u32, event: u8, end: bool, ticks: u16) -> Vec<u8> {
+        let ticks = ticks.to_be_bytes();
+        let payload = [event, if end { 0x8A } else { 0x0A }, ticks[0], ticks[1]];
+        let packet = media_core::rtp::RtpPacket {
+            marker: false,
+            payload_type: 101,
+            sequence,
+            timestamp,
+            ssrc: 0x0bad_cafe,
+            payload: &payload,
+        };
+        let mut datagram = vec![0u8; 12 + payload.len()];
+        let written = packet.serialize(&mut datagram).expect("an rtp datagram");
+        datagram.truncate(written);
+        datagram
+    }
+
+    #[tokio::test]
+    async fn a_digit_pressed_on_a_leg_reaches_the_event_bus_once_with_no_consumer_attached() {
+        let peer = UdpSocket::bind("127.0.0.1:0").expect("a fake peer socket");
+        peer.set_nonblocking(true).expect("nonblocking peer");
+        let peer_port = peer.local_addr().expect("peer address").port();
+        let plane = plane();
+        let witness = Arc::new(WitnessedObservations::default());
+        plane.observe_through(Arc::downgrade(&witness) as Weak<dyn ObservationSink>);
+        let session = SessionId::from_raw(1);
+
+        let opened = plane
+            .open_session(inline_session(&inline_offer_sdp(peer_port)))
+            .await
+            .expect("an inline leg answers a pcmu offer");
+        let answered = InlineOffer::parse(
+            &opened
+                .sdp_answer
+                .expect("an inline session answers with sdp"),
+            20,
+        )
+        .expect("our own answer is valid sdp");
+        let ours = SocketAddr::new(IpAddr::from([127, 0, 0, 1]), answered.peer_port);
+
+        peer.send_to(&tone_datagram(0, 4_000), ours)
+            .expect("the peer can reach the inline leg");
+        peer.send_to(&digit_datagram(1, 160, 1, false, 400), ours)
+            .expect("a digit begins");
+        for sequence in 2..5u16 {
+            peer.send_to(&digit_datagram(sequence, 160, 1, true, 800), ours)
+                .expect("rfc 4733 repeats the end packet three times");
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        assert_eq!(
+            witness.digits(),
+            vec![Observation::Dtmf {
+                track: Track::Customer,
+                digit: '1',
+                duration_ms: 100,
+                rtp_timestamp: 160,
+            }],
+            "one press is one event, whatever the end packet is repeated"
+        );
 
         plane
             .close_session(session)
@@ -3304,6 +3864,9 @@ m=audio {peer_port} RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\na=ptime:{ptime_ms}\r\n"
             spill_every: recorder::SPILL_EVERY,
             counters: Arc::new(RecorderCounters::default()),
             owner: "pod-a".to_string(),
+            upload_permits: std::sync::Arc::new(tokio::sync::Semaphore::new(
+                recorder::DEFAULT_UPLOAD_CONCURRENCY,
+            )),
         })
     }
 
@@ -3377,6 +3940,7 @@ m=audio {peer_port} RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\na=ptime:{ptime_ms}\r\n"
                 .await
                 .expect("a recording attachment closes and uploads");
         }
+        plane.await_uploads().await;
 
         let mut keys = bucket.keys();
         keys.sort();
@@ -3472,6 +4036,7 @@ m=audio {peer_port} RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\na=ptime:{ptime_ms}\r\n"
             .close_attachment(bob.session, AttachmentId::from_raw(11))
             .await
             .expect("the stereo object uploads");
+        plane.await_uploads().await;
 
         let (channels, samples) = recorded_wav(&bucket.body("acct-7/late.wav"));
         assert_eq!(channels, 2);
@@ -4570,6 +5135,9 @@ m=audio 41000 RTP/AVP 111\r\na=rtpmap:111 opus/48000/2\r\n",
             spill_every: recorder::SPILL_EVERY,
             counters: Arc::new(RecorderCounters::default()),
             owner: "pod-a".to_string(),
+            upload_permits: std::sync::Arc::new(tokio::sync::Semaphore::new(
+                recorder::DEFAULT_UPLOAD_CONCURRENCY,
+            )),
         });
         let error = plane
             .open_attachment(attachment(Transport::FileS3, "acct-42/rec-99.wav"))
@@ -4627,14 +5195,24 @@ m=audio 41000 RTP/AVP 111\r\na=rtpmap:111 opus/48000/2\r\n",
     fn a_group_member_writes_one_mono_object_per_track_it_selected() {
         let identity = identity("acct-42/rec-99.wav");
         assert_eq!(
-            participant_targets(&identity, "alice", TrackSelector::Only(Track::Customer)),
+            participant_targets(
+                &identity,
+                "alice",
+                TrackSelector::Only(Track::Customer),
+                Attribution::Explicit
+            ),
             vec![RecordingTarget {
                 key: "acct-42/rec-99/alice.wav".to_string(),
                 layout: Layout::Mono(Track::Customer),
             }]
         );
         assert_eq!(
-            participant_targets(&identity, "alice", TrackSelector::All),
+            participant_targets(
+                &identity,
+                "alice",
+                TrackSelector::All,
+                Attribution::Explicit
+            ),
             vec![
                 RecordingTarget {
                     key: "acct-42/rec-99/alice.customer.wav".to_string(),
@@ -4667,8 +5245,13 @@ m=audio 41000 RTP/AVP 111\r\na=rtpmap:111 opus/48000/2\r\n",
             account_id: identity.account_id.clone(),
             group: "conf-9".to_string(),
         };
-        let alice = participant_targets(&identity, "alice", TrackSelector::All);
-        let bob = participant_targets(&identity, "bob", TrackSelector::All);
+        let alice = participant_targets(
+            &identity,
+            "alice",
+            TrackSelector::All,
+            Attribution::Explicit,
+        );
+        let bob = participant_targets(&identity, "bob", TrackSelector::All, Attribution::Explicit);
 
         let opened = plane
             .join_group(&key, AttachmentId::from_raw(2), &identity, &alice)
@@ -4712,7 +5295,7 @@ m=audio 41000 RTP/AVP 111\r\na=rtpmap:111 opus/48000/2\r\n",
                 &key,
                 AttachmentId::from_raw(2),
                 &first,
-                &participant_targets(&first, "alice", TrackSelector::All),
+                &participant_targets(&first, "alice", TrackSelector::All, Attribution::Explicit),
             )
             .unwrap();
         let error = plane
@@ -4720,7 +5303,7 @@ m=audio 41000 RTP/AVP 111\r\na=rtpmap:111 opus/48000/2\r\n",
                 &key,
                 AttachmentId::from_raw(3),
                 &second,
-                &participant_targets(&second, "bob", TrackSelector::All),
+                &participant_targets(&second, "bob", TrackSelector::All, Attribution::Explicit),
             )
             .unwrap_err();
 
@@ -4750,6 +5333,7 @@ m=audio 41000 RTP/AVP 111\r\na=rtpmap:111 opus/48000/2\r\n",
                         &identity,
                         &format!("caller-{index}"),
                         TrackSelector::Only(Track::Customer),
+                        Attribution::Explicit,
                     ),
                 )
                 .unwrap();
@@ -4770,7 +5354,12 @@ m=audio 41000 RTP/AVP 111\r\na=rtpmap:111 opus/48000/2\r\n",
                 &key,
                 members[0],
                 &identity,
-                &participant_targets(&identity, "caller-0", TrackSelector::Only(Track::Customer)),
+                &participant_targets(
+                    &identity,
+                    "caller-0",
+                    TrackSelector::Only(Track::Customer),
+                    Attribution::Explicit,
+                ),
             )
             .expect("the same group name is free once the last member has gone");
         assert_eq!(counters.groups_live.load(Ordering::Relaxed), 1);
@@ -4832,6 +5421,90 @@ m=audio 41000 RTP/AVP 111\r\na=rtpmap:111 opus/48000/2\r\n",
                 ptime_ms: 20,
             }
         ));
+    }
+
+    #[test]
+    fn a_tap_answer_carries_the_advertised_address_not_the_bind_address() {
+        let offer = offer_of("0 101", &["0 PCMU/8000", "101 telephone-event/8000"]);
+        let answer_with = negotiated_tap_codec(&offer).expect("pcmu is negotiable");
+        let sdp = tap_answer_sdp(
+            1,
+            IpAddr::from([198, 51, 100, 9]),
+            &[41000],
+            AudioFormat::pcmu_8k_20ms(),
+            answer_with,
+            &offer,
+        )
+        .expect("an answer");
+        assert!(sdp.contains("c=IN IP4 198.51.100.9"), "{sdp}");
+        assert!(sdp.contains("m=audio 41000"), "{sdp}");
+        assert!(!sdp.contains("127.0.0.1"), "{sdp}");
+    }
+
+    #[tokio::test]
+    async fn an_inline_answer_carries_the_advertised_address_while_the_socket_binds_locally() {
+        let peer = UdpSocket::bind("127.0.0.1:0").expect("a fake peer socket");
+        let peer_port = peer.local_addr().expect("peer address").port();
+        let plane = plane_with_media(
+            IpAddr::from([203, 0, 113, 7]),
+            MediaPortAllocator::ephemeral(),
+        );
+
+        let answer = plane
+            .open_session(inline_session(&inline_offer_sdp(peer_port)))
+            .await
+            .expect("an inline leg answers a pcmu offer")
+            .sdp_answer
+            .expect("an inline session answers with sdp");
+
+        assert!(answer.contains("203.0.113.7"), "{answer}");
+        assert!(!answer.contains("127.0.0.1"), "{answer}");
+    }
+
+    #[tokio::test]
+    async fn a_media_port_range_bounds_inline_sockets_and_frees_them_on_close() {
+        let peer = UdpSocket::bind("127.0.0.1:0").expect("a fake peer socket");
+        let peer_port = peer.local_addr().expect("peer address").port();
+        let plane = plane_with_media(
+            IpAddr::from([127, 0, 0, 1]),
+            MediaPortAllocator::over_range(41500, 41501),
+        );
+
+        let answer = plane
+            .open_session(inline_session(&inline_offer_sdp(peer_port)))
+            .await
+            .expect("the first inline leg takes the only rtp port in the range")
+            .sdp_answer
+            .expect("an inline session answers with sdp");
+        assert!(answer.contains("m=audio 41500"), "{answer}");
+
+        let error = plane
+            .open_session(SessionView {
+                id: SessionId::from_raw(2),
+                ..inline_session(&inline_offer_sdp(peer_port))
+            })
+            .await
+            .expect_err("the range holds one rtp port");
+        assert!(
+            error.to_string().contains("every port in 41500-41501"),
+            "{error}"
+        );
+
+        plane
+            .close_session(SessionId::from_raw(1))
+            .await
+            .expect("the first session closes");
+
+        let answer = plane
+            .open_session(SessionView {
+                id: SessionId::from_raw(3),
+                ..inline_session(&inline_offer_sdp(peer_port))
+            })
+            .await
+            .expect("the freed port is handed out again")
+            .sdp_answer
+            .expect("an inline session answers with sdp");
+        assert!(answer.contains("m=audio 41500"), "{answer}");
     }
 
     fn offer_of(payload_types: &str, rtpmaps: &[&str]) -> SubscriptionOffer {
@@ -5030,6 +5703,7 @@ m=audio 41000 RTP/AVP 111\r\na=rtpmap:111 opus/48000/2\r\n",
             frames,
             AudioFormat::pcmu_8k_20ms(),
             AudioFormat::l16_16k_20ms(),
+            Attribution::Explicit,
         ));
 
         hub.publish(crate::hub::TapEvent::media(
@@ -5192,6 +5866,7 @@ m=audio 41000 RTP/AVP 111\r\na=rtpmap:111 opus/48000/2\r\n",
             frames.clone(),
             AudioFormat::pcmu_8k_20ms(),
             AudioFormat::pcmu_8k_20ms(),
+            Attribution::Explicit,
         ));
 
         hub.publish(TapEvent::media(Track::Customer, 0, &[0i16; 160]));
@@ -5284,6 +5959,392 @@ m=audio 41000 RTP/AVP 111\r\na=rtpmap:111 opus/48000/2\r\n",
             vec!["inbound"]
         );
     }
+    const SCHEME_SEPARATOR: &str = "\x2f\x2f";
+
+    struct WiredRoom {
+        endpoint: String,
+        stop: Option<tokio::sync::oneshot::Sender<()>>,
+        serving: tokio::task::JoinHandle<()>,
+    }
+
+    impl WiredRoom {
+        async fn open() -> WiredRoom {
+            WiredRoom::with_plane(Arc::new(plane())).await.0
+        }
+
+        async fn with_plane(
+            plane: Arc<TapPlane>,
+        ) -> (WiredRoom, Arc<control_api::SessionController>) {
+            let media: Arc<dyn MediaPlane> = Arc::clone(&plane) as Arc<dyn MediaPlane>;
+            let controller =
+                Arc::new(control_api::SessionController::new("wire-pod").with_media_plane(media));
+            plane.observe_through(Arc::downgrade(&controller) as Weak<dyn ObservationSink>);
+            let room = WiredRoom::serving(Arc::clone(&controller)).await;
+            (room, controller)
+        }
+
+        async fn serving(controller: Arc<control_api::SessionController>) -> WiredRoom {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("a control port");
+            let port = listener.local_addr().expect("the control address").port();
+            let (stop, stopped) = tokio::sync::oneshot::channel();
+            let serving = tokio::spawn(async move {
+                control_api::serve_shared_until(controller, listener, async {
+                    let _ = stopped.await;
+                })
+                .await
+                .expect("the control plane serves");
+            });
+            WiredRoom {
+                endpoint: format!("http:{SCHEME_SEPARATOR}127.0.0.1:{port}"),
+                stop: Some(stop),
+                serving,
+            }
+        }
+
+        async fn close(mut self) {
+            if let Some(stop) = self.stop.take() {
+                let _ = stop.send(());
+            }
+            let _ = self.serving.await;
+        }
+    }
+
+    fn silent_peer() -> (UdpSocket, String) {
+        let socket = UdpSocket::bind("127.0.0.1:0").expect("a fake peer socket");
+        socket.set_nonblocking(true).expect("nonblocking peer");
+        let port = socket.local_addr().expect("peer address").port();
+        let offer = inline_offer_sdp(port);
+        (socket, offer)
+    }
+
+    fn wire_reference(external_id: &str) -> control_api::proto::SessionRef {
+        control_api::proto::SessionRef {
+            id: Some(control_api::proto::session_ref::Id::ExternalId(
+                external_id.to_string(),
+            )),
+        }
+    }
+
+    #[tokio::test]
+    async fn describing_a_member_reads_back_its_own_state_and_enumerates_the_room() {
+        use control_api::proto;
+        use control_api::proto::media_control_client::MediaControlClient;
+
+        let room = WiredRoom::open().await;
+        let mut client = MediaControlClient::connect(room.endpoint.clone())
+            .await
+            .expect("a client reaches the control port");
+
+        let mut attachments = Vec::new();
+        let mut peers = Vec::new();
+        for member in ["alice", "bob", "carol"] {
+            let (peer, offer) = silent_peer();
+            peers.push(peer);
+            client
+                .create_session(proto::CreateSessionRequest {
+                    external_id: member.to_string(),
+                    kind: proto::SessionKind::Inline as i32,
+                    call_id: format!("call-{member}"),
+                    from_tags: Vec::new(),
+                    rtpengine_node: String::new(),
+                    mix: false,
+                    idempotency_key: String::new(),
+                    sdp_offer: offer,
+                    group: "sales-standup".to_string(),
+                })
+                .await
+                .expect("an inline leg is answered and seated")
+                .into_inner();
+            let attachment = client
+                .attach(proto::AttachRequest {
+                    session: Some(wire_reference(member)),
+                    transport: proto::Transport::GrpcStream as i32,
+                    capabilities: vec![
+                        proto::Capability::Sink as i32,
+                        proto::Capability::Inject as i32,
+                    ],
+                    selector: None,
+                    format: None,
+                    authoritative: false,
+                    label: member.to_string(),
+                    endpoint: "grpc-target".to_string(),
+                    group: String::new(),
+                    metadata: Default::default(),
+                    idempotency_key: String::new(),
+                })
+                .await
+                .expect("an inject attachment on a member session")
+                .into_inner();
+            attachments.push(attachment.attachment_id);
+        }
+
+        let update =
+            |attachment: String, pairs: Vec<(&str, &str)>| proto::UpdateAttachmentRequest {
+                attachment_id: attachment,
+                paused: None,
+                selector: None,
+                format: None,
+                idempotency_key: String::new(),
+                metadata: pairs
+                    .into_iter()
+                    .map(|(key, value)| (key.to_string(), value.to_string()))
+                    .collect(),
+            };
+        client
+            .update_attachment(update(
+                attachments[1].clone(),
+                vec![(MEMBER_MUTE_METADATA_KEY, MEMBER_FLAG_ON)],
+            ))
+            .await
+            .expect("bob is muted through his own attachment");
+        client
+            .update_attachment(update(
+                attachments[0].clone(),
+                vec![(MIX_TARGET_METADATA_KEY, "carol")],
+            ))
+            .await
+            .expect("alice whispers to carol");
+
+        let describe = |mut client: proto::media_control_client::MediaControlClient<
+            control_api::tonic::transport::Channel,
+        >,
+                        member: &'static str| async move {
+            client
+                .describe_session(wire_reference(member))
+                .await
+                .expect("a member describes")
+                .into_inner()
+        };
+
+        let alice = describe(client.clone(), "alice").await;
+        let member = alice.member.expect("a seated member reads its state back");
+        assert!(!member.mute && !member.deaf && !member.hold);
+        assert_eq!(member.mix_source, "inject");
+        assert_eq!(member.routes.len(), 1, "the whisper is the only route");
+        assert_eq!(member.routes[0].target, "carol");
+        assert_eq!(member.routes[0].source, "inject");
+        assert!(member.routes[0].monitor_audible);
+        assert_eq!(member.routes[0].attachment_id, attachments[0]);
+        let room_view = alice.conference.expect("a member enumerates its room");
+        assert_eq!(room_view.group, "sales-standup");
+        assert_eq!(room_view.member_count, 3);
+        assert_eq!(
+            room_view.members,
+            vec!["alice".to_string(), "bob".to_string(), "carol".to_string()]
+        );
+
+        let bob = describe(client.clone(), "bob").await;
+        let muted = bob.member.expect("bob reads his state back");
+        assert!(muted.mute, "the mute verb is visible to the next reader");
+        assert!(!muted.deaf && !muted.hold);
+        assert!(
+            muted.routes.is_empty(),
+            "a plain member routes nothing anywhere else"
+        );
+
+        let carol = describe(client.clone(), "carol").await;
+        let whispered_at = carol.member.expect("carol reads her state back");
+        assert!(!whispered_at.mute && !whispered_at.deaf && !whispered_at.hold);
+        assert!(
+            whispered_at.routes.is_empty(),
+            "being whispered at is not a route of one's own"
+        );
+
+        client
+            .destroy_session(wire_reference("carol"))
+            .await
+            .expect("carol leaves the room");
+
+        let after = describe(client.clone(), "alice").await;
+        let room_after = after.conference.expect("the room is still enumerable");
+        assert_eq!(room_after.member_count, 2);
+        assert_eq!(
+            room_after.members,
+            vec!["alice".to_string(), "bob".to_string()]
+        );
+        let alice_after = after.member.expect("alice still reads her state back");
+        assert_eq!(
+            alice_after.routes[0].target, "carol",
+            "the route outlives the member it named, which is what makes it auditable"
+        );
+
+        let bob_after = describe(client.clone(), "bob").await;
+        assert!(
+            bob_after.member.expect("bob is still seated").mute,
+            "member state has no lease, so it survives every other membership change"
+        );
+
+        room.close().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_detach_is_answered_before_the_upload_and_the_upload_event_ends_the_sequence() {
+        use control_api::proto;
+        use control_api::proto::media_control_client::MediaControlClient;
+
+        const SLOW_BY: Duration = Duration::from_millis(1_500);
+        const ANSWERED_WITHIN: Duration = Duration::from_millis(100);
+
+        let bucket = Arc::new(BucketSink::slow(SLOW_BY));
+        let plane = Arc::new(bucket_plane(&bucket));
+        let counters = Arc::clone(&plane.config.recording.counters);
+        let (room, controller) = WiredRoom::with_plane(Arc::clone(&plane)).await;
+        let mut events = controller.subscribe();
+        let mut client = MediaControlClient::connect(room.endpoint.clone())
+            .await
+            .expect("a client reaches the control port");
+
+        let (_peer, offer) = silent_peer();
+        client
+            .create_session(proto::CreateSessionRequest {
+                external_id: "call-7".to_string(),
+                kind: proto::SessionKind::Inline as i32,
+                call_id: "call-7".to_string(),
+                from_tags: Vec::new(),
+                rtpengine_node: String::new(),
+                mix: false,
+                idempotency_key: String::new(),
+                sdp_offer: offer,
+                group: String::new(),
+            })
+            .await
+            .expect("an inline leg to record");
+
+        let record = |mut client: MediaControlClient<control_api::tonic::transport::Channel>,
+                      endpoint: &'static str| async move {
+            client
+                .attach(proto::AttachRequest {
+                    session: Some(wire_reference("call-7")),
+                    transport: proto::Transport::FileS3 as i32,
+                    capabilities: vec![proto::Capability::Sink as i32],
+                    selector: None,
+                    format: None,
+                    authoritative: false,
+                    label: String::new(),
+                    endpoint: endpoint.to_string(),
+                    group: String::new(),
+                    metadata: Default::default(),
+                    idempotency_key: String::new(),
+                })
+                .await
+                .expect("a recording attachment")
+                .into_inner()
+                .attachment_id
+        };
+
+        let first = record(client.clone(), "acct-42/rec-99.wav").await;
+        let asked = Instant::now();
+        client
+            .detach(proto::AttachmentRef {
+                attachment_id: first.clone(),
+            })
+            .await
+            .expect("the recording is stopped");
+        let answered = asked.elapsed();
+        assert!(
+            answered < ANSWERED_WITHIN,
+            "Detach answered in {answered:?}, so it waited for the upload"
+        );
+        assert_eq!(plane.uploads_in_flight(), 1);
+
+        let second = record(client.clone(), "acct-42/rec-100.wav").await;
+        let asked_again = Instant::now();
+        client
+            .destroy_session(wire_reference("call-7"))
+            .await
+            .expect("the call ends while its recording is still uploading");
+        let ended = asked_again.elapsed();
+        assert!(
+            ended < ANSWERED_WITHIN,
+            "DestroySession answered in {ended:?}, so it waited for the upload"
+        );
+        assert!(
+            client
+                .describe_session(wire_reference("call-7"))
+                .await
+                .is_err(),
+            "an ended session is not describable by its external id, finishing or not"
+        );
+
+        let mut seen: Vec<(u64, session_core::EventKind)> = Vec::new();
+        let deadline = tokio::time::Instant::now() + SLOW_BY * 4;
+        while seen
+            .iter()
+            .filter(|(_, kind)| matches!(kind, session_core::EventKind::UploadCompleted { .. }))
+            .count()
+            < 2
+        {
+            let event = tokio::time::timeout_at(deadline, events.recv())
+                .await
+                .unwrap_or_else(|_| panic!("the upload events never arrived; saw {seen:?}"))
+                .expect("the event watcher stayed open");
+            assert_eq!(event.external_id, "call-7");
+            seen.push((event.seq, event.kind));
+        }
+
+        let seqs: Vec<u64> = seen.iter().map(|(seq, _)| *seq).collect();
+        assert_eq!(
+            seqs,
+            (0..seen.len() as u64).collect::<Vec<u64>>(),
+            "the sequence of a session whose uploads outlive it stays gapless and in order: \
+             {seen:?}"
+        );
+        let names: Vec<&str> = seen.iter().map(|(_, kind)| event_name(kind)).collect();
+        assert_eq!(
+            names,
+            vec![
+                "attachment-up",
+                "recording-started",
+                "attachment-down",
+                "recording-stopped",
+                "attachment-up",
+                "recording-started",
+                "recording-stopped",
+                "attachment-down",
+                "session-ended",
+                "upload-completed",
+                "upload-completed",
+            ],
+            "a stop is always published before its caller is answered, and both uploads report \
+             themselves after the session that owned them has already ended: {seen:?}"
+        );
+        assert!(
+            !second.is_empty() && second != first,
+            "the two recordings were different attachments"
+        );
+        assert_eq!(
+            bucket.keys(),
+            vec![
+                "acct-42/rec-99.wav".to_string(),
+                "acct-42/rec-100.wav".to_string()
+            ]
+        );
+        assert_eq!(counters.uploads_backgrounded.load(Ordering::Relaxed), 2);
+        assert_eq!(counters.uploaded.load(Ordering::Relaxed), 2);
+        plane.await_uploads().await;
+        assert_eq!(plane.uploads_in_flight(), 0);
+        assert_eq!(controller.sessions_finishing(), 0);
+        assert_eq!(controller.counts(), (0, 0));
+
+        room.close().await;
+    }
+
+    fn event_name(kind: &session_core::EventKind) -> &'static str {
+        use session_core::EventKind;
+        match kind {
+            EventKind::AttachmentUp { .. } => "attachment-up",
+            EventKind::AttachmentDown { .. } => "attachment-down",
+            EventKind::RecordingStarted { .. } => "recording-started",
+            EventKind::RecordingStopped { .. } => "recording-stopped",
+            EventKind::RecordingPaused { .. } => "recording-paused",
+            EventKind::UploadCompleted { .. } => "upload-completed",
+            EventKind::UploadFailed { .. } => "upload-failed",
+            EventKind::SessionEnded { .. } => "session-ended",
+            _ => "other",
+        }
+    }
 }
 
 #[cfg(test)]
@@ -5316,5 +6377,114 @@ mod leg_naming_tests {
         assert!(!requeries.note(&[0]));
         assert!(requeries.note(&[u32::MAX]));
         assert!(requeries.note(&[0]));
+    }
+
+    fn stamped(pairs: &[(&str, Option<i64>)]) -> Vec<(String, Option<i64>)> {
+        pairs
+            .iter()
+            .map(|(tag, created)| ((*tag).to_string(), *created))
+            .collect()
+    }
+
+    #[test]
+    fn creation_times_that_separate_two_legs_make_the_earliest_one_the_customer() {
+        let ordered = order_participants(&stamped(&[
+            ("fs-side", Some(1787737395)),
+            ("carrier-side", Some(1787737383)),
+        ]));
+        assert_eq!(ordered.attribution, Attribution::Inferred);
+        assert_eq!(ordered.tags, vec!["carrier-side", "fs-side"]);
+    }
+
+    #[test]
+    fn one_creation_second_for_both_legs_claims_no_direction_at_all() {
+        let ordered = order_participants(&stamped(&[
+            ("fs-side", Some(1787737383)),
+            ("carrier-side", Some(1787737383)),
+        ]));
+        assert_eq!(ordered.attribution, Attribution::Unknown);
+        assert_eq!(ordered.tags, vec!["fs-side", "carrier-side"]);
+    }
+
+    #[test]
+    fn a_participant_rtpengine_never_stamped_sorts_last_and_settles_nothing() {
+        let ordered = order_participants(&stamped(&[("late", None), ("early", None)]));
+        assert_eq!(ordered.attribution, Attribution::Unknown);
+        assert_eq!(ordered.tags, vec!["late", "early"]);
+        let half = order_participants(&stamped(&[("unstamped", None), ("stamped", Some(9))]));
+        assert_eq!(half.attribution, Attribution::Unknown);
+        assert_eq!(half.tags, vec!["stamped", "unstamped"]);
+    }
+
+    #[test]
+    fn a_second_dialogue_on_one_call_id_sorts_after_the_first_two_legs() {
+        let ordered = order_participants(&stamped(&[
+            ("legC", Some(1787737395)),
+            ("legD", Some(1787737395)),
+            ("legA", Some(1787737383)),
+            ("legB", Some(1787737383)),
+        ]));
+        assert_eq!(ordered.tags, vec!["legA", "legB", "legC", "legD"]);
+        assert_eq!(ordered.attribution, Attribution::Unknown);
+    }
+
+    #[test]
+    fn only_unknown_attribution_renames_the_grpc_and_recording_tracks() {
+        use control_api::convert::track_name_under;
+        for settled in [Attribution::Explicit, Attribution::Inferred] {
+            assert_eq!(track_name_under(Track::Customer, settled), "customer");
+            assert_eq!(track_name_under(Track::Agent, settled), "agent");
+        }
+        assert_eq!(
+            track_name_under(Track::Customer, Attribution::Unknown),
+            "leg_a"
+        );
+        assert_eq!(
+            track_name_under(Track::Agent, Attribution::Unknown),
+            "leg_b"
+        );
+        assert_eq!(
+            track_name_under(Track::Mixed, Attribution::Unknown),
+            "mixed"
+        );
+    }
+
+    #[test]
+    fn an_unattributed_recording_names_its_objects_leg_a_and_leg_b() {
+        let identity = RecordingIdentity::parse("acct-42/rec-99.wav").unwrap();
+        let guessing =
+            participant_targets(&identity, "alice", TrackSelector::All, Attribution::Unknown);
+        let keys: Vec<String> = guessing.iter().map(|target| target.key.clone()).collect();
+        assert_eq!(
+            keys,
+            vec![
+                "acct-42/rec-99/alice.leg_a.wav".to_string(),
+                "acct-42/rec-99/alice.leg_b.wav".to_string()
+            ]
+        );
+        let told = participant_targets(
+            &identity,
+            "alice",
+            TrackSelector::All,
+            Attribution::Explicit,
+        );
+        let keys: Vec<String> = told.iter().map(|target| target.key.clone()).collect();
+        assert_eq!(
+            keys,
+            vec![
+                "acct-42/rec-99/alice.customer.wav".to_string(),
+                "acct-42/rec-99/alice.agent.wav".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn the_frozen_twilio_track_names_never_move_however_the_legs_were_labelled() {
+        assert_eq!(
+            tracks_of(TrackSelector::All),
+            vec!["inbound".to_string(), "outbound".to_string()]
+        );
+        assert_eq!(consumer_ws::track_name(Track::Customer), "inbound");
+        assert_eq!(consumer_ws::track_name(Track::Agent), "outbound");
     }
 }

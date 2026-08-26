@@ -71,6 +71,27 @@ impl NgReply {
             .collect()
     }
 
+    pub fn tags_created(&self) -> Vec<(String, Option<i64>)> {
+        let Some(Value::Dict(tags)) = self.body.get("tags") else {
+            return Vec::new();
+        };
+        let mut found = Vec::new();
+        for (tag, detail) in tags {
+            let Ok(tag) = std::str::from_utf8(tag) else {
+                continue;
+            };
+            if tag.is_empty() {
+                continue;
+            }
+            let created = match detail.get("created") {
+                Some(Value::Int(seconds)) => Some(*seconds),
+                _ => None,
+            };
+            found.push((tag.to_string(), created));
+        }
+        found
+    }
+
     pub fn rtpengine_version(&self) -> Option<&str> {
         self.body.get("version").and_then(Value::as_str)
     }
@@ -512,5 +533,34 @@ mod tag_tests {
     #[test]
     fn a_reply_with_no_tags_yields_nothing_rather_than_failing() {
         assert!(reply("d6:result2:oke").tags().is_empty());
+    }
+
+    #[test]
+    fn tags_created_reports_the_second_rtpengine_stamped_on_each_participant() {
+        let held = reply(
+            "d4:tagsd4:legAd7:createdi1787737383e3:tag4:legAe\
+4:legCd7:createdi1787737395e3:tag4:legCeee",
+        );
+        assert_eq!(
+            held.tags_created(),
+            vec![
+                ("legA".to_string(), Some(1787737383)),
+                ("legC".to_string(), Some(1787737395)),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_participant_without_a_created_stamp_is_reported_as_unstamped() {
+        let held = reply("d4:tagsd4:legAd3:tag4:legAe4:legBd7:createdi7eeee");
+        assert_eq!(
+            held.tags_created(),
+            vec![("legA".to_string(), None), ("legB".to_string(), Some(7))]
+        );
+    }
+
+    #[test]
+    fn tags_created_of_a_reply_without_tags_is_empty_rather_than_a_failure() {
+        assert!(reply("d6:result2:oke").tags_created().is_empty());
     }
 }
