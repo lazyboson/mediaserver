@@ -2193,6 +2193,49 @@ and race it.
   future inside it. Awaiting it inline meant a long-lived `MediaStream` could
   hold the whole shutdown open with nothing bounding it.
 
+### media_ports.rs — the media port range and the advertised address (items G2 + G3, 2026-08-26)
+
+`MediaPortAllocator` is the only thing in the daemon that binds a media socket.
+`ephemeral()` (no range configured) binds port 0 and behaves exactly as the code
+did before this item; `over_range(min, max)` keeps a `VecDeque` of the **even**
+ports in the range behind a `Mutex` and hands them out front to back.
+
+`bind(local_ip)` returns a `BoundMediaSocket { socket, port, lease }`. The lease
+is the whole lifetime story: `PortLease::drop` decrements `in_use` and pushes the
+port back, so a port is released by *dropping the thing that owns it* rather than
+by remembering to call a free function on every path. `LiveSession` holds
+`Vec<PortLease>` (two for a two-leg tap, one for an inline leg), and
+`TapPlane::close_session` takes them out **after** joining the capture thread and
+logs `released_ports` — the order matters: a lease dropped before the thread
+joins could hand a port to a new session while the old socket is still bound to
+it. Drain reaches the same path through `destroy_session`, so a drained pod
+returns its whole range.
+
+A candidate port that will not bind (another process holds it) is skipped and
+counted, up to `BIND_ATTEMPTS_PER_REQUEST` (64) per request; the skipped ports go
+back on the free list, because the squatter may be gone by the next call. Only an
+empty free list is a refusal — `MediaPortError::RangeExhausted`, which names the
+range in its message and bumps `mss_media_ports_exhausted_total`.
+
+The advertised address is a plain `IpAddr` on `TapPlaneConfig`
+(`advertised_media_address`), read once at startup by
+`media_ports::advertise_address(local)`. Every SDP that names MSS to a peer now
+goes through one of two pure functions in `tap_plane.rs`, `tap_answer_sdp` and
+`inline_answer_sdp`, which take the advertised address as an argument — that is
+what makes the "advertised in, bind address absent" assertions unit-testable
+without a socket. Nothing else in the daemon renders an address into SDP.
+
+Not in the range, deliberately: the NG control socket (`NgTransport::bind`). It
+is an outbound flow to rtpengine's 22222 and the range exists to be opened
+*inbound* on a firewall; the lab drill prints those sockets so the distinction
+stays visible rather than looking like a leak.
+
+`lab/media_port_drill.sh` is the live check. It reads `/proc/net/udp` inside the
+container (the lab's rust image has no `ss`), so it sees every UDP socket the
+process holds, and asserts: sockets inside the range while tapping, ingest
+datagrams climbing, nothing inside the range once the session is destroyed, and
+`in_use` back to `capacity`.
+
 ### hub.rs — the fan-out core (M3), first increment
 The per-session pub/sub the roadmap calls the fan-out hub. Two-worlds
 shape: the capture thread owns the consumer list and is the only thing

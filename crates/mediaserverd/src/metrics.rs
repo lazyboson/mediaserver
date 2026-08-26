@@ -1,5 +1,6 @@
 use crate::drain::DrainState;
 use crate::event_pump::PumpCounters;
+use crate::media_ports::MediaPortAllocator;
 use crate::registry_keeper::KeeperCounters;
 use crate::tap_plane::TapPlaneMetrics;
 use control_api::SessionController;
@@ -20,6 +21,7 @@ pub struct MetricsSources {
     pub pump: Option<Arc<PumpCounters>>,
     pub keeper: Option<Arc<KeeperCounters>>,
     pub drain: Arc<DrainState>,
+    pub ports: Arc<MediaPortAllocator>,
 }
 
 pub fn render(sources: &MetricsSources) -> String {
@@ -559,6 +561,44 @@ pub fn render(sources: &MetricsSources) -> String {
         );
     }
 
+    let ports = sources.ports.counters();
+    for (name, help, kind, value) in [
+        (
+            "mss_media_ports_exhausted_total",
+            "Media socket binds refused because the configured port range had nothing free",
+            "counter",
+            ports.exhausted,
+        ),
+        (
+            "mss_media_ports_bind_conflicts_total",
+            "Ports in the configured media range that another process already held",
+            "counter",
+            ports.bind_conflicts,
+        ),
+        (
+            "mss_media_ports_in_use",
+            "Media sockets this pod holds open",
+            "gauge",
+            ports.in_use,
+        ),
+        (
+            "mss_media_ports_free",
+            "Ports left in the configured media range; 0 when no range is configured",
+            "gauge",
+            ports.free,
+        ),
+        (
+            "mss_media_ports_capacity",
+            "Rtp sockets the configured media range can serve; 0 when no range is configured",
+            "gauge",
+            ports.capacity,
+        ),
+    ] {
+        let _ = writeln!(out, "# HELP {name} {help}");
+        let _ = writeln!(out, "# TYPE {name} {kind}");
+        let _ = writeln!(out, "{name} {value}");
+    }
+
     let _ = writeln!(
         out,
         "# HELP mss_draining Whether this pod is draining and refusing new sessions"
@@ -648,6 +688,8 @@ mod tests {
         let plane = TapPlane::new(TapPlaneConfig {
             default_node: None,
             local_media_address: IpAddr::from([127, 0, 0, 1]),
+            advertised_media_address: IpAddr::from([127, 0, 0, 1]),
+            media_ports: crate::media_ports::MediaPortAllocator::ephemeral(),
             format: AudioFormat::pcmu_8k_20ms(),
             transcode_at_tap: true,
             opus_decode_rate_hz: 16000,
@@ -662,6 +704,7 @@ mod tests {
             pump: Some(Arc::new(PumpCounters::default())),
             keeper: Some(Arc::new(KeeperCounters::default())),
             drain: DrainState::shared(),
+            ports: crate::media_ports::MediaPortAllocator::ephemeral(),
         }
     }
 
