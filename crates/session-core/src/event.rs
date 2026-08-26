@@ -31,6 +31,8 @@ pub enum Observation {
     Dtmf {
         track: Track,
         digit: char,
+        duration_ms: u32,
+        rtp_timestamp: u32,
     },
     RecordingStarted {
         recording_id: String,
@@ -81,6 +83,8 @@ pub enum EventKind {
     Dtmf {
         track: Track,
         digit: char,
+        duration_ms: u32,
+        rtp_timestamp: u32,
     },
     RecordingStarted {
         recording_id: String,

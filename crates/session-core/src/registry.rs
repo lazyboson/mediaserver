@@ -766,7 +766,17 @@ impl SessionRegistry {
             return Err(ControlError::UnknownSession(session));
         }
         let kind = match observation {
-            Observation::Dtmf { track, digit } => EventKind::Dtmf { track, digit },
+            Observation::Dtmf {
+                track,
+                digit,
+                duration_ms,
+                rtp_timestamp,
+            } => EventKind::Dtmf {
+                track,
+                digit,
+                duration_ms,
+                rtp_timestamp,
+            },
             Observation::RecordingStarted {
                 recording_id,
                 path,
@@ -1709,6 +1719,8 @@ mod tests {
                 Observation::Dtmf {
                     track: Track::Customer,
                     digit: '5',
+                    duration_ms: 100,
+                    rtp_timestamp: 8000,
                 }
             ),
             Err(ControlError::UnknownSession(session))
@@ -1743,6 +1755,8 @@ mod tests {
                 Observation::Dtmf {
                     track: Track::Customer,
                     digit: '7',
+                    duration_ms: 140,
+                    rtp_timestamp: 41_000,
                 },
             )
             .unwrap();
@@ -1760,6 +1774,46 @@ mod tests {
         assert_eq!(events.len(), 2);
         assert!(events.iter().all(|event| event.attachment.is_none()));
         assert!(events.iter().all(|event| event.legacy_eligible));
+        assert_eq!(
+            events[0].kind,
+            EventKind::Dtmf {
+                track: Track::Customer,
+                digit: '7',
+                duration_ms: 140,
+                rtp_timestamp: 41_000,
+            }
+        );
+    }
+
+    #[test]
+    fn a_digit_is_published_with_no_consumer_attached_at_all() {
+        let (mut registry, session) = started();
+        registry.drain_events();
+
+        registry
+            .observe(
+                session,
+                Observation::Dtmf {
+                    track: Track::Agent,
+                    digit: '#',
+                    duration_ms: 80,
+                    rtp_timestamp: 640,
+                },
+            )
+            .unwrap();
+
+        let events = registry.drain_events();
+        assert_eq!(events.len(), 1);
+        assert!(events[0].attachment.is_none());
+        assert_eq!(
+            events[0].kind,
+            EventKind::Dtmf {
+                track: Track::Agent,
+                digit: '#',
+                duration_ms: 80,
+                rtp_timestamp: 640,
+            }
+        );
     }
 
     #[test]

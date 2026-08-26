@@ -1,4 +1,4 @@
-use crate::dtmf::DtmfDetector;
+use crate::dtmf::{DigitPress, DtmfDetector};
 use crate::frame::{AudioFormat, Encoding};
 use crate::g711;
 use crate::jitter::{
@@ -34,7 +34,7 @@ pub enum IngestOutcome {
     TooLate,
     Oversized,
     Resynchronized,
-    Dtmf(char),
+    Dtmf(DigitPress),
     TelephoneEvent,
     ComfortNoise,
     UnknownPayloadType(u8),
@@ -203,7 +203,7 @@ impl StreamPipeline {
                 max_depth_packets: floor_depth.saturating_mul(MAX_DEPTH_MULTIPLIER),
                 timestamp_increment,
             }),
-            dtmf: DtmfDetector::new(),
+            dtmf: DtmfDetector::new(clock_rate_hz),
             plc: PacketLossConcealer::new(format.sample_rate_hz),
             pcm: [0; MAX_FRAME_SAMPLES],
             decoded: [0; MAX_OPUS_FRAME_SAMPLES],
@@ -252,9 +252,9 @@ impl StreamPipeline {
             self.stats.telephone_events += 1;
             self.jitter.account(packet.sequence);
             return match self.dtmf.push(packet.timestamp, packet.payload) {
-                Some(digit) => {
+                Some(press) => {
                     self.stats.dtmf_digits += 1;
-                    IngestOutcome::Dtmf(digit)
+                    IngestOutcome::Dtmf(press)
                 }
                 None => IngestOutcome::TelephoneEvent,
             };
@@ -856,7 +856,14 @@ mod tests {
 
         assert_eq!(pipeline.ingest(&audio), IngestOutcome::Buffered);
         assert_eq!(pipeline.ingest(&digit_start), IngestOutcome::TelephoneEvent);
-        assert_eq!(pipeline.ingest(&digit_end), IngestOutcome::Dtmf('5'));
+        assert_eq!(
+            pipeline.ingest(&digit_end),
+            IngestOutcome::Dtmf(DigitPress {
+                digit: '5',
+                duration_ms: 100,
+                rtp_timestamp: 160,
+            })
+        );
 
         assert_eq!(pipeline.stats().telephone_events, 2);
         assert_eq!(pipeline.stats().dtmf_digits, 1);

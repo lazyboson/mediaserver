@@ -1,5 +1,6 @@
 use crate::conference::{Conference, ConferenceMember, ConferenceShared, ConferenceTotals};
 use crate::consumer_ws::{self, ConsumerConfig};
+use crate::digits::DigitQueue;
 use crate::hub::{
     Hub, HubClient, Subscription, SubscriptionControl, SubscriptionMetrics, TapEvent,
     TrackSelection,
@@ -100,6 +101,7 @@ struct LiveSession {
     conference: Option<String>,
     mix_route: Option<AttachmentId>,
     speakers: Option<tokio::task::JoinHandle<()>>,
+    digits: Arc<DigitQueue>,
 }
 
 enum LiveAttachment {
@@ -225,6 +227,7 @@ pub struct IngestSnapshot {
     pub legs_unknown_ssrc: u64,
     pub legs_stalled: u64,
     pub ssrc_requeries: u64,
+    pub dtmf_events_dropped: u64,
     pub consumers_live: u64,
     pub consumer_dropped_oldest: u64,
     pub consumer_delivered: u64,
@@ -268,6 +271,7 @@ struct MetricsInner {
     retired_consumer_delivered: u64,
     retired_consumer_suppressed: u64,
     ssrc_requeries: u64,
+    dtmf_events_dropped: u64,
     legs: HashMap<SessionId, Vec<Arc<SharedLegStats>>>,
     inline: HashMap<SessionId, Arc<InlineEgressShared>>,
     retired_inline: InlineEgressTotals,
@@ -329,6 +333,10 @@ impl TapPlaneMetrics {
         self.lock().ssrc_requeries += 1;
     }
 
+    fn record_digits_dropped(&self, dropped: u64) {
+        self.lock().dtmf_events_dropped += dropped;
+    }
+
     fn register_consumer(&self, attachment: AttachmentId, metrics: SubscriptionMetrics) {
         let mut inner = self.lock();
         if let Some(replaced) = inner.consumers.insert(attachment, metrics) {
@@ -359,6 +367,7 @@ impl TapPlaneMetrics {
             consumer_delivered: inner.retired_consumer_delivered,
             consumer_suppressed_while_paused: inner.retired_consumer_suppressed,
             ssrc_requeries: inner.ssrc_requeries,
+            dtmf_events_dropped: inner.dtmf_events_dropped,
             recordings_live: read(&recorder.live),
             recordings_started: read(&recorder.started),
             recordings_stopped: read(&recorder.stopped),
@@ -1098,6 +1107,12 @@ impl TapPlane {
         let mut legs = Vec::with_capacity(sockets.len());
         let mut shared_stats = Vec::with_capacity(sockets.len());
         let mut ssrc_publishers = Vec::with_capacity(sockets.len());
+        let digits = DigitQueue::new();
+        tokio::spawn(publish_digits(
+            view.id,
+            Arc::clone(&digits),
+            self.observer(),
+        ));
         for (index, socket) in sockets.into_iter().enumerate() {
             let telephone_event = offer
                 .streams
@@ -1120,6 +1135,7 @@ impl TapPlane {
             )
             .map_err(|error| MediaPlaneError(format!("tap leg: {error}")))?
             .with_ssrc_tracks(ssrc_tracks.clone())
+            .with_digit_sink(Arc::clone(&digits))
             .with_shared_stats(shared, STALL_AFTER, Instant::now());
             ssrc_publishers.push(leg.ssrc_track_publisher());
             legs.push(leg);
@@ -1220,6 +1236,7 @@ impl TapPlane {
                 conference: None,
                 mix_route: None,
                 speakers,
+                digits,
             },
         );
         drop(held);
@@ -1287,6 +1304,12 @@ impl TapPlane {
         .map_err(|error| MediaPlaneError(format!("inline egress: {error}")))?;
 
         let shared = Arc::new(SharedLegStats::default());
+        let digits = DigitQueue::new();
+        tokio::spawn(publish_digits(
+            view.id,
+            Arc::clone(&digits),
+            self.observer(),
+        ));
         let leg = TapLeg::with_pipeline_config(
             Track::Customer,
             socket,
@@ -1303,6 +1326,7 @@ impl TapPlane {
             RETAIN_NO_LOCAL_AUDIO,
         )
         .map_err(|error| MediaPlaneError(format!("inline leg: {error}")))?
+        .with_digit_sink(Arc::clone(&digits))
         .with_shared_stats(Arc::clone(&shared), STALL_AFTER, epoch);
 
         let (mut hub, hub_client) = Hub::new();
@@ -1344,6 +1368,7 @@ impl TapPlane {
                     conference,
                     mix_route: None,
                     speakers: None,
+                    digits: Arc::clone(&digits),
                 },
             );
             drop(held);
@@ -1449,6 +1474,7 @@ impl TapPlane {
                 conference: None,
                 mix_route: None,
                 speakers: None,
+                digits: Arc::clone(&digits),
             },
         );
         drop(held);
@@ -1886,6 +1912,8 @@ impl MediaPlane for TapPlane {
         }
 
         live.stop.store(true, Ordering::Relaxed);
+        live.digits.close();
+        self.metrics.record_digits_dropped(live.digits.dropped());
         if let Some(speakers) = live.speakers.take() {
             speakers.abort();
         }
@@ -2808,6 +2836,47 @@ async fn reresolve_speakers(
     }
 }
 
+async fn publish_digits(
+    session: SessionId,
+    digits: Arc<DigitQueue>,
+    sink: Option<Weak<dyn ObservationSink>>,
+) {
+    while let Some(press) = digits.next().await {
+        info!(
+            %session,
+            digit = %press.digit,
+            track = ?press.track,
+            duration_ms = press.duration_ms,
+            rtp_timestamp = press.rtp_timestamp,
+            "a digit was pressed on this call"
+        );
+        match sink.as_ref().and_then(Weak::upgrade) {
+            Some(sink) => sink.observe(
+                session,
+                Observation::Dtmf {
+                    track: press.track,
+                    digit: press.digit,
+                    duration_ms: press.duration_ms,
+                    rtp_timestamp: press.rtp_timestamp,
+                },
+            ),
+            None => warn!(
+                %session,
+                digit = %press.digit,
+                "no observation sink is wired; this digit reaches nobody"
+            ),
+        }
+    }
+    if digits.dropped() > 0 {
+        warn!(
+            %session,
+            dropped = digits.dropped(),
+            published = digits.published(),
+            "digits arrived faster than the event bus drained them"
+        );
+    }
+}
+
 fn speaker_track(index: usize) -> Track {
     if index == 0 {
         Track::Customer
@@ -3210,6 +3279,94 @@ a=rtpmap:101 telephone-event/8000\r\na=ptime:20\r\n"
                 "the egress sequence never skips: {sequences:?}"
             );
         }
+
+        plane
+            .close_session(session)
+            .await
+            .expect("the inline leg closes");
+    }
+
+    #[derive(Default)]
+    struct WitnessedObservations(Mutex<Vec<(SessionId, Observation)>>);
+
+    impl WitnessedObservations {
+        fn digits(&self) -> Vec<Observation> {
+            self.0
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(_, seen)| matches!(seen, Observation::Dtmf { .. }))
+                .map(|(_, seen)| seen.clone())
+                .collect()
+        }
+    }
+
+    impl ObservationSink for WitnessedObservations {
+        fn observe(&self, session: SessionId, observation: Observation) {
+            self.0.lock().unwrap().push((session, observation));
+        }
+    }
+
+    fn digit_datagram(sequence: u16, timestamp: u32, event: u8, end: bool, ticks: u16) -> Vec<u8> {
+        let ticks = ticks.to_be_bytes();
+        let payload = [event, if end { 0x8A } else { 0x0A }, ticks[0], ticks[1]];
+        let packet = media_core::rtp::RtpPacket {
+            marker: false,
+            payload_type: 101,
+            sequence,
+            timestamp,
+            ssrc: 0x0bad_cafe,
+            payload: &payload,
+        };
+        let mut datagram = vec![0u8; 12 + payload.len()];
+        let written = packet.serialize(&mut datagram).expect("an rtp datagram");
+        datagram.truncate(written);
+        datagram
+    }
+
+    #[tokio::test]
+    async fn a_digit_pressed_on_a_leg_reaches_the_event_bus_once_with_no_consumer_attached() {
+        let peer = UdpSocket::bind("127.0.0.1:0").expect("a fake peer socket");
+        peer.set_nonblocking(true).expect("nonblocking peer");
+        let peer_port = peer.local_addr().expect("peer address").port();
+        let plane = plane();
+        let witness = Arc::new(WitnessedObservations::default());
+        plane.observe_through(Arc::downgrade(&witness) as Weak<dyn ObservationSink>);
+        let session = SessionId::from_raw(1);
+
+        let opened = plane
+            .open_session(inline_session(&inline_offer_sdp(peer_port)))
+            .await
+            .expect("an inline leg answers a pcmu offer");
+        let answered = InlineOffer::parse(
+            &opened
+                .sdp_answer
+                .expect("an inline session answers with sdp"),
+            20,
+        )
+        .expect("our own answer is valid sdp");
+        let ours = SocketAddr::new(IpAddr::from([127, 0, 0, 1]), answered.peer_port);
+
+        peer.send_to(&tone_datagram(0, 4_000), ours)
+            .expect("the peer can reach the inline leg");
+        peer.send_to(&digit_datagram(1, 160, 1, false, 400), ours)
+            .expect("a digit begins");
+        for sequence in 2..5u16 {
+            peer.send_to(&digit_datagram(sequence, 160, 1, true, 800), ours)
+                .expect("rfc 4733 repeats the end packet three times");
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        assert_eq!(
+            witness.digits(),
+            vec![Observation::Dtmf {
+                track: Track::Customer,
+                digit: '1',
+                duration_ms: 100,
+                rtp_timestamp: 160,
+            }],
+            "one press is one event, whatever the end packet is repeated"
+        );
 
         plane
             .close_session(session)

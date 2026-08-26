@@ -2221,7 +2221,9 @@ and localization out of the media plane.
 MSS delivers digits to consumers (WS `dtmf` frames, gRPC `DtmfFrame`) and
 interprets none of them; an integrator that wants `*6` to mute maps the digit to
 an `UpdateAttachment` call. Gap found while documenting it: those digits never
-reach `mss.events` — D21.
+reached `mss.events` — D21, closed by item 48; the mapping is still the
+integrator's, but it can now be driven from the bus instead of from a media
+stream.
 
 **`mix_source=leg`.** A `mix_target` now picks its source: `inject` (default,
 item 38) or `leg`, the member's own RTP. `leg` + a member target is the **coach**
@@ -2254,8 +2256,8 @@ mix-metadata parser tests and a registry audit test for `MemberControlled`.
 
 **Residuals.** (a) Member state has no owner and no lease, and no API reads it
 back — D22. (b) One prompt source per room: overlapping prompts queue.
-(c) Enter/exit sounds and DTMF menus are integrator work by design, and D21 says
-the digit half is not on the bus yet. (d) Per-member volume/energy, member
+(c) Enter/exit sounds and DTMF menus are integrator work by design; since item 48
+the digits themselves are on the bus (D21), but nothing in MSS interprets them. (d) Per-member volume/energy, member
 enumeration, room lock and moderator roles are not built (architecture.md
 Appendix B lists them with recommendations). (e) Everything here is pod-local,
 like the conference itself.
@@ -2879,6 +2881,84 @@ way to get `customer`/`agent` on a tap is to pass the caller's from-tag —
 `docs/deploy.md` now says so under "Leg attribution", and the integrator's
 control plane is where that has to come from.
 
+### 48. DTMF digits on the event bus (G8, D21) — ✅ DONE (2026-08-26)
+
+**The gap this closes.** MSS decoded every RFC 4733 press (`DtmfDetector`,
+counted in `mss_ingest_dtmf_digits_total`) and handed it to *consumers* — the
+Twilio WS `dtmf` frame and the gRPC `DtmfFrame` — and to nobody else. `mss.events`
+carried no digit, so the integrator who wants `*6` to mute (item 40's decision:
+conference control is API-first, MSS interprets no digit) had to hold a media
+stream open just to hear one, and a recording-only or bus-only integration could
+not build a digit menu at all.
+
+**Gating decision: session level, no capability, no consumer needed.** A digit is
+a property of the **call**, not of a consumer: MSS decodes it from the call's own
+RTP, so there is no attachment to authenticate and nothing for an EVENTS
+capability to authorise. Digits therefore go through `Registry::observe` — the
+session-level path that `RecordingStarted` and `LegsAttributed` already use — and
+are published whenever the session exists, with `attachment: none`. This is
+deliberately **unlike** `SpeechReport` (D19/item 28), which originates *from* a
+consumer reporting inference it made and is gated on `CAPABILITY_EVENTS`: there
+the attachment is the claimant and must be privileged to speak for the call. The
+attachment-level EVENTS capability is irrelevant to a digit; an attachment with
+it gets no extra digits, and a session with no attachment at all still gets them
+all. (Proven both ways: `a_digit_is_published_with_no_consumer_attached_at_all`
+in `registry.rs`, and the live drill below runs with no consumer attached.)
+
+**What shipped.**
+
+- `media_core::dtmf::DigitPress { digit, duration_ms, rtp_timestamp }` replaces
+  the bare `char` in `IngestOutcome::Dtmf`. The **dedupe was already right** and
+  is now guarded by its own test: the detector reports on the end bit and keys on
+  `(digit, rtp_timestamp)`, so RFC 4733's three end retransmissions are one
+  press. `duration_ms` converts the reported duration through the **negotiated
+  RTP clock rate** (`PipelineConfig::clock_rate_hz`, per RFC 4733 §2.4.1 the
+  event stream shares the audio clock), so an 800-tick press reads 100 ms at
+  8 kHz and 16 ms at 48 kHz rather than being hardcoded to narrowband;
+- `crates/mediaserverd/src/digits.rs` (new): a bounded `ArrayQueue<Digit>` + a
+  `Notify`, the only bridge between the capture thread and the control plane. The
+  media thread's `publish` never blocks, never allocates and counts a refusal
+  (`mss_dtmf_events_dropped_total`) instead of waiting; a per-session Tokio task
+  drains it and calls `observe`. Capacity 64, which at "digits are rare" is a
+  drop that means something is wrong rather than a routine loss;
+- every tap leg **and** every inline leg carries the sink, so a digit pressed into
+  an inline (bot) leg is published too; `close_session` closes the queue, the
+  publisher drains what is queued and ends;
+- `Observation::Dtmf` / `EventKind::Dtmf` / `proto.Dtmf` gained `duration_ms` and
+  `rtp_timestamp` (fields 3 and 4 — **additive**, the payload oneof tag stays 14).
+  Track names honour item 47's attribution, so an unattributed session's digits
+  arrive on `leg_a`/`leg_b`, never a guessed `customer`.
+
+**Verified.** Replay/in-process: the detector's duration and clock-rate maths, the
+queue (cross-thread order, a full queue counting instead of blocking, close
+draining), the wire payload under `explicit` and `unknown` attribution, the
+registry's no-attachment publish, and an **end-to-end** test that opens a real
+inline leg on a UDP socket, sends one digit-start plus three end packets, and
+asserts exactly one `Observation::Dtmf { customer, '1', 100 ms, ts 160 }` reached
+the sink. Then **live** (`lab/dtmf_event_drill.sh`, new) on a fabricated tapped
+call with **no consumer attached at all**, `lab/call_driver.py` pressing `1` on
+the caller and `2` on the callee every 6 s and repeating each end packet three
+times — `mss.events` carried, one per press:
+
+```
+payload=Some(Dtmf(Dtmf { track: "customer", digit: "1", duration_ms: 100, rtp_timestamp: 79200 }))
+payload=Some(Dtmf(Dtmf { track: "agent",    digit: "2", duration_ms: 100, rtp_timestamp: 79200 }))
+payload=Some(Dtmf(Dtmf { track: "customer", digit: "1", duration_ms: 100, rtp_timestamp: 127040 }))
+payload=Some(Dtmf(Dtmf { track: "agent",    digit: "2", duration_ms: 100, rtp_timestamp: 127040 }))
+```
+
+`mss_dtmf_events_dropped_total 0`; `mss_ingest_dtmf_digits_total` leads the bus
+count only because it keeps counting after the tail window closes. `seq` is
+gapless and every record is `attachment: none`.
+
+**What it does not do.** MSS still interprets no digit — no menu, no collection,
+no inter-digit timer, no `#` terminator, and the frozen `firstDtmf`/`dtmfResult`
+`streamfsm` events remain a consumer-side concern. An integrator building a menu
+consumes `mss.events` and calls the API, which is item 40's decision unchanged.
+Nothing rate-limits digits: a stuck endpoint blasting end packets at distinct
+timestamps would publish one event each, bounded only by the queue's drop
+counter.
+
 ## Open defects and soft spots
 
 | # | Item | Where | Severity |
@@ -2899,7 +2979,7 @@ control plane is where that has to come from.
 | ~~D14~~ | ~~**A dead pod's rtpengine subscription is never torn down.**~~ — **fixed 2026-08-23 (item 25)**: `PersistedSession` now carries the tap's `to-tag` (`subscription_tag`, `serde(default)` so older records still decode), the adopter sends NG `unsubscribe` for it **before** re-subscribing (after winning the atomic claim), and a pod that loses its lease destroys the session locally so a partitioned-but-alive owner unsubscribes its own tap instead of double-tapping. `upsert` also stopped rewriting the lease key unconditionally (now `SET NX`) — it had made a lease unloseable, so the partitioned case could never be detected. New counters `mss_registry_orphans_unsubscribed_total`, `mss_registry_orphans_still_subscribed_total`, `mss_registry_surrendered_total`. **Verified in unit tests, against a fake rtpengine socket (the `unsubscribe` bytes) and against the lab's real Redis — not re-measured on a live pod kill**; the residual is that a refused `unsubscribe` still leaks one tap, counted rather than retried | `session_store.rs`, `registry_keeper.rs`, `tap_plane.rs` | closed |
 | ~~D23~~ | ~~**A padded recording-group member lost its pad's worth of audio off the tail.** `Segmenter::close_segment` subtracted the closed frames from `segment_start` (the lead-silence offset) *and* advanced `anchor_ms` by the same frames, so every spill moved a late joiner's timeline forward by the pad twice~~ — **found and fixed 2026-08-24 (item 41)**: the anchor now advances only by `frames - segment_start`. Invisible to every earlier test because an ungrouped recording has `segment_start == 0` and item 29's group drill (5 s stagger, 20 s run) never reached the 30 s spill. Live in the conference drill: `party-c.wav` **55.88 s against 66.16/66.24** before, **72.10 against 71.96/72.02** after, with the 10.66 s pad still at the front. Guarded by `a_padded_member_keeps_its_whole_tail_across_a_spill`, which fails by exactly the lead if the fix is reverted | `recorder.rs` | closed |
 | D20 | **A room recording belongs to a member, not to the conference.** The mixed-track `FILE_S3` attachment hangs off one member session, so the object ends when *that* member leaves even though the conference keeps mixing — and its t=0 is its attach moment, not the conference's open, so it aligns with the per-participant objects only if both are attached together. Fix shape: a conference-scoped recording owner (an attachment on the conference rather than on a leg) with the conference's `opened_at` as its anchor | `tap_plane.rs`, `conference.rs` | medium once a tenant records conferences whose members come and go |
-| D21 | **DTMF digits never reach the event bus.** A tapped or inline leg's digits are delivered to consumers (WS `dtmf` frames, gRPC `DtmfFrame`) and counted in `mss_ingest_dtmf_digits_total`, but nothing publishes `Observation::Dtmf`, so `mss.events` carries no digit. Conference control is API-first by design (item 40), and an integrator mapping digits to API calls therefore needs a consumer stream rather than the bus. Fix shape: publish the observation from the capture path, capability-gated like the speech report | `tap_spike.rs`, `tap_plane.rs`, `registry.rs` | medium for anyone wanting an in-call digit menu |
+| ~~D21~~ | ~~**DTMF digits never reach the event bus.** A tapped or inline leg's digits are delivered to consumers (WS `dtmf` frames, gRPC `DtmfFrame`) and counted in `mss_ingest_dtmf_digits_total`, but nothing publishes `Observation::Dtmf`, so `mss.events` carries no digit~~ — **fixed 2026-08-26 (item 48)**: every press on a tap leg or an inline leg is published as a session-level `MediaEvent` carrying `digit`, `track` (attribution-aware, so `leg_a`/`leg_b` when unproven), `duration_ms` (through the negotiated RTP clock) and the event's `rtp_timestamp`. **No capability and no consumer**: unlike `SpeechReport`, which a consumer *claims* and which is gated on `CAPABILITY_EVENTS`, a digit is a property of the call MSS decoded itself, so it goes out whenever the session exists. RFC 4733's three end retransmissions stay one event. The capture thread hands presses to the control plane over a bounded lock-free queue that counts refusals (`mss_dtmf_events_dropped_total`) rather than blocking the media path. Live-proved with no consumer attached (`lab/dtmf_event_drill.sh`). **Residual, by design:** MSS interprets no digit — no menu, no collection, no inter-digit timer (item 40: conference control is API-first) — and nothing rate-limits presses beyond the queue's drop counter | `digits.rs`, `tap_spike.rs`, `tap_plane.rs`, `registry.rs` | closed |
 | D22 | **Member state has no owner, no lease and no read-back.** `member_mute`/`member_deaf`/`member_hold` deliberately outlive the attachment that set them (item 40), so a controller that dies between `on` and `off` leaves a member muted for the life of the conference, and there is no API that reports a room's member state — only the aggregate gauges. Fix shape: expose member state on `DescribeSession` (and consider an optional lease on it, mirroring the session lease) | `conference.rs`, `tap_plane.rs`, `registry.rs` | medium once a tenant drives mute from a UI |
 | D16 | **A recording group is one pod's memory.** `TapPlane` holds the group, so every member of a conference recording must attach to the same pod: there is no placement that guarantees it (D8), a member whose session is adopted elsewhere is **refused** rather than restored (`grouped_not_adopted`, so the participant's file simply ends at the pod that died — the D9 shape per participant), and a group name reused on a second pod silently produces a second half-recording under the same prefix. Fix shape: schedule a group's sessions onto one pod, or move the group into shared storage so any pod can serve a member | `tap_plane.rs`, `registry_keeper.rs` | medium once a tenant records conferences across pods |
 | ~~D13~~ | ~~`StreamStart` (and the Twilio `start` frame's `tracks`) advertises `["customer","agent"]` for `TrackSelector::All`, but a silent `mixed` track is delivered too~~ — **fixed 2026-08-23 (item 27)**: the hub selection split into `All` (every track, including `mixed`) and `Speakers` (customer + agent). Consumers get `Speakers`, so delivery matches the advertisement exactly; the **recorder keeps `All`** because injected bot speech belongs in the recording. The frozen Twilio start frame and `StreamStart.tracks` were not touched — the delivery was brought in line with them. A consumer that wants the injected track can still ask for it by name (`TrackSelector::Only(Mixed)`). Replay-verified | `hub.rs`, `tap_plane.rs` | closed |
