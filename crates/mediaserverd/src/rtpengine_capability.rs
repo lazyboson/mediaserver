@@ -1,9 +1,10 @@
 use crate::ng_transport::{NgTransport, TransportError};
-use rtpengine_ng::{KernelForwarding, NgError, UNRECOGNIZED_COMMAND};
-use std::collections::HashSet;
+use rtpengine_ng::{KernelForwarding, NgError, RtpengineStatistics, UNRECOGNIZED_COMMAND};
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::net::SocketAddr;
 use std::sync::Mutex;
+use std::time::Instant;
 use tracing::{info, warn};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -78,6 +79,19 @@ impl fmt::Display for TapKernelVerdict {
 }
 
 impl TapKernelVerdict {
+    pub fn name(&self) -> &'static str {
+        match self {
+            TapKernelVerdict::TranscodedTapsAreProcessedInUserspace => {
+                "TranscodedTapsAreProcessedInUserspace"
+            }
+            TapKernelVerdict::TapsMayRideTheKernelPath => "TapsMayRideTheKernelPath",
+            TapKernelVerdict::ThisNodeIsNotUsingTheKernelModule => {
+                "ThisNodeIsNotUsingTheKernelModule"
+            }
+            TapKernelVerdict::Undetermined => "Undetermined",
+        }
+    }
+
     pub fn decide(kernel: KernelForwarding, transcode_at_tap: bool) -> TapKernelVerdict {
         if transcode_at_tap {
             return TapKernelVerdict::TranscodedTapsAreProcessedInUserspace;
@@ -95,10 +109,48 @@ impl TapKernelVerdict {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NodeSample {
+    pub verdict: TapKernelVerdict,
+    pub relayed_packets_kernel: u64,
+    pub relayed_packets_user: u64,
+    pub media_kernel: u64,
+    pub media_userspace: u64,
+    pub media_mixed: u64,
+    pub transcoded_media: u64,
+    pub sessions_live: u64,
+    pub taken: Instant,
+}
+
+impl NodeSample {
+    pub fn from_statistics(
+        statistics: &RtpengineStatistics,
+        transcode_at_tap: bool,
+        taken: Instant,
+    ) -> NodeSample {
+        NodeSample {
+            verdict: TapKernelVerdict::decide(statistics.kernel_forwarding(), transcode_at_tap),
+            relayed_packets_kernel: statistics.totals.packets_in_kernel,
+            relayed_packets_user: statistics.totals.packets_in_userspace,
+            media_kernel: statistics.current.media_in_kernel,
+            media_userspace: statistics.current.media_in_userspace,
+            media_mixed: statistics.current.media_in_both,
+            transcoded_media: statistics.current.transcoded_media,
+            sessions_live: statistics.current.sessions_total,
+            taken,
+        }
+    }
+
+    pub fn age_seconds(&self, now: Instant) -> f64 {
+        now.saturating_duration_since(self.taken).as_secs_f64()
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct NodeCapabilityLog {
     transcode_at_tap: bool,
     reported: Mutex<HashSet<SocketAddr>>,
+    last: Mutex<HashMap<SocketAddr, NodeSample>>,
 }
 
 impl NodeCapabilityLog {
@@ -106,6 +158,7 @@ impl NodeCapabilityLog {
         NodeCapabilityLog {
             transcode_at_tap,
             reported: Mutex::new(HashSet::new()),
+            last: Mutex::new(HashMap::new()),
         }
     }
 
@@ -120,14 +173,54 @@ impl NodeCapabilityLog {
             .unwrap_or(false)
     }
 
+    fn already_reported(&self, node: SocketAddr) -> bool {
+        self.reported
+            .lock()
+            .map(|held| held.contains(&node))
+            .unwrap_or(false)
+    }
+
     pub fn forget(&self, node: SocketAddr) {
         if let Ok(mut held) = self.reported.lock() {
             held.remove(&node);
         }
+        if let Ok(mut held) = self.last.lock() {
+            held.remove(&node);
+        }
+    }
+
+    pub fn record(&self, node: SocketAddr, sample: NodeSample) {
+        if let Ok(mut held) = self.last.lock() {
+            held.insert(node, sample);
+        }
+    }
+
+    pub fn samples(&self) -> Vec<(SocketAddr, NodeSample)> {
+        let mut samples: Vec<(SocketAddr, NodeSample)> = self
+            .last
+            .lock()
+            .map(|held| held.iter().map(|(node, sample)| (*node, *sample)).collect())
+            .unwrap_or_default();
+        samples.sort_by_key(|(node, _)| *node);
+        samples
     }
 
     pub async fn report_first_contact(&self, node: SocketAddr, transport: &NgTransport) {
-        if !self.claim(node) {
+        if self.already_reported(node) {
+            return;
+        }
+        self.observe(node, transport).await;
+    }
+
+    pub async fn observe(&self, node: SocketAddr, transport: &NgTransport) {
+        let first_contact = self.claim(node);
+        if !first_contact {
+            if let Ok(statistics) = transport.statistics().await {
+                self.record(
+                    node,
+                    NodeSample::from_statistics(&statistics, self.transcode_at_tap, Instant::now()),
+                );
+            }
             return;
         }
         let version = VersionReport::from_outcome(
@@ -140,6 +233,10 @@ impl NodeCapabilityLog {
             Ok(statistics) => {
                 let kernel = statistics.kernel_forwarding();
                 let verdict = TapKernelVerdict::decide(kernel, self.transcode_at_tap);
+                self.record(
+                    node,
+                    NodeSample::from_statistics(&statistics, self.transcode_at_tap, Instant::now()),
+                );
                 info!(
                     %node,
                     version = %version,
@@ -179,7 +276,7 @@ impl NodeCapabilityLog {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rtpengine_ng::UndeterminedReason;
+    use rtpengine_ng::{CurrentRates, RelayTotals, UndeterminedReason};
 
     #[test]
     fn a_transcoding_daemon_is_told_its_taps_cannot_use_the_kernel_module() {
@@ -278,5 +375,85 @@ mod tests {
         assert!(!log.claim(node));
         assert!(log.claim(other));
         assert!(!log.claim(other));
+    }
+
+    fn userspace_statistics() -> RtpengineStatistics {
+        RtpengineStatistics {
+            uptime_seconds: Some(400),
+            totals: RelayTotals {
+                packets: 9000,
+                packets_in_kernel: 0,
+                packets_in_userspace: 9000,
+                ..RelayTotals::default()
+            },
+            current: CurrentRates {
+                media_in_kernel: 0,
+                media_in_userspace: 4,
+                media_in_both: 0,
+                transcoded_media: 2,
+                sessions_total: 3,
+                ..CurrentRates::default()
+            },
+            transcoders: Vec::new(),
+            kernel_counters_present: true,
+        }
+    }
+
+    #[test]
+    fn a_sample_carries_the_relay_split_the_capacity_plan_needs() {
+        let sample = NodeSample::from_statistics(&userspace_statistics(), false, Instant::now());
+        assert_eq!(
+            sample.verdict,
+            TapKernelVerdict::ThisNodeIsNotUsingTheKernelModule
+        );
+        assert_eq!(sample.relayed_packets_kernel, 0);
+        assert_eq!(sample.relayed_packets_user, 9000);
+        assert_eq!(sample.media_userspace, 4);
+        assert_eq!(sample.media_kernel, 0);
+        assert_eq!(sample.media_mixed, 0);
+        assert_eq!(sample.transcoded_media, 2);
+        assert_eq!(sample.sessions_live, 3);
+    }
+
+    #[test]
+    fn a_transcoding_daemon_samples_the_verdict_that_names_its_own_choice() {
+        let sample = NodeSample::from_statistics(&userspace_statistics(), true, Instant::now());
+        assert_eq!(
+            sample.verdict,
+            TapKernelVerdict::TranscodedTapsAreProcessedInUserspace
+        );
+        assert_eq!(
+            sample.verdict.name(),
+            "TranscodedTapsAreProcessedInUserspace"
+        );
+    }
+
+    #[test]
+    fn the_last_sample_of_each_node_is_kept_in_node_order_and_dropped_when_the_node_is_forgotten() {
+        let log = NodeCapabilityLog::new(false);
+        let first: SocketAddr = "127.0.0.1:22222".parse().unwrap();
+        let second: SocketAddr = "127.0.0.2:22222".parse().unwrap();
+        let taken = Instant::now();
+        log.record(
+            second,
+            NodeSample::from_statistics(&userspace_statistics(), false, taken),
+        );
+        log.record(
+            first,
+            NodeSample::from_statistics(&userspace_statistics(), false, taken),
+        );
+        let mut fresher = userspace_statistics();
+        fresher.totals.packets_in_userspace = 12000;
+        log.record(first, NodeSample::from_statistics(&fresher, false, taken));
+        let samples = log.samples();
+        assert_eq!(samples.len(), 2);
+        assert_eq!(samples[0].0, first);
+        assert_eq!(samples[0].1.relayed_packets_user, 12000);
+        assert_eq!(samples[1].0, second);
+        assert_eq!(samples[1].1.relayed_packets_user, 9000);
+        log.forget(first);
+        let left = log.samples();
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].0, second);
     }
 }
