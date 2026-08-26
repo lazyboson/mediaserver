@@ -1196,10 +1196,14 @@ custom-kernel detour. That half is now a read-only checklist for the platform
 team (architecture §8.1) rather than an unknown, and `kernel_probe.sh` is the
 instrument it hands them.
 
-**Left open:** the kernel verdict is log-only, not a metric; the capability
-probe never repeats, so an rtpengine restarted under a running daemon keeps its
-first-contact report; and `controlstatistics.proxies` and the per-interface
-blocks are read by the shell probe but not modelled in Rust.
+**Left open:** ~~the kernel verdict is log-only, not a metric~~ — **struck
+2026-08-26 (item 57)**: every health probe's `statistics` sample is now exported
+per node as `mss_rtpengine_tap_kernel_verdict{node,verdict}` and the relay-split
+gauges beside it. The capability *log line* still does not repeat (a node that
+answers every probe keeps its first-contact report, though its verdict is
+re-decided on every sample and a failed probe forgets it), and
+`controlstatistics.proxies` and the per-interface blocks are read by the shell
+probe but not modelled in Rust.
 
 ### 24. WebRTC agent leg on a second rtpengine node — ✅ DONE (2026-08-23)
 **Why this exists:** every drill before it anchored both legs of a call in one
@@ -3485,33 +3489,59 @@ variant (`MUTE_TTL_MS`) and lets it expire instead of sending `off`.
 default with the refresh loop a UI should run, and Appendix B's no-lease
 paragraph is rewritten.
 
-### 57. The kernel verdict, and rtpengine's relay split, as metrics (item 23 residual; serves H3)
-**Where:** `crates/mediaserverd/src/{rtpengine_capability.rs,health.rs,metrics.rs}`,
-`deploy/prometheus-alerts.yaml`, `docs/deploy.md`.
-**What:** every rtpengine `statistics` probe already taken for `/readyz`
-(`NgNodeProbe::probe`, every `MSS_HEALTH_PROBE_INTERVAL_SECS`) leaves its
-findings only in a log line. Keep the last sample per node and export it, so
-handoff H3's three-moment comparison can be read off Prometheus instead of a
-shell on the rtpengine host.
-**Decisions, made:**
-- `NodeCapabilityLog` keeps `last: Mutex<HashMap<SocketAddr, NodeSample>>`
-  with the verdict, `relayedpackets_kernel/_user`, `media_kernel/_userspace/_mixed`,
-  `transcodedmedia`, live sessions and the sample's `Instant`. `forget` clears it.
-- Labelled series in the `mss_dependency_ready{…}` style:
-  `mss_rtpengine_tap_kernel_verdict{node,verdict} 1` (one series per node, the
-  four `TapKernelVerdict` names as label values), `mss_rtpengine_relayed_packets_kernel{node}`,
-  `mss_rtpengine_relayed_packets_user{node}`, `mss_rtpengine_media_kernel{node}`,
-  `mss_rtpengine_media_userspace{node}`, `mss_rtpengine_media_mixed{node}`,
-  `mss_rtpengine_transcoded_media{node}`, `mss_rtpengine_sample_age_seconds{node}`.
-- Alert: `MssTapsFellOutOfKernel` — `verdict="TranscodedTapsAreProcessedInUserspace"`
-  or `media_userspace` rising while `media_kernel` is flat for 10 min, with the
-  §8.1 checklist as the runbook link.
-**Verify:** metrics unit test with a constructed `NodeCapabilityLog` holding two
-nodes; a lab run against the compose rtpengine showing
-`verdict="ThisNodeIsNotUsingTheKernelModule"` and non-zero `_user` counters.
-**Done when:** the series appear in deploy.md's metric table, the item 23
-"log-only" residual is struck, and H3's row points at the metrics as the
-first instrument and the shell probe as the second.
+### 57. The kernel verdict, and rtpengine's relay split, as metrics — ✅ DONE (2026-08-26)
+**What shipped:** the rtpengine `statistics` reply that every `/readyz` probe
+already fetched no longer dies in a log line. `NodeCapabilityLog` keeps
+`last: Mutex<HashMap<SocketAddr, NodeSample>>` — the verdict,
+`relayedpackets_kernel`/`_user`, `media_kernel`/`_userspace`/`_mixed`,
+`transcodedmedia`, the node's live session count and the sample's `Instant` —
+and `metrics.rs` renders it per node in the `mss_dependency_ready{…}` labelled
+style: `mss_rtpengine_tap_kernel_verdict{node,verdict} 1` (one series per node,
+the four `TapKernelVerdict` names as label values),
+`mss_rtpengine_relayed_packets_kernel{node}`,
+`mss_rtpengine_relayed_packets_user{node}`, `mss_rtpengine_media_kernel{node}`,
+`mss_rtpengine_media_userspace{node}`, `mss_rtpengine_media_mixed{node}`,
+`mss_rtpengine_transcoded_media{node}`, `mss_rtpengine_sessions_live{node}` and
+`mss_rtpengine_sample_age_seconds{node}`. `MssTapsFellOutOfKernel`
+(`deploy/prometheus-alerts.yaml`, new `mss-rtpengine` group, synced into
+`deploy/k8s/base/prometheusrule.yaml`) fires on
+`verdict="TranscodedTapsAreProcessedInUserspace"` or on userspace media rising
+for 10 min while kernel media stays flat, with architecture §8.1 as the runbook.
+The split that keeps it cheap: `observe` refreshes the sample on every health
+probe (one extra NG command per node per `MSS_HEALTH_PROBE_INTERVAL_SECS`, never
+on the media path), while `report_first_contact` — still what `main`'s startup
+ping and `TapPlane::open_session` call — is now `observe` behind a read of the
+reported-once set, so opening a session on a known node stays free and the
+first-contact log line stays once per node. `forget` clears the sample too, so a
+node that stops answering stops being reported instead of freezing at its last
+numbers. `mss_rtpengine_sessions_live` is one series more than this item
+specified; it is the same sample field the item already required be kept, and
+H3 wants it beside the packet counters.
+**Verified:** unit tests only. `NodeSample::from_statistics` is pure, so the
+whole mapping is asserted from a constructed `RtpengineStatistics` (userspace
+node → `ThisNodeIsNotUsingTheKernelModule`; the same node with
+`transcode_at_tap` → `TranscodedTapsAreProcessedInUserspace`); a second test
+proves the last sample per node wins, that `samples()` comes back in node order,
+and that `forget` drops one node and leaves the other. In `metrics.rs`, a
+constructed `NodeCapabilityLog` holding **two** nodes — one userspace, one
+kernel — renders both verdict series with their labels, all seven per-node
+gauges with the right values, one `# TYPE` line per metric, and a sample age;
+and a pod that has probed nothing emits none of the series. The yaml of both
+alert files parses and the generated `PrometheusRule` carries the new group.
+**Owed:** the **lab run is not done** — the Docker stack was down in this
+session, so nothing here has been read off a real rtpengine. The lab check still
+owed is a run against the compose rtpengine showing
+`verdict="ThisNodeIsNotUsingTheKernelModule"` with non-zero
+`mss_rtpengine_relayed_packets_user` and a `sample_age_seconds` that stays under
+the probe interval, plus one `MSS_TAP_TRANSCODE=on` run showing the transcoding
+verdict. `MssTapsFellOutOfKernel`'s PromQL has never been evaluated by a
+Prometheus.
+**Residual:** the numbers are the *node's*, not this pod's, so two pods tapping
+one rtpengine report the same counters — aggregate with `max by (node)`, never
+`sum`. A verdict that changes leaves the previous label set in Prometheus until
+it goes stale (the price of the one-series-per-node shape the item chose). And a
+node that keeps answering `ping` but stops answering `statistics` keeps its last
+sample, visible only as a growing `mss_rtpengine_sample_age_seconds`.
 
 ## Open defects and soft spots
 
@@ -3557,7 +3587,7 @@ the worked example of each handoff.
 | --- | --- | --- | --- |
 | H1 | **An event consumer for `mss.events`** | typed `MediaEvent` on one Kafka topic, keyed by `external_id`, gapless per-session `seq`, at-least-once since D5 (so dedupe by `(external_id, seq)`), `legacy_eligible` marking the authoritative attachment | a consumer that renders those events onto whatever the existing control plane already understands. *Worked example:* the reference deployment's translator, which maps them onto its legacy positional `eventTopic` format — written, awaiting review and merge in its own repository (item 1) |
 | H2 | **The deployed rtpengine version check** | `subscribe` verified against lab rtpengine 14.1.1.8; `lab/kernel_probe.sh` prints the finding on any host, and `lab/preflight.sh` prints it as one `rtpengine_version` line, and [deploy.md](deploy.md#first-day-on-real-gear--an-ordered-runbook) step 0 makes reading it the stopping condition when `ng_subscribe` fails | read the version from the process, the package or rtpengine's CLI interface (`--listen-cli`) on the target host. **It cannot be asked over NG** — rtpengine has no NG `version` command, in this build or upstream (item 23). If the deployed build lacks `subscribe`, the ingest model needs an upgrade path first |
-| H3 | **rtpengine-side per-tap cost on the target metal** | the MSS-side cost is measured; `lab/kernel_probe.sh` plus the read-only checklist in architecture §8.1 is the instrument, sequenced as [deploy.md](deploy.md#first-day-on-real-gear--an-ordered-runbook) step 3 | run it on the real box: `relayedpackets_kernel` vs `_user` and `media_kernel` vs `media_userspace` across baseline / taps-with-transcode / taps-without-transcode. This sets the rtpengine capacity plan. D14 is fixed (item 25), so a pod restart mid-probe no longer pollutes the numbers |
+| H3 | **rtpengine-side per-tap cost on the target metal** | the MSS-side cost is measured, and since item 57 the rtpengine side is on **Prometheus**: every health probe samples NG `statistics` and exports `mss_rtpengine_tap_kernel_verdict{node,verdict}`, `mss_rtpengine_relayed_packets_kernel`/`_user`, `mss_rtpengine_media_kernel`/`_userspace`/`_mixed`, `mss_rtpengine_transcoded_media`, `mss_rtpengine_sessions_live` and `mss_rtpengine_sample_age_seconds`, with `MssTapsFellOutOfKernel` watching them. `lab/kernel_probe.sh` plus the read-only checklist in architecture §8.1 is the second instrument, sequenced as [deploy.md](deploy.md#first-day-on-real-gear--an-ordered-runbook) step 3 | read the three moments — baseline / taps-with-transcode / taps-without-transcode — off the metrics first, then confirm on the real box with the shell probe (it sees `controlstatistics.proxies` and the per-interface blocks, which MSS does not model). This sets the rtpengine capacity plan. D14 is fixed (item 25), so a pod restart mid-probe no longer pollutes the numbers |
 | H4 | **End-to-end barge-in through the integrator's stack** | every MSS-owned hop is measured: consumer `SpeechReport` → bus → `StopPlayback` at **p50 3.5 ms** (item 5), and inline `Clear` → silence at the peer's ear at **p50 12.2 ms**, one ptime (item 35); [deploy.md](deploy.md#first-day-on-real-gear--an-ordered-runbook) step 6 says to measure the whole path while the inline leg is first bridged | the tail is theirs: their event consumer (H1) and their prompt player. Measure the whole path against their perceptual budget |
 | H5 | **The SIP proxy's B2B integration for inline legs** | `CreateSession{kind=INLINE, sdp_offer}` returns a real SDP answer and the leg speaks and listens on real sockets; a `group` seats it in a conference; [deploy.md](deploy.md#high-availability-what-is-adoptable-and-what-is-not) records that an inline leg does **not** survive a pod loss, so recovery is call-control's | offer/answer plumbing from their proxy or B2BUA into that API. No inline leg in this repository has met a **SIP** endpoint — every inline and conference measurement is against an RTP peer with no signalling |
 | H6 | **FS byte-parity against real production recordings** | item 31 measured a live call recorded both ways: container, channel layout and rms agree exactly, and a re-aligned 2 s window agrees on 1.0000 of samples at mean diff 0.6/32768; [deploy.md](deploy.md#first-day-on-real-gear--an-ordered-runbook) step 4 walks the recording checks, frozen identity first. It also established that **byte-parity at a fixed offset is not an achievable bar** — the two recorders conceal independently, so the inter-file offset wanders | a **two-party** comparison on their FreeSWITCH, with their codec, their pause contract, and a human listen. The lab's write side plays silence, so only one channel was truly compared |

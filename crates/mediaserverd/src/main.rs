@@ -401,7 +401,7 @@ async fn serve_control_plane(
         cookie_prefix: cookie_prefix(),
         sdp_session_id: cookie_prefix(),
         recording,
-        capabilities,
+        capabilities: Arc::clone(&capabilities),
     }));
     let draining = Arc::clone(&plane);
     let observing = Arc::clone(&plane);
@@ -508,6 +508,7 @@ async fn serve_control_plane(
                     drain: Arc::clone(&drain_state),
                     ports: Arc::clone(&media_ports),
                     readiness: Arc::clone(&readiness),
+                    capabilities: Arc::clone(&capabilities),
                 };
                 tokio::spawn(metrics::serve(metrics_listener, sources));
             }

@@ -1183,6 +1183,23 @@ whose endpoint does silence suppression. Its value is that
 `MssJitterLossHigh` got *quieter and more honest* — those gaps used to land
 in `mss_jitter_lost_total`.
 
+The rtpengine node series (item 57, 2026-08-26) are the one place where
+`metrics.rs` reports numbers that are **not MSS's own**: they are the last NG
+`statistics` sample each health probe took, exported per node in the
+`mss_dependency_ready{…}` labelled style —
+`mss_rtpengine_tap_kernel_verdict{node,verdict}` at 1 for the verdict that held,
+then `mss_rtpengine_{relayed_packets_kernel,relayed_packets_user,media_kernel,
+media_userspace,media_mixed,transcoded_media,sessions_live}{node}` and
+`mss_rtpengine_sample_age_seconds{node}`. Cardinality is bounded by the number
+of rtpengine nodes a pod has probed, not by calls, and a pod that has probed
+nothing emits none of them (the same "absent source leaves its series out"
+rule as Kafka and Redis). The age gauge is the honesty check: `statistics`
+failing leaves the last sample in place, and the age is what says so.
+`MssTapsFellOutOfKernel` alerts on the transcoding verdict or on userspace
+media rising for 10 min while kernel media stays flat, with architecture §8.1
+as its runbook. Two pods tapping one node report the same counters, so
+aggregate with `max by (node)`, never `sum`.
+
 The SSRC re-resolution series (2026-08-22) are meant to be read as one
 sequence: `mss_legs_ssrc_changes_total` (a leg's sender changed),
 `mss_ssrc_requeries_total` (the control world asked rtpengine about it),
@@ -2483,7 +2500,8 @@ connection), `EventBusProbe` → `EventTransport::reachable` (a partition-offset
 fetch, never a produce, so probes leave no records on `mss.events`; the trait
 method defaults to `Ok` so test transports keep meaning what they meant), and
 `NgNodeProbe` → NG `ping`, which on success calls
-`NodeCapabilityLog::report_first_contact` and on failure calls the new
+`NodeCapabilityLog::observe` (`report_first_contact` until item 57 moved the
+per-probe sampling in behind it) and on failure calls the new
 `NodeCapabilityLog::forget`. That pair is what closes item 23's open re-probe: a
 node's capabilities are re-learned the first time it answers after any failure,
 instead of the pod keeping a dead node's verdict forever.
@@ -2731,9 +2749,31 @@ its kernel module?" — once per node, on the first NG contact with it.
   `relayed_packets_in_userspace=130865`, plus the transcoder chain
   `["PCMU/8000 -> opus/48000/2"]` and the WARN verdict. With `off`: the same
   facts and the "no kernel path for a tap to ride" verdict.
-- Not done: no metric is exported for the verdict (it is log-only), and the
-  probe never repeats — an rtpengine restarted under a running daemon keeps its
-  first-contact report. Both are cheap to add when something needs them.
+- **The sample is no longer log-only (item 57, 2026-08-26).** `NodeCapabilityLog`
+  now also keeps `last: Mutex<HashMap<SocketAddr, NodeSample>>`, and a
+  `NodeSample` is the verdict plus the numbers handoff H3 asks for:
+  `relayedpackets_kernel`/`_user` (totals since the node started),
+  `media_kernel`/`_userspace`/`_mixed` and `transcodedmedia` (current), the
+  node's live session count, and the `Instant` the sample was taken.
+  `NodeSample::from_statistics` is pure, so the mapping is a unit test; `samples()`
+  hands `metrics.rs` a node-ordered `Vec` under one lock; `forget` clears the
+  sample as well as the reported-once set, so a node that stops answering stops
+  being reported rather than freezing at its last numbers.
+- **Two entry points now, because they cost different things.** `observe` always
+  takes a `statistics` round-trip and refreshes the sample, and on the *first*
+  contact with a node it also asks `version` and writes the whole first-contact
+  log line. `report_first_contact` is `observe` behind a read of the
+  reported-once set, so it is a lock and a return for a node already seen.
+  `health.rs`'s `NgNodeProbe` calls `observe` (one extra NG command per node per
+  `MSS_HEALTH_PROBE_INTERVAL_SECS` — per probe, never per packet, never on the
+  media path); `main`'s startup ping and `TapPlane::open_session` keep calling
+  `report_first_contact`, so opening a session on a known node still costs
+  nothing. That is also why the *log* stays once-per-node while the *sample*
+  refreshes: a line per probe interval per node would be noise.
+- Still not done: `verdict` is re-decided from each sample, so an rtpengine
+  restarted under a running daemon gets a fresh verdict on the next probe, but
+  the first-contact **log line** (and the version report in it) is not re-emitted
+  unless the node fails a probe first.
 
 ### tap_spike.rs — the Phase-0 capture (media world)
 Owns the sockets and the pacing for one tap: drain both legs, release one
