@@ -48,7 +48,7 @@ pub async fn serve_authenticated_until(
         .add_service(telcompat)
         .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async move {
             shutdown.await;
-            let _ = draining.send(true);
+            draining.send_replace(true);
         })
         .await
 }

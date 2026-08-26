@@ -5,8 +5,8 @@ use crossbeam_queue::ArrayQueue;
 use media_core::{
     AudioFormat, ContributorId, Gain, ListenerId, MixError, MixMatrix, Party, SpeechGate, Track,
 };
-use session_core::mix::{MemberControl, MixRoute, MixTarget};
-use session_core::SessionId;
+use session_core::mix::{MemberControl, MemberRouteView, MemberStateView, MixRoute, MixTarget};
+use session_core::{AttachmentId, SessionId};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
@@ -101,7 +101,18 @@ pub enum ConferenceCommand {
     },
 }
 
+struct MirroredMember {
+    session: SessionId,
+    external_id: String,
+    mute: bool,
+    deaf: bool,
+    hold: bool,
+    route: MixRoute,
+    route_owner: Option<AttachmentId>,
+}
+
 pub struct Conference {
+    name: String,
     format: AudioFormat,
     commands: Arc<ArrayQueue<ConferenceCommand>>,
     prompts: Arc<ArrayQueue<Vec<i16>>>,
@@ -109,7 +120,7 @@ pub struct Conference {
     stop: Arc<AtomicBool>,
     shared: Arc<ConferenceShared>,
     thread: Option<JoinHandle<()>>,
-    members: Vec<SessionId>,
+    members: Vec<MirroredMember>,
 }
 
 impl Conference {
@@ -137,6 +148,7 @@ impl Conference {
             .spawn(move || mixed.run())
             .map_err(|error| ConferenceError::Thread(error.to_string()))?;
         Ok(Conference {
+            name: name.to_string(),
             format,
             commands,
             prompts,
@@ -174,17 +186,33 @@ impl Conference {
 
     pub fn seat(&mut self, member: ConferenceMember) -> Result<(), ConferenceError> {
         let session = member.session;
+        let external_id = member.external_id.clone();
         self.commands
             .push(ConferenceCommand::Join(Box::new(member)))
             .map_err(|_| ConferenceError::Busy)?;
-        self.members.push(session);
+        self.members.push(MirroredMember {
+            session,
+            external_id,
+            mute: false,
+            deaf: false,
+            hold: false,
+            route: MixRoute::private(),
+            route_owner: None,
+        });
         Ok(())
     }
 
-    pub fn route(&mut self, session: SessionId, route: MixRoute) -> Result<(), ConferenceError> {
-        if !self.members.contains(&session) {
-            return Err(ConferenceError::NotSeated(session));
-        }
+    pub fn route(
+        &mut self,
+        session: SessionId,
+        owner: Option<AttachmentId>,
+        route: MixRoute,
+    ) -> Result<(), ConferenceError> {
+        let mirrored = self
+            .mirrored(session)
+            .ok_or(ConferenceError::NotSeated(session))?;
+        mirrored.route = route.clone();
+        mirrored.route_owner = owner;
         self.commands
             .push(ConferenceCommand::Route { session, route })
             .map_err(|_| ConferenceError::Busy)
@@ -195,12 +223,50 @@ impl Conference {
         session: SessionId,
         control: MemberControl,
     ) -> Result<(), ConferenceError> {
-        if !self.members.contains(&session) {
-            return Err(ConferenceError::NotSeated(session));
+        let mirrored = self
+            .mirrored(session)
+            .ok_or(ConferenceError::NotSeated(session))?;
+        if let Some(mute) = control.mute {
+            mirrored.mute = mute;
+        }
+        if let Some(deaf) = control.deaf {
+            mirrored.deaf = deaf;
+        }
+        if let Some(hold) = control.hold {
+            mirrored.hold = hold;
         }
         self.commands
             .push(ConferenceCommand::Control { session, control })
             .map_err(|_| ConferenceError::Busy)
+    }
+
+    pub fn member_state(&self, session: SessionId) -> Option<MemberStateView> {
+        let member = self.members.iter().find(|held| held.session == session)?;
+        let routes = if member.route == MixRoute::private() {
+            Vec::new()
+        } else {
+            vec![MemberRouteView {
+                route: member.route.clone(),
+                attachment: member.route_owner,
+            }]
+        };
+        Some(MemberStateView {
+            conference: self.name.clone(),
+            members: self
+                .members
+                .iter()
+                .map(|held| held.external_id.clone())
+                .collect(),
+            mute: member.mute,
+            deaf: member.deaf,
+            hold: member.hold,
+            source: member.route.source,
+            routes,
+        })
+    }
+
+    fn mirrored(&mut self, session: SessionId) -> Option<&mut MirroredMember> {
+        self.members.iter_mut().find(|held| held.session == session)
     }
 
     pub fn free_prompt_chunks(&self) -> usize {
@@ -218,7 +284,7 @@ impl Conference {
     }
 
     pub fn unseat(&mut self, session: SessionId) -> Option<JoinHandle<()>> {
-        self.members.retain(|held| *held != session);
+        self.members.retain(|held| held.session != session);
         if self
             .commands
             .push(ConferenceCommand::Leave(session))

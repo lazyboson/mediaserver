@@ -1,0 +1,63 @@
+# hostNetwork variant: the pod uses the node's own network stack, so a media
+# port MSS binds IS a port on the node -- no mapping, no per-port declaration,
+# and a range as wide as the node has to spare.
+#
+# THE TRADE-OFF, against ../hostport. What you gain: an arbitrarily wide media
+# range (the reference deployment's legacy gateway exposes 35000-65000/udp per
+# pod), no DNAT in the media path, and the source address of MSS's own packets
+# is the node's, which is what a symmetric-RTP peer expects to see. What you
+# give up: pod-network isolation and most of what NetworkPolicy can say about
+# this pod; the container's ports are the node's ports, so a port collision with
+# anything else on that node is a bind failure at session time
+# (mss_media_ports_bind_conflicts_total counts them); and only one pod fits per
+# node, hence the required anti-affinity.
+#
+# This is the variant to reach for when media volume is the point. Both work.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mediaserverd
+spec:
+  template:
+    spec:
+      hostNetwork: true
+      # Without this, a hostNetwork pod uses the node's resolv.conf and cannot
+      # resolve redis.mediaserver.svc.cluster.local.
+      dnsPolicy: ClusterFirstWithHostNet
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - topologyKey: kubernetes.io/hostname
+              labelSelector:
+                matchLabels:
+                  app.kubernetes.io/name: mediaserver
+                  app.kubernetes.io/component: media-plane
+      containers:
+        - name: mediaserverd
+          env:
+            # The address peers are told to send to. On hostNetwork that is the
+            # node's own address, which only the node knows -- hence the
+            # downward API rather than a value in the ConfigMap.
+            - name: MSS_MEDIA_ADVERTISE_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.hostIP
+            # And what the sockets BIND. Pinning it to the node address instead
+            # of 0.0.0.0 makes the source address of MSS's own packets
+            # predictable, which matters to a peer doing symmetric RTP and to
+            # anyone reading a capture. On a multi-homed node where the address
+            # rtpengine reaches is not status.hostIP, set this literally in the
+            # ConfigMap instead and leave the advertise address alone.
+            - name: MSS_TAP_LOCAL_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.hostIP
+          ports:
+            # No hostPort entries and no media entries: on hostNetwork these are
+            # informational, and the media range needs no declaration at all.
+            - name: control
+              containerPort: 50051
+              protocol: TCP
+            - name: metrics
+              containerPort: 9464
+              protocol: TCP

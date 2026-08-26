@@ -1,0 +1,152 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mediaserverd
+  labels:
+    app.kubernetes.io/name: mediaserver
+    app.kubernetes.io/component: media-plane
+spec:
+  # Two pods is the minimum that makes the Redis registry mean anything: a pod
+  # loss is only survivable if another pod is there to adopt the taps.
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: mediaserver
+      app.kubernetes.io/component: media-plane
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      # Calls are minutes long and a draining pod closes them politely, so a
+      # rollout is slow by nature. Never surge past one: two pods draining at
+      # once means two adoption storms.
+      maxSurge: 1
+      maxUnavailable: 0
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: mediaserver
+        app.kubernetes.io/component: media-plane
+    spec:
+      serviceAccountName: mediaserverd
+      # MSS_DRAIN_TIMEOUT_SECS (30) + margin for the kubelet's own round trips.
+      # Below this the runtime SIGKILLs the drain half-done and a tapped call
+      # costs its consumer ~14 s of audio instead of ~2 s.
+      terminationGracePeriodSeconds: 45
+      # No preStop hook on purpose. The drain is signal-driven: mediaserverd
+      # handles SIGTERM itself, and its FIRST step flips /readyz to 503, so the
+      # endpoint is pulled by the same mechanism a preStop sleep exists to
+      # emulate. A preStop sleep would only delay the SIGTERM and eat the grace
+      # period.
+      securityContext:
+        runAsNonRoot: true
+        # The distroless "nonroot" user baked into the image.
+        runAsUser: 65532
+        runAsGroup: 65532
+        # Owns the spill volume, which the process must write to.
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      affinity:
+        podAntiAffinity:
+          # Spread pods across nodes so one node loss is one adoption, not a
+          # fleet-wide one. The hostnetwork overlay promotes this to
+          # requiredDuringScheduling, because host ports collide.
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels:
+                    app.kubernetes.io/name: mediaserver
+                    app.kubernetes.io/component: media-plane
+      containers:
+        - name: mediaserverd
+          # Overridden by the `images:` transformer in kustomization.yaml.
+          image: ghcr.io/lazyboson/mediaserver:v0.1.0
+          imagePullPolicy: IfNotPresent
+          envFrom:
+            - configMapRef:
+                name: mediaserverd-env
+            - secretRef:
+                name: mediaserverd-secrets
+          env:
+            # The registry lease owner. Without it every pod calls itself
+            # "mediaserverd" and adoption cannot tell them apart.
+            - name: MSS_POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+          ports:
+            - name: control
+              containerPort: 50051
+              protocol: TCP
+            - name: metrics
+              containerPort: 9464
+              protocol: TCP
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: metrics
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 2
+            successThreshold: 1
+          livenessProbe:
+            # /healthz consults no dependency on purpose: restarting a pod
+            # because Redis is down turns one outage into a crash-loop.
+            httpGet:
+              path: /healthz
+              port: metrics
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          startupProbe:
+            # First contact with rtpengine, the spill salvage pass and the
+            # Kafka connect all happen before the listener binds.
+            httpGet:
+              path: /healthz
+              port: metrics
+            periodSeconds: 2
+            failureThreshold: 30
+          resources:
+            # MEASURE THIS. Architecture 8 estimates "a few thousand
+            # concurrent sessions per modern 8-core pod" for passive taps and
+            # ~2x per inline session -- an estimate to validate in the
+            # benchmark, not a promise. These requests are a starting point for
+            # a few hundred concurrent tapped calls; watch
+            # mss_media_ports_in_use, the jitter-buffer and consumer-queue
+            # gauges, and CPU per session under the real codec mix.
+            requests:
+              cpu: "2"
+              memory: 1Gi
+            limits:
+              # No CPU limit on purpose: the packet path runs on dedicated
+              # real-time OS threads, and CFS throttling on those threads shows
+              # up as pacing jitter and consumer underruns, not as a slow API.
+              # Bound the pod with requests and a node-level allocation instead.
+              memory: 2Gi
+          volumeMounts:
+            - name: recording-spill
+              mountPath: /var/lib/mediaserverd/spill
+            # The root filesystem is read-only; this is the one writable path
+            # anything else in the process could reach for.
+            - name: tmp
+              mountPath: /tmp
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+      volumes:
+        - name: recording-spill
+          # Per-pod scratch for closed recording segments (defect D9). It only
+          # ever has to survive a container restart, not a pod loss: a
+          # cross-pod adopter cannot read another pod's disk either way, so a
+          # PVC buys nothing here. Size it at
+          # (spill interval) x (concurrent recordings) x 16 kB/s, with headroom
+          # for a broker or bucket outage.
+          emptyDir:
+            sizeLimit: 4Gi
+        - name: tmp
+          emptyDir:
+            sizeLimit: 64Mi

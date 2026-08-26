@@ -1,3 +1,4 @@
+use crate::digits::{Digit, DigitQueue};
 use crate::hub::{Hub, TapEvent};
 use crate::inline_leg::InlineEgress;
 use crate::supervisor::{AudioFlowWatchdog, SessionHealth};
@@ -199,6 +200,7 @@ pub struct TapLeg {
     frames_released: u64,
     datagram_log: Vec<u8>,
     shared: Option<Arc<SharedLegStats>>,
+    digit_sink: Option<Arc<DigitQueue>>,
     watchdog: Option<AudioFlowWatchdog>,
     watched_datagrams: u64,
     stalled: bool,
@@ -260,6 +262,7 @@ impl TapLeg {
             frames_released: 0,
             datagram_log: Vec::new(),
             shared: None,
+            digit_sink: None,
             watchdog: None,
             watched_datagrams: 0,
             stalled: false,
@@ -303,6 +306,11 @@ impl TapLeg {
         if let Some(shared) = &self.shared {
             shared.store(&stats, self.stalled, self.stalls);
         }
+    }
+
+    pub fn with_digit_sink(mut self, digits: Arc<DigitQueue>) -> Self {
+        self.digit_sink = Some(digits);
+        self
     }
 
     pub fn with_ssrc_tracks(mut self, ssrc_tracks: Vec<(u32, Track)>) -> Self {
@@ -453,16 +461,19 @@ impl TapLeg {
                         .as_micros() as u64;
                     let outcome = self.pipeline.ingest_at(&buf[..len], arrival_micros);
                     self.observe_ssrc();
-                    if let IngestOutcome::Dtmf(digit) = outcome {
+                    if let IngestOutcome::Dtmf(press) = outcome {
                         if self.digits_recorded < MAX_RECORDED_DIGITS {
-                            self.digits[self.digits_recorded] = digit;
+                            self.digits[self.digits_recorded] = press.digit;
                             self.digits_recorded += 1;
                         }
                         if let Some(hub) = hub.as_deref_mut() {
                             hub.publish(TapEvent::Dtmf {
                                 track: self.track,
-                                digit,
+                                digit: press.digit,
                             });
+                        }
+                        if let Some(digits) = self.digit_sink.as_deref() {
+                            digits.publish(Digit::pressed(self.track, press));
                         }
                     }
                     self.stats.datagrams += 1;

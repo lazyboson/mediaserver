@@ -2,14 +2,20 @@
 
 mod conference;
 mod consumer_ws;
+mod digits;
+mod discovery;
+mod drain;
 mod event_pump;
+mod health;
 mod hub;
 mod inline_leg;
+mod media_ports;
 mod media_rt;
 mod metrics;
 mod ng_transport;
 mod recorder;
 mod recording_spill;
+mod recording_uploads;
 mod registry_keeper;
 mod rtpengine_capability;
 mod session_store;
@@ -18,11 +24,15 @@ mod tap_plane;
 mod tap_session;
 mod tap_spike;
 
+use control_api::proto;
+use control_api::proto::media_control_server::MediaControl;
+use control_api::tonic::Request;
 use control_api::{AuthPolicy, ObservationSink, SessionController};
+use drain::{DrainSteps, SessionsClosed};
 use media_core::AudioFormat;
 use ng_transport::{NgTransport, NgTransportConfig};
 use std::net::{IpAddr, SocketAddr};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tap_plane::{TapPlane, TapPlaneConfig};
 use tracing::{error, info, warn};
@@ -33,6 +43,8 @@ const KAFKA_BROKERS_ENV: &str = "MSS_KAFKA_BROKERS";
 const EVENTS_TOPIC_ENV: &str = "MSS_EVENTS_TOPIC";
 const EVENTS_PARTITIONS_ENV: &str = "MSS_EVENTS_PARTITIONS";
 const REDIS_URL_ENV: &str = "MSS_REDIS_URL";
+const DISCOVERY_PREFIX_ENV: &str = "MSS_DISCOVERY_REDIS_KEY_PREFIX";
+const DISCOVERY_URL_ENV: &str = "MSS_DISCOVERY_REDIS_URL";
 const POD_NAME_ENV: &str = "MSS_POD_NAME";
 const LOCAL_MEDIA_IP_ENV: &str = "MSS_TAP_LOCAL_IP";
 const METRICS_LISTEN_ENV: &str = "MSS_METRICS_LISTEN";
@@ -43,7 +55,6 @@ const OPUS_DECODE_RATE_DEFAULT_HZ: u32 = 16000;
 const AUTH_TOKEN_ENV: &str = "MSS_AUTH_TOKEN";
 const RECORDING_BUCKET_ENV: &str = "MSS_RECORDING_BUCKET";
 const DEFAULT_POD_NAME: &str = "mediaserverd";
-const EVENT_FLUSH_WINDOW: std::time::Duration = std::time::Duration::from_secs(10);
 
 fn main() {
     tracing_subscriber::fmt()
@@ -87,10 +98,16 @@ fn main() {
         let capabilities = Arc::new(rtpengine_capability::NodeCapabilityLog::new(
             transcode_at_tap(),
         ));
-        probe_configured_rtpengine_node(&capabilities).await;
+        let drain_state = drain::DrainState::shared();
+        let readiness = health::Readiness::shared(Arc::clone(&drain_state));
+        let probe_interval = health::probe_interval();
+        probe_configured_rtpengine_node(&capabilities, &readiness, probe_interval).await;
 
         match control_listen_address() {
-            Some(Ok(listen)) => serve_control_plane(listen, capabilities).await,
+            Some(Ok(listen)) => {
+                serve_control_plane(listen, capabilities, drain_state, readiness, probe_interval)
+                    .await
+            }
             Some(Err(configured)) => {
                 error!(
                     configured,
@@ -103,10 +120,8 @@ fn main() {
                     env = CONTROL_LISTEN_ENV,
                     "no control plane listen address configured; idling"
                 );
-                tokio::signal::ctrl_c()
-                    .await
-                    .expect("failed to listen for shutdown signal");
-                info!("shutdown signal received");
+                let signal = drain::next_shutdown_signal().await;
+                info!(signal = signal.name(), "shutdown signal received");
             }
         }
     });
@@ -115,15 +130,23 @@ fn main() {
     info!("mediaserverd stopped");
 }
 
-async fn probe_configured_rtpengine_node(capabilities: &rtpengine_capability::NodeCapabilityLog) {
-    let Ok(configured) = std::env::var(RTPENGINE_NODE_ENV) else {
+async fn probe_configured_rtpengine_node(
+    capabilities: &Arc<rtpengine_capability::NodeCapabilityLog>,
+    readiness: &Arc<health::Readiness>,
+    probe_interval: std::time::Duration,
+) {
+    let configured = std::env::var(RTPENGINE_NODE_ENV)
+        .ok()
+        .filter(|configured| !configured.trim().is_empty());
+    let Some(configured) = configured else {
         info!(
             env = RTPENGINE_NODE_ENV,
             "no rtpengine node configured; skipping NG reachability probe"
         );
+        readiness.record_not_configured(health::Dependency::Rtpengine);
         return;
     };
-    let node: SocketAddr = match configured.parse() {
+    let node: SocketAddr = match configured.trim().parse() {
         Ok(node) => node,
         Err(error) => {
             error!(
@@ -132,9 +155,14 @@ async fn probe_configured_rtpengine_node(capabilities: &rtpengine_capability::No
                 env = RTPENGINE_NODE_ENV,
                 "rtpengine node must be an ip:port address"
             );
+            readiness.record_failure(
+                health::Dependency::Rtpengine,
+                format!("{RTPENGINE_NODE_ENV} is not an ip:port address"),
+            );
             return;
         }
     };
+    readiness.describe(health::Dependency::Rtpengine, Some(node.to_string()));
 
     let any_local = SocketAddr::from(([0, 0, 0, 0], 0));
     let transport = match NgTransport::bind(
@@ -145,35 +173,56 @@ async fn probe_configured_rtpengine_node(capabilities: &rtpengine_capability::No
     )
     .await
     {
-        Ok(transport) => transport,
+        Ok(transport) => Arc::new(transport),
         Err(error) => {
             error!(%node, %error, "could not bind the NG control socket");
+            readiness.record_failure(
+                health::Dependency::Rtpengine,
+                format!("the NG control socket could not be bound: {error}"),
+            );
             return;
         }
     };
 
     let outcome = transport.ping().await;
-    let health = transport.health();
+    let health_now = transport.health();
     match outcome {
         Ok(_) => {
             info!(
                 %node,
                 local = ?transport.local_addr().ok(),
-                healthy = health.healthy,
-                replies = health.replies,
+                healthy = health_now.healthy,
+                replies = health_now.replies,
                 "rtpengine NG node answered ping"
             );
             capabilities.report_first_contact(node, &transport).await;
+            readiness.record_ready(health::Dependency::Rtpengine);
         }
-        Err(error) => error!(
-            %node,
-            %error,
-            healthy = health.healthy,
-            timeouts = health.timeouts,
-            consecutive_timeouts = health.consecutive_timeouts,
-            "rtpengine NG node did not answer ping"
-        ),
+        Err(error) => {
+            error!(
+                %node,
+                %error,
+                healthy = health_now.healthy,
+                timeouts = health_now.timeouts,
+                consecutive_timeouts = health_now.consecutive_timeouts,
+                "rtpengine NG node did not answer ping"
+            );
+            readiness.record_failure(health::Dependency::Rtpengine, error.to_string());
+        }
     }
+
+    health::watch(
+        Arc::clone(readiness),
+        health::NgNodeProbe::new(transport, node, Arc::clone(capabilities))
+            as Arc<dyn health::HealthProbe>,
+        probe_interval,
+    );
+    info!(
+        %node,
+        seconds = probe_interval.as_secs(),
+        "this rtpengine node is re-probed on this interval; its capabilities are re-learned \
+         after any failure"
+    );
 }
 
 fn cookie_prefix() -> u64 {
@@ -293,17 +342,27 @@ fn auth_policy_from_env() -> AuthPolicy {
 }
 
 fn local_media_address() -> IpAddr {
-    std::env::var(LOCAL_MEDIA_IP_ENV)
+    let address = std::env::var(LOCAL_MEDIA_IP_ENV)
         .ok()
         .and_then(|configured| configured.parse().ok())
-        .unwrap_or(IpAddr::from([0, 0, 0, 0]))
+        .unwrap_or(IpAddr::from([0, 0, 0, 0]));
+    info!(
+        env = LOCAL_MEDIA_IP_ENV,
+        address = %address,
+        "media and ng sockets bind to this address"
+    );
+    address
 }
 
 async fn serve_control_plane(
     listen: SocketAddr,
     capabilities: Arc<rtpengine_capability::NodeCapabilityLog>,
+    drain_state: Arc<drain::DrainState>,
+    readiness: Arc<health::Readiness>,
+    probe_interval: std::time::Duration,
 ) {
     let owner = std::env::var(POD_NAME_ENV).unwrap_or_else(|_| DEFAULT_POD_NAME.to_string());
+    let drain_budget = drain::drain_timeout();
     let recording = match recorder::RecordingSupport::from_env(&owner) {
         Ok(recording) => recording,
         Err(error) => {
@@ -327,11 +386,15 @@ async fn serve_control_plane(
         );
     }
     let opus_rate = opus_decode_rate_hz();
+    let local_media = local_media_address();
+    let media_ports = media_ports::MediaPortAllocator::from_env();
     let plane = Arc::new(TapPlane::new(TapPlaneConfig {
         default_node: std::env::var(RTPENGINE_NODE_ENV)
             .ok()
             .and_then(|configured| configured.parse().ok()),
-        local_media_address: local_media_address(),
+        local_media_address: local_media,
+        advertised_media_address: media_ports::advertise_address(local_media),
+        media_ports: Arc::clone(&media_ports),
         format: tap_format(opus_rate),
         transcode_at_tap: capabilities.transcode_at_tap(),
         opus_decode_rate_hz: opus_rate,
@@ -347,15 +410,22 @@ async fn serve_control_plane(
 
     let mut pump_worker = None;
     match event_sink_from_env().await {
-        Ok(Some((sink, worker, counters))) => {
+        Ok(Some((sink, worker, counters, transport))) => {
             controller = controller.with_event_sink(sink);
             pump_worker = Some((worker, counters));
+            readiness.record_ready(health::Dependency::Kafka);
+            health::watch(
+                Arc::clone(&readiness),
+                health::EventBusProbe::new(transport) as Arc<dyn health::HealthProbe>,
+                probe_interval,
+            );
         }
         Ok(None) => {
             info!(
                 env = KAFKA_BROKERS_ENV,
                 "no event bus configured; events stay in-process"
             );
+            readiness.record_not_configured(health::Dependency::Kafka);
         }
         Err(error) => {
             error!(%error, "the configured event bus is unreachable; refusing to start");
@@ -375,24 +445,53 @@ async fn serve_control_plane(
     let controller = Arc::new(controller);
     observing.observe_through(Arc::downgrade(&controller) as std::sync::Weak<dyn ObservationSink>);
     let mut keeper_counters = None;
+    let mut keeper_handles = None;
+    let mut registry_store = None;
     match session_store_from_env().await {
         Ok(Some(store)) => {
-            let keeper =
-                registry_keeper::RegistryKeeper::new(Arc::clone(&controller), store, owner.clone())
-                    .with_subscriptions(
-                        Arc::clone(&observing) as Arc<dyn registry_keeper::TapSubscriptions>
-                    );
+            readiness.record_ready(health::Dependency::Redis);
+            health::watch(
+                Arc::clone(&readiness),
+                health::SessionStoreProbe::new(
+                    Arc::clone(&store) as Arc<dyn session_store::SessionStore>
+                ) as Arc<dyn health::HealthProbe>,
+                probe_interval,
+            );
+            registry_store = Some(Arc::clone(&store));
+            let keeper = Arc::new(
+                registry_keeper::RegistryKeeper::new(
+                    Arc::clone(&controller),
+                    store as Arc<dyn session_store::SessionStore>,
+                    owner.clone(),
+                )
+                .with_subscriptions(
+                    Arc::clone(&observing) as Arc<dyn registry_keeper::TapSubscriptions>
+                ),
+            );
             keeper_counters = Some(keeper.counters());
-            tokio::spawn(keeper.run());
+            let renewing = tokio::spawn(Arc::clone(&keeper).run());
+            keeper_handles = Some(KeeperHandles { keeper, renewing });
         }
-        Ok(None) => info!(
-            env = REDIS_URL_ENV,
-            "no session registry configured; sessions live and die with this pod"
-        ),
+        Ok(None) => {
+            info!(
+                env = REDIS_URL_ENV,
+                "no session registry configured; sessions live and die with this pod"
+            );
+            readiness.record_not_configured(health::Dependency::Redis);
+        }
         Err(error) => {
             error!(%error, "the configured session registry is unreachable; refusing to start");
             return;
         }
+    }
+
+    let counting_discovery = Arc::new(discovery::DiscoveryCounters::default());
+    let mut discovery_counters = None;
+    if let Some(node_map) =
+        node_discovery_from_env(registry_store.as_ref(), &counting_discovery).await
+    {
+        observing.discover_through(node_map);
+        discovery_counters = Some(counting_discovery);
     }
 
     match metrics_listen_address() {
@@ -405,6 +504,10 @@ async fn serve_control_plane(
                         .as_ref()
                         .map(|(_, counters)| Arc::clone(counters)),
                     keeper: keeper_counters.clone(),
+                    discovery: discovery_counters.clone(),
+                    drain: Arc::clone(&drain_state),
+                    ports: Arc::clone(&media_ports),
+                    readiness: Arc::clone(&readiness),
                 };
                 tokio::spawn(metrics::serve(metrics_listener, sources));
             }
@@ -428,19 +531,37 @@ async fn serve_control_plane(
     }
 
     let auth = auth_policy_from_env();
-    let served = control_api::serve_authenticated_until(controller, auth, listener, async {
-        tokio::signal::ctrl_c()
-            .await
-            .expect("failed to listen for shutdown signal");
-        info!(
-            live_taps = draining.live_sessions(),
-            "shutdown signal received; draining the control plane"
-        );
-    })
-    .await;
-    if let Err(error) = served {
-        warn!(%error, "the control plane stopped with an error");
-    }
+    let mut until_draining = controller.drain_watch();
+    let serving = tokio::spawn(control_api::serve_authenticated_until(
+        Arc::clone(&controller),
+        auth,
+        listener,
+        async move {
+            let _ = until_draining.wait_for(|draining| *draining).await;
+        },
+    ));
+
+    let signal = drain::next_shutdown_signal().await;
+    info!(
+        signal = signal.name(),
+        live_taps = draining.live_sessions(),
+        drain_budget_secs = drain_budget.as_secs(),
+        "shutdown signal received; draining the control plane"
+    );
+    drain::exit_on_second_signal();
+
+    let steps = ControlPlaneDrain {
+        drain: Arc::clone(&drain_state),
+        controller: Arc::clone(&controller),
+        plane: Arc::clone(&draining),
+        keeper: keeper_handles,
+        serving: Mutex::new(Some(serving)),
+        events: pump_worker
+            .as_ref()
+            .map(|(_, counters)| Arc::clone(counters)),
+    };
+    drain::run_drain(&steps, drain_budget).await;
+
     if let Some(counters) = keeper_counters {
         info!(
             persisted = counters
@@ -448,13 +569,18 @@ async fn serve_control_plane(
                 .load(std::sync::atomic::Ordering::Relaxed),
             adopted = counters.adopted.load(std::sync::atomic::Ordering::Relaxed),
             released = counters.released.load(std::sync::atomic::Ordering::Relaxed),
+            handed_off = counters
+                .handed_off
+                .load(std::sync::atomic::Ordering::Relaxed),
             lost = counters.lost.load(std::sync::atomic::Ordering::Relaxed),
             failed = counters.failed.load(std::sync::atomic::Ordering::Relaxed),
             "session registry totals at shutdown"
         );
     }
     if let Some((worker, counters)) = pump_worker {
-        let unsent = event_pump::await_empty_backlog(&counters, EVENT_FLUSH_WINDOW).await;
+        let unsent = counters
+            .retry_depth
+            .load(std::sync::atomic::Ordering::Relaxed);
         if unsent > 0 {
             warn!(
                 unsent,
@@ -478,11 +604,111 @@ async fn serve_control_plane(
     }
 }
 
+struct KeeperHandles {
+    keeper: Arc<registry_keeper::RegistryKeeper>,
+    renewing: tokio::task::JoinHandle<()>,
+}
+
+type ServingControlPlane =
+    tokio::task::JoinHandle<Result<(), control_api::tonic::transport::Error>>;
+
+struct ControlPlaneDrain {
+    drain: Arc<drain::DrainState>,
+    controller: Arc<SessionController>,
+    plane: Arc<TapPlane>,
+    keeper: Option<KeeperHandles>,
+    serving: Mutex<Option<ServingControlPlane>>,
+    events: Option<Arc<event_pump::PumpCounters>>,
+}
+
+#[control_api::async_trait]
+impl DrainSteps for ControlPlaneDrain {
+    fn stop_accepting(&self) {
+        self.drain.begin();
+        self.controller.begin_drain();
+        info!(
+            live_taps = self.plane.live_sessions(),
+            uploads_in_flight = self.plane.uploads_in_flight(),
+            "readiness is off and no new session or attachment will be taken here"
+        );
+    }
+
+    async fn hand_off_leases(&self) -> usize {
+        let Some(handles) = self.keeper.as_ref() else {
+            return 0;
+        };
+        handles.renewing.abort();
+        handles.keeper.hand_off_leases().await
+    }
+
+    async fn close_sessions(&self) -> SessionsClosed {
+        let mut closed = SessionsClosed::default();
+        for (session, _) in self.controller.snapshot() {
+            let external_id = session.external_id.clone();
+            let ended = self
+                .controller
+                .destroy_session(Request::new(proto::SessionRef {
+                    id: Some(proto::session_ref::Id::ExternalId(external_id.clone())),
+                }))
+                .await;
+            match ended {
+                Ok(_) => {
+                    closed.closed += 1;
+                    info!(
+                        %external_id,
+                        "session closed for shutdown: consumers stopped, recording finished, tap unsubscribed"
+                    );
+                }
+                Err(error) => {
+                    closed.failed += 1;
+                    warn!(
+                        %external_id,
+                        %error,
+                        "this session could not be closed cleanly; rtpengine keeps its subscription"
+                    );
+                }
+            }
+        }
+        closed
+    }
+
+    async fn await_uploads(&self) -> usize {
+        let settled = self.plane.await_uploads().await;
+        if settled > 0 {
+            info!(
+                settled,
+                "every recording upload backgrounded by a detach reached storage or its spill disk"
+            );
+        }
+        settled
+    }
+
+    async fn await_control_plane_idle(&self) {
+        let serving = self.serving.lock().ok().and_then(|mut held| held.take());
+        let Some(serving) = serving else {
+            return;
+        };
+        match serving.await {
+            Ok(Ok(())) => info!("the control plane listener closed"),
+            Ok(Err(error)) => warn!(%error, "the control plane stopped with an error"),
+            Err(error) => warn!(%error, "the control plane task did not end cleanly"),
+        }
+    }
+
+    async fn flush_events(&self) -> u64 {
+        let Some(counters) = self.events.as_ref() else {
+            return 0;
+        };
+        event_pump::await_empty_backlog(counters, drain::EVENT_FLUSH_WINDOW).await
+    }
+}
+
 async fn event_sink_from_env() -> Result<
     Option<(
         Arc<event_pump::KafkaEventPump>,
         tokio::task::JoinHandle<()>,
         Arc<event_pump::PumpCounters>,
+        Arc<dyn event_pump::EventTransport>,
     )>,
     String,
 > {
@@ -505,18 +731,76 @@ async fn event_sink_from_env() -> Result<
         .and_then(|value| value.parse().ok())
         .unwrap_or(event_pump::DEFAULT_PARTITIONS);
 
-    let transport = event_pump::RskafkaTransport::connect(brokers, &topic, partitions).await?;
-    let (pump, worker) = event_pump::KafkaEventPump::start(Arc::new(transport));
+    let transport: Arc<dyn event_pump::EventTransport> =
+        Arc::new(event_pump::RskafkaTransport::connect(brokers, &topic, partitions).await?);
+    let (pump, worker) = event_pump::KafkaEventPump::start(Arc::clone(&transport));
     let counters = pump.counters();
-    Ok(Some((Arc::new(pump), worker, counters)))
+    Ok(Some((Arc::new(pump), worker, counters, transport)))
 }
 
 async fn session_store_from_env(
-) -> Result<Option<Arc<dyn session_store::SessionStore>>, session_store::StoreError> {
-    let Ok(url) = std::env::var(REDIS_URL_ENV) else {
+) -> Result<Option<Arc<session_store::RedisSessionStore>>, session_store::StoreError> {
+    let Some(url) = configured(REDIS_URL_ENV) else {
         return Ok(None);
     };
     let store = session_store::RedisSessionStore::connect(&url).await?;
     info!(url, "session registry connected");
     Ok(Some(Arc::new(store)))
+}
+
+fn configured(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+async fn node_discovery_from_env(
+    registry: Option<&Arc<session_store::RedisSessionStore>>,
+    counters: &Arc<discovery::DiscoveryCounters>,
+) -> Option<Arc<discovery::NodeDiscovery>> {
+    let prefix = configured(DISCOVERY_PREFIX_ENV);
+    let separate_url = configured(DISCOVERY_URL_ENV);
+    info!(
+        env = DISCOVERY_PREFIX_ENV,
+        prefix = prefix.as_deref().unwrap_or("unset"),
+        url = separate_url.as_deref().unwrap_or("unset"),
+        "rtpengine node discovery"
+    );
+    let prefix = prefix?;
+    let map: Arc<dyn discovery::NodeMap> = match separate_url {
+        Some(url) => match session_store::RedisSessionStore::connect(&url).await {
+            Ok(store) => {
+                info!(url, "the discovery map has its own redis");
+                Arc::new(store)
+            }
+            Err(error) => {
+                warn!(
+                    url,
+                    %error,
+                    env = DISCOVERY_URL_ENV,
+                    "the discovery redis is unreachable; every call will fall back to the \
+                     default rtpengine node"
+                );
+                return None;
+            }
+        },
+        None => match registry {
+            Some(store) => Arc::clone(store) as Arc<dyn discovery::NodeMap>,
+            None => {
+                warn!(
+                    env = DISCOVERY_PREFIX_ENV,
+                    registry = REDIS_URL_ENV,
+                    separate = DISCOVERY_URL_ENV,
+                    "a discovery key prefix is configured but no redis is; discovery is off"
+                );
+                return None;
+            }
+        },
+    };
+    Some(Arc::new(discovery::NodeDiscovery::new(
+        map,
+        prefix,
+        Arc::clone(counters),
+    )))
 }

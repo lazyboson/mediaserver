@@ -523,7 +523,17 @@ That is what makes `offered_format` in `rtpengine-ng` a safe question to ask.
 
 ### dtmf.rs — complete for RFC 4733 digit reporting
 - Reports once per press on end-bit, deduped by (digit, RTP timestamp);
-  events ≥16 (flash-hook etc.) deliberately ignored.
+  events ≥16 (flash-hook etc.) deliberately ignored. That dedupe is what makes
+  RFC 4733's three end retransmissions **one** press, and since item 48 it has a
+  test of its own rather than being an implicit property.
+- `push` returns a `DigitPress { digit, duration_ms, rtp_timestamp }`, not a bare
+  `char` (item 48, D21): the bus needs the press length and a timestamp that
+  lines a digit up with recorded audio. **`duration_ms` is converted through the
+  detector's own clock rate**, which `StreamPipeline` gives it from
+  `PipelineConfig::clock_rate_hz` — the *negotiated* RTP clock, not a hardcoded
+  8000. RFC 4733 §2.4.1 has the event stream share the audio stream's clock, so
+  an 800-tick press reads 100 ms on a G.711 call and 16 ms on a 48 kHz Opus one.
+  A zero clock rate yields 0 ms rather than dividing by zero.
 
 ### frame.rs — complete
 - `samples_per_packet` returns `None` on zero ptime/rate rather than
@@ -720,6 +730,70 @@ copying it. Nothing in `InlineOffer` talks to rtpengine.
   emit is legal SDP by our own reading of it. No real SIP peer has parsed it
   yet (item 33 is replay + fake socket only).
 
+### Leg attribution: what a `query` reply does and does not carry (item 47)
+
+`NgReply::tags_created()` returns each participant's `created` alongside its
+tag, preserving the reply's own order. What that field is, **measured** with
+`lab/ng_tag_created_probe.py` against the lab's rtpengine 14.1.1.8 rather than
+read from documentation:
+
+- a tag entry's only scalar fields are `tag` and **`created`** — an integer of
+  whole **seconds**. The sub-second companions `created_ts` (microseconds since
+  epoch) and `created_us` exist **only at the top level** of the reply, next to
+  the call's own `created`; there is no per-tag equivalent;
+- `created` is stamped **per dialogue**, not per participant. An offer and an
+  answer 4 s apart both came back `1787737315`. A second offer/answer pair on
+  the *same* call-id 12 s later came back `1787737395` for both of its tags
+  (legA/legB `…383`, legC/legD `…395`);
+- therefore creation time can separate B2B dialogues sharing one call-id and
+  **can never** separate the two legs of one dialogue. `MSS`'s
+  `order_participants()` returns `Attribution::Inferred` only when the first two
+  participants carry strictly different seconds, which for a two-party call on
+  this version never happens;
+- the reply's own tag order is **not** rtpengine's insertion order by the time
+  MSS sees it: `bencode::Value::Dict` is a `BTreeMap`, so `tags()` is
+  lexicographic by tag bytes. That, not any creation order, is what inverted the
+  labels in the two-node drill (D17);
+- and the probe itself must randomise its cookie prefix: rtpengine replays a
+  cached reply for a repeated cookie, so a fixed prefix makes consecutive runs
+  answer with the *previous* run's call (the D12 shape, seen again here).
+
+### DTMF digits on the event bus, and why they need no capability (item 48, D21)
+
+`crates/mediaserverd/src/digits.rs` is the whole bridge: a bounded
+`ArrayQueue<Digit>` plus a `Notify`. `TapLeg::drain` — on the real-time capture
+thread — calls `publish`, which pushes or counts a refusal and returns; it never
+blocks, never allocates and never touches the registry. One Tokio task per
+session drains the queue and calls `ObservationSink::observe`, which is the same
+`Weak<dyn ObservationSink>` the recorder uses. `close_session` closes the queue,
+the publisher drains what is left and ends on its own — it is deliberately **not**
+aborted like the SSRC watcher, because a digit pressed just before the hangup is
+still a fact about the call.
+
+**The gating decision, and why it differs from `SpeechReport`.** A digit is
+published at **session level**, whenever the session exists: no attachment, no
+`CAPABILITY_EVENTS`, no consumer needed. MSS decoded it from the call's own RTP,
+so there is nothing to authenticate — the same footing as `RecordingStarted` and
+`LegsAttributed`, which also go through `Registry::observe`. `SpeechReport`
+(item 28, D19) is gated because it is the mirror image: a *consumer* claiming
+something it inferred, where the attachment is the claimant and must be
+privileged to speak for the call. Reading the attachment-level EVENTS capability
+here would mean a call with no consumer produced no digits, which is exactly the
+integration this closes — a recording-only or bus-only integrator building a digit
+menu. Do not "harmonise" the two paths; the asymmetry is the point.
+
+- capacity is 64 presses. Digits are rare (item 40 chose not to rate-limit
+  them), so a drop means something is wrong, and it is visible:
+  `mss_dtmf_events_dropped_total`, accumulated per session at close;
+- **both** tap legs and inline legs carry the sink, so digits pressed into a bot
+  leg reach the bus too;
+- the payload's `track` goes through `convert::track_name_under`, so an
+  `attribution=unknown` session's digits arrive on `leg_a`/`leg_b` — item 47's
+  rule, unchanged, applied to digits;
+- `proto.Dtmf` gained `duration_ms = 3` and `rtp_timestamp = 4`. Additive: the
+  `MediaEvent` payload oneof tag stays **14**, and an old consumer decoding the
+  message simply sees the two new fields defaulted.
+
 ## crates/protocol — frozen wire contracts
 - `twilio.rs` and `fork_events.rs` serialization tests are the contract
   (Constitution VII). Do not change shapes; add new versioned surfaces.
@@ -743,6 +817,20 @@ copying it. Nothing in `InlineOffer` talks to rtpengine.
   migrates (architecture.md risk #4).
 
 ## crates/session-core — the control-plane state machine (M4), sans-IO
+
+`attribution.rs` holds `Attribution` (`Explicit` / `Inferred` / `Unknown`,
+default `Explicit`) — how a session's track names were arrived at (item 47,
+D17). `SessionRecord` carries it, `SessionView` exposes it, and **every**
+`MediaEvent` is stamped with the record's value at `push_event` time, so a
+consumer of `mss.events` can tell a named direction from a guess without asking
+the API. It is set at `create_session` (a TAP with no `from_tags` is `Unknown`;
+everything else, including every INLINE leg, is `Explicit` — MSS answered an
+inline leg itself, so its capture is unambiguous) and rewritten by
+`Observation::LegsAttributed` from the media plane, which is also the event that
+reaches the bus. `record_attribution()` is the direct setter for callers that
+have no observation to make. It is deliberately **not** persisted in
+`PersistedSession`: a session with no `from_tags` is not rebuildable, and one
+with them re-derives `Explicit` on the adopting pod.
 
 `SessionRegistry` is the MediaControl API of architecture.md §5.1 as a pure
 state machine: no sockets, no async, no clock of its own. The tonic service
@@ -1704,8 +1792,9 @@ setup then fails reverts the same way. Two INJECT attachments on one leg share
 one injector — last writer wins, documented, not enforced.
 
 Events: `EventKind::MixRouted{target, monitor_audible}` →
-`MediaEvent.mix_routed` (oneof tag 25; item 40 then took 26, so the next free
-payload tag is 27) on the
+`MediaEvent.mix_routed` (oneof tag 25; item 40 then took 26 and item 47's
+`legs_attributed` took 27, so **the next free payload tag is 28** — item 48 added
+fields to the existing `Dtmf` message rather than a new payload) on the
 attach that declares a route and on every change, so an integrator can audit who
 whispered to whom and whether it was on the record. `mss_ctl mix <attachment-id>
 <own|all|member-id> [include|exclude]` is the lab handle. New metrics:
@@ -1806,7 +1895,9 @@ on any attachment of that member's own session (`member_mute` / `member_deaf` /
 `member_hold`, each `on` or `off`, absent = untouched) and they **outlive that
 attachment on purpose** — `close_attachment` reverts a whisper route and does
 *not* revert member state, because muting somebody is not a property of the
-consumer that asked for it. That also means no owner and no lease: tasks.md D22.
+consumer that asked for it. That also means no owner and no lease: tasks.md D22
+— item 49 then made the state **readable** on `DescribeSession` without giving
+it an owner (see the item-49 section below).
 No capability is required (the API caller's own authentication is the
 authorization, exactly like `paused`); `MemberControl::from_metadata` in
 `session-core/src/mix.rs` is the only parser, and `EventKind::MemberControlled`
@@ -1893,6 +1984,56 @@ still hearing everybody; and the refusals (a flag that is not `on`/`off`, a
 member verb on a leg that is in no conference, a from-tag-shaped playback target
 on an inline leg) — plus the mix-metadata parser tests and a registry audit
 test.
+
+### conference.rs — the control-world member mirror, read back by Describe (item 49, D22, 2026-08-26)
+
+`Conference` — the **control-plane handle**, not the mixing thread — now keeps a
+`MirroredMember` per seated session: external id, `mute`/`deaf`/`hold`, the live
+`MixRoute` and the `AttachmentId` that asked for it. Before item 49 the handle
+held only `Vec<SessionId>`; the authoritative copy of member state was
+`Seated` **inside the mix loop**, and the control world could not read it without
+a round trip through the media thread.
+
+**Where to write member state now.** The mirror is written by exactly the four
+calls that enqueue a media-thread command — `seat`, `route`, `control`,
+`unseat` — so a new member verb means updating both the mirror field and the
+`ConferenceCommand` arm, or the read-back silently lies. `route` grew an
+`owner: Option<AttachmentId>` parameter for this (`route_injection` passes the
+attachment, `revert_injection` passes `None` with `MixRoute::private()`); the
+`ConferenceCommand::Route` payload is unchanged, because the mixer does not care
+who asked.
+
+**The read path.** `Conference::member_state` → `MemberStateView`
+(`session-core/src/mix.rs`, plane-agnostic) → `MediaPlane::member_state`, a
+**synchronous** trait method defaulting to `None` exactly like
+`inline_egress_sink`, so a media plane without conferences is unaffected.
+`TapPlane` answers from `conference_of(session)` plus the conference table.
+`SessionController::session_message` calls it **before** it takes the registry
+lock — the registry lock and the conference-table lock must never nest, and the
+media plane never reaches back into the registry, which is what keeps that
+ordering safe. On the wire: `Session.member` (field 13) and
+`Session.conference` (14), both additive; the next free `Session` field is 15
+and **no `MediaEvent` payload tag was taken — the next free payload tag is still
+28**. `mss_ctl describe` needed no change: it renders the whole message.
+
+**Reporting rules worth keeping.** `routes` is empty when the route equals
+`MixRoute::private()` — the seat default, meaning the member's injected audio
+reaches its own ear only and the mixed track does not carry it — and holds one
+entry otherwise, including `own` + `mix_monitor=include`, which is a real
+non-default route (private playback that the record carries). One entry, not
+many, because two INJECT attachments on one leg share one injector and the last
+writer wins (item 38's documented edge); the field is `repeated` so that edge can
+stop being an edge without a wire break. Being whispered *at* is **not** a route
+of one's own, so the addressee reports none: routes describe what a member sends,
+never what it receives. `conference.members` is the mirror's own list, so it
+still names a room whose whisper target has left — the stale route stays
+auditable instead of vanishing.
+
+**Still no lease (D22's other half).** Nothing reclaims a mute when the
+controller that set it dies; the read-back makes a room reconcilable on
+reconnect, and that is all it makes. A lease needs an owner: item 40 rejected the
+attachment, and the API does not model the caller, so the decision is deferred
+rather than guessed.
 
 ### tap_plane.rs — the control plane's hands in the media world
 
@@ -2030,6 +2171,24 @@ into something that actually taps calls.
   leg keeps its positional default. Acceptance: two consecutive live calls,
   caller's voice on `inbound` (rms 564) and silence on `outbound` (rms 6),
   independent of stream order.
+- **Which participant is the *customer* is a separate question, and MSS refuses
+  to guess it (D17, item 47).** SSRC correlation answers "which stream carries
+  which participant's voice"; it says nothing about which participant called.
+  That came from `from_tags[0]`, and when the caller's tag was not supplied
+  `complete_from_tags` filled `from_tags` from `NgReply::tags()` — a `BTreeMap`,
+  so **lexicographic by tag**. `order_participants()` (pure, in `tap_plane.rs`)
+  now sorts the participants by their `created` stamp (stable, unstamped last)
+  and yields `Attribution::Inferred` only when the first two differ strictly;
+  otherwise `Unknown`. Under `Unknown`, `convert::track_name_under` /
+  `tracks_under` rename the gRPC stream tracks, the gRPC media/DTMF frames, the
+  event payload tracks and the recording group's object keys to
+  **`leg_a`/`leg_b`**; `consumer_ws::track_name` is untouched, because the
+  Twilio dialect is frozen (Article VII). `LiveSession` and `SessionHandles`
+  carry the verdict so every attachment opened later names itself consistently,
+  and `Observation::LegsAttributed` reports it back to the registry, which is
+  what puts `attribution` on `DescribeSession` and on the bus. See the
+  rtpengine-ng section for why `created` cannot separate a two-party call's legs,
+  and `lab/leg_attribution_drill.sh` for the live proof in both directions.
 - **Mid-call SSRC re-resolution (D1, 2026-08-22).** A leg no longer decides
   its speaker once and for all. `reresolve_speakers` is the control-world
   half: a per-session task that wakes every `SSRC_WATCH_INTERVAL` (500 ms),
@@ -2103,7 +2262,8 @@ code. What differs:
 Three modes, in priority order: the Phase-0 tap spike when its env vars are
 set (unchanged scaffolding), the **control plane** when
 `MSS_CONTROL_LISTEN` is an `ip:port`, and otherwise an idle process that
-waits for a signal. `MSS_RTPENGINE_NODE` becomes the default node for
+waits for a signal — **SIGTERM or SIGINT** since item 42, which also gave the
+control-plane mode the bounded drain sequence in `drain.rs`. `MSS_RTPENGINE_NODE` becomes the default node for
 sessions that do not name one, `MSS_TAP_LOCAL_IP` the media address, and
 `MSS_POD_NAME` the `owner_pod` reported by `DescribeSession`.
 
@@ -2121,6 +2281,227 @@ identity), `pause`, `detach`, `play` and `destroy`.
 `crates/control-api/examples/mss_stream_probe.rs` is its data-plane sibling:
 it attaches a `GRPC_STREAM` consumer, subscribes, and writes what it hears
 as a wav per track with rms and peak — the tool the item-10 lab proof used.
+
+### drain.rs — the shutdown sequence (item 42, G1, 2026-08-26)
+
+The module exists because a graceful shutdown is a *sequence with a deadline*,
+and a sequence is only trustworthy if it can be tested without a lab. So the
+steps are a trait (`DrainSteps`) and the ordering + budgeting is a pure function
+over it (`run_drain`), with `ControlPlaneDrain` in `main.rs` as the only real
+implementation. The unit tests use a fake that records call order and can hang
+on any one step; time is `tokio::time::Instant` throughout (**not**
+`std::time::Instant` — the tests run under `start_paused`, where the std clock
+does not move and every budget assertion would be meaningless).
+
+- `next_shutdown_signal()` selects over `ctrl_c()` and
+  `SignalKind::terminate()`. Both mediaserverd modes use it — the control plane
+  and the idle "no `MSS_CONTROL_LISTEN`" process. A platform without SIGTERM
+  degrades to SIGINT with a warning rather than failing to start.
+- `DrainState` is a single `AtomicBool` behind an `Arc`. It is deliberately not
+  the controller's `watch` channel: a readiness probe wants a cheap synchronous
+  read from an HTTP handler. `metrics.rs` renders it as `mss_draining`, and G4
+  will answer `/readyz` from the same flag.
+- `exit_on_second_signal()` spawns a task that `exit(0)`s on the next signal.
+  Registering a second SIGTERM stream is fine; tokio's handler is process-wide
+  and never unregisters, so an impatient operator gets an immediate exit rather
+  than the default disposition.
+- Budget arithmetic: one deadline for the whole drain, and each step gets
+  `remaining - reserve`, capped. Lease hand-off is capped at `budget/4` and the
+  event flush holds a reserve of `min(10 s, budget/3)`. The point is that a hung
+  Redis (or a hung anything early) cannot consume the window that closes
+  consumers and finishes recordings. A step that expires or is skipped is named
+  in the log and in `DrainReport`; the process still exits 0, because the pod is
+  being replaced either way.
+
+Why the step order is what it is: the lease is handed off **before** the taps are
+unsubscribed, so the adopter can re-subscribe while our copy is still flowing.
+That allows a brief double subscription rather than a gap; rtpengine gives each
+subscription its own to-tag, so our unsubscribe cannot touch the adopter's. The
+alternative order guarantees a hole in the consumer's audio, which is the defect
+item 11 measured at 14.41 s.
+
+Spilling live recordings is not a step of its own. `close-sessions` calls
+`destroy_session`, which is `TapPlane::close_session` — it ends every attachment
+(the D3 polite path), and a recording attachment's `finish()` uploads or, on
+failure, spills to `MSS_RECORDING_SPILL_DIR` for the next boot's
+`recording_spill::salvage`. A separate spill step would duplicate that fallback
+and race it.
+
+### Related changes in the modules around it (item 42)
+
+- `session_store.rs` gained `SessionStore::release_lease(external_id, owner)`:
+  DEL the lease key when we still hold it, **keep** the session record and the
+  index entry. `forget` (an ended call) and `release_lease` (a call that should
+  move) are different operations and the drill's assertions depend on the
+  difference.
+- `registry_keeper.rs` gained `hand_off_leases()`, which drains
+  `persisted_here` through `release_lease` and counts
+  `mss_registry_handed_off_total`. `run` now takes `Arc<Self>` so `main.rs` can
+  keep the keeper alive after aborting its renew task — the abort must come
+  first, or a later `persist_and_renew` tick would `forget` records the adopter
+  now holds.
+- `control-api`: `create_session` and `attach` answer
+  `UNAVAILABLE: this pod is draining` (`describe`/`destroy`/`detach` keep
+  working — a draining pod must still be able to close its own work).
+  `begin_drain` now uses `watch::Sender::send_replace`: `send` is a **no-op when
+  no receiver is alive**, so a pod with no live `MediaStream` could be told to
+  drain and stay `draining=false`. That was a real latent bug in the existing
+  `serve_authenticated_until` shutdown path, found by a unit test.
+- `main.rs`: the tonic server now runs as a task whose shutdown future waits on
+  the controller's drain watch, rather than being awaited inline with a `ctrl_c`
+  future inside it. Awaiting it inline meant a long-lived `MediaStream` could
+  hold the whole shutdown open with nothing bounding it.
+
+### media_ports.rs — the media port range and the advertised address (items G2 + G3, 2026-08-26)
+
+`MediaPortAllocator` is the only thing in the daemon that binds a media socket.
+`ephemeral()` (no range configured) binds port 0 and behaves exactly as the code
+did before this item; `over_range(min, max)` keeps a `VecDeque` of the **even**
+ports in the range behind a `Mutex` and hands them out front to back.
+
+`bind(local_ip)` returns a `BoundMediaSocket { socket, port, lease }`. The lease
+is the whole lifetime story: `PortLease::drop` decrements `in_use` and pushes the
+port back, so a port is released by *dropping the thing that owns it* rather than
+by remembering to call a free function on every path. `LiveSession` holds
+`Vec<PortLease>` (two for a two-leg tap, one for an inline leg), and
+`TapPlane::close_session` takes them out **after** joining the capture thread and
+logs `released_ports` — the order matters: a lease dropped before the thread
+joins could hand a port to a new session while the old socket is still bound to
+it. Drain reaches the same path through `destroy_session`, so a drained pod
+returns its whole range.
+
+A candidate port that will not bind (another process holds it) is skipped and
+counted, up to `BIND_ATTEMPTS_PER_REQUEST` (64) per request; the skipped ports go
+back on the free list, because the squatter may be gone by the next call. Only an
+empty free list is a refusal — `MediaPortError::RangeExhausted`, which names the
+range in its message and bumps `mss_media_ports_exhausted_total`.
+
+The advertised address is a plain `IpAddr` on `TapPlaneConfig`
+(`advertised_media_address`), read once at startup by
+`media_ports::advertise_address(local)`. Every SDP that names MSS to a peer now
+goes through one of two pure functions in `tap_plane.rs`, `tap_answer_sdp` and
+`inline_answer_sdp`, which take the advertised address as an argument — that is
+what makes the "advertised in, bind address absent" assertions unit-testable
+without a socket. Nothing else in the daemon renders an address into SDP.
+
+Not in the range, deliberately: the NG control socket (`NgTransport::bind`). It
+is an outbound flow to rtpengine's 22222 and the range exists to be opened
+*inbound* on a firewall; the lab drill prints those sockets so the distinction
+stays visible rather than looking like a leak.
+
+`lab/media_port_drill.sh` is the live check. It reads `/proc/net/udp` inside the
+container (the lab's rust image has no `ss`), so it sees every UDP socket the
+process holds, and asserts: sockets inside the range while tapping, ingest
+datagrams climbing, nothing inside the range once the session is destroyed, and
+`in_use` back to `capacity`.
+
+### discovery.rs — the optional call-id → rtpengine node map (item 51, G11, 2026-08-26)
+
+Three pieces, deliberately small. `parse_mapped_node(&str)` is pure and holds
+every format decision: a value that does not start with `{` must parse as a
+`SocketAddr` (the bare `host:port` form); one that does is a `MappedNode`
+(`node`, optional `from_tags`, optional `caller_tag`) and the caller's tag is
+moved to the **front** of the tag list, deduped, with blanks dropped. It returns
+`Result<DiscoveredNode, String>` — a `String` because the only consumer logs it.
+
+`NodeMap` is the one-method trait (`read(key) -> Option<String>`) that keeps the
+lookup testable without Redis. `RedisSessionStore` implements it through its new
+`read_key`, which is a plain `GET` on the connection helper the registry already
+uses: **this daemon has one Redis client type**, and a second one would have been
+a second place to get connection handling wrong. `NodeDiscovery` owns the prefix
+and the counters and does the logging; `resolve(call_id)` returns
+`Option<DiscoveredNode>` and *never* an error, because there is no failure mode
+here that should reach the caller — every one of them is "use the default node,
+and say so".
+
+In `tap_plane.rs` the entry point is `discover_through`, a `OnceLock` set after
+the store connects (the plane is built before the registry in `main.rs`, so the
+wiring has to be late — the same shape as `observe_through`). `resolve_node`
+replaced the direct `node_for` call in `open_tap_session` and returns
+`ResolvedNode { node, view, caller_named }`. Two things about it are load-bearing:
+
+- `caller_named` starts as "the request named from_tags" and is **only** raised
+  by a map value carrying `caller_tag`. It is passed into `complete_from_tags`,
+  which used to derive the same fact from `from_tags.is_empty()` — that
+  inference is exactly what a map-supplied tag list would have broken, silently
+  promoting an unattributed call to `explicit`. Now a full tag list with no named
+  caller returns `Attribution::Unknown` and warns, and a partial one lets the
+  `query` complete the set but still cannot claim a direction (`seeded` in that
+  function);
+- the map fills `view.from_tags` **only if the request left them empty**, and
+  truncates to `MAX_TAPPED_LEGS`. A caller who named tags is never second-guessed.
+
+When both tags come from the map the tap issues **no `query`** — that is the
+whole point of the map, and the reason `from_tags` is in the value format at all.
+
+Not done here, and worth knowing: the resolved node is not persisted into the
+session registry, so an adopting pod re-reads the map rather than inheriting the
+answer. That is fine while the call is up and the key's TTL holds, and it is why
+`deploy.md` says the TTL must outlive the longest call.
+
+`metrics.rs` renders the three counters only when `MetricsSources.discovery` is
+`Some`, which it is only when a prefix is configured — the same "absent beats a
+lying zero" rule the pump and keeper counters follow.
+
+### health.rs — the readiness snapshot behind /readyz (item 44, G4, 2026-08-26)
+
+`Readiness` is the whole design in one sentence: a `Mutex<[DependencyHealth; 3]>`
+that background tasks write and the HTTP handler only reads. Nothing on the
+request path touches a socket, so a kubelet probe with a 1 s timeout cannot be
+made to hang by a wedged Redis — the worst it can read is a stale verdict, which
+is bounded by `MSS_HEALTH_PROBE_INTERVAL_SECS` (default 10).
+
+The three dependencies are fixed (`Dependency::{Rtpengine, Redis, Kafka}`) and
+indexed by `slot()` into the array — a fixed array rather than a map because the
+set is not extensible at runtime and the exposition wants a stable order. Each
+entry carries a `Condition` (`NotConfigured`, `NotProbedYet`, `Ready`,
+`Failing(reason)`), the optional address to name in the report, the last `Instant`
+it answered, and its consecutive-failure count. `NotProbedYet` is deliberately
+**not ready**: a pod that has not learned its state must not take traffic. In
+practice nobody sees it, because `main.rs` records `Ready` or `NotConfigured` for
+Redis and Kafka at connect time and for rtpengine at its first-contact ping — all
+before the metrics listener binds.
+
+`snapshot()` derives everything the two consumers need (the `/readyz` body and the
+`mss_ready` / `mss_dependency_ready` series) in one lock pass; `verdict()` renders
+the body. Its first line is the machine-readable part — `ready`, or `not ready: `
+followed by the reasons joined with `; ` — because `kubectl describe` shows only
+the first line of a failed probe's body. The rest is one line per dependency plus
+`draining: yes|no`. Draining is read live off `DrainState`, not recorded, which is
+why `/readyz` flips 503 on the *first* drain step (`stop_accepting`) with no new
+wiring: the live check caught the transition 7 ms before the listener went away.
+
+`watch(readiness, probe, interval)` is the only loop. It sleeps
+`next_probe_delay(interval, consecutive_failures)` — the interval on success, and
+1 s → 2 → 4 → 8 → capped at the interval while failing — then runs the probe under
+a 15 s timeout, a timeout being a failure like any other. The backoff runs
+*upward from short*, the opposite of a retry backoff: a failing dependency is
+re-probed sooner than a healthy one, because the pod wants back into service as
+soon as the outage ends. The three `HealthProbe` impls are thin:
+`SessionStoreProbe` → `SessionStore::ping` (Redis `PING` on a fresh multiplexed
+connection), `EventBusProbe` → `EventTransport::reachable` (a partition-offset
+fetch, never a produce, so probes leave no records on `mss.events`; the trait
+method defaults to `Ok` so test transports keep meaning what they meant), and
+`NgNodeProbe` → NG `ping`, which on success calls
+`NodeCapabilityLog::report_first_contact` and on failure calls the new
+`NodeCapabilityLog::forget`. That pair is what closes item 23's open re-probe: a
+node's capabilities are re-learned the first time it answers after any failure,
+instead of the pod keeping a dead node's verdict forever.
+
+Routing lives in `metrics.rs::route`, a pure function over the request bytes so
+every status code is a unit test rather than a socket test. It reads only the
+request line, splits the query/fragment off the path, answers `/metrics`,
+`/healthz` and `/readyz`, and returns **404** for anything else and **405** for a
+non-GET. That last part is a behavior change: the listener used to serve the
+exposition for *any* path. Every lab script, `soak.py` and the alert rules ask for
+`/metrics` by name, so nothing in the repo depended on it — but an operator with a
+scrape config pointing at `/` will now get a 404.
+
+`MetricsSources` gained `readiness`, and `main.rs` passes the same `Arc` to the
+listener and the watchers. `probe_configured_rtpengine_node` grew from a one-shot
+into "probe once inline, then spawn the watcher", and now also treats an empty or
+whitespace `MSS_RTPENGINE_NODE` as unset (item 43's rule) and a malformed one as a
+permanent failure rather than as "no node configured".
 
 ### hub.rs — the fan-out core (M3), first increment
 The per-session pub/sub the roadmap calls the fan-out hub. Two-worlds
@@ -2653,16 +3034,33 @@ recorder.rs — native conference recording* above for the two shapes, the
   (`frames_beyond_cap`, `mss_recordings_truncated_total`) rather than
   silently dropped. Streaming multipart upload is the fix when calls longer
   than that matter; it is not built.
-- **`StopRecording` waits for the upload, deliberately.** `Detach` (and
-  `DestroySession`) await the recorder's finish, so a cigol `StopRecording`
-  blocks for as long as the upload takes — bounded by `UPLOAD_TIMEOUT` (60 s)
-  and `FINISH_TIMEOUT` (90 s). The alternative, backgrounding the upload,
-  cannot work today: `observe` refuses a session the registry has forgotten,
-  so `UploadCompleted` would be lost exactly when the call has ended, which is
-  every time. If a pilot finds the added `StopRecording` latency unacceptable,
-  the fix is a session-independent event path (an event that carries
-  `external_id` without needing a live session), not a silent background
-  upload.
+- **`StopRecording` no longer waits for the upload (item 50, D11).** The
+  recorder task now has two phases. Phase one is the capture loop; when it ends
+  it publishes `RecordingStopped`, sends a `StopReport`
+  (duration/frames/segmenter stats) down a oneshot, and only then goes on.
+  `RecorderHandle::finish()` awaits that report — bounded by `STOP_TIMEOUT`
+  (5 s), which is a segment close and no I/O — and hands the still-running task
+  back as a `FinishedCapture`. Phase two acquires an upload permit, renders,
+  encodes, uploads and publishes `UploadCompleted` or the new `UploadFailed`.
+  So `Detach`/`DestroySession` answer as soon as the audio is safe, and the
+  upload's own event arrives later. `FINISH_TIMEOUT` (90 s) is now a
+  test-only helper (`FinishedCapture::settle`), not a production bound; the
+  production bounds are `STOP_TIMEOUT`, `UPLOAD_TIMEOUT` (60 s per object) and
+  `recording_uploads::UPLOAD_SETTLE_TIMEOUT` (10 min).
+- **Bounded background upload concurrency.** `RecordingSupport` carries an
+  `Arc<Semaphore>` sized by `MSS_RECORDING_UPLOAD_CONCURRENCY` (default 4,
+  `upload_concurrency_from_env`, logged at startup). The permit is taken *after*
+  the stop is reported, so a queue of uploads never delays a detach — it only
+  delays the uploads. The startup salvage pass does **not** take a permit: it
+  runs once, before any call, and serialising it against nothing would only slow
+  a restart.
+- **A failed upload now says so.** `Observation::UploadFailed { recording_id,
+  key, error }` → `EventKind::UploadFailed` → proto payload tag **28** (the next
+  free one). Before this, a recording that never reached storage produced
+  `RecordingStopped` and then silence, so an integrator waiting for
+  `UploadCompleted` waited forever. Both the wav-encoding failure and the
+  upload failure emit it, with the store's own message as `error`, and the audio
+  is still spilled for the D9 salvage pass.
 - **Known gaps:** no multipart/streaming upload (hence the cap and the memory
   cost); `recordingChannels=mono` metadata is not honoured (a single-track
   *selector* gives a mono file, a mono *mix* of both parties does not exist);
@@ -2670,6 +3068,64 @@ recorder.rs — native conference recording* above for the two shapes, the
   per pod, so a pod that dies mid-call loses the audio it had buffered even
   though the session itself is adopted elsewhere (the adopted session
   re-taps, but the recording restarts).
+
+### recording_uploads.rs — the background upload watch (item 50, D11, 2026-08-26)
+
+`UploadTracker` is the only thing that knows an upload outlived the RPC that
+stopped it. `TapPlane::finish_recording` calls `adopt(finished, observer)`, which
+
+- asks the observation sink to **retain the session for the upload** before the
+  detach returns, so the registry cannot forget it in between;
+- counts the hand-off (`mss_recording_uploads_backgrounded_total`) and keeps a
+  live gauge (`mss_recording_uploads_in_flight`);
+- spawns one small watcher per upload that awaits the recorder task with
+  `UPLOAD_SETTLE_TIMEOUT` (10 min), logs what landed, releases the retention and
+  then notifies `wait_idle`. On expiry it aborts, counts
+  `mss_recording_upload_settle_timeouts_total`, and releases anyway — a stuck
+  upload must not pin a session record forever, and the audio is on the spill
+  disk for the D9 salvage pass.
+
+`wait_idle()` is what the drain waits on: `drain.rs` gained an `await-uploads`
+step between `close-sessions` and `control-plane-idle`, because an upload that
+settles after `flush-events` would have its event stranded in the outbox when
+the process exits. The step returns how many were in flight when it began
+(`DrainReport::uploads_settled`) — informational, and deliberately not asserted
+anywhere: it is a racing number by nature.
+
+### The gapless-sequence problem, and why the session record is kept (item 50)
+
+Publishing an event after the session ended is the whole difficulty of D11.
+`push_event` assigns `seq` from the session record and **silently drops** an
+event whose session is gone, so a backgrounded upload would lose
+`UploadCompleted` on every hangup — which is why the blocking detach existed.
+
+Two designs were on the table. **Reserving a seq** at detach and publishing the
+late event with it keeps the sequence gapless but not *monotonic*: while the
+session lives on (a `StopRecording` that is not a hangup), later events take
+higher numbers and the reserved one arrives after them, so a consumer with a
+low-water mark stalls on a hole that is already spoken for. **Keeping the
+session record alive** costs one `BTreeMap` entry per settling upload and keeps
+both properties, so that is what landed:
+
+- `SessionRecord` gained `pending_uploads` and `finishing`.
+  `retain_for_upload` / `release_after_upload` bracket a background upload;
+  `destroy_session` marks the record `finishing` instead of removing it when
+  `pending_uploads > 0`, and the last release removes it for real.
+- A finishing session is **not** live: `session_ids()` and `session_count()`
+  skip it, so `snapshot()`, the registry keeper and the drain never see it, and
+  `live()` (the new guard used by `attach`, `start_playback` and
+  `destroy_session`) refuses it with `UnknownSession` — a finishing session
+  cannot be adopted, attached to, or ended twice.
+- The `external_index` entry **is** dropped at destroy, so the external id is
+  reusable immediately. The consequence, deliberate: `DescribeSession` by
+  *session id* still answers a finishing session, by *external id* does not.
+- `ObservationSink` gained `retain_for_upload` / `release_after_upload` with
+  default no-op implementations, so every test fake still compiles; when nothing
+  retains, the behaviour degrades to exactly what it was before (the late event
+  is dropped and logged).
+- For a consumer of `mss.events` this means one new rule:
+  **`UploadCompleted`/`UploadFailed` may arrive after `SessionEnded` for the
+  same session, and is then the last event of that session's sequence.**
 
 ### recording_spill.rs — the segment journal and the restart salvage (item 30, D9, 2026-08-23)
 
