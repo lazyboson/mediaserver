@@ -328,7 +328,18 @@ message FinalTranscript {
 }
 
 message EndOfUtterance { string track = 1; }
-message Dtmf { string track = 1; string digit = 2; }
+// One press, published as soon as the RFC 4733 end packet arrives, whether or
+// not any consumer is attached: digits belong to the call, not to a consumer.
+// The three retransmissions of that end packet are one event. duration_ms is
+// the press length the endpoint reported, converted through the negotiated RTP
+// clock rate; rtp_timestamp is the event's start timestamp on that same clock,
+// so digits can be lined up with recorded audio.
+message Dtmf {
+  string track = 1;
+  string digit = 2;
+  uint32 duration_ms = 3;
+  uint32 rtp_timestamp = 4;
+}
 message PlaybackStarted { string playback_id = 1; }
 message PlaybackStopped { string playback_id = 1; string reason = 2; }
 message RecordingStarted { string recording_id = 1; string path = 2; string shape = 3; }

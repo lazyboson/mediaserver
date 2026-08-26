@@ -272,9 +272,16 @@ fn payload_wire(kind: EventKind, attribution: Attribution) -> proto::media_event
         EventKind::EndOfInteraction { reason } => {
             Payload::EndOfInteraction(proto::EndOfInteraction { reason })
         }
-        EventKind::Dtmf { track, digit } => Payload::Dtmf(proto::Dtmf {
+        EventKind::Dtmf {
+            track,
+            digit,
+            duration_ms,
+            rtp_timestamp,
+        } => Payload::Dtmf(proto::Dtmf {
             track: track_name_under(track, attribution).to_string(),
             digit: digit.to_string(),
+            duration_ms,
+            rtp_timestamp,
         }),
         EventKind::RecordingStarted {
             recording_id,
@@ -669,6 +676,32 @@ mod tests {
             speaking(Attribution::Unknown),
             ("unknown".to_string(), "leg_a".to_string())
         );
+    }
+
+    #[test]
+    fn a_digit_event_carries_the_press_timing_and_honours_the_leg_attribution() {
+        let pressed = |attribution| {
+            let wire = event_wire(event_of(
+                attribution,
+                EventKind::Dtmf {
+                    track: Track::Agent,
+                    digit: '#',
+                    duration_ms: 140,
+                    rtp_timestamp: 41_000,
+                },
+            ));
+            match wire.payload {
+                Some(proto::media_event::Payload::Dtmf(dtmf)) => dtmf,
+                other => panic!("unexpected payload {other:?}"),
+            }
+        };
+
+        let explicit = pressed(Attribution::Explicit);
+        assert_eq!(explicit.track, "agent");
+        assert_eq!(explicit.digit, "#");
+        assert_eq!(explicit.duration_ms, 140);
+        assert_eq!(explicit.rtp_timestamp, 41_000);
+        assert_eq!(pressed(Attribution::Unknown).track, "leg_b");
     }
 
     #[test]
