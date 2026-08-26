@@ -349,6 +349,15 @@ fn payload_wire(kind: EventKind, attribution: Attribution) -> proto::media_event
         EventKind::UploadCompleted { recording_id, uri } => {
             Payload::UploadCompleted(proto::UploadCompleted { recording_id, uri })
         }
+        EventKind::UploadFailed {
+            recording_id,
+            key,
+            error,
+        } => Payload::UploadFailed(proto::UploadFailed {
+            recording_id,
+            key,
+            error,
+        }),
         EventKind::PlaybackStarted { playback } => {
             Payload::PlaybackStarted(proto::PlaybackStarted {
                 playback_id: playback.to_string(),

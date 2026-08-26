@@ -348,6 +348,7 @@ message MediaEvent {
     MixRouted mix_routed = 25;
     MemberControlled member_controlled = 26;
     LegsAttributed legs_attributed = 27;
+    UploadFailed upload_failed = 28;
   }
 }
 
@@ -395,6 +396,11 @@ message RecordingStarted { string recording_id = 1; string path = 2; string shap
 message RecordingPaused { string recording_id = 1; bool paused = 2; uint64 duration_ms = 3; }
 message RecordingStopped { string recording_id = 1; uint64 duration_ms = 2; }
 message UploadCompleted { string recording_id = 1; string uri = 2; }
+// The terminal event of a recording that never reached storage (D11). It is
+// published after the detach that stopped the recording has already been
+// answered, and it is the last event of that session's sequence: the audio is
+// on this pod's spill disk, waiting for the salvage pass on its next start.
+message UploadFailed { string recording_id = 1; string key = 2; string error = 3; }
 message AttachmentUp { string label = 1; }
 // Emitted once per session when MSS settles who is who, so an integrator can
 // audit speaker attribution instead of trusting it. attribution is "explicit",
