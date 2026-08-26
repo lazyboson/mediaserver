@@ -3139,6 +3139,96 @@ detach and the upload still loses the event (D9's salvage recovers the audio on
 that pod's next start, without an event). And `MSS_RECORDING_UPLOAD_CONCURRENCY`
 bounds concurrency, not memory: N uploads in flight hold N rendered WAVs.
 
+### 51. rtpengine node discovery — the optional Redis map (G11) — ✅ DONE (2026-08-26)
+
+**The gap this closes.** `CreateSession` takes an `rtpengine_node`, and a caller
+that knows it is fine. A caller that knows only the SIP Call-ID is not: it lands
+on `MSS_RTPENGINE_NODE`, and with more than one rtpengine that is a guess.
+`TelCompat` is exactly such a caller — `StartStream` carries `sipCallId` and no
+node — so the façade that exists to need no changes in cigol was the one surface
+that could not pick a node. This is the discovery map decided in Phase 0
+(architecture §4) and demoted to an optimisation on 2026-08-17, now built as
+one.
+
+**Decision — pull, not push, and nothing cached.** One Redis `GET` per
+`CreateSession` that names no node, on the create path only. No cache, no
+watcher, no invalidation: a call is created once, so a per-create read is the
+same order of cost as the `query` MSS already does, and a stale cache is a class
+of bug this cannot have. Resolution order is **request node → map → default
+node**, and the map is only consulted when the request named nothing.
+
+**Decision — plain `host:port` first, JSON when the proxy knows more.** The
+minimum an integrator writes is `10.0.0.5:22222`. The richer form is
+`{"node":"…","caller_tag":"…","from_tags":["…","…"]}`, and it earns two things:
+both tags let MSS subscribe the tap **without a `query`**, and `caller_tag`
+makes the attribution `explicit`. A tag list *without* `caller_tag` stays
+**`unknown`** (tracks `leg_a`/`leg_b`, item 47's rule) — the map may not decide
+who called by accident of ordering. That is the one D17 interaction, and it is
+documented in `docs/deploy.md`.
+
+**Decision — a lookup failure is never a session failure.** Redis unreachable, no
+key, or a value that is not an address: WARN, count it, use the default node. The
+create proceeds and fails or succeeds on its own merits. `MSS_DISCOVERY_REDIS_URL`
+that cannot be connected at startup switches discovery **off** with a WARN rather
+than refusing to start, unlike `MSS_REDIS_URL` (the registry is a promise of HA;
+the map is an optimisation).
+
+**What shipped.**
+
+- `crates/mediaserverd/src/discovery.rs` — `parse_mapped_node` (pure, 6 tests),
+  the `NodeMap` trait, `NodeDiscovery::resolve`, `DiscoveryCounters`. Redis
+  access reuses `RedisSessionStore` through its new `read_key`, so there is one
+  Redis client type in this daemon and one place that handles its connections;
+- `TapPlane::discover_through` + `resolve_node`, which replaces the direct
+  `node_for` call in `open_tap_session`. `node_for` still answers the two ends of
+  the order (a named node, the default); the map sits between them.
+  `complete_from_tags` now takes `caller_named` instead of inferring it from
+  "from_tags is non-empty", which is what keeps a map-supplied tag list honest;
+- env `MSS_DISCOVERY_REDIS_KEY_PREFIX` (unset = off) and
+  `MSS_DISCOVERY_REDIS_URL` (unset = the registry's Redis), read and logged in
+  `main.rs`, passed through all three lab `mss-control` pods;
+- metrics `mss_discovery_hits_total` / `_misses_total` / `_errors_total`, exposed
+  **only when discovery is configured** (an absent series beats a lying zero);
+- the proxy side: `lab/opensips/opensips.cfg` gained a templated block, **off by
+  default** (`__DISCOVERY__` → `off`, with `__DISCOVERY_PREFIX__`,
+  `__DISCOVERY_TTL__`, `__DISCOVERY_NODE__` beside it), and `docs/deploy.md`
+  carries the `cachedb_redis` `cache_store`/`cache_remove` snippet an integrator
+  copies.
+
+**A packaging finding worth keeping.** `opensips/opensips:3.4` ships
+`cachedb_local.so` and `cachedb_sql.so` but **no `cachedb_redis.so`**, and
+`apt.opensips.org` no longer publishes a 3.4 component for bullseye (only
+3.6/4.0 and devel), so the module cannot be installed into that image. The lab
+proxy therefore writes the map through `exec.so` + `lab/opensips/
+discovery_publish.py` (a 90-line RESP client). The key and the value are
+byte-identical to what the documented `cache_store` writes; only the writer
+differs. Check `ls /usr/lib/x86_64-linux-gnu/opensips/modules | grep cachedb` on
+your own image before copying the snippet.
+
+**Verified — live lab** (`lab/node_discovery_drill.sh`, new, 2026-08-26). The
+pod's default node was pointed at a **black hole** (`172.31.99.199:22222`) so
+nothing but the map could work:
+
+| | |
+| --- | --- |
+| the proxy published | `{"node":"172.31.99.10:22222","caller_tag":"hosttest","from_tags":["hosttest","y3HmFyeQae04N"]}` |
+| `mss_ctl create <id> <call-id> -` (no node, no tags) | tapped **1192 datagrams in 12 s**, `attribution=explicit` |
+| counters | `mss_discovery_hits_total 1`, misses 0, errors 0 |
+| an unmapped call-id | one **miss**, then refused: `no reply from rtpengine at 172.31.99.199:22222 after 3 attempts` — the fallback, not a guess |
+| the BYE | `cache_remove` equivalent ran; `GET` → `(nil)` |
+
+Both legs came from the map, so that tap issued **no `query` at all** — the
+optimisation the Phase-0 decision was after.
+
+**Residual.** The resolved node is not written back into the session registry, so
+a pod that adopts an orphaned session re-reads the map (fine while the call is up
+and the key's TTL holds) and falls back to the default node if the map is gone by
+then. A deployment whose calls outlive the key's TTL should either lengthen the
+TTL or name the node on `CreateSession`. Nothing here is proved on a **real**
+`cachedb_redis` proxy — the lab image cannot load the module — so the snippet in
+`deploy.md` is documentation, not a tested artifact; the key/value it writes is
+what was tested.
+
 ## Open defects and soft spots
 
 | # | Item | Where | Severity |
@@ -3211,13 +3301,20 @@ once as a milestone blocker and once as an integration handoff:
    taps-without-transcode is the measurement, and architecture §8.1 has the
    full read-only checklist. D14 is fixed (item 25), so a pod restart during the probe no longer
    pollutes it — though the fix has not been re-measured live.
-3. **OpenSIPS → Redis call→node discovery** — **no longer a blocker
-   (2026-08-17).** MSS now resolves a call's participants itself: cigol passes
-   the SIP call-id and the caller's from-tag (both already on the channel as
-   `Variable_sip_call_id` and `Variable_sip_full_from`) and `TapPlane` asks
-   rtpengine's `query` for the rest. The map remains the better long-term
-   answer — it avoids a `query` per tap and works when MSS never sees the
-   channel — but it is now an optimisation, not a prerequisite for a pilot.
+3. **OpenSIPS → Redis call→node discovery** — **MSS's half is built
+   (item 51, 2026-08-26); what is left is one config block on someone else's
+   proxy.** Set `MSS_DISCOVERY_REDIS_KEY_PREFIX` and a `CreateSession` that
+   names no node reads `<prefix><Call-ID>` from Redis before falling back to
+   `MSS_RTPENGINE_NODE`; hits/misses/errors are counted and a lookup failure is
+   always a fallback, never a refused session. The proxy side is a
+   `cache_store`/`cache_remove` pair (`cachedb_redis`) copy-pasteable from
+   [deploy.md](deploy.md) — and the lab proved the whole path live with the
+   pod's default node pointed at a black hole. It stays listed here because
+   **only the integrator can add it to a production proxy**, and because the
+   pinned `opensips/opensips:3.4` image ships no `cachedb_redis.so`, so the
+   module must be present on whatever build the deployment runs. Still an
+   optimisation, not a prerequisite: MSS resolves participants itself through
+   rtpengine's `query` when nobody publishes the map.
 
 ## Later phases
 

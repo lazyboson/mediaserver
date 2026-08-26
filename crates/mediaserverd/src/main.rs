@@ -3,6 +3,7 @@
 mod conference;
 mod consumer_ws;
 mod digits;
+mod discovery;
 mod drain;
 mod event_pump;
 mod health;
@@ -42,6 +43,8 @@ const KAFKA_BROKERS_ENV: &str = "MSS_KAFKA_BROKERS";
 const EVENTS_TOPIC_ENV: &str = "MSS_EVENTS_TOPIC";
 const EVENTS_PARTITIONS_ENV: &str = "MSS_EVENTS_PARTITIONS";
 const REDIS_URL_ENV: &str = "MSS_REDIS_URL";
+const DISCOVERY_PREFIX_ENV: &str = "MSS_DISCOVERY_REDIS_KEY_PREFIX";
+const DISCOVERY_URL_ENV: &str = "MSS_DISCOVERY_REDIS_URL";
 const POD_NAME_ENV: &str = "MSS_POD_NAME";
 const LOCAL_MEDIA_IP_ENV: &str = "MSS_TAP_LOCAL_IP";
 const METRICS_LISTEN_ENV: &str = "MSS_METRICS_LISTEN";
@@ -443,19 +446,27 @@ async fn serve_control_plane(
     observing.observe_through(Arc::downgrade(&controller) as std::sync::Weak<dyn ObservationSink>);
     let mut keeper_counters = None;
     let mut keeper_handles = None;
+    let mut registry_store = None;
     match session_store_from_env().await {
         Ok(Some(store)) => {
             readiness.record_ready(health::Dependency::Redis);
             health::watch(
                 Arc::clone(&readiness),
-                health::SessionStoreProbe::new(Arc::clone(&store)) as Arc<dyn health::HealthProbe>,
+                health::SessionStoreProbe::new(
+                    Arc::clone(&store) as Arc<dyn session_store::SessionStore>
+                ) as Arc<dyn health::HealthProbe>,
                 probe_interval,
             );
+            registry_store = Some(Arc::clone(&store));
             let keeper = Arc::new(
-                registry_keeper::RegistryKeeper::new(Arc::clone(&controller), store, owner.clone())
-                    .with_subscriptions(
-                        Arc::clone(&observing) as Arc<dyn registry_keeper::TapSubscriptions>
-                    ),
+                registry_keeper::RegistryKeeper::new(
+                    Arc::clone(&controller),
+                    store as Arc<dyn session_store::SessionStore>,
+                    owner.clone(),
+                )
+                .with_subscriptions(
+                    Arc::clone(&observing) as Arc<dyn registry_keeper::TapSubscriptions>
+                ),
             );
             keeper_counters = Some(keeper.counters());
             let renewing = tokio::spawn(Arc::clone(&keeper).run());
@@ -474,6 +485,15 @@ async fn serve_control_plane(
         }
     }
 
+    let counting_discovery = Arc::new(discovery::DiscoveryCounters::default());
+    let mut discovery_counters = None;
+    if let Some(node_map) =
+        node_discovery_from_env(registry_store.as_ref(), &counting_discovery).await
+    {
+        observing.discover_through(node_map);
+        discovery_counters = Some(counting_discovery);
+    }
+
     match metrics_listen_address() {
         Some(Ok(metrics_listen)) => match tokio::net::TcpListener::bind(metrics_listen).await {
             Ok(metrics_listener) => {
@@ -484,6 +504,7 @@ async fn serve_control_plane(
                         .as_ref()
                         .map(|(_, counters)| Arc::clone(counters)),
                     keeper: keeper_counters.clone(),
+                    discovery: discovery_counters.clone(),
                     drain: Arc::clone(&drain_state),
                     ports: Arc::clone(&media_ports),
                     readiness: Arc::clone(&readiness),
@@ -718,11 +739,68 @@ async fn event_sink_from_env() -> Result<
 }
 
 async fn session_store_from_env(
-) -> Result<Option<Arc<dyn session_store::SessionStore>>, session_store::StoreError> {
-    let Ok(url) = std::env::var(REDIS_URL_ENV) else {
+) -> Result<Option<Arc<session_store::RedisSessionStore>>, session_store::StoreError> {
+    let Some(url) = configured(REDIS_URL_ENV) else {
         return Ok(None);
     };
     let store = session_store::RedisSessionStore::connect(&url).await?;
     info!(url, "session registry connected");
     Ok(Some(Arc::new(store)))
+}
+
+fn configured(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+async fn node_discovery_from_env(
+    registry: Option<&Arc<session_store::RedisSessionStore>>,
+    counters: &Arc<discovery::DiscoveryCounters>,
+) -> Option<Arc<discovery::NodeDiscovery>> {
+    let prefix = configured(DISCOVERY_PREFIX_ENV);
+    let separate_url = configured(DISCOVERY_URL_ENV);
+    info!(
+        env = DISCOVERY_PREFIX_ENV,
+        prefix = prefix.as_deref().unwrap_or("unset"),
+        url = separate_url.as_deref().unwrap_or("unset"),
+        "rtpengine node discovery"
+    );
+    let prefix = prefix?;
+    let map: Arc<dyn discovery::NodeMap> = match separate_url {
+        Some(url) => match session_store::RedisSessionStore::connect(&url).await {
+            Ok(store) => {
+                info!(url, "the discovery map has its own redis");
+                Arc::new(store)
+            }
+            Err(error) => {
+                warn!(
+                    url,
+                    %error,
+                    env = DISCOVERY_URL_ENV,
+                    "the discovery redis is unreachable; every call will fall back to the \
+                     default rtpengine node"
+                );
+                return None;
+            }
+        },
+        None => match registry {
+            Some(store) => Arc::clone(store) as Arc<dyn discovery::NodeMap>,
+            None => {
+                warn!(
+                    env = DISCOVERY_PREFIX_ENV,
+                    registry = REDIS_URL_ENV,
+                    separate = DISCOVERY_URL_ENV,
+                    "a discovery key prefix is configured but no redis is; discovery is off"
+                );
+                return None;
+            }
+        },
+    };
+    Some(Arc::new(discovery::NodeDiscovery::new(
+        map,
+        prefix,
+        Arc::clone(counters),
+    )))
 }
