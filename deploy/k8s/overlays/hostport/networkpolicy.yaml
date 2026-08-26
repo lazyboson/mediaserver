@@ -1,0 +1,72 @@
+# The firewall matrix from docs/deploy.md, expressed for the pod network.
+# EVERY CIDR AND PORT BELOW IS AN EXAMPLE -- replace them with your rtpengine
+# hosts, your Redis, your brokers and your object store before applying.
+#
+# Two caveats worth knowing before you trust this file:
+#  * Traffic arriving through a hostPort mapping is DNAT'd by the node, and
+#    several CNIs do not run it through NetworkPolicy at all. Treat the media
+#    ingress rule as documentation and enforce the real thing on the node
+#    firewall or the security group.
+#  * A default-deny egress policy that forgets DNS breaks every hostname in the
+#    ConfigMap in a way that looks like a broker outage. The rule is here.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: mediaserverd
+  labels:
+    app.kubernetes.io/name: mediaserver
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: mediaserver
+      app.kubernetes.io/component: media-plane
+  policyTypes: ["Ingress", "Egress"]
+  ingress:
+    # The control plane and the gRPC data plane, from whatever calls MSS.
+    - from:
+        - namespaceSelector: {}
+      ports:
+        - port: 50051
+          protocol: TCP
+    # Scrapes.
+    - from:
+        - namespaceSelector: {}
+      ports:
+        - port: 9464
+          protocol: TCP
+    # The tap copy, from the rtpengine hosts only. Keep this range identical to
+    # MSS_MEDIA_PORT_MIN..MAX.
+    - from:
+        - ipBlock:
+            cidr: 10.0.0.0/24
+      ports:
+        - protocol: UDP
+          port: 40100
+          endPort: 40119
+  egress:
+    # DNS.
+    - ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
+    # NG control to each rtpengine. This is the flow MSS initiates -- it is how
+    # a tap is asked for in the first place -- and it is NOT inside the media
+    # range.
+    - to:
+        - ipBlock:
+            cidr: 10.0.0.0/24
+      ports:
+        - port: 22222
+          protocol: UDP
+    # Redis (session registry), Kafka (events), object storage (recordings).
+    - to:
+        - namespaceSelector: {}
+      ports:
+        - port: 6379
+          protocol: TCP
+        - port: 9092
+          protocol: TCP
+    - ports:
+        - port: 443
+          protocol: TCP

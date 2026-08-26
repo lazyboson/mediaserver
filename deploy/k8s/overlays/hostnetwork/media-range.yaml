@@ -1,0 +1,16 @@
+# A wide range is the reason to pick hostNetwork at all: 1000 ports here = 500
+# even ports = 500 tapped legs = 250 two-party calls per pod, and widening it
+# costs one edit rather than 1000 manifest entries. Keep it clear of the node's
+# ephemeral range (`sysctl net.ipv4.ip_local_port_range`, commonly
+# 32768-60999) or MSS and the kernel will fight over ports; 40000-40999 sits
+# inside that window on a default Linux node, so either move the range or
+# reserve it with `net.ipv4.ip_local_reserved_ports`.
+#
+# Open exactly this range inbound from every rtpengine host.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mediaserverd-env
+data:
+  MSS_MEDIA_PORT_MIN: "40000"
+  MSS_MEDIA_PORT_MAX: "40999"
