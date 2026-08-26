@@ -1895,7 +1895,9 @@ on any attachment of that member's own session (`member_mute` / `member_deaf` /
 `member_hold`, each `on` or `off`, absent = untouched) and they **outlive that
 attachment on purpose** — `close_attachment` reverts a whisper route and does
 *not* revert member state, because muting somebody is not a property of the
-consumer that asked for it. That also means no owner and no lease: tasks.md D22.
+consumer that asked for it. That also means no owner and no lease: tasks.md D22
+— item 49 then made the state **readable** on `DescribeSession` without giving
+it an owner (see the item-49 section below).
 No capability is required (the API caller's own authentication is the
 authorization, exactly like `paused`); `MemberControl::from_metadata` in
 `session-core/src/mix.rs` is the only parser, and `EventKind::MemberControlled`
@@ -1982,6 +1984,56 @@ still hearing everybody; and the refusals (a flag that is not `on`/`off`, a
 member verb on a leg that is in no conference, a from-tag-shaped playback target
 on an inline leg) — plus the mix-metadata parser tests and a registry audit
 test.
+
+### conference.rs — the control-world member mirror, read back by Describe (item 49, D22, 2026-08-26)
+
+`Conference` — the **control-plane handle**, not the mixing thread — now keeps a
+`MirroredMember` per seated session: external id, `mute`/`deaf`/`hold`, the live
+`MixRoute` and the `AttachmentId` that asked for it. Before item 49 the handle
+held only `Vec<SessionId>`; the authoritative copy of member state was
+`Seated` **inside the mix loop**, and the control world could not read it without
+a round trip through the media thread.
+
+**Where to write member state now.** The mirror is written by exactly the four
+calls that enqueue a media-thread command — `seat`, `route`, `control`,
+`unseat` — so a new member verb means updating both the mirror field and the
+`ConferenceCommand` arm, or the read-back silently lies. `route` grew an
+`owner: Option<AttachmentId>` parameter for this (`route_injection` passes the
+attachment, `revert_injection` passes `None` with `MixRoute::private()`); the
+`ConferenceCommand::Route` payload is unchanged, because the mixer does not care
+who asked.
+
+**The read path.** `Conference::member_state` → `MemberStateView`
+(`session-core/src/mix.rs`, plane-agnostic) → `MediaPlane::member_state`, a
+**synchronous** trait method defaulting to `None` exactly like
+`inline_egress_sink`, so a media plane without conferences is unaffected.
+`TapPlane` answers from `conference_of(session)` plus the conference table.
+`SessionController::session_message` calls it **before** it takes the registry
+lock — the registry lock and the conference-table lock must never nest, and the
+media plane never reaches back into the registry, which is what keeps that
+ordering safe. On the wire: `Session.member` (field 13) and
+`Session.conference` (14), both additive; the next free `Session` field is 15
+and **no `MediaEvent` payload tag was taken — the next free payload tag is still
+28**. `mss_ctl describe` needed no change: it renders the whole message.
+
+**Reporting rules worth keeping.** `routes` is empty when the route equals
+`MixRoute::private()` — the seat default, meaning the member's injected audio
+reaches its own ear only and the mixed track does not carry it — and holds one
+entry otherwise, including `own` + `mix_monitor=include`, which is a real
+non-default route (private playback that the record carries). One entry, not
+many, because two INJECT attachments on one leg share one injector and the last
+writer wins (item 38's documented edge); the field is `repeated` so that edge can
+stop being an edge without a wire break. Being whispered *at* is **not** a route
+of one's own, so the addressee reports none: routes describe what a member sends,
+never what it receives. `conference.members` is the mirror's own list, so it
+still names a room whose whisper target has left — the stale route stays
+auditable instead of vanishing.
+
+**Still no lease (D22's other half).** Nothing reclaims a mute when the
+controller that set it dies; the read-back makes a room reconcilable on
+reconnect, and that is all it makes. A lease needs an owner: item 40 rejected the
+attachment, and the API does not model the caller, so the decision is deferred
+rather than guessed.
 
 ### tap_plane.rs — the control plane's hands in the media world
 

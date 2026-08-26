@@ -103,6 +103,49 @@ message Session {
   // passing a from-tag and an integrator that needs speaker attribution must
   // pass the caller's tag.
   string attribution = 12;
+  // Conference members only (INLINE with a group): this member's own state as
+  // the control plane holds it — the mirror the member verbs write, not a
+  // question asked of the mixing thread. Absent when the session is not
+  // seated in a conference on this pod. D22.
+  MemberState member = 13;
+  // Conference members only: the room this member is seated in, so an
+  // integrator can enumerate it from any member without a second RPC.
+  ConferenceView conference = 14;
+}
+
+// One live route of a member's audio inside its conference. A member with no
+// route heard elsewhere reports none: its injected audio reaches its own ear
+// only and the mixed track does not carry it.
+message MemberRoute {
+  // "own", "all", or the external id of the member this audio is addressed to.
+  string target = 1;
+  // "inject" (audio a consumer pushes) or "leg" (the member's own rtp, the
+  // coach shape).
+  string source = 2;
+  // Whether the conference's mixed track — the recording feed — carries it.
+  bool monitor_audible = 3;
+  // The attachment that asked for this route, empty when nothing owns it.
+  string attachment_id = 4;
+}
+
+// A conference member's state, read from the control plane's own mirror.
+// D22 residual: this state has no lease, so it outlives the controller that
+// set it for the life of the conference.
+message MemberState {
+  bool mute = 1;
+  bool deaf = 2;
+  bool hold = 3;
+  // Where this member's routed audio comes from: "inject" or "leg".
+  string mix_source = 4;
+  repeated MemberRoute routes = 5;
+}
+
+// The room a member is seated in, as this pod holds it. A conference is
+// pod-local (D16), so this enumerates the members mixed here.
+message ConferenceView {
+  string group = 1;
+  uint32 member_count = 2;
+  repeated string members = 3;
 }
 
 message SessionRef {

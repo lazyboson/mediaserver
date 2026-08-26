@@ -1,14 +1,14 @@
 use crate::convert::{
-    attachment_id, capabilities, capabilities_wire, event_wire, format, format_wire, playback_id,
-    selector, selector_wire, session_id, session_kind, session_kind_wire, status_of, transport,
-    transport_wire,
+    attachment_id, capabilities, capabilities_wire, conference_wire, event_wire, format,
+    format_wire, member_state_wire, playback_id, selector, selector_wire, session_id, session_kind,
+    session_kind_wire, status_of, transport, transport_wire,
 };
 use crate::proto;
 use crate::proto::media_control_server::{MediaControl, MediaControlServer};
 use session_core::{
     AttachSpec, AttachmentId, AttachmentUpdate, AttachmentView, ConsumerEvent, ControlError,
-    CreateSession, EventKind, MediaEvent, Observation, PlaybackId, PlaybackSpec, SessionId,
-    SessionKind, SessionRegistry, SessionView,
+    CreateSession, EventKind, MediaEvent, MemberStateView, Observation, PlaybackId, PlaybackSpec,
+    SessionId, SessionKind, SessionRegistry, SessionView,
 };
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -123,6 +123,11 @@ pub trait MediaPlane: Send + Sync + 'static {
     ) -> Result<(), MediaPlaneError>;
 
     fn inline_egress_sink(&self, session: SessionId) -> Option<Arc<dyn InlineEgressSink>> {
+        let _ = session;
+        None
+    }
+
+    fn member_state(&self, session: SessionId) -> Option<MemberStateView> {
         let _ = session;
         None
     }
@@ -325,6 +330,10 @@ impl SessionController {
     }
 
     fn session_message(&self, session: SessionId) -> Result<proto::Session, Status> {
+        let member = self
+            .media
+            .as_ref()
+            .and_then(|media| media.member_state(session));
         let registry = self.lock();
         let view = registry.session_view(session).map_err(status_of)?;
         let attachments = view
@@ -346,6 +355,8 @@ impl SessionController {
             sdp_answer: view.sdp_answer.unwrap_or_default(),
             group: view.group,
             attribution: view.attribution.as_str().to_string(),
+            member: member.as_ref().map(member_state_wire),
+            conference: member.as_ref().map(conference_wire),
         })
     }
 }
