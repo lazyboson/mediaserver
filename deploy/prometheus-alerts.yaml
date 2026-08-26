@@ -203,3 +203,32 @@ groups:
             The recorder buffers the whole call in memory and stops at its
             cap (2 h of audio). Calls longer than that need the streaming
             multipart upload that is not built yet.
+
+  - name: mss-rtpengine
+    rules:
+      - alert: MssTapsFellOutOfKernel
+        expr: >-
+          max by (instance, node) (mss_rtpengine_tap_kernel_verdict{verdict="TranscodedTapsAreProcessedInUserspace"}) > 0
+          or
+          (
+            delta(mss_rtpengine_media_userspace[10m]) > 0
+            and delta(mss_rtpengine_media_kernel[10m]) == 0
+          )
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "rtpengine is carrying MSS taps in userspace, not the kernel module"
+          description: >-
+            Either this daemon asks rtpengine to transcode the tap (the
+            verdict label says so, and a transcoded subscription is always a
+            userspace subscription), or node {{ $labels.node }} is growing
+            userspace media streams while its kernel media stays flat. Both
+            mean the rtpengine host pays the full per-tap copy cost, which is
+            the number the capacity plan is built on. Walk the read-only
+            checklist in docs/architecture.md section 8.1 (and
+            lab/kernel_probe.sh) on that host: compare
+            mss_rtpengine_relayed_packets_kernel against
+            mss_rtpengine_relayed_packets_user across baseline,
+            taps-with-transcode and taps-without-transcode. Consider
+            MSS_TAP_TRANSCODE=off if the consumers can take the native codec.

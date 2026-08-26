@@ -400,9 +400,7 @@ impl HealthProbe for NgNodeProbe {
     async fn probe(&self) -> Result<(), String> {
         match self.transport.ping().await {
             Ok(_) => {
-                self.capabilities
-                    .report_first_contact(self.node, &self.transport)
-                    .await;
+                self.capabilities.observe(self.node, &self.transport).await;
                 Ok(())
             }
             Err(error) => {

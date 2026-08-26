@@ -593,6 +593,31 @@ silently ignored. No operator? Drop both files and scrape
 `mediaserverd-scrape:9464/metrics` however you already scrape things; nothing in
 mediaserverd depends on the operator.
 
+### rtpengine node series (item 57)
+
+Every `/readyz` rtpengine probe (`MSS_HEALTH_PROBE_INTERVAL_SECS`) also takes an
+NG `statistics` sample and exports it, so handoff **H3**'s three-moment
+comparison can be read off Prometheus instead of a shell on the rtpengine host.
+The series exist only for nodes this pod has actually probed, and they are the
+*node's own* counters, not MSS's — two pods tapping one rtpengine report the
+same numbers.
+
+| Series | Means |
+| --- | --- |
+| `mss_rtpengine_tap_kernel_verdict{node,verdict}` | 1 on the one verdict that held at the last probe. Label values are the four verdicts: `TranscodedTapsAreProcessedInUserspace`, `TapsMayRideTheKernelPath`, `ThisNodeIsNotUsingTheKernelModule`, `Undetermined` |
+| `mss_rtpengine_relayed_packets_kernel{node}` | packets this node has relayed in the kernel module since it started |
+| `mss_rtpengine_relayed_packets_user{node}` | packets it has relayed in userspace since it started |
+| `mss_rtpengine_media_kernel{node}` | media streams in the kernel module right now |
+| `mss_rtpengine_media_userspace{node}` | media streams in userspace right now |
+| `mss_rtpengine_media_mixed{node}` | media streams counted in both right now |
+| `mss_rtpengine_transcoded_media{node}` | media streams this node is transcoding right now |
+| `mss_rtpengine_sessions_live{node}` | sessions this node is managing right now |
+| `mss_rtpengine_sample_age_seconds{node}` | seconds since the probe that produced the sample. It grows past the probe interval when `statistics` stops answering — read it before trusting the rest |
+
+`MssTapsFellOutOfKernel` fires on the transcoding verdict, or on userspace media
+growing for 10 min while kernel media stays flat; its runbook is
+[architecture §8.1](architecture.md#81-running-mss-against-a-kernel-module-rtpengine).
+
 ## Running against a kernel-module rtpengine
 
 Whether a tap drags the tapped legs out of rtpengine's kernel fast path is
@@ -606,7 +631,10 @@ the version cannot be asked over NG are all in
 [architecture §8.1](architecture.md#81-running-mss-against-a-kernel-module-rtpengine).
 The short form: set `MSS_TAP_TRANSCODE=off`, confirm codec coverage first, run
 `lab/kernel_probe.sh <host> <port>` at baseline **and** with taps running, and
-read the daemon's own `rtpengine node capabilities on first contact` line.
+read the daemon's own `rtpengine node capabilities on first contact` line —
+or, since item 57, read the verdict and the relay split off `/metrics`
+(`mss_rtpengine_tap_kernel_verdict`, `mss_rtpengine_relayed_packets_kernel`
+vs `_user`), which is refreshed on every health probe rather than once.
 
 ## Preflight — check the environment before deploying into it
 
