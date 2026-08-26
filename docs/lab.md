@@ -1002,6 +1002,48 @@ Also worth knowing for item 19's soak: D13 reproduces here on every run —
 the start frame advertises `["inbound","outbound"]` and a silent `mixed`
 track arrives anyway, which is why the gap consumer reports three tracks.
 
+## drain_drill.sh — the same pod stopped politely (SIGTERM, 2026-08-26)
+
+`pod_kill_drill.sh`'s sibling, and the reason to read them together: identical
+setup — a live 150 s MicroSIP call, tapped by pod A with a WS `gap_consumer.py`
+attached, pod B idle on the same Redis — but pod A is **stopped** rather than
+killed:
+
+```sh
+DOCKER_API_VERSION=1.43 docker compose -f lab/docker-compose.microsip.yml \
+  -f lab/docker-compose.webrtc.yml up -d rtpengine opensips freeswitch \
+  call-watcher redpanda redis minio minio-init llm-bridge mss-control \
+  mss-control-b
+./lab/drain_drill.sh
+# pod A is only stopped; bring it back with
+DOCKER_API_VERSION=1.43 docker compose -f lab/docker-compose.microsip.yml up -d mss-control
+```
+
+`docker stop -t 60`, because docker's default grace period is 10 s and the drain
+window is 30 s — a shorter `-t` than `MSS_DRAIN_TIMEOUT_SECS` measures the
+runtime's SIGKILL, not MSS's drain. The drill first asserts pod A's PID 1 is
+`mediaserverd` (`cargo run` exec-replaces itself on Unix); if that ever changes,
+the signal lands on cargo and the whole run means nothing.
+
+### The run (stamp 1787732824, 2026-08-26)
+
+| | SIGKILL (item 11) | SIGTERM drain (item 42) |
+| --- | --- | --- |
+| exit code | 137 | **0** |
+| consumer audio gap | 14.41 s | **1.96 s** |
+| adopted by the survivor | 14.4 s after the kill | **2.7 s after the signal** |
+| lease | expired on its 15 s TTL | **released explicitly** |
+| consumer close | socket dropped | Twilio `stop` frame after 2022 frames |
+| rtpengine subscription | orphaned (D14) | unsubscribed |
+
+`docker stop` returned in **0.44 s**; the drain itself logged
+`elapsed_ms=30` against its 30 000 ms budget, so the timeout is a ceiling and
+not a cost. Both tap legs finished with `jitter_lost=0`, `recv_errors=0`. The
+consumer's two connections — 2022 frames, then 12752 after pod B re-dialed the
+same endpoint — span one artifact, so the 1.96 s is measured on the wav, the
+same way item 11 measured its 14.41 s. The full step-by-step log is in
+[tasks.md item 42](tasks.md).
+
 ## soak.py — N calls for the better part of an hour (2026-08-22)
 
 Item 19. Every drill above answers "does this work once". `lab/soak.py` answers

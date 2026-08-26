@@ -1114,3 +1114,42 @@ async fn a_recording_closed_by_a_hangup_still_gets_its_callbacks_before_the_sess
         "the recording callbacks must land before the session is forgotten: {seen:?}"
     );
 }
+
+#[tokio::test]
+async fn a_draining_pod_takes_no_new_work_but_still_answers_for_the_calls_it_holds() {
+    let controller = controller();
+    let session = session_with(&controller, "req-1").await;
+
+    controller.begin_drain();
+    assert!(controller.is_draining());
+
+    let refused = controller
+        .create_session(Request::new(create("req-2")))
+        .await
+        .expect_err("a draining pod must not take a new session");
+    assert_eq!(refused.code(), Code::Unavailable);
+    assert!(refused.message().contains("draining"));
+
+    let refused = controller
+        .attach(Request::new(attach(
+            &session,
+            proto::Transport::WsTwilio,
+            &[proto::Capability::Sink],
+        )))
+        .await
+        .expect_err("a draining pod must not take a new attachment");
+    assert_eq!(refused.code(), Code::Unavailable);
+
+    controller
+        .describe_session(Request::new(proto::SessionRef {
+            id: Some(proto::session_ref::Id::ExternalId("req-1".to_string())),
+        }))
+        .await
+        .expect("a draining pod still describes what it holds");
+    controller
+        .destroy_session(Request::new(proto::SessionRef {
+            id: Some(proto::session_ref::Id::ExternalId("req-1".to_string())),
+        }))
+        .await
+        .expect("a draining pod must still be able to close its own sessions");
+}
