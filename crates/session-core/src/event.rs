@@ -1,3 +1,4 @@
+use crate::attribution::Attribution;
 use crate::ids::{AttachmentId, PlaybackId, SessionId};
 use crate::registry::SessionKind;
 use media_core::Track;
@@ -48,6 +49,10 @@ pub enum Observation {
     UploadCompleted {
         recording_id: String,
         uri: String,
+    },
+    LegsAttributed {
+        attribution: Attribution,
+        tracks: Vec<String>,
     },
 }
 
@@ -105,6 +110,10 @@ pub enum EventKind {
     AttachmentUp {
         label: String,
     },
+    LegsAttributed {
+        attribution: Attribution,
+        tracks: Vec<String>,
+    },
     MixRouted {
         target: String,
         monitor_audible: bool,
@@ -149,6 +158,7 @@ pub struct MediaEvent {
     pub attachment: Option<AttachmentId>,
     pub seq: u64,
     pub legacy_eligible: bool,
+    pub attribution: Attribution,
     pub kind: EventKind,
 }
 
@@ -234,6 +244,7 @@ mod tests {
             attachment: Some(AttachmentId::from_raw(2)),
             seq: 7,
             legacy_eligible: false,
+            attribution: Attribution::Explicit,
             kind: EventKind::Partial {
                 track: Track::Customer,
                 text: "hel".to_string(),
