@@ -2685,6 +2685,103 @@ locally, so argument passing and the sender snippet are proven but a real
 and `mc` fallbacks are code-reviewed, not run; and a probe record on the
 configured topic is the one side effect the tool cannot take back.
 
+### 46. Deploy manifests + the operator guide (G6) — ✅ DONE (2026-08-26)
+
+**The gap this closes.** Everything MSS needs to be deployed existed only as
+knowledge in this repository's history: there were no manifests, and
+`docs/deploy.md` was a stub holding the rows items 42–45 had added. The first
+session on real gear would have written a Deployment from scratch and guessed at
+the grace period, the port range, the advertised address and the probe paths —
+the four things the previous four items had just made measurable.
+
+**What landed.** `deploy/k8s/`, a Kustomize tree with no Helm and no templating
+language, so what you read is what gets applied:
+
+- `base/` — Deployment, ConfigMap (**every** non-secret `MSS_*` variable with its
+  meaning), Secret **template** (every value the literal `REPLACE_ME`, behind a
+  banner saying so, documenting the key names), two headless Services (gRPC needs
+  client-side balancing or every session pins to one pod), PDB
+  (`maxUnavailable: 1`), ServiceAccount (no RBAC — mediaserverd calls no
+  Kubernetes API), ServiceMonitor and PrometheusRule.
+- `overlays/hostport/` — pod network, an enumerated `hostPort` range,
+  `MSS_MEDIA_ADVERTISE_IP` from `status.hostIP`, and a NetworkPolicy that is the
+  firewall matrix in machine-readable form. `regenerate.sh <min> <max>` rewrites
+  the port entries and the ConfigMap range **together**.
+- `overlays/hostnetwork/` — `hostNetwork: true`,
+  `dnsPolicy: ClusterFirstWithHostNet`, both `MSS_MEDIA_ADVERTISE_IP` and
+  `MSS_TAP_LOCAL_IP` from `status.hostIP`, and a 1000-port range.
+- `sync-alerts.sh` — wraps `deploy/prometheus-alerts.yaml` into the
+  PrometheusRule, so the operator manifest and the plain-Prometheus rule file
+  cannot drift. Verified: the generated `spec` is byte-identical to the alert
+  document (16 rules in 4 groups).
+- `validate.sh` + `validate_fields.py` — the check that runs without a cluster.
+
+`docs/deploy.md` is now the whole guide: what MSS needs and never needs, the
+manifests and the hostPort/hostNetwork trade-off table, **every** `MSS_*`
+variable in six grouped tables (name / default / meaning / when to change / which
+item added it) plus the lab-only spike variables and the warning that
+`MSS_TAP_CALL_ID` silently turns the daemon into a one-shot tap, the port and
+firewall matrix (including the two flows people forget: NG **egress** to 22222,
+and the **outbound** dial to a `WS_TWILIO` consumer), media-range sizing, pod
+sizing from architecture §8 with an explicit "these are estimates", the HA table
+of what adopts and what does not, the drain sequence, alerts, the §8.1 kernel
+pointer, the preflight, and a six-step "first day on real gear" runbook.
+
+**Validation — no cluster was available, so three layers, honestly labelled:**
+
+```
+PASS  render      base (9 objects, kubectl kustomize v1.25.9 / kustomize v4.5.7)
+PASS  render      overlays/hostport (10 objects)
+PASS  render      overlays/hostnetwork (9 objects)
+SKIP  schema      no kubeconform on PATH
+PASS  fields      72 assertions over 3 rendered overlays
+```
+
+`kubectl apply --dry-run=client` is **not** one of the layers and never will be:
+it fetches its schemas from a live API server, so with no cluster it fails with a
+connection error and proves nothing. The 72 assertions were **negative-tested** —
+shortening `terminationGracePeriodSeconds` to 20 and breaking the readiness path
+made 6 of them fail with exit 1 — so the layer is known to bite.
+
+**Decisions** (recorded here so nobody relitigates them from the YAML):
+
+- **Both network shapes ship, neither is blessed.** The choice belongs to whoever
+  owns the cluster, and the manifests state the cost of each: a `hostPort` cannot
+  express a range, so a wide range costs one manifest entry per port and one pod
+  per node; `hostNetwork` buys any range at the price of pod isolation and
+  invisible port collisions. Both set the advertised address from `status.hostIP`
+  through the downward API, because in both cases the address a peer must reach
+  is the node's and only the node knows it.
+- **No `preStop` hook.** The drain is signal-driven (item 42) and its *first* step
+  flips `/readyz` to 503 — exactly what a `preStop: sleep` exists to emulate.
+  Adding one would delay the SIGTERM and eat the grace period. Said in the
+  manifest, not just here.
+- **No CPU limit, and the reason is in the file.** The packet path runs on
+  dedicated real-time threads; CFS throttling there is pacing jitter and consumer
+  underruns, not a slow API. Requests carry a "MEASURE THIS" note pointing at
+  architecture §8's estimate.
+- **`emptyDir` for the spill dir, not a PVC.** It only has to survive a container
+  restart: a cross-pod adopter cannot read another pod's disk either way (D9's
+  residual), so a PVC would buy nothing and add a scheduling constraint.
+- **Headless Services.** One long-lived HTTP/2 connection per gRPC client behind
+  a ClusterIP would pin every session on that client to one pod. The file names
+  the fallback for clients that cannot balance themselves.
+- **The Secret is a template, and loudly.** Every value is `REPLACE_ME`, because
+  the failure it prevents is real: the control plane would trust the token
+  `REPLACE_ME` from any caller.
+- **The alert rules are generated, not copied.** `deploy/prometheus-alerts.yaml`
+  stays the source of truth and usable by a plain Prometheus; the diff
+  `sync-alerts.sh` produces is the drift check.
+
+**What it does not prove:** nothing here has been applied to a Kubernetes
+cluster — not once. Every object is rendered and field-checked, and the values in
+it are the ones measured live in the lab by items 42–45, but the manifests
+themselves are unexercised: the probes have never been called by a kubelet, the
+`hostPort` mapping has never carried a packet, `status.hostIP` has never been
+substituted by a real API server, and no rollout has ever drained a pod under a
+Deployment controller. Steps 1, 5 and 6 of the runbook are where that gets
+found out.
+
 ## Open defects and soft spots
 
 | # | Item | Where | Severity |
@@ -2728,13 +2825,13 @@ the worked example of each handoff.
 | # | Handoff | What MSS already provides | What the integrator owes |
 | --- | --- | --- | --- |
 | H1 | **An event consumer for `mss.events`** | typed `MediaEvent` on one Kafka topic, keyed by `external_id`, gapless per-session `seq`, at-least-once since D5 (so dedupe by `(external_id, seq)`), `legacy_eligible` marking the authoritative attachment | a consumer that renders those events onto whatever the existing control plane already understands. *Worked example:* the reference deployment's translator, which maps them onto its legacy positional `eventTopic` format — written, awaiting review and merge in its own repository (item 1) |
-| H2 | **The deployed rtpengine version check** | `subscribe` verified against lab rtpengine 14.1.1.8; `lab/kernel_probe.sh` prints the finding on any host, and `lab/preflight.sh` prints it as one `rtpengine_version` line | read the version from the process, the package or rtpengine's CLI interface (`--listen-cli`) on the target host. **It cannot be asked over NG** — rtpengine has no NG `version` command, in this build or upstream (item 23). If the deployed build lacks `subscribe`, the ingest model needs an upgrade path first |
-| H3 | **rtpengine-side per-tap cost on the target metal** | the MSS-side cost is measured; `lab/kernel_probe.sh` plus the read-only checklist in architecture §8.1 is the instrument | run it on the real box: `relayedpackets_kernel` vs `_user` and `media_kernel` vs `media_userspace` across baseline / taps-with-transcode / taps-without-transcode. This sets the rtpengine capacity plan. D14 is fixed (item 25), so a pod restart mid-probe no longer pollutes the numbers |
-| H4 | **End-to-end barge-in through the integrator's stack** | every MSS-owned hop is measured: consumer `SpeechReport` → bus → `StopPlayback` at **p50 3.5 ms** (item 5), and inline `Clear` → silence at the peer's ear at **p50 12.2 ms**, one ptime (item 35) | the tail is theirs: their event consumer (H1) and their prompt player. Measure the whole path against their perceptual budget |
-| H5 | **The SIP proxy's B2B integration for inline legs** | `CreateSession{kind=INLINE, sdp_offer}` returns a real SDP answer and the leg speaks and listens on real sockets; a `group` seats it in a conference | offer/answer plumbing from their proxy or B2BUA into that API. No inline leg in this repository has met a **SIP** endpoint — every inline and conference measurement is against an RTP peer with no signalling |
-| H6 | **FS byte-parity against real production recordings** | item 31 measured a live call recorded both ways: container, channel layout and rms agree exactly, and a re-aligned 2 s window agrees on 1.0000 of samples at mean diff 0.6/32768. It also established that **byte-parity at a fixed offset is not an achievable bar** — the two recorders conceal independently, so the inter-file offset wanders | a **two-party** comparison on their FreeSWITCH, with their codec, their pause contract, and a human listen. The lab's write side plays silence, so only one channel was truly compared |
+| H2 | **The deployed rtpengine version check** | `subscribe` verified against lab rtpengine 14.1.1.8; `lab/kernel_probe.sh` prints the finding on any host, and `lab/preflight.sh` prints it as one `rtpengine_version` line, and [deploy.md](deploy.md#first-day-on-real-gear--an-ordered-runbook) step 0 makes reading it the stopping condition when `ng_subscribe` fails | read the version from the process, the package or rtpengine's CLI interface (`--listen-cli`) on the target host. **It cannot be asked over NG** — rtpengine has no NG `version` command, in this build or upstream (item 23). If the deployed build lacks `subscribe`, the ingest model needs an upgrade path first |
+| H3 | **rtpengine-side per-tap cost on the target metal** | the MSS-side cost is measured; `lab/kernel_probe.sh` plus the read-only checklist in architecture §8.1 is the instrument, sequenced as [deploy.md](deploy.md#first-day-on-real-gear--an-ordered-runbook) step 3 | run it on the real box: `relayedpackets_kernel` vs `_user` and `media_kernel` vs `media_userspace` across baseline / taps-with-transcode / taps-without-transcode. This sets the rtpengine capacity plan. D14 is fixed (item 25), so a pod restart mid-probe no longer pollutes the numbers |
+| H4 | **End-to-end barge-in through the integrator's stack** | every MSS-owned hop is measured: consumer `SpeechReport` → bus → `StopPlayback` at **p50 3.5 ms** (item 5), and inline `Clear` → silence at the peer's ear at **p50 12.2 ms**, one ptime (item 35); [deploy.md](deploy.md#first-day-on-real-gear--an-ordered-runbook) step 6 says to measure the whole path while the inline leg is first bridged | the tail is theirs: their event consumer (H1) and their prompt player. Measure the whole path against their perceptual budget |
+| H5 | **The SIP proxy's B2B integration for inline legs** | `CreateSession{kind=INLINE, sdp_offer}` returns a real SDP answer and the leg speaks and listens on real sockets; a `group` seats it in a conference; [deploy.md](deploy.md#high-availability-what-is-adoptable-and-what-is-not) records that an inline leg does **not** survive a pod loss, so recovery is call-control's | offer/answer plumbing from their proxy or B2BUA into that API. No inline leg in this repository has met a **SIP** endpoint — every inline and conference measurement is against an RTP peer with no signalling |
+| H6 | **FS byte-parity against real production recordings** | item 31 measured a live call recorded both ways: container, channel layout and rms agree exactly, and a re-aligned 2 s window agrees on 1.0000 of samples at mean diff 0.6/32768; [deploy.md](deploy.md#first-day-on-real-gear--an-ordered-runbook) step 4 walks the recording checks, frozen identity first. It also established that **byte-parity at a fixed offset is not an achievable bar** — the two recorders conceal independently, so the inter-file offset wanders | a **two-party** comparison on their FreeSWITCH, with their codec, their pause contract, and a human listen. The lab's write side plays silence, so only one channel was truly compared |
 | H7 | **Retiring the legacy media path** | the workloads are served: fan-out, recording, inline legs, conferences, monitor/whisper/barge | the tenant decision to turn the old media bugs off (`record_session`, the audio fork, the conference-per-AI-interaction dummy leg), and to decommission whatever gateway service they run today. Rollback stays config-only while both paths are installed |
-| H8 | **A pilot, a stability period and UX sign-off** | metrics on `MSS_METRICS_LISTEN` with alert rules in `deploy/`, a soak harness (`lab/soak.py`) and an impairment matrix | run flagged tenants for the agreed period; watch D11 (blocking detach), D17 (leg labels without an explicit from-tag) and the conference defects D16/D20/D21/D22 in the field; get a human to judge audio quality, which no automated assertion in this repository claims to have done |
+| H8 | **A pilot, a stability period and UX sign-off** | metrics on `MSS_METRICS_LISTEN` with alert rules in `deploy/`, a soak harness (`lab/soak.py`) and an impairment matrix, plus deployable manifests: `deploy/k8s/` with both network shapes, probes, a drain-safe grace period and a `ServiceMonitor`/`PrometheusRule` generated from those alert rules (item 46) | run flagged tenants for the agreed period; watch D11 (blocking detach), D17 (leg labels without an explicit from-tag) and the conference defects D16/D20/D21/D22 in the field; get a human to judge audio quality, which no automated assertion in this repository claims to have done |
 
 ## Waiting on other people (M2 close-out)
 

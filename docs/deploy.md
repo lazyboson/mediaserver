@@ -1,43 +1,294 @@
 # Deploying mediaserverd — operator guide
 
-**Stub.** This file is being filled in by the integration-readiness work; the
-complete guide (every env var, the port/firewall matrix, sizing, HA behavior,
-rollout behavior and the preflight tool) lands with item G6. Until then it holds
-the rows that earlier items added, and [lab.md](lab.md) remains the worked
-example of a running deployment.
+Everything needed to run mediaserverd against a real deployment: what it talks
+to, every variable it reads, the firewall it needs, how it behaves during a
+rollout and a pod loss, how to check an environment **before** deploying into
+it, and an ordered runbook for the first day on real gear.
+
+MSS is a generic product. Anything whose media anchors in **rtpengine** can run
+it; nothing below assumes a particular proxy, softswitch or controller. Where a
+concrete stack appears — OpenSIPS, FreeSWITCH, a legacy telephony controller —
+it is a **worked example** of one integrator's shape, never a requirement. The
+lab that shape runs in is [lab.md](lab.md).
+
+## What mediaserverd needs, and what it never needs
+
+| It needs | Why | Optional? |
+| --- | --- | --- |
+| An **rtpengine** with `subscribe request`/`subscribe answer` | this is the tap. There is no fallback and no workaround: without it MSS cannot get audio | no |
+| A **UDP port range** rtpengine can reach | where rtpengine sends the tap copy, and where an inline leg lives | no |
+| **Redis** | ownership leases, so another pod adopts a tap when one dies | yes — without it sessions live and die with their pod |
+| **Kafka** | the `mss.events` stream everything downstream reacts to | yes — without it events stay in-process and nobody sees them |
+| **S3-compatible storage** | recordings, at `${accountID}/${recordingID}.${format}` | yes — without it `file-s3` attachments are refused |
+| A **writable directory** | recording spill, so a container restart does not lose buffered audio | yes, but recommended |
+| A **synchronised clock** | recording timestamps, event order, recording-group alignment across pods | no |
+
+It never needs: a SIP stack (no signalling reaches MSS — the proxy or softswitch
+keeps that), a FreeSWITCH, a Kubernetes API token (it calls no API), root, or a
+writable root filesystem.
+
+## The manifests
+
+[`deploy/k8s`](../deploy/k8s) is a Kustomize tree — no Helm, no templating
+language, so what you read is what gets applied.
+
+```
+deploy/k8s/base/                Deployment, ConfigMap, Secret template, two
+                                Services, PDB, ServiceAccount, ServiceMonitor,
+                                PrometheusRule
+deploy/k8s/overlays/hostport/     pod network + an enumerated hostPort range
+deploy/k8s/overlays/hostnetwork/  the node's network stack + a wide range
+deploy/k8s/validate.sh            checks the tree without a cluster
+deploy/k8s/sync-alerts.sh         regenerates the PrometheusRule from
+                                  deploy/prometheus-alerts.yaml
+```
+
+```sh
+kubectl create namespace mediaserver
+kubectl -n mediaserver create secret generic mediaserverd-secrets \
+  --from-literal=MSS_AUTH_TOKEN="$(openssl rand -hex 32)" \
+  --from-literal=MSS_RECORDING_S3_ACCESS_KEY_ID=... \
+  --from-literal=MSS_RECORDING_S3_SECRET_ACCESS_KEY=...
+kubectl kustomize deploy/k8s/overlays/hostnetwork   # read it first
+kubectl apply -k deploy/k8s/overlays/hostnetwork
+```
+
+The base is **not** deployable on its own for media: it leaves the media range
+empty, so every tap socket takes an ephemeral port and no firewall can describe
+it. Pick an overlay.
+
+`base/secret.yaml` is a **template** whose every value is the literal string
+`REPLACE_ME`, carrying a banner that says so. It exists to document the key
+names; create the real Secret out of band (above) or from your
+sealed-secrets/external-secrets operator and drop the file from
+`base/kustomization.yaml`. `MSS_AUTH_TOKEN` is the value that matters most:
+unset or empty, **the control plane accepts unauthenticated callers**, and the
+daemon logs a warning saying exactly that.
+
+### hostPort or hostNetwork
+
+Both ship, because the choice belongs to whoever owns the cluster.
+
+| | `overlays/hostport` | `overlays/hostnetwork` |
+| --- | --- | --- |
+| Media range | one `containerPort`/`hostPort` entry **per port** — Kubernetes cannot express a range — so it is capped at what stays hand-maintainable (the shipped example is 20 ports = 10 tapped legs = 5 two-party calls per pod) | as wide as the node has to spare; the shipped example is 1000 ports = 250 two-party calls per pod |
+| Widening it | `overlays/hostport/regenerate.sh <min> <max>` rewrites the entries and the ConfigMap values together | edit two numbers |
+| Pod isolation | keeps the pod network, NetworkPolicy, a CNI you need not reason about | gone: the container's ports **are** the node's ports |
+| Advertised address | the **node** IP (`status.hostIP`) — that is where the mapping lives | the node IP, because that is the pod's own address |
+| Media path | DNAT'd by the node | no translation at all |
+| Pods per node | one (they collide on every port) — anti-affinity is `required` | one, same reason |
+| Port collisions | scheduler-visible: the pod will not schedule | invisible until a session binds; `mss_media_ports_bind_conflicts_total` counts them |
+
+Pick `hostnetwork` when media volume is the point, `hostport` when the platform
+team will not allow it. Neither affects egress: MSS opens the NG socket to
+rtpengine itself, and Redis/Kafka/S3 are ordinary outbound TCP.
+
+### Validating the tree
+
+```sh
+sh deploy/k8s/validate.sh
+```
+
+Three layers, each announced in its own line: `kubectl kustomize` (or
+`kustomize build`) renders every overlay; `kubeconform -strict` validates the
+rendered objects against the Kubernetes schemas **if it is installed**; and a
+python pass asserts what a schema cannot — both probes on the metrics port with
+the documented periods, `terminationGracePeriodSeconds` clearing
+`MSS_DRAIN_TIMEOUT_SECS`, the spill directory being a mounted volume, the
+`hostPort` entries and `MSS_MEDIA_PORT_MIN..MAX` describing the *same* range, the
+advertised address coming from the downward API rather than a literal, and no
+Secret shipping a real-looking value.
+
+`kubectl apply --dry-run=client` is deliberately **not** one of the layers: it
+fetches its schemas from a live API server, so without a cluster it fails with a
+connection error and proves nothing.
+
+**Verified 2026-08-26** on this repo, `kubectl` v1.25.9 / kustomize v4.5.7, no
+cluster reachable: all three overlays render (9, 10 and 9 objects) and **72
+field assertions pass**; `kubeconform` is not installed here, so that layer
+reported `SKIP`. The assertions were negative-tested — shortening
+`terminationGracePeriodSeconds` to 20 and breaking the readiness path made 6 of
+the 72 fail with exit 1.
 
 ## Environment
 
-| Variable | Default | Meaning |
-| --- | --- | --- |
-| `MSS_DRAIN_TIMEOUT_SECS` | `30` | Ceiling on the whole shutdown drain (see [tasks.md item 42](tasks.md)): stop accepting, hand registry leases to an adopter, close every session politely (consumer stop frames, recordings finished, taps unsubscribed), flush the event backlog. The process exits **0** whether or not the window is used up; a second SIGTERM/SIGINT exits at once. `0` means "stop accepting and exit". Set the pod's `terminationGracePeriodSeconds` **at or above** this value, or the container runtime will SIGKILL the drain half-done — with `docker stop`, whose default grace period is 10 s, pass `-t` above this value. |
-| `MSS_MEDIA_PORT_MIN` / `MSS_MEDIA_PORT_MAX` | unset (ephemeral ports) | The inclusive UDP port range every media socket binds inside — the tap sockets rtpengine sends the subscribed copy to, and inline legs' RTP. Set both, or neither. **Even ports only** are handed out, so a range of *N* ports serves *N/2* RTP sockets (one per tapped leg: a two-party tap takes two) and the `mss_media_ports_capacity` gauge reports the real number. Unset means today's behavior: an ephemeral port per socket, which no firewall can describe. Open this range inbound from every rtpengine host. The NG control socket is **not** in it — that is an outbound flow to rtpengine's `22222`. |
-| `MSS_MEDIA_ADVERTISE_IP` | unset (= `MSS_TAP_LOCAL_IP`) | The address MSS puts in every SDP it hands a peer: the tap's subscribe answer and the inline leg's answer. Sockets still **bind** `MSS_TAP_LOCAL_IP`. Set this when the address a peer must reach is not the address the pod binds — a NAT, a routed VIP, a `hostNetwork` node behind a load balancer. If it is wrong, rtpengine's tap copy goes nowhere and the tap looks up with no audio. |
-| `MSS_HEALTH_PROBE_INTERVAL_SECS` | `10` | How often the background watchers re-probe each configured dependency for `/readyz` (see [tasks.md item 44](tasks.md)): Redis `PING`, a Kafka partition-offset read, and NG `ping` to the rtpengine node. A **failing** dependency is re-probed sooner — 1 s, 2, 4, 8, then this interval — so a restarted dependency is picked up quickly; a probe that hangs is a failure after 15 s. Lower it for a faster readiness reaction, raise it to cut chatter. The request path never probes, so this value bounds only how stale a `/readyz` answer can be. |
-| `MSS_TAP_LOCAL_IP` | `0.0.0.0` | The local address media and NG sockets bind to. On `hostNetwork: true` set it to the node address that rtpengine can reach, not `0.0.0.0`, so the source address of MSS's own packets is predictable. |
+The authority for this table is `crates/mediaserverd/src` — the `*_ENV`
+consts — and every value is logged at startup, as the value or as "unset". An
+**empty string means unset** for every knob with an unset state, so a variable
+can be neutralised in a ConfigMap without deleting it.
 
-## Media ports and firewalling
+### Listeners
 
-A deployment with a firewall between rtpengine and MSS needs three things to
-agree: `MSS_MEDIA_PORT_MIN`/`MAX` (what MSS binds), the range the firewall admits
-inbound from the rtpengine hosts, and — if they differ — `MSS_MEDIA_ADVERTISE_IP`
-(what MSS tells rtpengine to send to). Size the range at **two ports per
-concurrent tapped call** (one even port per leg, and the odd successor is left
-free for RTCP), plus headroom.
+| Variable | Default | Meaning | When to change | Added by |
+| --- | --- | --- | --- | --- |
+| `MSS_CONTROL_LISTEN` | unset | `ip:port` for `MediaControl`, the `TelCompat` façade and the gRPC `MediaStream` data plane — **all three on one port**. Unset means the daemon starts, probes rtpengine and serves nothing ("idling"). A malformed value is refused at startup | always set it; `0.0.0.0:50051` in the manifests | M4 |
+| `MSS_METRICS_LISTEN` | unset | `ip:port` for `/metrics`, `/healthz` and `/readyz`. Unset means counters stay in the logs and the pod's probes have nothing to talk to. A bind failure here **refuses to start**, on purpose | always set it; `0.0.0.0:9464` in the manifests | M4 / [item 44](tasks.md) |
+| `MSS_AUTH_TOKEN` | unset | Bearer token every control- and data-plane caller must present. **Unset or empty = unauthenticated callers are accepted**, with a warning in the log | always set it, from a Secret | M4 |
+| `MSS_POD_NAME` | `mediaserverd` | The registry lease owner. Left at the default, every pod calls itself the same thing and adoption cannot tell them apart | never by hand — the manifests take it from `metadata.name` | M4 |
+| `RUST_LOG` | `info` | `tracing-subscriber` EnvFilter. Logs are JSON either way | `debug` while chasing something; per-module targets are cheaper than global debug | — |
+
+### rtpengine and the tap
+
+| Variable | Default | Meaning | When to change | Added by |
+| --- | --- | --- | --- | --- |
+| `MSS_RTPENGINE_NODE` | unset | `ip:port` of the default NG control socket, used when `CreateSession` names no node. Pinged at startup and re-probed on the health interval; its capabilities are logged on first contact | set it to the rtpengine that anchors most calls; a per-call node in the API overrides it | M2 |
+| `MSS_TAP_TRANSCODE` | `on` | `on` asks rtpengine to transcode the tap into `MSS_TAP_FORMAT`. `off` (also `false`/`0`/`no`) takes the call's own codec — **the only knob on our side that can keep a tapped call on rtpengine's kernel fast path** | `off` once you know which codecs actually appear on the legs; with `off`, a codec MSS cannot decode is refused **by name** at subscribe time rather than dropped silently. See [architecture §8.1](architecture.md#81-running-mss-against-a-kernel-module-rtpengine) | [item 20](tasks.md) |
+| `MSS_TAP_FORMAT` | `pcmu` | What a tap is decoded as: `pcmu`/`ulaw`, `pcma`/`alaw`, `opus`. An unrecognised value warns and falls back to `pcmu` | `opus` for WebRTC legs. Measured: rtpengine's **transcoder** under-produces Opus (3.8 pkt/s against 50.0 native), so pair `opus` with `MSS_TAP_TRANSCODE=off` | [item 16](tasks.md) |
+| `MSS_OPUS_DECODE_RATE_HZ` | `16000` | The rate Opus taps are decoded at: 8000, 12000, 16000, 24000 or 48000 (libopus's own list). Anything else warns and falls back | match what your consumers want; 16 kHz is the usual ASR rate | [item 16](tasks.md) |
+
+### Media addressing
+
+| Variable | Default | Meaning | When to change | Added by |
+| --- | --- | --- | --- | --- |
+| `MSS_TAP_LOCAL_IP` | `0.0.0.0` | The local address media **and NG** sockets bind | on `hostNetwork: true`, set it to the node address rtpengine can reach, so the source address of MSS's own packets is predictable | Phase 0 |
+| `MSS_MEDIA_ADVERTISE_IP` | unset (= the bind address) | The address MSS puts in **every SDP it hands a peer**: the tap's subscribe answer and an inline leg's answer. Sockets still bind `MSS_TAP_LOCAL_IP` | whenever the address a peer must reach is not the address the pod binds — a NAT, a routed VIP, a `hostPort` mapping, a `hostNetwork` node behind a load balancer. **If it is wrong, rtpengine's tap copy goes nowhere and the tap looks up with no audio** | [item 43](tasks.md) |
+| `MSS_MEDIA_PORT_MIN` / `MSS_MEDIA_PORT_MAX` | unset (ephemeral ports) | The inclusive UDP range every media socket binds inside — tap sockets and inline RTP. Set both, or neither. **Even ports only** are handed out, so *N* ports serve *N/2* RTP sockets (one per tapped leg; a two-party tap takes two) and `mss_media_ports_capacity` reports the real number | always set it in a firewalled deployment. Unset means an ephemeral port per socket, which no firewall can describe | [item 43](tasks.md) |
+
+### Session registry and events
+
+| Variable | Default | Meaning | When to change | Added by |
+| --- | --- | --- | --- | --- |
+| `MSS_REDIS_URL` | unset | `redis://…` for ownership leases (TTL 15 s, renewed by heartbeat). Unset = **no HA**: sessions live and die with their pod. Configured but unreachable = **refuse to start** | always set it for more than one pod | [item 3](tasks.md) |
+| `MSS_KAFKA_BROKERS` | unset | Comma-separated bootstrap brokers for `MediaEvent`. Unset = events stay in-process, so nothing downstream sees them. Set but naming no broker, or unreachable = **refuse to start** | always set it once anything consumes events | M4 |
+| `MSS_EVENTS_TOPIC` | `mss.events` | The topic events are published to | a per-environment topic name | M4 |
+| `MSS_EVENTS_PARTITIONS` | `4` | Partition count used when the topic has to be created. Events are keyed by `external_id`, so per-session order survives any partition count | more partitions for more consumer parallelism | M4 |
+
+Events are **at-least-once** since defect D5: a consumer must dedupe by
+`(external_id, seq)`. `seq` is gapless per session, so a hole is visible.
+
+### Recording
+
+| Variable | Default | Meaning | When to change | Added by |
+| --- | --- | --- | --- | --- |
+| `MSS_RECORDING_BUCKET` | unset | The bucket holding `${accountID}/${recordingID}.${format}` — a **frozen** identity scheme (Constitution, Article VII). Unset = `file-s3` attachments are refused by name; unusable = **refuse to start** | always set it for recording | M5 |
+| `MSS_RECORDING_S3_ENDPOINT` | unset (AWS) | Endpoint URL for a non-AWS S3 API | MinIO, Ceph, any S3-compatible store | M5 |
+| `MSS_RECORDING_S3_REGION` | `us-east-1` | Region for request signing | match the bucket | M5 |
+| `MSS_RECORDING_S3_ACCESS_KEY_ID` / `…_SECRET_ACCESS_KEY` | unset | Static credentials. Leave **both** out to let the object store client pick up an instance/IRSA/workload-identity role instead; a half-set pair is the failure that looks like a bug | prefer a role; use keys where there is none | M5 |
+| `MSS_RECORDING_SPILL_DIR` | unset (memory only) | Closed segments spill here so a container restart does not lose them (defect D9), and this pod's leftovers are salvaged on its next start — never over an object that already exists | always set it, to a writable volume. The root filesystem is read-only and the process runs as uid 65532, so it must be a mount | [item 30](tasks.md) |
+| `MSS_RECORDING_SPILL_SECONDS` | `30` | How often a live recording spills. This **is** the worst-case audio loss when a container dies mid-call on the same pod | lower for shorter worst-case loss, at more IO | [item 30](tasks.md) |
+
+### Lifecycle
+
+| Variable | Default | Meaning | When to change | Added by |
+| --- | --- | --- | --- | --- |
+| `MSS_DRAIN_TIMEOUT_SECS` | `30` | Ceiling on the whole shutdown drain: stop accepting, hand registry leases to an adopter, close every session politely (consumer stop frames, recordings finished, taps unsubscribed), flush the event backlog. The process exits **0** whether or not the window is used up; a second SIGTERM/SIGINT exits at once. `0` means "stop accepting and exit". Set `terminationGracePeriodSeconds` **at or above** it — with `docker stop`, whose default grace is 10 s, pass `-t` above it | raise it if long calls need longer to close politely; the grace period must follow | [item 42](tasks.md) |
+| `MSS_HEALTH_PROBE_INTERVAL_SECS` | `10` | How often the background watchers re-probe each **configured** dependency for `/readyz`: Redis `PING`, a Kafka partition-offset read, NG `ping`. A failing dependency is re-probed sooner — 1 s, 2, 4, 8, then this interval — so a restarted dependency is picked up quickly; a probe that hangs is a failure after 15 s. The request path never probes, so this bounds only how stale a `/readyz` answer can be | lower for a faster readiness reaction, raise to cut chatter | [item 44](tasks.md) |
+
+### Lab instruments — never set these in a deployment
+
+Setting **`MSS_TAP_CALL_ID`** switches the binary out of the daemon into the
+one-shot phase-0 tap spike: it taps that one call, writes a file, exits, and
+serves **no API at all**. Its companions do nothing without it and are
+documented in [lab.md](lab.md): `MSS_TAP_FROM_TAGS`, `MSS_TAP_OUTPUT`,
+`MSS_TAP_SECONDS`, `MSS_TAP_DATAGRAM_LOG_DIR`, `MSS_LISTENERS`,
+`MSS_CONSUMER_URL`, `MSS_CONSUMER_ACCOUNT_ID`, `MSS_CONSUMER_STREAM_SID`,
+`MSS_CONSUMER_TRACKS`, `MSS_INJECT_TARGET`.
+
+## Ports and firewall matrix
+
+Hand this to whoever owns the firewall. "MSS host" is the pod IP on
+`hostport`/pod-network deployments and the node IP on `hostNetwork`.
+
+| Dir | Proto | Port | Peer | What it carries | Required |
+| --- | --- | --- | --- | --- | --- |
+| in | TCP | `MSS_CONTROL_LISTEN` (50051) | whatever drives MSS: your controller, the `TelCompat` callers, gRPC `MediaStream` consumers | `MediaControl` + `TelCompat` + the data plane, one port, bearer-authenticated | yes |
+| in | TCP | `MSS_METRICS_LISTEN` (9464) | Prometheus, and the kubelet for the probes | `/metrics`, `/healthz`, `/readyz` | yes |
+| in | **UDP** | `MSS_MEDIA_PORT_MIN..MAX` | **every** rtpengine host that may own a call | the tap copy rtpengine sends, and inline-leg RTP | yes |
+| out | **UDP** | 22222 (rtpengine's NG port) | every rtpengine node | NG control: `offer`, `answer`, `subscribe request`/`answer`, `unsubscribe`, `query`, `statistics`, `ping`. **Not inside the media range** — MSS initiates it, which is how a tap gets asked for at all | yes |
+| out | TCP | 6379 | Redis | ownership leases | if HA |
+| out | TCP | 9092 (or your broker port) | every Kafka broker | `mss.events` | if events |
+| out | TCP | 443 / your endpoint port | object storage | recording uploads | if recording |
+| out | TCP | 443 / 80 / whatever the consumer listens on | `WS_TWILIO` consumer URLs | MSS **dials out** to a websocket consumer, so this is egress, not ingress | if WS consumers |
+| out | UDP+TCP | 53 | DNS | every hostname in the ConfigMap. A default-deny egress policy that forgets this looks exactly like a broker outage | yes |
+| out | UDP | 123 | NTP | see the clock requirement — usually the node's job, not the pod's | yes |
+
+**No inbound SIP, ever.** Signalling never reaches MSS; the proxy or softswitch
+keeps it, and MSS learns about a call through its own API and through rtpengine.
+
+Media is deliberately absent from the Kubernetes Services: rtpengine sends the
+tap copy straight to the address MSS advertised, and a Service in that path
+would rewrite the destination and break symmetric RTP.
+
+### Sizing the media range
+
+Three things must agree: `MSS_MEDIA_PORT_MIN`/`MAX` (what MSS binds), the range
+the firewall admits inbound from the rtpengine hosts, and — if they differ —
+`MSS_MEDIA_ADVERTISE_IP` (what MSS tells rtpengine to send to).
+
+Size it at **two ports per concurrent tapped call**: one even port per leg, with
+the odd successor left free for RTCP. So a 1000-port range = 500 even ports =
+500 tapped legs = **250 two-party calls per pod**. Add headroom: a port is
+returned when the session is destroyed, and a busy pod churns.
+
+Keep the range clear of the node's ephemeral range
+(`sysctl net.ipv4.ip_local_port_range`, commonly 32768–60999) or the kernel and
+MSS will fight over ports — reserve it with `net.ipv4.ip_local_reserved_ports`
+if it must overlap.
 
 Watch `mss_media_ports_in_use` against `mss_media_ports_capacity`;
 `mss_media_ports_exhausted_total` rising means sessions are being refused for
-want of a port, and `mss_media_ports_bind_conflicts_total` rising means something
-else on the host is inside MSS's range.
+want of a port, and `mss_media_ports_bind_conflicts_total` rising means
+something else on the host is inside MSS's range.
 
 Verified in the lab (2026-08-26, `lab/media_port_drill.sh`): a live tapped call
-on a 40-port range bound `40100` and `40102`, carried 1503 datagrams in 15 s, and
-returned both ports to the range when the session was destroyed.
+on a 40-port range bound `40100` and `40102`, carried 1503 datagrams in 15 s,
+and returned both ports to the range when the session was destroyed.
+
+## Sizing a pod
+
+The estimate, from [architecture §8](architecture.md#8-scaling--deployment-model):
+a passive tap of both legs at G.711/20 ms is ~100 pkt/s in, one decode+resample
+and per-consumer encodes — **comfortably a few thousand concurrent sessions per
+modern 8-core pod** with an allocation-free hot path. An interactive **inline**
+session costs roughly **2×** (bidirectional plus playout pacing). A conference
+costs the mix, once per room, plus a per-member encode.
+
+These are estimates to validate, **not promises**, which is why the manifests
+say so where the numbers live. Start from the shipped requests — `cpu: 2`,
+`memory: 1Gi`, `limits.memory: 2Gi` — for a few hundred concurrent tapped calls,
+then measure your own codec mix and consumer count and move them.
+
+Two deliberate choices in that block:
+
+- **No CPU limit.** The packet path runs on dedicated real-time OS threads; CFS
+  throttling on those threads surfaces as pacing jitter and consumer underruns,
+  not as a slow API. Bound the pod with requests and node-level allocation.
+- **The spill volume is an `emptyDir`, not a PVC.** It only has to survive a
+  container restart: a cross-pod adopter cannot read another pod's disk either
+  way. Size it at (spill interval) × (concurrent recordings) × 16 kB/s per
+  8 kHz 16-bit channel — about 1 MB per channel-minute — with headroom for a
+  bucket outage.
+
+Scale on active session count (and CPU) rather than requests per second. Calls
+are minutes long, so **scale-in is slow by nature**: a pod cannot leave until its
+calls end or are adopted. Plan for it.
+
+## High availability: what is adoptable and what is not
+
+Ownership is a TTL'd lease in Redis, renewed by heartbeat. On pod loss another
+pod takes the lease and re-subscribes. That works because taps are
+**pull-initiated** — MSS asks rtpengine to send it a copy — so the new pod can
+simply ask again. Nothing else in the system has that property.
+
+| Workload | Survives a pod loss? | What actually happens |
+| --- | --- | --- |
+| **Passive taps** | **yes** | another pod adopts the session and re-subscribes. Measured: **1.96 s** of consumer audio gap after a graceful SIGTERM drain (adoption 2.7 s after the signal), against **14.41 s** for the same call killed with `SIGKILL` |
+| **Attachments MSS dials out to** (`WS_TWILIO`, `file-s3`) | yes | re-established by the adopter along with the tap |
+| **Attachments that dial into MSS** (`GRPC_STREAM`) | no, by construction | the consumer's HTTP/2 connection died with the pod; it must reattach. This is why the Service is headless — a client resolving all pod IPs notices |
+| **Inline legs** (Phase 3) | **no** | the peer's SDP points at a socket that no longer exists. This fails like any media endpoint failure and needs recovery at call-control level |
+| **Conferences** (Phase 4) | **no** | the mixer is pod-local; a room does not move. Defect D16 — pod-local groups — is open pending a placement decision |
+| **Recordings** | **partly** | closed segments spill to per-pod local disk, so a **same-pod** restart loses at most `MSS_RECORDING_SPILL_SECONDS`. A **cross-pod** adopter cannot read that disk: it recovers what it can, pads the rest, and counts it in `mss_recording_frames_lost_on_adopt_total`. Defect D9's residual |
+| **Events** | yes | at-least-once with a bounded retry backlog; a pod death or an overfull backlog still loses events, and the gapless per-session `seq` makes the hole visible |
+
+Run at least two pods, spread across nodes (the base prefers it; both overlays
+require it, because host ports collide). The PodDisruptionBudget holds voluntary
+disruption to `maxUnavailable: 1` — two pods draining at once means two adoption
+storms at once.
 
 ## Health probes
 
-`MSS_METRICS_LISTEN` serves three paths and nothing else (anything else is a 404,
-a non-GET a 405):
+`MSS_METRICS_LISTEN` serves three paths and nothing else (anything else is a
+404, a non-GET a 405):
 
 | Path | Meaning | Probe |
 | --- | --- | --- |
@@ -51,29 +302,93 @@ livenessProbe:  { httpGet: { path: /healthz, port: 9464 }, periodSeconds: 10 }
 ```
 
 Readiness turns 503 on the **first** step of the drain, so a rollout stops
-sending new sessions to a pod before it starts closing the ones it holds — measured
-in the lab (2026-08-26): `docker stop -t 60` on a live pod, `/readyz` polled every
-~5 ms, 200 at t+0.028 s, **503 `not ready: draining` at t+0.035 s**, listener gone
-at t+0.042 s, exit 0 at t+0.404 s. A dependency outage is measured too: stopping
-the lab Redis turned `/readyz` 503 within **8 s** with
-`not ready: redis unreachable: session store: timed out`, `/healthz` stayed 200,
-and starting Redis again returned 200 within **3 s**.
+sending new sessions to a pod before it starts closing the ones it holds —
+measured in the lab (2026-08-26): `docker stop -t 60` on a live pod, `/readyz`
+polled every ~5 ms, 200 at t+0.028 s, **503 `not ready: draining` at
+t+0.035 s**, listener gone at t+0.042 s, exit 0 at t+0.404 s. A dependency
+outage is measured too: stopping the lab Redis turned `/readyz` 503 within
+**8 s** with `not ready: redis unreachable: session store: timed out`,
+`/healthz` stayed 200, and starting Redis again returned 200 within **3 s**.
 
 Do not point a probe at `/metrics`: it renders the whole exposition and says
 nothing about readiness.
 
+The manifests also carry a `startupProbe` on `/healthz` (2 s × 30): first
+contact with rtpengine, the spill salvage pass and the Kafka connect all happen
+before the listener binds, and a slow one of those should not trip liveness.
+
 ## Rollout behavior
 
 mediaserverd drains on **SIGTERM** as well as SIGINT, so an ordinary Kubernetes
-rollout or eviction is graceful: readiness goes false first (`/readyz` answers
-**503 `not ready: draining`** and the `mss_draining` gauge flips to 1), the registry lease is released so another pod adopts the call
-on its next sweep rather than after the 15 s TTL, and consumers are closed with
-their protocol's own stop frame instead of a dropped socket.
+rollout or eviction is graceful. The sequence, in order, all inside
+`MSS_DRAIN_TIMEOUT_SECS`:
+
+1. **stop accepting** — readiness goes false (`/readyz` 503 `not ready:
+   draining`, `mss_draining` flips to 1); no new session or attachment is taken
+   here.
+2. **hand off leases** — the registry lease is released so another pod adopts on
+   its next sweep rather than after the 15 s TTL.
+3. **close sessions** — each one politely: consumers get their protocol's own
+   stop frame, recordings are finished and uploaded, taps are unsubscribed.
+4. **control plane idle** — the listener closes once in-flight calls finish.
+5. **flush events** — the backlog is given a 10 s window to reach Kafka.
+
+Then exit **0**, whether or not the window was used up. A **second** signal
+exits at once.
 
 Measured in the lab (2026-08-26, `lab/drain_drill.sh`): a tapped live call, pod
 stopped with `docker stop -t 60`, **exit 0 in 0.44 s**, drain 30 ms, the second
 pod adopting **2.7 s** after the signal and the consumer's audio gap **1.96 s** —
 against **14.41 s** for the same call killed with SIGKILL.
+
+Two things follow for the manifests:
+
+- **`terminationGracePeriodSeconds` must clear `MSS_DRAIN_TIMEOUT_SECS`.** The
+  base ships 45 against a 30 s drain — margin for the kubelet's own round
+  trips. Below the drain timeout the runtime SIGKILLs a half-done drain and
+  every call on that pod pays the 14 s gap instead of the 2 s one.
+  `validate.sh` asserts the relationship.
+- **No `preStop` hook, on purpose.** The drain is signal-driven: mediaserverd
+  handles SIGTERM itself and its *first* step flips `/readyz` to 503, so the
+  endpoint is pulled by exactly the mechanism a `preStop: sleep` exists to
+  emulate. Adding one would only delay the SIGTERM and eat the grace period.
+
+`maxSurge: 1, maxUnavailable: 0` and the PDB keep a rollout to one draining pod
+at a time. A rollout of a fleet carrying long calls takes as long as the calls
+do — that is the design, not a stall.
+
+## Alerts and metrics
+
+[`deploy/prometheus-alerts.yaml`](../deploy/prometheus-alerts.yaml) is the single
+source of truth: it works as a plain Prometheus `rule_files:` entry, and
+`deploy/k8s/sync-alerts.sh` wraps it into
+`deploy/k8s/base/prometheusrule.yaml` for the Prometheus Operator, so the two
+cannot drift (the diff the script produces **is** the drift check). Every
+silent-drop counter has an alert — Constitution, Article VIII: a drop is a
+first-class metric, never a silence. The thresholds are Phase-1 starting points;
+tune them against your own baseline.
+
+The `ServiceMonitor` scrapes every 15 s, because the rules use `rate(…[5m])`
+windows and anything slower makes a short drop burst invisible. It selects by
+`release: prometheus` — match your own Prometheus's selector or the monitor is
+silently ignored. No operator? Drop both files and scrape
+`mediaserverd-scrape:9464/metrics` however you already scrape things; nothing in
+mediaserverd depends on the operator.
+
+## Running against a kernel-module rtpengine
+
+Whether a tap drags the tapped legs out of rtpengine's kernel fast path is
+decided by **transcoding, not tapping** — the module carries no codec, so
+anything rtpengine must convert is handled in its userspace, while fan-out to an
+extra destination is something the module is built for. No MSS media-path code is
+involved either way.
+
+The eligibility checklist for a tenant, the on-metal read-only probes, and why
+the version cannot be asked over NG are all in
+[architecture §8.1](architecture.md#81-running-mss-against-a-kernel-module-rtpengine).
+The short form: set `MSS_TAP_TRANSCODE=off`, confirm codec coverage first, run
+`lab/kernel_probe.sh <host> <port>` at baseline **and** with taps running, and
+read the daemon's own `rtpengine node capabilities on first contact` line.
 
 ## Preflight — check the environment before deploying into it
 
@@ -191,3 +506,97 @@ leaves the environment as it found it. The probe record is the one thing it
 cannot take back — it lands on the **configured** topic, so pass
 `--topic mss.preflight` if a probe record on `mss.events` would confuse a
 consumer.
+
+## First day on real gear — an ordered runbook
+
+Do these in order. Each step's failure is diagnosable on its own; skipping ahead
+turns one unknown into three. Everything before step 3 is read-only.
+
+**0. Preflight, from a jump host in the target network.**
+
+```sh
+./lab/preflight.sh --ng <rtpengine>:22222 --redis <url> --kafka <brokers> \
+  --s3-endpoint <endpoint> --bucket <bucket> --media-ports <min>-<max> \
+  --advertise-ip <the address rtpengine must reach> --ssh <rtpengine-host>
+```
+
+Exit 0 before going further. `ng_subscribe` FAIL stops the whole exercise —
+that rtpengine cannot feed MSS a tap, and handoff **H2** (read the version on
+the host; it cannot be asked over NG) is the next thing to do. Pass `--ssh` if
+you possibly can: `media_udp` is the check that catches the firewall, and it is
+a `SKIP` without it. Note every `SKIP` — each is an unchecked assumption, and
+each names the command that would settle it.
+
+**1. Deploy, with no calls pointed at it.** Apply an overlay, then read the
+startup log and the two probes before anything else:
+
+```sh
+kubectl -n mediaserver logs deploy/mediaserverd | head -40
+kubectl -n mediaserver port-forward deploy/mediaserverd 9464:9464 &
+curl -s localhost:9464/healthz; curl -sS localhost:9464/readyz
+```
+
+Every `MSS_*` value is echoed at startup as a value or as "unset" — read that
+list against the ConfigMap; a typo'd variable name is silently "unset". Confirm
+`rtpengine node capabilities on first contact` names your node, and that
+`/readyz` is **200**. A 503 names the dependency on its first line.
+
+**2. One tapped call, `MSS_TAP_TRANSCODE=off`.** Have the proxy anchor one real
+call, then create a session and attach one consumer through the API. Transcoding
+off from the start, so the first call also answers the codec question: MSS sees
+the carrier's own codec, and one it cannot decode is refused **by name** instead
+of silently dropped. Check, in this order: the consumer receives audio; the
+packet rate is what the codec implies (~50 pkt/s per leg at 20 ms — a rate far
+below that is rtpengine's transcoder, not MSS); `mss_media_ports_in_use` shows
+two ports for a two-party call; `mss.events` carries the session's events with a
+gapless `seq`. **No audio at the consumer with a healthy subscribe is almost
+always `MSS_MEDIA_ADVERTISE_IP` or the inbound media range** — that pair is the
+single most common first-day failure.
+
+**3. `kernel_probe.sh` again, with taps running.** Baseline was step 0; now
+compare. On the rtpengine host add the read-only evidence NG cannot expose —
+`/proc/rtpengine/<table>/list` for `num_destinations` on the target entries, and
+`currentstatistics.media_kernel` / `media_userspace` / `transcodedmedia` — at
+baseline, with a transcoding tap, and with a transcode-off tap. That comparison
+**is** handoff **H3**, the rtpengine-side per-tap cost, and it sets the rtpengine
+capacity plan. The full read-only checklist is
+[architecture §8.1](architecture.md#81-running-mss-against-a-kernel-module-rtpengine).
+
+**4. Recording.** Attach a `file-s3` consumer to one call, hang up, and check the
+object landed at exactly `${accountID}/${recordingID}.${format}` — that identity
+is frozen, and anything reading recordings downstream depends on it. Then pause
+and resume mid-call and confirm the segmenting. Then kill the container mid-call
+and confirm the spill salvage on restart. Note the residual honestly: a
+**cross-pod** adopter cannot read the dead pod's spill directory (defect D9), and
+byte-parity against a FreeSWITCH recording is handoff **H6**.
+
+**5. Drain and adopt, on purpose, before it happens by accident.** With a tapped
+call up: `kubectl -n mediaserver delete pod <pod>`. Expect the drain sequence in
+the log, exit 0, another pod adopting, and a consumer gap of a couple of seconds
+— not fifteen. If the pod is SIGKILLed instead, `terminationGracePeriodSeconds`
+is below `MSS_DRAIN_TIMEOUT_SECS`.
+
+**6. Inline, through the proxy's B2B.** Last, because it is the only step whose
+failure can be entirely on the other side. `CreateSession{kind=INLINE,
+sdp_offer}` returns a real SDP answer; the proxy or B2BUA has to bridge a SIP leg
+onto it. **No inline leg in this repository has ever met a SIP endpoint** — every
+inline and conference measurement here is against a bare RTP peer with no
+signalling. That is handoff **H5**, and inline legs do **not** survive a pod
+loss (see the HA table). Measure barge-in end to end against your own perceptual
+budget while you are there — handoff **H4**.
+
+Then, and only then, flip a tenant.
+
+## The reference deployment, as a worked example
+
+The project grew out of one production contact-center stack, and that stack
+appears throughout the docs as a concrete stand-in for generic roles: carrier →
+OpenSIPS → rtpengine → FreeSWITCH for the customer leg, a Go telephony
+controller driving FreeSWITCH over ESL, and a per-call RTP↔WebSocket gateway
+that MSS supersedes. The compatibility surfaces that shape exercises — the
+Twilio Media Streams websocket dialect, the `mod_audio_fork` event names, the
+the legacy verb API façade — are **optional adapters**, not part of the core.
+
+Read it as an example of how the pieces fit, never as a requirement. Any
+deployment whose media anchors in rtpengine can run MSS with none of it.
+[lab.md](lab.md) is that shape, small enough to run on one machine.
