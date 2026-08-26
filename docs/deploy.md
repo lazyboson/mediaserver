@@ -318,6 +318,16 @@ MSS interprets no digit itself: no menu state, no collection, no inter-digit
 timer. Track names follow the attribution above, so an unattributed session's
 digits arrive on `leg_a`/`leg_b`.
 
+## Conference member state — read it back before you trust it
+
+`DescribeSession` on a conference member's session reports that member's live
+`mute`/`deaf`/`hold`, its mix routes (target, source, whether the recording feed
+carries it, and the attachment that owns each) and the room it sits in — group
+name, member count and every member's external id — so a UI can reconcile a whole
+room from any one member, with no extra RPC. Member state has **no lease**: if
+your controller dies between `mute on` and `mute off` the member stays muted for
+the life of the conference, so reconcile on reconnect rather than assuming.
+
 ## High availability: what is adoptable and what is not
 
 Ownership is a TTL'd lease in Redis, renewed by heartbeat. On pod loss another

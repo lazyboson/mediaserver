@@ -32,7 +32,9 @@ use rtpengine_ng::{
     InlineOffer, NegotiatedCodec, PlayMedia, PlaySource, PlayTarget, SdpError, SubscribeRequest,
     SubscriptionAnswer, SubscriptionOffer,
 };
-use session_core::mix::{MemberControl, MixRoute, MIX_TARGET_EVERYONE, MIX_TARGET_OWN};
+use session_core::mix::{
+    MemberControl, MemberStateView, MixRoute, MIX_TARGET_EVERYONE, MIX_TARGET_OWN,
+};
 use session_core::{
     AttachmentId, AttachmentView, Attribution, Capabilities, Observation, SessionId, SessionKind,
     SessionView, TrackSelector, Transport,
@@ -1581,7 +1583,7 @@ impl TapPlane {
                 MediaPlaneError(format!("conference {name} is not running on this pod"))
             })?;
             conference
-                .route(session, route)
+                .route(session, Some(attachment), route)
                 .map_err(|error| MediaPlaneError(format!("conference {name}: {error}")))?;
         }
         if let Ok(mut held) = self.sessions.lock() {
@@ -1708,7 +1710,7 @@ impl TapPlane {
             Err(_) => return,
         };
         if let Some(conference) = held.get_mut(&name) {
-            match conference.route(session, MixRoute::private()) {
+            match conference.route(session, None, MixRoute::private()) {
                 Ok(()) => info!(
                     %session,
                     %attachment,
@@ -1879,6 +1881,15 @@ impl MediaPlane for TapPlane {
     fn inline_egress_sink(&self, session: SessionId) -> Option<Arc<dyn InlineEgressSink>> {
         self.inline_egress(session)
             .map(|handle| Arc::new(handle) as Arc<dyn InlineEgressSink>)
+    }
+
+    fn member_state(&self, session: SessionId) -> Option<MemberStateView> {
+        let name = self.conference_of(session).ok()?;
+        self.conferences
+            .lock()
+            .ok()?
+            .get(&name)?
+            .member_state(session)
     }
 
     async fn open_session(&self, view: SessionView) -> Result<OpenedSession, MediaPlaneError> {
@@ -5681,6 +5692,213 @@ m=audio 41000 RTP/AVP 111\r\na=rtpmap:111 opus/48000/2\r\n",
             tracks_of(TrackSelector::Only(Track::Customer)),
             vec!["inbound"]
         );
+    }
+    const SCHEME_SEPARATOR: &str = "\x2f\x2f";
+
+    struct WiredRoom {
+        endpoint: String,
+        stop: Option<tokio::sync::oneshot::Sender<()>>,
+        serving: tokio::task::JoinHandle<()>,
+    }
+
+    impl WiredRoom {
+        async fn open() -> WiredRoom {
+            let plane: Arc<dyn MediaPlane> = Arc::new(plane());
+            let controller =
+                Arc::new(control_api::SessionController::new("wire-pod").with_media_plane(plane));
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("a control port");
+            let port = listener.local_addr().expect("the control address").port();
+            let (stop, stopped) = tokio::sync::oneshot::channel();
+            let serving = tokio::spawn(async move {
+                control_api::serve_shared_until(controller, listener, async {
+                    let _ = stopped.await;
+                })
+                .await
+                .expect("the control plane serves");
+            });
+            WiredRoom {
+                endpoint: format!("http:{SCHEME_SEPARATOR}127.0.0.1:{port}"),
+                stop: Some(stop),
+                serving,
+            }
+        }
+
+        async fn close(mut self) {
+            if let Some(stop) = self.stop.take() {
+                let _ = stop.send(());
+            }
+            let _ = self.serving.await;
+        }
+    }
+
+    fn silent_peer() -> (UdpSocket, String) {
+        let socket = UdpSocket::bind("127.0.0.1:0").expect("a fake peer socket");
+        socket.set_nonblocking(true).expect("nonblocking peer");
+        let port = socket.local_addr().expect("peer address").port();
+        let offer = inline_offer_sdp(port);
+        (socket, offer)
+    }
+
+    fn wire_reference(external_id: &str) -> control_api::proto::SessionRef {
+        control_api::proto::SessionRef {
+            id: Some(control_api::proto::session_ref::Id::ExternalId(
+                external_id.to_string(),
+            )),
+        }
+    }
+
+    #[tokio::test]
+    async fn describing_a_member_reads_back_its_own_state_and_enumerates_the_room() {
+        use control_api::proto;
+        use control_api::proto::media_control_client::MediaControlClient;
+
+        let room = WiredRoom::open().await;
+        let mut client = MediaControlClient::connect(room.endpoint.clone())
+            .await
+            .expect("a client reaches the control port");
+
+        let mut attachments = Vec::new();
+        let mut peers = Vec::new();
+        for member in ["alice", "bob", "carol"] {
+            let (peer, offer) = silent_peer();
+            peers.push(peer);
+            client
+                .create_session(proto::CreateSessionRequest {
+                    external_id: member.to_string(),
+                    kind: proto::SessionKind::Inline as i32,
+                    call_id: format!("call-{member}"),
+                    from_tags: Vec::new(),
+                    rtpengine_node: String::new(),
+                    mix: false,
+                    idempotency_key: String::new(),
+                    sdp_offer: offer,
+                    group: "sales-standup".to_string(),
+                })
+                .await
+                .expect("an inline leg is answered and seated")
+                .into_inner();
+            let attachment = client
+                .attach(proto::AttachRequest {
+                    session: Some(wire_reference(member)),
+                    transport: proto::Transport::GrpcStream as i32,
+                    capabilities: vec![
+                        proto::Capability::Sink as i32,
+                        proto::Capability::Inject as i32,
+                    ],
+                    selector: None,
+                    format: None,
+                    authoritative: false,
+                    label: member.to_string(),
+                    endpoint: "grpc-target".to_string(),
+                    group: String::new(),
+                    metadata: Default::default(),
+                    idempotency_key: String::new(),
+                })
+                .await
+                .expect("an inject attachment on a member session")
+                .into_inner();
+            attachments.push(attachment.attachment_id);
+        }
+
+        let update =
+            |attachment: String, pairs: Vec<(&str, &str)>| proto::UpdateAttachmentRequest {
+                attachment_id: attachment,
+                paused: None,
+                selector: None,
+                format: None,
+                idempotency_key: String::new(),
+                metadata: pairs
+                    .into_iter()
+                    .map(|(key, value)| (key.to_string(), value.to_string()))
+                    .collect(),
+            };
+        client
+            .update_attachment(update(
+                attachments[1].clone(),
+                vec![(MEMBER_MUTE_METADATA_KEY, MEMBER_FLAG_ON)],
+            ))
+            .await
+            .expect("bob is muted through his own attachment");
+        client
+            .update_attachment(update(
+                attachments[0].clone(),
+                vec![(MIX_TARGET_METADATA_KEY, "carol")],
+            ))
+            .await
+            .expect("alice whispers to carol");
+
+        let describe = |mut client: proto::media_control_client::MediaControlClient<
+            control_api::tonic::transport::Channel,
+        >,
+                        member: &'static str| async move {
+            client
+                .describe_session(wire_reference(member))
+                .await
+                .expect("a member describes")
+                .into_inner()
+        };
+
+        let alice = describe(client.clone(), "alice").await;
+        let member = alice.member.expect("a seated member reads its state back");
+        assert!(!member.mute && !member.deaf && !member.hold);
+        assert_eq!(member.mix_source, "inject");
+        assert_eq!(member.routes.len(), 1, "the whisper is the only route");
+        assert_eq!(member.routes[0].target, "carol");
+        assert_eq!(member.routes[0].source, "inject");
+        assert!(member.routes[0].monitor_audible);
+        assert_eq!(member.routes[0].attachment_id, attachments[0]);
+        let room_view = alice.conference.expect("a member enumerates its room");
+        assert_eq!(room_view.group, "sales-standup");
+        assert_eq!(room_view.member_count, 3);
+        assert_eq!(
+            room_view.members,
+            vec!["alice".to_string(), "bob".to_string(), "carol".to_string()]
+        );
+
+        let bob = describe(client.clone(), "bob").await;
+        let muted = bob.member.expect("bob reads his state back");
+        assert!(muted.mute, "the mute verb is visible to the next reader");
+        assert!(!muted.deaf && !muted.hold);
+        assert!(
+            muted.routes.is_empty(),
+            "a plain member routes nothing anywhere else"
+        );
+
+        let carol = describe(client.clone(), "carol").await;
+        let whispered_at = carol.member.expect("carol reads her state back");
+        assert!(!whispered_at.mute && !whispered_at.deaf && !whispered_at.hold);
+        assert!(
+            whispered_at.routes.is_empty(),
+            "being whispered at is not a route of one's own"
+        );
+
+        client
+            .destroy_session(wire_reference("carol"))
+            .await
+            .expect("carol leaves the room");
+
+        let after = describe(client.clone(), "alice").await;
+        let room_after = after.conference.expect("the room is still enumerable");
+        assert_eq!(room_after.member_count, 2);
+        assert_eq!(
+            room_after.members,
+            vec!["alice".to_string(), "bob".to_string()]
+        );
+        let alice_after = after.member.expect("alice still reads her state back");
+        assert_eq!(
+            alice_after.routes[0].target, "carol",
+            "the route outlives the member it named, which is what makes it auditable"
+        );
+
+        let bob_after = describe(client.clone(), "bob").await;
+        assert!(
+            bob_after.member.expect("bob is still seated").mute,
+            "member state has no lease, so it survives every other membership change"
+        );
+
+        room.close().await;
     }
 }
 

@@ -1,8 +1,9 @@
 use crate::proto;
 use media_core::{AudioFormat, Encoding, Track};
+use session_core::mix::{MIX_SOURCE_INJECT, MIX_SOURCE_LEG};
 use session_core::{
     AttachmentId, Attribution, Capabilities, ConsumerEvent, ControlError, EventKind, MediaEvent,
-    PlaybackId, SessionId, SessionKind, TrackSelector, Transport,
+    MemberStateView, MixSource, PlaybackId, SessionId, SessionKind, TrackSelector, Transport,
 };
 use std::str::FromStr;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -48,6 +49,43 @@ pub fn session_kind(wire: i32) -> Result<SessionKind, Status> {
         Ok(proto::SessionKind::Unspecified) | Err(_) => {
             Err(Status::invalid_argument("session kind is required"))
         }
+    }
+}
+
+pub fn source_name(source: MixSource) -> &'static str {
+    match source {
+        MixSource::Inject => MIX_SOURCE_INJECT,
+        MixSource::Leg => MIX_SOURCE_LEG,
+    }
+}
+
+pub fn member_state_wire(state: &MemberStateView) -> proto::MemberState {
+    proto::MemberState {
+        mute: state.mute,
+        deaf: state.deaf,
+        hold: state.hold,
+        mix_source: source_name(state.source).to_string(),
+        routes: state
+            .routes
+            .iter()
+            .map(|held| proto::MemberRoute {
+                target: held.route.target_name().to_string(),
+                source: held.route.source_name().to_string(),
+                monitor_audible: held.route.monitor_audible,
+                attachment_id: held
+                    .attachment
+                    .map(|owner| owner.to_string())
+                    .unwrap_or_default(),
+            })
+            .collect(),
+    }
+}
+
+pub fn conference_wire(state: &MemberStateView) -> proto::ConferenceView {
+    proto::ConferenceView {
+        group: state.conference.clone(),
+        member_count: state.members.len() as u32,
+        members: state.members.clone(),
     }
 }
 

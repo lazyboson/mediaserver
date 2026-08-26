@@ -2254,8 +2254,9 @@ hearing everybody; and the refusals (a flag that is not `on`/`off`, a member ver
 off a conference, a from-tag-shaped playback target on an inline leg). Plus the
 mix-metadata parser tests and a registry audit test for `MemberControlled`.
 
-**Residuals.** (a) Member state has no owner and no lease, and no API reads it
-back — D22. (b) One prompt source per room: overlapping prompts queue.
+**Residuals.** (a) Member state has no owner and no lease — D22; since item 49
+`DescribeSession` reads it back on the member's own session, but nothing reclaims
+it. (b) One prompt source per room: overlapping prompts queue.
 (c) Enter/exit sounds and DTMF menus are integrator work by design; since item 48
 the digits themselves are on the bus (D21), but nothing in MSS interprets them. (d) Per-member volume/energy, member
 enumeration, room lock and moderator roles are not built (architecture.md
@@ -2959,6 +2960,80 @@ Nothing rate-limits digits: a stuck endpoint blasting end packets at distinct
 timestamps would publish one event each, bounded only by the queue's drop
 counter.
 
+### 49. Member state read-back (G9, D22) — ✅ DONE (2026-08-26)
+
+**The gap this closes.** Item 40 made `member_mute` / `member_deaf` /
+`member_hold` deliberately outlive the attachment that set them, and then no API
+reported them. A controller that muted a member and died left that member muted
+with no way to find out: the only evidence was the aggregate gauges
+(`mss_conference_{muted,deaf,held}_members`), which say *how many*, never *who*.
+Nor could an integrator enumerate a room — the member list lived only inside the
+mixing thread.
+
+**Decision — no new RPC, and no new noun either.** `DescribeSession` on a member
+session now answers with that member's own state and, in the same message, the
+room it is seated in. There is no `DescribeConference`: a conference is not an
+addressable object in this API, it is a name that member sessions share (item 37),
+so the read-back follows the same rule as the write path — member verbs ride on
+the member's own session, and so does the read.
+
+**Decision — read the control-world mirror, never the mixing thread.**
+`Conference` (the control-plane handle) now holds a `MirroredMember` per seated
+session — external id, `mute`/`deaf`/`hold`, its `MixRoute` and the attachment
+that asked for it — written by exactly the calls that enqueue the media-thread
+command (`seat`, `route`, `control`, `unseat`). `Describe` reads that mirror under
+the conference table's lock. The alternative, asking the mixing thread, would put
+a request/response round trip into the packet path for a read that the control
+world already knows the answer to; the mirror is also why a read-back is
+immediate rather than eventually consistent with the command queue.
+
+**What shipped.**
+
+- `session_core::mix::MemberStateView` / `MemberRouteView`: the plane-agnostic
+  shape (conference name, member external ids, the three flags, the mix source
+  and the live routes);
+- `MediaPlane::member_state(session)` — a **synchronous** trait method defaulting
+  to `None`, like `inline_egress_sink`, so a media plane with no conferences is
+  unchanged. `TapPlane` answers it from `conference_of` + the conference table;
+  `SessionController::session_message` calls it **before** taking the registry
+  lock, so the two locks are never nested;
+- proto `Session.member = 13` and `Session.conference = 14` (**additive**; the
+  next free `Session` field is 15, and no payload tag was taken — the next free
+  `MediaEvent` payload tag is still 28), carrying the new `MemberState`,
+  `MemberRoute` and `ConferenceView` messages. `mss_ctl describe` prints them
+  already, since it renders the whole message.
+
+**What a reader sees.** `member` is absent unless the session is seated in a
+conference on this pod. `routes` is empty for a plain member — its injected audio
+reaches its own ear only and the mixed track does not carry it — and holds one
+entry the moment anything is routed, including `own` with
+`mix_monitor=include`; each entry names the `target`, the `source`
+(`inject`|`leg`), whether the recording feed carries it (`monitor_audible`) and
+the `attachment_id` that owns it. Being whispered *at* is not a route of one's
+own, so the addressee reports none. `conference` lists the room even after the
+member it names has left, which is what makes a stale whisper auditable rather
+than invisible.
+
+**Verified over the wire** (`describing_a_member_reads_back_its_own_state_and_
+enumerates_the_room` in `tap_plane.rs`): a real `TapPlane` behind a real
+`SessionController` on a real TCP socket, driven by a generated
+`MediaControlClient` — three inline legs seated in `sales-standup`, B muted
+through `UpdateAttachment` metadata, A whispering to C through the same channel.
+Describe on A reports the whisper (`target carol`, `source inject`,
+`monitor_audible`, the owning attachment id) and enumerates
+`[alice, bob, carol]`; Describe on B reports `mute` with no routes; Describe on C
+reports neither. C is then destroyed: the room reads back as `[alice, bob]` with
+`member_count 2`, A's route still names `carol`, and B is **still muted** — the
+lease residual, demonstrated rather than described.
+
+**Residual — no lease (the other half of D22).** Member state still has no owner
+and no expiry: nothing reclaims a mute when the controller that set it dies. The
+read-back makes that recoverable (an integrator can now reconcile a room on
+reconnect) but not automatic. A lease would have to decide whose it is — the
+attachment that set it, which item 40 explicitly rejected, or the API caller,
+which this API does not model — so it is left open deliberately and stays on the
+defect list.
+
 ## Open defects and soft spots
 
 | # | Item | Where | Severity |
@@ -2980,7 +3055,7 @@ counter.
 | ~~D23~~ | ~~**A padded recording-group member lost its pad's worth of audio off the tail.** `Segmenter::close_segment` subtracted the closed frames from `segment_start` (the lead-silence offset) *and* advanced `anchor_ms` by the same frames, so every spill moved a late joiner's timeline forward by the pad twice~~ — **found and fixed 2026-08-24 (item 41)**: the anchor now advances only by `frames - segment_start`. Invisible to every earlier test because an ungrouped recording has `segment_start == 0` and item 29's group drill (5 s stagger, 20 s run) never reached the 30 s spill. Live in the conference drill: `party-c.wav` **55.88 s against 66.16/66.24** before, **72.10 against 71.96/72.02** after, with the 10.66 s pad still at the front. Guarded by `a_padded_member_keeps_its_whole_tail_across_a_spill`, which fails by exactly the lead if the fix is reverted | `recorder.rs` | closed |
 | D20 | **A room recording belongs to a member, not to the conference.** The mixed-track `FILE_S3` attachment hangs off one member session, so the object ends when *that* member leaves even though the conference keeps mixing — and its t=0 is its attach moment, not the conference's open, so it aligns with the per-participant objects only if both are attached together. Fix shape: a conference-scoped recording owner (an attachment on the conference rather than on a leg) with the conference's `opened_at` as its anchor | `tap_plane.rs`, `conference.rs` | medium once a tenant records conferences whose members come and go |
 | ~~D21~~ | ~~**DTMF digits never reach the event bus.** A tapped or inline leg's digits are delivered to consumers (WS `dtmf` frames, gRPC `DtmfFrame`) and counted in `mss_ingest_dtmf_digits_total`, but nothing publishes `Observation::Dtmf`, so `mss.events` carries no digit~~ — **fixed 2026-08-26 (item 48)**: every press on a tap leg or an inline leg is published as a session-level `MediaEvent` carrying `digit`, `track` (attribution-aware, so `leg_a`/`leg_b` when unproven), `duration_ms` (through the negotiated RTP clock) and the event's `rtp_timestamp`. **No capability and no consumer**: unlike `SpeechReport`, which a consumer *claims* and which is gated on `CAPABILITY_EVENTS`, a digit is a property of the call MSS decoded itself, so it goes out whenever the session exists. RFC 4733's three end retransmissions stay one event. The capture thread hands presses to the control plane over a bounded lock-free queue that counts refusals (`mss_dtmf_events_dropped_total`) rather than blocking the media path. Live-proved with no consumer attached (`lab/dtmf_event_drill.sh`). **Residual, by design:** MSS interprets no digit — no menu, no collection, no inter-digit timer (item 40: conference control is API-first) — and nothing rate-limits presses beyond the queue's drop counter | `digits.rs`, `tap_spike.rs`, `tap_plane.rs`, `registry.rs` | closed |
-| D22 | **Member state has no owner, no lease and no read-back.** `member_mute`/`member_deaf`/`member_hold` deliberately outlive the attachment that set them (item 40), so a controller that dies between `on` and `off` leaves a member muted for the life of the conference, and there is no API that reports a room's member state — only the aggregate gauges. Fix shape: expose member state on `DescribeSession` (and consider an optional lease on it, mirroring the session lease) | `conference.rs`, `tap_plane.rs`, `registry.rs` | medium once a tenant drives mute from a UI |
+| D22 | 🔶 **Member state has no owner and no lease** — read-back landed (item 49, 2026-08-26): `DescribeSession` on a member session reports its `mute`/`deaf`/`hold`, its mix routes and the room's members, read from the control-world mirror. What remains: `member_mute`/`member_deaf`/`member_hold` still outlive the attachment that set them (item 40) with no expiry, so a controller that dies between `on` and `off` leaves a member muted for the life of the conference — recoverable now by reconciling the room on reconnect, but nothing reclaims it. A lease needs an owner this API does not model (item 40 rejected the attachment as owner) | `conference.rs`, `tap_plane.rs`, `registry.rs` | medium once a tenant drives mute from a UI |
 | D16 | **A recording group is one pod's memory.** `TapPlane` holds the group, so every member of a conference recording must attach to the same pod: there is no placement that guarantees it (D8), a member whose session is adopted elsewhere is **refused** rather than restored (`grouped_not_adopted`, so the participant's file simply ends at the pod that died — the D9 shape per participant), and a group name reused on a second pod silently produces a second half-recording under the same prefix. Fix shape: schedule a group's sessions onto one pod, or move the group into shared storage so any pod can serve a member | `tap_plane.rs`, `registry_keeper.rs` | medium once a tenant records conferences across pods |
 | ~~D13~~ | ~~`StreamStart` (and the Twilio `start` frame's `tracks`) advertises `["customer","agent"]` for `TrackSelector::All`, but a silent `mixed` track is delivered too~~ — **fixed 2026-08-23 (item 27)**: the hub selection split into `All` (every track, including `mixed`) and `Speakers` (customer + agent). Consumers get `Speakers`, so delivery matches the advertisement exactly; the **recorder keeps `All`** because injected bot speech belongs in the recording. The frozen Twilio start frame and `StreamStart.tracks` were not touched — the delivery was brought in line with them. A consumer that wants the injected track can still ask for it by name (`TrackSelector::Only(Mixed)`). Replay-verified | `hub.rs`, `tap_plane.rs` | closed |
 | ~~D17~~ | ~~**Leg labels invert when the caller's from-tag is not given.** With `from_tags` unspecified (`-`), `TapPlane` labels the two legs in the order rtpengine's `query` returns them, and in the two-node drill that put **FreeSWITCH's** tag first — so `customer` and `agent` were swapped in the recording and in the `tracks` a consumer sees~~ — **fixed 2026-08-26 (item 47)**: the order was in fact `BTreeMap` order, i.e. lexicographic by tag. MSS now refuses to name a direction it cannot back up: `attribution=explicit` when a from-tag was supplied (and for every inline leg), `inferred` when rtpengine's per-participant `created` seconds strictly order the legs, `unknown` otherwise — and under `unknown` the gRPC tracks, the event payload tracks and the recording object keys are `leg_a`/`leg_b`, with a WARN log, a `LegsAttributed` event and `attribution` on `DescribeSession` and on every event envelope. The frozen WS Twilio names never move. Live-proved on a call built to invert (callee tag sorting first): `unknown` + `leg_a`/`leg_b` with no from-tag, `explicit` + `customer`/`agent` with one. **Residual, and it is the vendor's:** `created` is stamped per *dialogue*, so the two legs of one call always tie — `inferred` cannot fire for a two-party call on rtpengine 14.1.1.8, and an integrator who needs speaker attribution **must** pass the caller's from-tag (`docs/deploy.md`, "Leg attribution") | `tap_plane.rs`, `attribution.rs` | closed (residual is the vendor's) |
@@ -3086,4 +3161,5 @@ Appendix B. Item 41 judged all of it on **real sockets**: three container peers
 at 440/880/1320 Hz in one conference, **twenty tone-per-phase assertions green**
 at a ≥30:1 margin, and both recording shapes in MinIO at once. What the phase
 owes is deployment-gated (a SIP proxy's B2B leg into a conference, a pilot) plus
-the four defects it left open: D16, D20, D21 and D22.
+the defects it left open: D16 and D20, with D21 closed by item 48 and D22 half
+closed by item 49 (read-back landed, no lease).
