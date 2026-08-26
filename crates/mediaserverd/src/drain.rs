@@ -11,6 +11,7 @@ pub const EVENT_FLUSH_WINDOW: Duration = Duration::from_secs(10);
 pub const STOP_ACCEPTING: &str = "stop-accepting";
 pub const HAND_OFF_LEASES: &str = "hand-off-leases";
 pub const CLOSE_SESSIONS: &str = "close-sessions";
+pub const AWAIT_UPLOADS: &str = "await-uploads";
 pub const CONTROL_PLANE_IDLE: &str = "control-plane-idle";
 pub const FLUSH_EVENTS: &str = "flush-events";
 
@@ -127,6 +128,10 @@ pub trait DrainSteps: Send + Sync {
 
     async fn close_sessions(&self) -> SessionsClosed;
 
+    async fn await_uploads(&self) -> usize {
+        0
+    }
+
     async fn await_control_plane_idle(&self);
 
     async fn flush_events(&self) -> u64;
@@ -139,6 +144,7 @@ pub struct DrainReport {
     pub skipped: Vec<&'static str>,
     pub leases_handed_off: usize,
     pub sessions: SessionsClosed,
+    pub uploads_settled: usize,
     pub unsent_events: Option<u64>,
     pub elapsed: Duration,
 }
@@ -236,6 +242,20 @@ pub async fn run_drain(steps: &dyn DrainSteps, budget: Duration) -> DrainReport 
     match slice(deadline, reserve, None) {
         Some(window) => {
             let step_started = Instant::now();
+            match tokio::time::timeout(window, steps.await_uploads()).await {
+                Ok(settled) => {
+                    report.uploads_settled = settled;
+                    report.finished_step(AWAIT_UPLOADS, step_started);
+                }
+                Err(_) => report.expired_step(AWAIT_UPLOADS, window),
+            }
+        }
+        None => report.skipped_step(AWAIT_UPLOADS),
+    }
+
+    match slice(deadline, reserve, None) {
+        Some(window) => {
+            let step_started = Instant::now();
             match tokio::time::timeout(window, steps.await_control_plane_idle()).await {
                 Ok(()) => report.finished_step(CONTROL_PLANE_IDLE, step_started),
                 Err(_) => report.expired_step(CONTROL_PLANE_IDLE, window),
@@ -264,6 +284,7 @@ pub async fn run_drain(steps: &dyn DrainSteps, budget: Duration) -> DrainReport 
             elapsed_ms = report.elapsed.as_millis() as u64,
             leases_handed_off = report.leases_handed_off,
             sessions_closed = report.sessions.closed,
+            uploads_settled = report.uploads_settled,
             unsent_events = report.unsent_events,
             "drain complete"
         );
@@ -276,6 +297,7 @@ pub async fn run_drain(steps: &dyn DrainSteps, budget: Duration) -> DrainReport 
             leases_handed_off = report.leases_handed_off,
             sessions_closed = report.sessions.closed,
             sessions_failed = report.sessions.failed,
+            uploads_settled = report.uploads_settled,
             unsent_events = report.unsent_events,
             "drain incomplete; exiting anyway so the pod is replaced"
         );
@@ -338,6 +360,12 @@ mod tests {
             }
         }
 
+        async fn await_uploads(&self) -> usize {
+            self.note(AWAIT_UPLOADS);
+            self.hang_if_asked(AWAIT_UPLOADS).await;
+            1
+        }
+
         async fn await_control_plane_idle(&self) {
             self.note(CONTROL_PLANE_IDLE);
             self.hang_if_asked(CONTROL_PLANE_IDLE).await;
@@ -369,13 +397,17 @@ mod tests {
                 STOP_ACCEPTING,
                 HAND_OFF_LEASES,
                 CLOSE_SESSIONS,
+                AWAIT_UPLOADS,
                 CONTROL_PLANE_IDLE,
                 FLUSH_EVENTS
-            ]
+            ],
+            "a backgrounded recording upload must settle before the event backlog is flushed, \
+             or its own event never leaves this pod"
         );
         assert!(report.clean(), "{report:?}");
         assert_eq!(report.leases_handed_off, 3);
         assert_eq!(report.sessions.closed, 2);
+        assert_eq!(report.uploads_settled, 1);
         assert_eq!(report.unsent_events, Some(0));
     }
 
@@ -397,7 +429,7 @@ mod tests {
         let steps = RecordingSteps::hanging_at(CLOSE_SESSIONS);
         let report = run_drain(&steps, DEFAULT_DRAIN_TIMEOUT).await;
         assert_eq!(report.expired, vec![CLOSE_SESSIONS]);
-        assert_eq!(report.skipped, vec![CONTROL_PLANE_IDLE]);
+        assert_eq!(report.skipped, vec![AWAIT_UPLOADS, CONTROL_PLANE_IDLE]);
         assert_eq!(report.unsent_events, Some(0));
         assert!(report.elapsed <= DEFAULT_DRAIN_TIMEOUT);
     }
@@ -412,6 +444,7 @@ mod tests {
             vec![
                 HAND_OFF_LEASES,
                 CLOSE_SESSIONS,
+                AWAIT_UPLOADS,
                 CONTROL_PLANE_IDLE,
                 FLUSH_EVENTS
             ]

@@ -2986,16 +2986,33 @@ recorder.rs — native conference recording* above for the two shapes, the
   (`frames_beyond_cap`, `mss_recordings_truncated_total`) rather than
   silently dropped. Streaming multipart upload is the fix when calls longer
   than that matter; it is not built.
-- **`StopRecording` waits for the upload, deliberately.** `Detach` (and
-  `DestroySession`) await the recorder's finish, so a cigol `StopRecording`
-  blocks for as long as the upload takes — bounded by `UPLOAD_TIMEOUT` (60 s)
-  and `FINISH_TIMEOUT` (90 s). The alternative, backgrounding the upload,
-  cannot work today: `observe` refuses a session the registry has forgotten,
-  so `UploadCompleted` would be lost exactly when the call has ended, which is
-  every time. If a pilot finds the added `StopRecording` latency unacceptable,
-  the fix is a session-independent event path (an event that carries
-  `external_id` without needing a live session), not a silent background
-  upload.
+- **`StopRecording` no longer waits for the upload (item 50, D11).** The
+  recorder task now has two phases. Phase one is the capture loop; when it ends
+  it publishes `RecordingStopped`, sends a `StopReport`
+  (duration/frames/segmenter stats) down a oneshot, and only then goes on.
+  `RecorderHandle::finish()` awaits that report — bounded by `STOP_TIMEOUT`
+  (5 s), which is a segment close and no I/O — and hands the still-running task
+  back as a `FinishedCapture`. Phase two acquires an upload permit, renders,
+  encodes, uploads and publishes `UploadCompleted` or the new `UploadFailed`.
+  So `Detach`/`DestroySession` answer as soon as the audio is safe, and the
+  upload's own event arrives later. `FINISH_TIMEOUT` (90 s) is now a
+  test-only helper (`FinishedCapture::settle`), not a production bound; the
+  production bounds are `STOP_TIMEOUT`, `UPLOAD_TIMEOUT` (60 s per object) and
+  `recording_uploads::UPLOAD_SETTLE_TIMEOUT` (10 min).
+- **Bounded background upload concurrency.** `RecordingSupport` carries an
+  `Arc<Semaphore>` sized by `MSS_RECORDING_UPLOAD_CONCURRENCY` (default 4,
+  `upload_concurrency_from_env`, logged at startup). The permit is taken *after*
+  the stop is reported, so a queue of uploads never delays a detach — it only
+  delays the uploads. The startup salvage pass does **not** take a permit: it
+  runs once, before any call, and serialising it against nothing would only slow
+  a restart.
+- **A failed upload now says so.** `Observation::UploadFailed { recording_id,
+  key, error }` → `EventKind::UploadFailed` → proto payload tag **28** (the next
+  free one). Before this, a recording that never reached storage produced
+  `RecordingStopped` and then silence, so an integrator waiting for
+  `UploadCompleted` waited forever. Both the wav-encoding failure and the
+  upload failure emit it, with the store's own message as `error`, and the audio
+  is still spilled for the D9 salvage pass.
 - **Known gaps:** no multipart/streaming upload (hence the cap and the memory
   cost); `recordingChannels=mono` metadata is not honoured (a single-track
   *selector* gives a mono file, a mono *mix* of both parties does not exist);
@@ -3003,6 +3020,64 @@ recorder.rs — native conference recording* above for the two shapes, the
   per pod, so a pod that dies mid-call loses the audio it had buffered even
   though the session itself is adopted elsewhere (the adopted session
   re-taps, but the recording restarts).
+
+### recording_uploads.rs — the background upload watch (item 50, D11, 2026-08-26)
+
+`UploadTracker` is the only thing that knows an upload outlived the RPC that
+stopped it. `TapPlane::finish_recording` calls `adopt(finished, observer)`, which
+
+- asks the observation sink to **retain the session for the upload** before the
+  detach returns, so the registry cannot forget it in between;
+- counts the hand-off (`mss_recording_uploads_backgrounded_total`) and keeps a
+  live gauge (`mss_recording_uploads_in_flight`);
+- spawns one small watcher per upload that awaits the recorder task with
+  `UPLOAD_SETTLE_TIMEOUT` (10 min), logs what landed, releases the retention and
+  then notifies `wait_idle`. On expiry it aborts, counts
+  `mss_recording_upload_settle_timeouts_total`, and releases anyway — a stuck
+  upload must not pin a session record forever, and the audio is on the spill
+  disk for the D9 salvage pass.
+
+`wait_idle()` is what the drain waits on: `drain.rs` gained an `await-uploads`
+step between `close-sessions` and `control-plane-idle`, because an upload that
+settles after `flush-events` would have its event stranded in the outbox when
+the process exits. The step returns how many were in flight when it began
+(`DrainReport::uploads_settled`) — informational, and deliberately not asserted
+anywhere: it is a racing number by nature.
+
+### The gapless-sequence problem, and why the session record is kept (item 50)
+
+Publishing an event after the session ended is the whole difficulty of D11.
+`push_event` assigns `seq` from the session record and **silently drops** an
+event whose session is gone, so a backgrounded upload would lose
+`UploadCompleted` on every hangup — which is why the blocking detach existed.
+
+Two designs were on the table. **Reserving a seq** at detach and publishing the
+late event with it keeps the sequence gapless but not *monotonic*: while the
+session lives on (a `StopRecording` that is not a hangup), later events take
+higher numbers and the reserved one arrives after them, so a consumer with a
+low-water mark stalls on a hole that is already spoken for. **Keeping the
+session record alive** costs one `BTreeMap` entry per settling upload and keeps
+both properties, so that is what landed:
+
+- `SessionRecord` gained `pending_uploads` and `finishing`.
+  `retain_for_upload` / `release_after_upload` bracket a background upload;
+  `destroy_session` marks the record `finishing` instead of removing it when
+  `pending_uploads > 0`, and the last release removes it for real.
+- A finishing session is **not** live: `session_ids()` and `session_count()`
+  skip it, so `snapshot()`, the registry keeper and the drain never see it, and
+  `live()` (the new guard used by `attach`, `start_playback` and
+  `destroy_session`) refuses it with `UnknownSession` — a finishing session
+  cannot be adopted, attached to, or ended twice.
+- The `external_index` entry **is** dropped at destroy, so the external id is
+  reusable immediately. The consequence, deliberate: `DescribeSession` by
+  *session id* still answers a finishing session, by *external id* does not.
+- `ObservationSink` gained `retain_for_upload` / `release_after_upload` with
+  default no-op implementations, so every test fake still compiles; when nothing
+  retains, the behaviour degrades to exactly what it was before (the late event
+  is dropped and logged).
+- For a consumer of `mss.events` this means one new rule:
+  **`UploadCompleted`/`UploadFailed` may arrive after `SessionEnded` for the
+  same session, and is then the last event of that session's sequence.**
 
 ### recording_spill.rs — the segment journal and the restart salvage (item 30, D9, 2026-08-23)
 

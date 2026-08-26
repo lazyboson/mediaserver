@@ -1473,13 +1473,14 @@ object. `join_group` also asserts every member gets the same instant.
 5) and was run against the live lab — bob joined 5 s late, the pod logged
 `lead_silence_ms=5016`, and the object read back off MinIO opens with **40128
 zero samples = 5016 ms**. Lengths: alice 25.030 s vs bob 25.116 s, an **86 ms**
-difference where the stagger was 5 s. The residual 86 ms is the *tail*: `Detach`
-waits for the upload (D11) and the drill detaches the members one after the
-other. Numbers in lab.md.
+difference where the stagger was 5 s. The residual 86 ms is the *tail*: at the
+time `Detach` waited for the upload (D11, closed by item 50 on 2026-08-26) and
+the drill detaches the members one after the other. Numbers in lab.md.
 
 **Residual.** Head alignment is exact; equal length still assumes the members
-stop together, and D11 (blocking detach) and D16 (a group is one pod's memory,
-so the anchor is one pod's monotonic clock) are unchanged.
+stop together, and D16 (a group is one pod's memory, so the anchor is one pod's
+monotonic clock) is unchanged. D11's blocking detach — the 86 ms tail measured
+here — is closed by item 50.
 
 ### 30. Recording durability across pod death (defect D9) — 🔶 **partly closed (2026-08-23)**
 
@@ -2297,7 +2298,8 @@ Full tables in [lab.md](lab.md).
   carrying all three tones, and a group's `party-<stamp>/{a,b,c}.wav` at
   71.96 / 72.02 / 72.10 s carrying **only** their own tone (cross-talk 0–8
   against 3000), with C's file opening on **10.66 s** of the P2-1 anchor pad.
-  The three group files agree to 140 ms (D11's sequential detaches).
+  The three group files agree to 140 ms (sequential detaches, each of which
+  waited for its upload before item 50 closed D11).
 - `mss_conference_clipped_samples_total` = **0**, deliberately: all four sources
   run at `TONE_AMPLITUDE=6000`. At the peers' default 24000 the mix clips, and
   clipping intermodulates onto exactly the harmonics being measured — the
@@ -3034,6 +3036,109 @@ attachment that set it, which item 40 explicitly rejected, or the API caller,
 which this API does not model — so it is left open deliberately and stays on the
 defect list.
 
+### 50. Non-blocking StopRecording/Detach (G10, D11) — ✅ DONE (2026-08-26)
+
+**The gap this closes.** `Detach`/`StopRecording` used to block for as long as
+the upload took (bounded 60 s per object, 90 s overall), because the recorder
+task did the upload before its `JoinHandle` resolved and the RPC awaited that
+handle. The reason it was written that way is the real difficulty: `push_event`
+takes an event's `seq` from the session record and **silently drops** an event
+whose session is gone, so a backgrounded upload would lose `UploadCompleted` on
+every hangup — which is every recording that ends with the call.
+
+**Decision — keep the session record, do not reserve a seq.** Two designs were
+weighed and the choice is recorded in `docs/implementation-notes.md`
+("The gapless-sequence problem"). Reserving a terminal `seq` at detach keeps the
+sequence gapless but **not monotonic**: when the session lives on past the
+recording, later events take higher numbers and the reserved one lands after
+them, so a consumer with a low-water mark stalls on a hole that is already
+spoken for. Keeping the record alive in a `finishing` state costs one
+`BTreeMap` entry per settling upload and keeps both properties. So:
+
+- `SessionRecord` gained `pending_uploads` + `finishing`;
+  `retain_for_upload`/`release_after_upload` bracket the background upload, and
+  `destroy_session` marks the record `finishing` rather than removing it while
+  an upload is still owed. The last release removes it.
+- A finishing session is **not adoptable and not listable**: `session_ids()`,
+  `session_count()` and therefore `snapshot()`, the registry keeper and the
+  drain all skip it, and the new `live()` guard makes `attach`,
+  `start_playback` and a second `destroy_session` refuse it by name.
+- Its `external_index` entry **is** dropped at destroy, so the external id is
+  free again immediately. The trade-off, deliberate and documented:
+  `DescribeSession` by session id still answers a finishing session, by
+  external id does not.
+- **New rule for consumers of `mss.events`:** `UploadCompleted`/`UploadFailed`
+  may arrive after `SessionEnded` for the same session, and is then the last
+  event of that session's sequence.
+
+**The recorder is now two phases.** Phase one is the capture loop; it publishes
+`RecordingStopped`, sends a `StopReport` (duration, frames, segmenter stats)
+down a oneshot and goes on. `RecorderHandle::finish()` awaits only that report,
+bounded by the new `STOP_TIMEOUT` (5 s — a segment close, no I/O), and hands the
+still-running task back as a `FinishedCapture`. Phase two takes an upload permit
+from `MSS_RECORDING_UPLOAD_CONCURRENCY` (default **4**), renders, encodes,
+uploads and publishes the result. `FINISH_TIMEOUT` (90 s) is now a test-only
+helper; the production bounds are `STOP_TIMEOUT`, `UPLOAD_TIMEOUT` (60 s per
+object) and `UPLOAD_SETTLE_TIMEOUT` (10 min, after which a stuck upload is
+aborted, counted and its retention released rather than pinning a session
+record forever — the audio is on the spill disk for D9's salvage).
+
+**A failed upload now says so.** `UploadFailed { recording_id, key, error }`
+(proto payload tag **28**, the next free one) is published for a refused upload,
+a timed-out upload and a wav-encoding failure. Before this a recording that
+never reached storage produced `RecordingStopped` and then silence, so an
+integrator waiting for `UploadCompleted` waited forever.
+
+**New: `recording_uploads.rs`.** `UploadTracker` retains the session, counts the
+hand-off (`mss_recording_uploads_backgrounded_total`), holds the gauge
+(`mss_recording_uploads_in_flight`), watches each upload and releases the
+retention when it settles. `drain.rs` gained an **`await-uploads`** step between
+`close-sessions` and `control-plane-idle` — an upload that settles after
+`flush-events` would strand its own event in the outbox at exit.
+
+**Verified — replay/in-process.** `a_stop_is_reported_before_the_upload_starts_and_the_upload_runs_on_alone`
+(a 1.5 s fake sink: `finish()` returns in under 100 ms with the stop already
+published and the upload not; `UploadCompleted` lands afterwards),
+`background_uploads_run_no_wider_than_their_configured_concurrency` (one permit
+serialises two uploads while both detaches return at once),
+`a_refused_upload_still_reports_the_stop_and_keeps_the_audio_on_disk` (now
+asserts `UploadFailed` with the store's message), two registry tests for the
+sequence (`a_recording_upload_holds_a_session_record_open_so_its_own_event_keeps_the_sequence`,
+`a_failed_upload_is_the_last_event_of_the_session_it_belonged_to`), the drain
+step order, and **over the wire** in
+`a_detach_is_answered_before_the_upload_and_the_upload_event_ends_the_sequence`
+— a real `TapPlane` + `SessionController` on a socket, two recordings on one
+session, `Detach` and `DestroySession` both answered in under 100 ms against a
+sink that sleeps 1.5 s, and the eleven events read off the watcher come back
+`seq 0..10` with both `UploadCompleted`s after `SessionEnded`.
+
+**Verified — live lab** (`lab/detach_latency_drill.sh`, new, 2026-08-26):
+
+| | phase A (MinIO healthy) | phase B (MinIO `docker pause`d) |
+| --- | --- | --- |
+| `Detach` RPC | **49 ms** | **11 ms** |
+| `DestroySession` RPC | — | **10 ms** |
+| upload took | 29 ms | **12.07 s** (11:51:25 → 11:51:37) |
+| while it ran | — | `mss_recording_uploads_in_flight 1` with `mss_sessions_live 0` |
+| terminal event | `UploadCompleted` seq **13** | `UploadCompleted` seq **10**, i.e. *after* `SessionEnded` seq 9 |
+| sequence | gapless `0..14` | gapless `0..10` |
+| object | 469 KiB | 252 KiB |
+
+The pod's own words in phase B: `recording stopped; its upload runs in the
+background` → `this session will be remembered until its recording upload
+settles` → (12 s later) `recording uploaded` → `a backgrounded recording upload
+settled` → `the last upload of this ended session settled; forgotten`. Both RPC
+times include `mss_ctl`'s process start and gRPC connect, so the server-side
+figure is smaller still; before this item the same detach would have returned
+only after the upload, which phase B held for 12 s deliberately.
+
+**Residual.** `UploadFailed` is proved in-process and replay-only — the live
+drill made storage *slow*, not permanently broken, so no live `UploadFailed` was
+observed. The retention is per-pod state: a pod killed with `-9` between the
+detach and the upload still loses the event (D9's salvage recovers the audio on
+that pod's next start, without an event). And `MSS_RECORDING_UPLOAD_CONCURRENCY`
+bounds concurrency, not memory: N uploads in flight hold N rendered WAVs.
+
 ## Open defects and soft spots
 
 | # | Item | Where | Severity |
@@ -3043,7 +3148,7 @@ defect list.
 | ~~D3~~ | ~~`close_attachment` **aborts** the consumer task instead of closing the websocket politely (no `stop` frame)~~ — **fixed 2026-08-23 (item 27)**: `TapPlane::end_attachment` ends the hub subscription and lets the consumer finish, so a WS consumer sends its Twilio `stop` frame and a gRPC consumer gets a `StreamStop` naming the reason ("the attachment was detached" / "the call ended"); a consumer that will not finish inside `POLITE_CLOSE` (2 s) is still aborted, with a warning. `close_session` takes the same path, so an ordinary hangup is polite too. Replay-verified (the task runs to completion instead of being aborted; the `Stop` frame reaches a real gRPC consumer over the wire); not observed against a live consumer | `tap_plane.rs` | closed |
 | ~~D4~~ | ~~`WS_TWILIO` and `GRPC_STREAM` attachments are served; `FILE_S3` (phase 2) and `RTP_INLINE` (phase 3) are refused by name~~ — **`FILE_S3` now served (2026-08-22, item 15)**: the recorder is a hub consumer with the frozen identity, pause-segmenting and `object_store` upload. `RTP_INLINE` is still refused by name as an **attachment transport**, and item 33 (2026-08-23) did not change that: an inline leg is a session *kind*, and a consumer reaches one over `GRPC_STREAM`/`WS_TWILIO` like any other — the INJECT direction is P3-3. `RTP_INLINE` may end up never being needed | `tap_plane.rs` | partly closed — the transport stays unused |
 | 🔶 D9 | ~~A recording lives in the recording pod's memory until the call ends: a pod death loses the buffered audio and no upload is resumed~~ — **partly closed 2026-08-23 (item 30)**: closed segments now spill to `MSS_RECORDING_SPILL_DIR` every `MSS_RECORDING_SPILL_SECONDS` (default 30) and on pause, the final upload stitches spill + memory tail into the one frozen key, this pod's leftovers are salvaged on its next start (never over an object that already exists), and an adopter recovers what it can read while padding and counting the rest (`mss_recording_frames_lost_on_adopt_total`). **Residual, by construction:** the spill dir is per-pod local disk, so a **cross-pod** adopter still cannot read the dead pod's segments — worst-case loss falls from the whole call to the spill interval *on the same pod*, and stays the whole prefix across pods until the spill lives somewhere every pod can read (same fix as D16). No retention policy on the spill dir. Replay/fake-verified only; no live pod-kill drill with a recorder attached. `MAX_RECORDING` (2 h) is unchanged | `recorder.rs`, `recording_spill.rs`, `registry_keeper.rs` | medium — cross-pod half open |
-| D11 | `StopRecording`/`Detach` **blocks until the upload finishes** (bounded 60 s/90 s), because `observe` needs a live session and a backgrounded upload would lose `UploadCompleted` on every hangup. A pilot may find the latency unacceptable; the fix is a session-independent event path | `tap_plane.rs`, `recorder.rs` | medium — watch it in the pilot |
+| ~~D11~~ | ~~`StopRecording`/`Detach` **blocks until the upload finishes** (bounded 60 s/90 s), because `observe` needs a live session and a backgrounded upload would lose `UploadCompleted` on every hangup~~ — **fixed 2026-08-26 (item 50)**: the recorder splits into a capture phase that publishes `RecordingStopped` and releases the caller (bounded by `STOP_TIMEOUT`, 5 s, no I/O) and a background upload phase bounded by `MSS_RECORDING_UPLOAD_CONCURRENCY` (default 4). The event is not lost because the registry keeps the session record in a `finishing` state until its uploads settle — not adoptable, not listable, external id freed at once — so the late `UploadCompleted`/the new `UploadFailed` gets the next `seq` in that session's own sequence, gaplessly and in order. Live: `Detach` **11 ms** and `DestroySession` **10 ms** against a `docker pause`d MinIO that held the upload **12.07 s**, `uploads_in_flight 1` with `sessions_live 0`, then `UploadCompleted` at seq 10 after `SessionEnded` at seq 9. **Residual:** `UploadFailed` is replay-proved only, and a `kill -9` between detach and upload still loses the event (the audio is salvaged, per D9) | `recorder.rs`, `recording_uploads.rs`, `registry.rs` | closed (residual documented) |
 | ~~D10~~ | ~~Pause is honoured by the recorder only; a paused `WS_TWILIO`/`GRPC_STREAM` attachment keeps receiving media~~ — **fixed 2026-08-23 (item 27)**: the hub checks a per-subscription pause flag before every frame, so `StreamPause` really stops feeding an ASR; skipped frames are counted (`mss_consumer_suppressed_while_paused_total`) and resume starts at the current tap position rather than replaying a backlog. A gRPC attachment paused before its consumer subscribes stays paused when the stream opens. Recorder pause behaviour is unchanged. Replay-verified through `update_attachment`; not observed live | `tap_plane.rs`, `hub.rs` | closed |
 | ~~D5~~ | ~~Event delivery is **at-most-once**; a broker outage drops events~~ — **fixed 2026-08-22 (item 13)**: bounded retry backlog, order preserved, drop-oldest counted. Now **at-least-once**, so the translator must dedupe by `(external_id, seq)`; a backlog past its 8192 cap or a pod death still loses events | `event_pump.rs` | closed |
 | D6 | `play media` `from-tag` semantics are **unmeasured** — architecture §6's claim was retracted after the instrument turned out to be broken (see lab.md correction) | docs + lab | low, but §6 must not be trusted until re-probed |
@@ -3059,7 +3164,7 @@ defect list.
 | D16 | **A recording group is one pod's memory.** `TapPlane` holds the group, so every member of a conference recording must attach to the same pod: there is no placement that guarantees it (D8), a member whose session is adopted elsewhere is **refused** rather than restored (`grouped_not_adopted`, so the participant's file simply ends at the pod that died — the D9 shape per participant), and a group name reused on a second pod silently produces a second half-recording under the same prefix. Fix shape: schedule a group's sessions onto one pod, or move the group into shared storage so any pod can serve a member | `tap_plane.rs`, `registry_keeper.rs` | medium once a tenant records conferences across pods |
 | ~~D13~~ | ~~`StreamStart` (and the Twilio `start` frame's `tracks`) advertises `["customer","agent"]` for `TrackSelector::All`, but a silent `mixed` track is delivered too~~ — **fixed 2026-08-23 (item 27)**: the hub selection split into `All` (every track, including `mixed`) and `Speakers` (customer + agent). Consumers get `Speakers`, so delivery matches the advertisement exactly; the **recorder keeps `All`** because injected bot speech belongs in the recording. The frozen Twilio start frame and `StreamStart.tracks` were not touched — the delivery was brought in line with them. A consumer that wants the injected track can still ask for it by name (`TrackSelector::Only(Mixed)`). Replay-verified | `hub.rs`, `tap_plane.rs` | closed |
 | ~~D17~~ | ~~**Leg labels invert when the caller's from-tag is not given.** With `from_tags` unspecified (`-`), `TapPlane` labels the two legs in the order rtpengine's `query` returns them, and in the two-node drill that put **FreeSWITCH's** tag first — so `customer` and `agent` were swapped in the recording and in the `tracks` a consumer sees~~ — **fixed 2026-08-26 (item 47)**: the order was in fact `BTreeMap` order, i.e. lexicographic by tag. MSS now refuses to name a direction it cannot back up: `attribution=explicit` when a from-tag was supplied (and for every inline leg), `inferred` when rtpengine's per-participant `created` seconds strictly order the legs, `unknown` otherwise — and under `unknown` the gRPC tracks, the event payload tracks and the recording object keys are `leg_a`/`leg_b`, with a WARN log, a `LegsAttributed` event and `attribution` on `DescribeSession` and on every event envelope. The frozen WS Twilio names never move. Live-proved on a call built to invert (callee tag sorting first): `unknown` + `leg_a`/`leg_b` with no from-tag, `explicit` + `customer`/`agent` with one. **Residual, and it is the vendor's:** `created` is stamped per *dialogue*, so the two legs of one call always tie — `inferred` cannot fire for a two-party call on rtpengine 14.1.1.8, and an integrator who needs speaker attribution **must** pass the caller's from-tag (`docs/deploy.md`, "Leg attribution") | `tap_plane.rs`, `attribution.rs` | closed (residual is the vendor's) |
-| ~~D18~~ | ~~**Recording-group members are not time-aligned.** Each member's file anchored on **its own first frame**, so a late joiner's file started at its join moment and two members of one group differed in length (90.32 s vs 90.26 s in the two-node drill), leaving reassembly to the event timeline~~ — **fixed 2026-08-23 (item 29)**: a recording group stamps `opened_at` when its first member joins and every later member's segmenter pads its first segment with silence from that anchor to its own first frame (`Segmenter::lead_with_silence`, reported as `lead_silence_frames`), padded once per recording so pause/resume cannot double-count it. Replay-verified (late joiner padded, two members equal length, the pause interaction, and a WAV read back out of a fake sink) **and live**: the drill's staggered re-run had bob join 5 s late and his object came back opening with 5016 ms of zeros, 25.116 s against alice's 25.030 s. **Residual:** equal length still assumes the members stop together — the 86 ms here is D11's blocking detach, and D16 keeps the anchor inside one pod's clock | `recorder.rs`, `tap_plane.rs` | closed (residual documented) |
+| ~~D18~~ | ~~**Recording-group members are not time-aligned.** Each member's file anchored on **its own first frame**, so a late joiner's file started at its join moment and two members of one group differed in length (90.32 s vs 90.26 s in the two-node drill), leaving reassembly to the event timeline~~ — **fixed 2026-08-23 (item 29)**: a recording group stamps `opened_at` when its first member joins and every later member's segmenter pads its first segment with silence from that anchor to its own first frame (`Segmenter::lead_with_silence`, reported as `lead_silence_frames`), padded once per recording so pause/resume cannot double-count it. Replay-verified (late joiner padded, two members equal length, the pause interaction, and a WAV read back out of a fake sink) **and live**: the drill's staggered re-run had bob join 5 s late and his object came back opening with 5016 ms of zeros, 25.116 s against alice's 25.030 s. **Residual:** equal length still assumes the members stop together — the 86 ms here was D11's blocking detach, closed by item 50, and D16 keeps the anchor inside one pod's clock | `recorder.rs`, `tap_plane.rs` | closed (residual documented) |
 | ~~D19~~ | ~~A consumer cannot tell MSS that the caller started speaking: `Registry::report` had no caller outside tests~~ — **fixed 2026-08-23 (item 28)**: `ConsumerToServer.SpeechReport` on the gRPC `MediaStream` stream (kind `STARTED`/`PARTIAL`/`FINAL`/`END_OF_UTTERANCE`/`END_OF_INTERACTION`, track, text, confidence, the consumer's own `observed_at`) reaches `Registry::report`, gated on `CAPABILITY_EVENTS` — an attachment without it gets `PERMISSION_DENIED` and the stream ends, the same protocol-violation shape as an unprivileged `inject`. Proven on a live tapped call: `lab/barge_drill.sh` now triggers on a real `SpeechReport` and measures cut-through p50 3.54–3.98 ms (item 5). **Residual, accepted:** the `WS_TWILIO` dialect cannot report speech — its bytes are frozen (Article VII) and it carries no such message, so a WS consumer's only barge stays the `clear` message's direct rtpengine `stop media` (unevented; the D2 shape). Interactive voice-AI on WS should attach over gRPC instead | `stream.rs`, `convert.rs`, `session-core/registry.rs` | closed |
 
 ## Integration handoffs (deployment-gated)
@@ -3083,7 +3188,7 @@ the worked example of each handoff.
 | H5 | **The SIP proxy's B2B integration for inline legs** | `CreateSession{kind=INLINE, sdp_offer}` returns a real SDP answer and the leg speaks and listens on real sockets; a `group` seats it in a conference; [deploy.md](deploy.md#high-availability-what-is-adoptable-and-what-is-not) records that an inline leg does **not** survive a pod loss, so recovery is call-control's | offer/answer plumbing from their proxy or B2BUA into that API. No inline leg in this repository has met a **SIP** endpoint — every inline and conference measurement is against an RTP peer with no signalling |
 | H6 | **FS byte-parity against real production recordings** | item 31 measured a live call recorded both ways: container, channel layout and rms agree exactly, and a re-aligned 2 s window agrees on 1.0000 of samples at mean diff 0.6/32768; [deploy.md](deploy.md#first-day-on-real-gear--an-ordered-runbook) step 4 walks the recording checks, frozen identity first. It also established that **byte-parity at a fixed offset is not an achievable bar** — the two recorders conceal independently, so the inter-file offset wanders | a **two-party** comparison on their FreeSWITCH, with their codec, their pause contract, and a human listen. The lab's write side plays silence, so only one channel was truly compared |
 | H7 | **Retiring the legacy media path** | the workloads are served: fan-out, recording, inline legs, conferences, monitor/whisper/barge | the tenant decision to turn the old media bugs off (`record_session`, the audio fork, the conference-per-AI-interaction dummy leg), and to decommission whatever gateway service they run today. Rollback stays config-only while both paths are installed |
-| H8 | **A pilot, a stability period and UX sign-off** | metrics on `MSS_METRICS_LISTEN` with alert rules in `deploy/`, a soak harness (`lab/soak.py`) and an impairment matrix, plus deployable manifests: `deploy/k8s/` with both network shapes, probes, a drain-safe grace period and a `ServiceMonitor`/`PrometheusRule` generated from those alert rules (item 46) | run flagged tenants for the agreed period; watch D11 (blocking detach) and the conference defects D16/D20/D21/D22 in the field, and confirm that the integrator's control plane really passes the caller's from-tag — without it every tap is `attribution=unknown` and its tracks are `leg_a`/`leg_b` (item 47); get a human to judge audio quality, which no automated assertion in this repository claims to have done |
+| H8 | **A pilot, a stability period and UX sign-off** | metrics on `MSS_METRICS_LISTEN` with alert rules in `deploy/`, a soak harness (`lab/soak.py`) and an impairment matrix, plus deployable manifests: `deploy/k8s/` with both network shapes, probes, a drain-safe grace period and a `ServiceMonitor`/`PrometheusRule` generated from those alert rules (item 46) | run flagged tenants for the agreed period; watch the conference defects D16/D20/D21/D22 in the field, and confirm that the integrator's control plane really passes the caller's from-tag — without it every tap is `attribution=unknown` and its tracks are `leg_a`/`leg_b` (item 47); get a human to judge audio quality, which no automated assertion in this repository claims to have done |
 
 ## Waiting on other people (M2 close-out)
 
