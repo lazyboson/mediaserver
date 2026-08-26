@@ -120,6 +120,12 @@ impl NodeCapabilityLog {
             .unwrap_or(false)
     }
 
+    pub fn forget(&self, node: SocketAddr) {
+        if let Ok(mut held) = self.reported.lock() {
+            held.remove(&node);
+        }
+    }
+
     pub async fn report_first_contact(&self, node: SocketAddr, transport: &NgTransport) {
         if !self.claim(node) {
             return;

@@ -4,6 +4,7 @@ mod conference;
 mod consumer_ws;
 mod drain;
 mod event_pump;
+mod health;
 mod hub;
 mod inline_leg;
 mod media_ports;
@@ -92,10 +93,16 @@ fn main() {
         let capabilities = Arc::new(rtpengine_capability::NodeCapabilityLog::new(
             transcode_at_tap(),
         ));
-        probe_configured_rtpengine_node(&capabilities).await;
+        let drain_state = drain::DrainState::shared();
+        let readiness = health::Readiness::shared(Arc::clone(&drain_state));
+        let probe_interval = health::probe_interval();
+        probe_configured_rtpengine_node(&capabilities, &readiness, probe_interval).await;
 
         match control_listen_address() {
-            Some(Ok(listen)) => serve_control_plane(listen, capabilities).await,
+            Some(Ok(listen)) => {
+                serve_control_plane(listen, capabilities, drain_state, readiness, probe_interval)
+                    .await
+            }
             Some(Err(configured)) => {
                 error!(
                     configured,
@@ -118,15 +125,23 @@ fn main() {
     info!("mediaserverd stopped");
 }
 
-async fn probe_configured_rtpengine_node(capabilities: &rtpengine_capability::NodeCapabilityLog) {
-    let Ok(configured) = std::env::var(RTPENGINE_NODE_ENV) else {
+async fn probe_configured_rtpengine_node(
+    capabilities: &Arc<rtpengine_capability::NodeCapabilityLog>,
+    readiness: &Arc<health::Readiness>,
+    probe_interval: std::time::Duration,
+) {
+    let configured = std::env::var(RTPENGINE_NODE_ENV)
+        .ok()
+        .filter(|configured| !configured.trim().is_empty());
+    let Some(configured) = configured else {
         info!(
             env = RTPENGINE_NODE_ENV,
             "no rtpengine node configured; skipping NG reachability probe"
         );
+        readiness.record_not_configured(health::Dependency::Rtpengine);
         return;
     };
-    let node: SocketAddr = match configured.parse() {
+    let node: SocketAddr = match configured.trim().parse() {
         Ok(node) => node,
         Err(error) => {
             error!(
@@ -135,9 +150,14 @@ async fn probe_configured_rtpengine_node(capabilities: &rtpengine_capability::No
                 env = RTPENGINE_NODE_ENV,
                 "rtpengine node must be an ip:port address"
             );
+            readiness.record_failure(
+                health::Dependency::Rtpengine,
+                format!("{RTPENGINE_NODE_ENV} is not an ip:port address"),
+            );
             return;
         }
     };
+    readiness.describe(health::Dependency::Rtpengine, Some(node.to_string()));
 
     let any_local = SocketAddr::from(([0, 0, 0, 0], 0));
     let transport = match NgTransport::bind(
@@ -148,35 +168,56 @@ async fn probe_configured_rtpengine_node(capabilities: &rtpengine_capability::No
     )
     .await
     {
-        Ok(transport) => transport,
+        Ok(transport) => Arc::new(transport),
         Err(error) => {
             error!(%node, %error, "could not bind the NG control socket");
+            readiness.record_failure(
+                health::Dependency::Rtpengine,
+                format!("the NG control socket could not be bound: {error}"),
+            );
             return;
         }
     };
 
     let outcome = transport.ping().await;
-    let health = transport.health();
+    let health_now = transport.health();
     match outcome {
         Ok(_) => {
             info!(
                 %node,
                 local = ?transport.local_addr().ok(),
-                healthy = health.healthy,
-                replies = health.replies,
+                healthy = health_now.healthy,
+                replies = health_now.replies,
                 "rtpengine NG node answered ping"
             );
             capabilities.report_first_contact(node, &transport).await;
+            readiness.record_ready(health::Dependency::Rtpengine);
         }
-        Err(error) => error!(
-            %node,
-            %error,
-            healthy = health.healthy,
-            timeouts = health.timeouts,
-            consecutive_timeouts = health.consecutive_timeouts,
-            "rtpengine NG node did not answer ping"
-        ),
+        Err(error) => {
+            error!(
+                %node,
+                %error,
+                healthy = health_now.healthy,
+                timeouts = health_now.timeouts,
+                consecutive_timeouts = health_now.consecutive_timeouts,
+                "rtpengine NG node did not answer ping"
+            );
+            readiness.record_failure(health::Dependency::Rtpengine, error.to_string());
+        }
     }
+
+    health::watch(
+        Arc::clone(readiness),
+        health::NgNodeProbe::new(transport, node, Arc::clone(capabilities))
+            as Arc<dyn health::HealthProbe>,
+        probe_interval,
+    );
+    info!(
+        %node,
+        seconds = probe_interval.as_secs(),
+        "this rtpengine node is re-probed on this interval; its capabilities are re-learned \
+         after any failure"
+    );
 }
 
 fn cookie_prefix() -> u64 {
@@ -311,9 +352,11 @@ fn local_media_address() -> IpAddr {
 async fn serve_control_plane(
     listen: SocketAddr,
     capabilities: Arc<rtpengine_capability::NodeCapabilityLog>,
+    drain_state: Arc<drain::DrainState>,
+    readiness: Arc<health::Readiness>,
+    probe_interval: std::time::Duration,
 ) {
     let owner = std::env::var(POD_NAME_ENV).unwrap_or_else(|_| DEFAULT_POD_NAME.to_string());
-    let drain_state = drain::DrainState::shared();
     let drain_budget = drain::drain_timeout();
     let recording = match recorder::RecordingSupport::from_env(&owner) {
         Ok(recording) => recording,
@@ -362,15 +405,22 @@ async fn serve_control_plane(
 
     let mut pump_worker = None;
     match event_sink_from_env().await {
-        Ok(Some((sink, worker, counters))) => {
+        Ok(Some((sink, worker, counters, transport))) => {
             controller = controller.with_event_sink(sink);
             pump_worker = Some((worker, counters));
+            readiness.record_ready(health::Dependency::Kafka);
+            health::watch(
+                Arc::clone(&readiness),
+                health::EventBusProbe::new(transport) as Arc<dyn health::HealthProbe>,
+                probe_interval,
+            );
         }
         Ok(None) => {
             info!(
                 env = KAFKA_BROKERS_ENV,
                 "no event bus configured; events stay in-process"
             );
+            readiness.record_not_configured(health::Dependency::Kafka);
         }
         Err(error) => {
             error!(%error, "the configured event bus is unreachable; refusing to start");
@@ -393,6 +443,12 @@ async fn serve_control_plane(
     let mut keeper_handles = None;
     match session_store_from_env().await {
         Ok(Some(store)) => {
+            readiness.record_ready(health::Dependency::Redis);
+            health::watch(
+                Arc::clone(&readiness),
+                health::SessionStoreProbe::new(Arc::clone(&store)) as Arc<dyn health::HealthProbe>,
+                probe_interval,
+            );
             let keeper = Arc::new(
                 registry_keeper::RegistryKeeper::new(Arc::clone(&controller), store, owner.clone())
                     .with_subscriptions(
@@ -403,10 +459,13 @@ async fn serve_control_plane(
             let renewing = tokio::spawn(Arc::clone(&keeper).run());
             keeper_handles = Some(KeeperHandles { keeper, renewing });
         }
-        Ok(None) => info!(
-            env = REDIS_URL_ENV,
-            "no session registry configured; sessions live and die with this pod"
-        ),
+        Ok(None) => {
+            info!(
+                env = REDIS_URL_ENV,
+                "no session registry configured; sessions live and die with this pod"
+            );
+            readiness.record_not_configured(health::Dependency::Redis);
+        }
         Err(error) => {
             error!(%error, "the configured session registry is unreachable; refusing to start");
             return;
@@ -425,6 +484,7 @@ async fn serve_control_plane(
                     keeper: keeper_counters.clone(),
                     drain: Arc::clone(&drain_state),
                     ports: Arc::clone(&media_ports),
+                    readiness: Arc::clone(&readiness),
                 };
                 tokio::spawn(metrics::serve(metrics_listener, sources));
             }
@@ -613,6 +673,7 @@ async fn event_sink_from_env() -> Result<
         Arc<event_pump::KafkaEventPump>,
         tokio::task::JoinHandle<()>,
         Arc<event_pump::PumpCounters>,
+        Arc<dyn event_pump::EventTransport>,
     )>,
     String,
 > {
@@ -635,10 +696,11 @@ async fn event_sink_from_env() -> Result<
         .and_then(|value| value.parse().ok())
         .unwrap_or(event_pump::DEFAULT_PARTITIONS);
 
-    let transport = event_pump::RskafkaTransport::connect(brokers, &topic, partitions).await?;
-    let (pump, worker) = event_pump::KafkaEventPump::start(Arc::new(transport));
+    let transport: Arc<dyn event_pump::EventTransport> =
+        Arc::new(event_pump::RskafkaTransport::connect(brokers, &topic, partitions).await?);
+    let (pump, worker) = event_pump::KafkaEventPump::start(Arc::clone(&transport));
     let counters = pump.counters();
-    Ok(Some((Arc::new(pump), worker, counters)))
+    Ok(Some((Arc::new(pump), worker, counters, transport)))
 }
 
 async fn session_store_from_env(
