@@ -256,6 +256,8 @@ pub struct IngestSnapshot {
     pub recording_spills: u64,
     pub recording_segments_spilled: u64,
     pub recording_segment_spill_failures: u64,
+    pub recording_spill_lost_ownership: u64,
+    pub recording_spill_foreign_manifests: u64,
     pub recording_salvaged: u64,
     pub recording_salvage_skipped: u64,
     pub recording_salvage_failures: u64,
@@ -393,6 +395,8 @@ impl TapPlaneMetrics {
             recording_spills: read(&recorder.spilled),
             recording_segments_spilled: read(&recorder.segments_spilled),
             recording_segment_spill_failures: read(&recorder.segment_spill_failures),
+            recording_spill_lost_ownership: read(&recorder.spill_lost_ownership),
+            recording_spill_foreign_manifests: read(&recorder.spill_foreign_manifests),
             recording_salvaged: read(&recorder.salvaged),
             recording_salvage_skipped: read(&recorder.salvage_skipped),
             recording_salvage_failures: read(&recorder.salvage_failures),
@@ -3024,6 +3028,18 @@ mod tests {
             Ok(false)
         }
 
+        async fn get(&self, key: &str) -> Result<Vec<u8>, recorder::UploadError> {
+            Err(recorder::UploadError::Missing(key.to_string()))
+        }
+
+        async fn list(&self, _prefix: &str) -> Result<Vec<String>, recorder::UploadError> {
+            Ok(Vec::new())
+        }
+
+        async fn delete(&self, _key: &str) -> Result<(), recorder::UploadError> {
+            Ok(())
+        }
+
         fn describe(&self) -> String {
             "nowhere".to_string()
         }
@@ -3086,6 +3102,32 @@ mod tests {
                 .unwrap()
                 .iter()
                 .any(|(held, _)| held == key))
+        }
+
+        async fn get(&self, key: &str) -> Result<Vec<u8>, recorder::UploadError> {
+            self.puts
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|(held, _)| held == key)
+                .map(|(_, body)| body.clone())
+                .ok_or_else(|| recorder::UploadError::Missing(key.to_string()))
+        }
+
+        async fn list(&self, prefix: &str) -> Result<Vec<String>, recorder::UploadError> {
+            Ok(self
+                .puts
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(held, _)| held.starts_with(prefix))
+                .map(|(held, _)| held.clone())
+                .collect())
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), recorder::UploadError> {
+            self.puts.lock().unwrap().retain(|(held, _)| held != key);
+            Ok(())
         }
 
         fn describe(&self) -> String {
@@ -3332,6 +3374,7 @@ mod tests {
         RecordingSupport {
             sink: Some(Arc::new(NowhereSink)),
             spill_dir: None,
+            journal: None,
             spill_every: recorder::SPILL_EVERY,
             counters: Arc::new(RecorderCounters::default()),
             owner: "pod-a".to_string(),
@@ -3860,6 +3903,7 @@ m=audio {peer_port} RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\na=ptime:{ptime_ms}\r\n"
     fn bucket_plane(bucket: &Arc<BucketSink>) -> TapPlane {
         plane_with_recording(RecordingSupport {
             sink: Some(Arc::clone(bucket) as Arc<dyn recorder::RecordingSink>),
+            journal: None,
             spill_dir: None,
             spill_every: recorder::SPILL_EVERY,
             counters: Arc::new(RecorderCounters::default()),
@@ -5132,6 +5176,7 @@ m=audio 41000 RTP/AVP 111\r\na=rtpmap:111 opus/48000/2\r\n",
         let plane = plane_with_recording(RecordingSupport {
             sink: Some(Arc::new(NowhereSink)),
             spill_dir: None,
+            journal: None,
             spill_every: recorder::SPILL_EVERY,
             counters: Arc::new(RecorderCounters::default()),
             owner: "pod-a".to_string(),

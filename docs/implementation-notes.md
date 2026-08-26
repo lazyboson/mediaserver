@@ -1200,6 +1200,16 @@ media rising for 10 min while kernel media stays flat, with architecture §8.1
 as its runbook. Two pods tapping one node report the same counters, so
 aggregate with `max by (node)`, never `sum`.
 
+The recording spill series gained two counters with item 53:
+`mss_recording_spill_lost_ownership_total` (closed segments this pod did not
+spill because another pod had adopted the journal — a partition signal, not a
+storage signal) and `mss_recording_spill_foreign_manifests` (journals this pod's
+startup salvage left alone because their manifest names another owner). Both sit
+beside `mss_recording_spill_segments_total` and
+`mss_recording_spill_failures_total`, and neither has an alert rule yet: a
+non-zero `lost_ownership` is the interesting one, and what a good threshold is
+will not be known until a pilot has produced a baseline.
+
 The SSRC re-resolution series (2026-08-22) are meant to be read as one
 sequence: `mss_legs_ssrc_changes_total` (a leg's sender changed),
 `mss_ssrc_requeries_total` (the control world asked rtpengine about it),
@@ -1262,6 +1272,17 @@ controller's own API — `CreateSession` then `Attach` per attachment, replaying
 attachment, idempotency) applies to a rebuilt session exactly as to a new one,
 and `TapPlane` re-establishes the rtpengine subscription as a side effect.
 `MAX_ADOPTIONS_PER_SWEEP` (8) stops one pod inhaling every orphan at once.
+
+**What the keeper does for a recording (item 53, 2026-08-26).** Nothing changed
+in `registry_keeper.rs` for the cross-pod spill, and that is the point:
+`persisted_from` already stamps `PersistedRecording{recording_id, owner,
+recorded_ms, spilled_ms}` on every tick and `rebuild` already derives
+`mss.recording.resumeMs` / `mss.recording.spillOwner` into the rebuilt
+attachment's metadata. What changed is what those two mean downstream —
+`resumeMs` is still where the recording had reached, but `spillOwner` no longer
+predicts what the adopter can read: with `MSS_RECORDING_SPILL_TO=s3` the
+adopter reads the dead pod's segments out of the recording bucket and pads only
+the unspilled tail, so a foreign `spillOwner` is now a log field, not a loss.
 
 **Cancelling the previous owner's tap (D14, fixed 2026-08-23).** `rebuild`
 first calls `TapSubscriptions::unsubscribe_orphan(node, call_id, to_tag)` —
@@ -3223,10 +3244,77 @@ frame in `mss_recording_frames_lost_on_adopt_total`. Past `MAX_ADOPT_LEAD`
 (5 min) the padding is refused rather than allocated, since the pad is real
 memory; the loss is still counted.
 
-**The limit to state plainly:** the spill directory is per-pod local disk, so a
-cross-pod adopter reads nothing and the dead pod's audio becomes counted
-silence. Whole-fix shape (shared spill volume, or one multipart upload per
-segment straight to object storage) is the same shape D16 needs.
+**The limit item 53 removed:** with `MSS_RECORDING_SPILL_TO=disk` (the default)
+the spill directory is per-pod local disk, so a cross-pod adopter reads nothing
+and the dead pod's audio becomes counted silence. With `s3` the journal lives in
+the recording bucket and any pod reads it back — see the next section.
+
+### recording_spill.rs — the journal in the recording bucket (item 53, D9, 2026-08-26)
+
+The journal grew a backend seam so the same journal can live on local disk or in
+the recording bucket, and the recorder above it did not change shape at all.
+
+- **`SpillStore`** is the seam: `write(journal, manifest, chunks)`,
+  `read(journal, chunks)`, `read_manifest(journal)`, `list_manifests()`,
+  `remove(journal)` and `describe(journal)`. A *journal* is named by the first
+  target's object key — the same identity the disk layout already used — so
+  `SpillManifest` is untouched and a `disk` journal written before this change
+  is still read back byte for byte.
+- **`DiskSpill`** is today's code, extracted: `<MSS_RECORDING_SPILL_DIR>/journal/
+  <first object key>/manifest.json` plus `<target index>-<seq>.pcm`, atomic
+  rename for the manifest, every syscall on `spawn_blocking`.
+- **`ObjectSpill`** writes the same layout into the recording bucket under
+  `MSS_RECORDING_SPILL_PREFIX` (default `_spill/`), through the same
+  `RecordingSink` the finished object goes to: `_spill/<first object
+  key>/manifest.json` and `_spill/<first object key>/<target index>-<seq>.pcm`.
+  Chunks go up first and the manifest last, so a manifest never names a chunk
+  that is not there. Every call is bounded by `SPILL_TIMEOUT` (10 s) — the
+  recorder task awaits it, so an unbounded put would stall the tap's consumer
+  queue; a timeout is counted like any other failed spill and the audio stays in
+  memory for the next tick. The prefix is **reserved**: nothing else may be
+  written under it, and it is documented in deploy.md beside the frozen
+  identity, with a bucket lifecycle rule (expire `_spill/` after 7 days) as the
+  retention policy MSS still does not implement.
+- `RecordingSink` therefore gained `get`, `list` and `delete` beside `put` and
+  `exists` (`object_store` has all three; `list` walks the `BoxStream` and
+  returns plain keys). `UploadError::Missing` is the "not there" answer `get`
+  needs, so a first-ever `read_manifest` is not logged as a failure.
+  `S3RecordingSink` maps `NotFound` to it for both `get` and `delete`.
+
+**Ownership lives in the manifest, and it is what makes this safe.**
+`SpillManifest.owner` already existed. `SegmentJournal::open` on an adopting pod
+finds a journal that *continues* its recording, rewrites `owner` to itself and
+**writes the manifest immediately** — the claim happens before the first
+`append`, not with it. Every `append` re-reads the manifest first: if `owner` is
+no longer this pod, the append is refused, `surrendered()` goes true,
+`spill_closed_segment` counts `mss_recording_spill_lost_ownership_total`, drops
+the journal handle and keeps recording into memory. A partitioned-but-alive pod
+therefore cannot corrupt an adopted journal, and it also cannot delete it: with
+no journal handle there is nothing to `discard`.
+
+**Read-back no longer depends on which pod spilled.** `PersistedRecording.owner`
+is still carried to the adopter as `mss.recording.spillOwner` (it is what the
+log needs to say whose audio is missing), but it gates nothing: `recorder::run`
+reads back whatever the configured store holds for that journal and pads only
+the frames that are in neither memory nor the store. With `s3` that makes
+`mss_recording_frames_lost_on_adopt_total` at most one
+`MSS_RECORDING_SPILL_SECONDS` on **any** pod, which is the invariant
+`an_adopter_on_any_pod_loses_at_most_one_spill_interval_when_the_journal_is_in_the_bucket`
+is named after.
+
+**Salvage stays same-pod.** `recording_spill::salvage` (still `main.rs`, before
+the daemon serves) now lists manifests through the store, and a manifest whose
+`owner` is another pod is **left alone** and counted
+(`mss_recording_spill_foreign_manifests`) — with a shared store, salvaging a
+journal another pod is still writing would race it, and adoption is the cross-pod
+path. Its own journals behave exactly as before, `exists`-first and never over an
+object that already reached storage.
+
+**What still costs audio:** the unspilled tail (bounded by the spill interval),
+a pod that dies between its last spill and the adopter's `open`, and the
+`_spill/` objects of a recording that never finished on any pod, which nothing
+expires — retention is the operator's, and that is D9's remaining residual
+together with the live drill.
 
 ### Recording groups — N sessions, one recording (item 21, landed 2026-08-23)
 
