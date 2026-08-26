@@ -81,7 +81,10 @@ pub fn exit_on_second_signal() {
 }
 
 pub fn drain_timeout() -> Duration {
-    let Ok(configured) = std::env::var(DRAIN_TIMEOUT_ENV) else {
+    let configured = std::env::var(DRAIN_TIMEOUT_ENV)
+        .ok()
+        .filter(|configured| !configured.trim().is_empty());
+    let Some(configured) = configured else {
         info!(
             env = DRAIN_TIMEOUT_ENV,
             value = "unset",

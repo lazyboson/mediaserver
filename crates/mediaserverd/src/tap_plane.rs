@@ -8,6 +8,7 @@ use crate::inline_leg::{
     egress_ssrc, InlineEgress, InlineEgressHandle, InlineEgressShared, InlineEgressTotals,
     EGRESS_CHUNK_MS,
 };
+use crate::media_ports::{MediaPortAllocator, PortLease};
 use crate::ng_transport::{NgTransport, NgTransportConfig};
 use crate::recorder::{
     self, Layout, RecorderCounters, RecorderHandle, RecorderSpec, RecordingFormat,
@@ -36,7 +37,7 @@ use session_core::{
     TrackSelector, Transport,
 };
 use std::collections::HashMap;
-use std::net::{IpAddr, SocketAddr, UdpSocket};
+use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
@@ -64,6 +65,8 @@ const POLITE_CLOSE: Duration = Duration::from_secs(2);
 pub struct TapPlaneConfig {
     pub default_node: Option<SocketAddr>,
     pub local_media_address: IpAddr,
+    pub advertised_media_address: IpAddr,
+    pub media_ports: Arc<MediaPortAllocator>,
     pub format: AudioFormat,
     pub transcode_at_tap: bool,
     pub opus_decode_rate_hz: u32,
@@ -82,6 +85,7 @@ struct SessionHandles {
 
 struct LiveSession {
     kind: SessionKind,
+    media_ports: Vec<PortLease>,
     transport: Option<Arc<NgTransport>>,
     external_id: String,
     call_id: String,
@@ -1031,16 +1035,16 @@ impl TapPlane {
 
         let mut sockets = Vec::with_capacity(offer.streams.len());
         let mut receive_ports = Vec::with_capacity(offer.streams.len());
+        let mut port_leases = Vec::with_capacity(offer.streams.len());
         for _ in &offer.streams {
-            let socket = UdpSocket::bind(SocketAddr::new(self.config.local_media_address, 0))
-                .map_err(|error| MediaPlaneError(format!("media socket: {error}")))?;
-            receive_ports.push(
-                socket
-                    .local_addr()
-                    .map_err(|error| MediaPlaneError(format!("media socket: {error}")))?
-                    .port(),
-            );
-            sockets.push(socket);
+            let bound = self
+                .config
+                .media_ports
+                .bind(self.config.local_media_address)
+                .map_err(|error| MediaPlaneError(error.to_string()))?;
+            receive_ports.push(bound.port);
+            port_leases.push(bound.lease);
+            sockets.push(bound.socket);
         }
 
         let answer_with = if transcoding {
@@ -1055,16 +1059,14 @@ impl TapPlane {
             "answering the subscription with this codec"
         );
 
-        let local_address = self.config.local_media_address.to_string();
-        let answer_sdp = SubscriptionAnswer {
-            session_id: self.config.sdp_session_id,
-            local_address: &local_address,
-            receive_ports: &receive_ports,
+        let answer_sdp = tap_answer_sdp(
+            self.config.sdp_session_id,
+            self.config.advertised_media_address,
+            &receive_ports,
             format,
             answer_with,
-        }
-        .to_sdp(&offer)
-        .map_err(|error| MediaPlaneError(format!("answer sdp: {error}")))?;
+            &offer,
+        )?;
 
         transport
             .subscribe_answer(&view.call_id, &to_tag, &answer_sdp)
@@ -1184,6 +1186,7 @@ impl TapPlane {
             view.id,
             LiveSession {
                 kind: SessionKind::Tap,
+                media_ports: port_leases,
                 transport: Some(transport),
                 external_id: view.external_id.clone(),
                 call_id: view.call_id.clone(),
@@ -1222,24 +1225,27 @@ impl TapPlane {
         let peer = SocketAddr::new(peer_address, offer.peer_port);
         let format = offer.format();
 
-        let socket = UdpSocket::bind(SocketAddr::new(self.config.local_media_address, 0))
-            .map_err(|error| MediaPlaneError(format!("media socket: {error}")))?;
+        let bound = self
+            .config
+            .media_ports
+            .bind(self.config.local_media_address)
+            .map_err(|error| MediaPlaneError(error.to_string()))?;
+        let socket = bound.socket;
+        let receive_port = bound.port;
+        let port_leases = vec![bound.lease];
         socket
             .set_nonblocking(true)
             .map_err(|error| MediaPlaneError(format!("media socket: {error}")))?;
-        let receive_port = socket
-            .local_addr()
-            .map_err(|error| MediaPlaneError(format!("media socket: {error}")))?
-            .port();
         let egress_socket = socket
             .try_clone()
             .map_err(|error| MediaPlaneError(format!("egress socket: {error}")))?;
 
-        let local_address = self.config.local_media_address.to_string();
-        let answer_sdp = offer
-            .answer(self.config.sdp_session_id, &local_address, receive_port)
-            .to_sdp()
-            .map_err(|error| MediaPlaneError(format!("inline answer: {error}")))?;
+        let answer_sdp = inline_answer_sdp(
+            self.config.sdp_session_id,
+            self.config.advertised_media_address,
+            receive_port,
+            &offer,
+        )?;
 
         let epoch = Instant::now();
         let (mut egress, egress_handle) = InlineEgress::bind(
@@ -1296,6 +1302,7 @@ impl TapPlane {
                 view.id,
                 LiveSession {
                     kind: SessionKind::Inline,
+                    media_ports: port_leases,
                     transport: None,
                     external_id: view.external_id.clone(),
                     call_id: view.call_id.clone(),
@@ -1399,6 +1406,7 @@ impl TapPlane {
             view.id,
             LiveSession {
                 kind: SessionKind::Inline,
+                media_ports: port_leases,
                 transport: None,
                 external_id: view.external_id.clone(),
                 call_id: view.call_id.clone(),
@@ -1869,8 +1877,17 @@ impl MediaPlane for TapPlane {
                 warn!(%session, "the capture thread did not join cleanly");
             }
         }
+        let released = std::mem::take(&mut live.media_ports);
+        let released_ports: Vec<u16> = released.iter().map(PortLease::port).collect();
+        drop(released);
         self.metrics.retire_session(session);
-        info!(%session, kind = ?live.kind, call_id = %live.call_id, "session closed");
+        info!(
+            %session,
+            kind = ?live.kind,
+            call_id = %live.call_id,
+            ?released_ports,
+            "session closed"
+        );
         Ok(())
     }
 
@@ -2436,6 +2453,39 @@ fn transcoded_tap_codec(
     settled.ok_or_else(|| MediaPlaneError("rtpengine offered no streams".to_string()))
 }
 
+fn tap_answer_sdp(
+    session_id: u64,
+    advertised: IpAddr,
+    receive_ports: &[u16],
+    format: AudioFormat,
+    answer_with: NegotiatedCodec,
+    offer: &SubscriptionOffer,
+) -> Result<String, MediaPlaneError> {
+    let advertised = advertised.to_string();
+    SubscriptionAnswer {
+        session_id,
+        local_address: &advertised,
+        receive_ports,
+        format,
+        answer_with,
+    }
+    .to_sdp(offer)
+    .map_err(|error| MediaPlaneError(format!("answer sdp: {error}")))
+}
+
+fn inline_answer_sdp(
+    session_id: u64,
+    advertised: IpAddr,
+    receive_port: u16,
+    offer: &InlineOffer,
+) -> Result<String, MediaPlaneError> {
+    let advertised = advertised.to_string();
+    offer
+        .answer(session_id, &advertised, receive_port)
+        .to_sdp()
+        .map_err(|error| MediaPlaneError(format!("inline answer: {error}")))
+}
+
 fn negotiated_tap_codec(offer: &SubscriptionOffer) -> Result<NegotiatedCodec, MediaPlaneError> {
     let mut settled: Option<NegotiatedCodec> = None;
     for (index, stream) in offer.streams.iter().enumerate() {
@@ -2809,12 +2859,32 @@ mod tests {
         TapPlane::new(TapPlaneConfig {
             default_node: None,
             local_media_address: IpAddr::from([127, 0, 0, 1]),
+            advertised_media_address: IpAddr::from([127, 0, 0, 1]),
+            media_ports: MediaPortAllocator::ephemeral(),
             format: AudioFormat::pcmu_8k_20ms(),
             transcode_at_tap: true,
             opus_decode_rate_hz: 16000,
             cookie_prefix: 1,
             sdp_session_id: 1,
             recording,
+            capabilities: Arc::new(NodeCapabilityLog::new(true)),
+        })
+    }
+
+    use std::net::UdpSocket;
+
+    fn plane_with_media(advertised: IpAddr, ports: Arc<MediaPortAllocator>) -> TapPlane {
+        TapPlane::new(TapPlaneConfig {
+            default_node: None,
+            local_media_address: IpAddr::from([127, 0, 0, 1]),
+            advertised_media_address: advertised,
+            media_ports: ports,
+            format: AudioFormat::pcmu_8k_20ms(),
+            transcode_at_tap: true,
+            opus_decode_rate_hz: 16000,
+            cookie_prefix: 1,
+            sdp_session_id: 1,
+            recording: RecordingSupport::default(),
             capabilities: Arc::new(NodeCapabilityLog::new(true)),
         })
     }
@@ -4832,6 +4902,90 @@ m=audio 41000 RTP/AVP 111\r\na=rtpmap:111 opus/48000/2\r\n",
                 ptime_ms: 20,
             }
         ));
+    }
+
+    #[test]
+    fn a_tap_answer_carries_the_advertised_address_not_the_bind_address() {
+        let offer = offer_of("0 101", &["0 PCMU/8000", "101 telephone-event/8000"]);
+        let answer_with = negotiated_tap_codec(&offer).expect("pcmu is negotiable");
+        let sdp = tap_answer_sdp(
+            1,
+            IpAddr::from([198, 51, 100, 9]),
+            &[41000],
+            AudioFormat::pcmu_8k_20ms(),
+            answer_with,
+            &offer,
+        )
+        .expect("an answer");
+        assert!(sdp.contains("c=IN IP4 198.51.100.9"), "{sdp}");
+        assert!(sdp.contains("m=audio 41000"), "{sdp}");
+        assert!(!sdp.contains("127.0.0.1"), "{sdp}");
+    }
+
+    #[tokio::test]
+    async fn an_inline_answer_carries_the_advertised_address_while_the_socket_binds_locally() {
+        let peer = UdpSocket::bind("127.0.0.1:0").expect("a fake peer socket");
+        let peer_port = peer.local_addr().expect("peer address").port();
+        let plane = plane_with_media(
+            IpAddr::from([203, 0, 113, 7]),
+            MediaPortAllocator::ephemeral(),
+        );
+
+        let answer = plane
+            .open_session(inline_session(&inline_offer_sdp(peer_port)))
+            .await
+            .expect("an inline leg answers a pcmu offer")
+            .sdp_answer
+            .expect("an inline session answers with sdp");
+
+        assert!(answer.contains("203.0.113.7"), "{answer}");
+        assert!(!answer.contains("127.0.0.1"), "{answer}");
+    }
+
+    #[tokio::test]
+    async fn a_media_port_range_bounds_inline_sockets_and_frees_them_on_close() {
+        let peer = UdpSocket::bind("127.0.0.1:0").expect("a fake peer socket");
+        let peer_port = peer.local_addr().expect("peer address").port();
+        let plane = plane_with_media(
+            IpAddr::from([127, 0, 0, 1]),
+            MediaPortAllocator::over_range(41500, 41501),
+        );
+
+        let answer = plane
+            .open_session(inline_session(&inline_offer_sdp(peer_port)))
+            .await
+            .expect("the first inline leg takes the only rtp port in the range")
+            .sdp_answer
+            .expect("an inline session answers with sdp");
+        assert!(answer.contains("m=audio 41500"), "{answer}");
+
+        let error = plane
+            .open_session(SessionView {
+                id: SessionId::from_raw(2),
+                ..inline_session(&inline_offer_sdp(peer_port))
+            })
+            .await
+            .expect_err("the range holds one rtp port");
+        assert!(
+            error.to_string().contains("every port in 41500-41501"),
+            "{error}"
+        );
+
+        plane
+            .close_session(SessionId::from_raw(1))
+            .await
+            .expect("the first session closes");
+
+        let answer = plane
+            .open_session(SessionView {
+                id: SessionId::from_raw(3),
+                ..inline_session(&inline_offer_sdp(peer_port))
+            })
+            .await
+            .expect("the freed port is handed out again")
+            .sdp_answer
+            .expect("an inline session answers with sdp");
+        assert!(answer.contains("m=audio 41500"), "{answer}");
     }
 
     fn offer_of(payload_types: &str, rtpmaps: &[&str]) -> SubscriptionOffer {

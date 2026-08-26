@@ -2408,6 +2408,92 @@ Kubernetes (the `terminationGracePeriodSeconds >= MSS_DRAIN_TIMEOUT_SECS`
 manifest is G6's); the timeout-expiry branches are fake-verified only, since the
 live drain finished in 30 ms.
 
+### 43. Media port range + advertised address (G2 + G3) — ✅ DONE (2026-08-26)
+
+**The bug this closes.** Every media socket bound `local_media_address:0` — an
+ephemeral port from the kernel's whole range. No firewall can be written for
+that: the operator must open UDP from the rtpengine hosts to the port MSS
+receives the tap copy on, and MSS could not say which ports those would be.
+The same code put the *bind* address into every SDP it hands a peer, so a pod
+that binds a private address and is reached on a different one (NAT, a
+hostNetwork node with a routed VIP, a cloud load balancer) told rtpengine to
+send audio to an address that does not route back.
+
+**What landed.** A new `crates/mediaserverd/src/media_ports.rs`:
+
+- `MediaPortAllocator` — a free list of **even ports only** over
+  `[MSS_MEDIA_PORT_MIN, MSS_MEDIA_PORT_MAX]`. `bind(local_ip)` returns the
+  socket, its port and a `PortLease`; the lease's `Drop` returns the port. A
+  port another process already holds is skipped and counted, not fatal.
+  Exhaustion is a refused session with the range named in the error.
+- `MSS_MEDIA_ADVERTISE_IP` — `media_ports::advertise_address()`. The tap's
+  subscribe answer and the inline SDP answer are now built by
+  `tap_answer_sdp` / `inline_answer_sdp` from the **advertised** address, while
+  the socket still binds the **local** one. Symmetric RTP is unchanged: inline
+  egress still sends from the receive socket.
+- Metrics: `mss_media_ports_in_use`, `mss_media_ports_free`,
+  `mss_media_ports_capacity` (gauges), `mss_media_ports_exhausted_total`,
+  `mss_media_ports_bind_conflicts_total` (counters).
+
+All three variables default to today's behavior exactly: no range means
+ephemeral binds, no advertise IP means the bind address is advertised.
+
+**Measured live (2026-08-26), `lab/media_port_drill.sh`** — a real MicroSIP call
+through OpenSIPS/rtpengine/FreeSWITCH, tapped by a pod started with
+`MSS_MEDIA_PORT_MIN=40100 MSS_MEDIA_PORT_MAX=40139` (20 RTP sockets) and
+`MSS_MEDIA_ADVERTISE_IP=172.31.99.31`:
+
+```
+drill: the pod reports capacity=20 free=20 in_use=0
+drill: udp sockets inside the range before the call: [none]
+drill: udp sockets inside the range while tapping: [40100 40102]
+drill: udp sockets outside the range (ng control sockets, by design): [45745 46345]
+drill: in_use=2 free=18 exhausted=0 conflicts=0
+drill: ingest datagrams 0 -> 1503 over 15s
+drill: udp sockets inside the range after the session closed: [none]
+drill: in_use=0 free=20
+drill: PASS
+```
+
+Two tapped legs took the first two **even** ports; audio flowed at the expected
+~50 pkt/s per leg; both ports came back to the range when the session was
+destroyed. `ss` is not in the lab's rust image, so the drill reads
+`/proc/net/udp` inside the container — which is also why the NG control sockets
+are visible and worth stating: they are **outside** the range on purpose.
+
+**Decisions** (defaults preserve today's behavior exactly):
+
+- **The allocator lives in `mediaserverd`, not `media-core`.** It is I/O-adjacent
+  bookkeeping (it binds sockets), and `media-core` stays sans-IO.
+- **Even ports only.** The odd successor of every allocated port is never handed
+  out, so a peer that wants RTCP on `port+1` can have it without a second
+  allocator. A 40-port range therefore serves **20** sockets, and the
+  `capacity` gauge says so rather than leaving the operator to divide.
+- **The NG control socket keeps an ephemeral port.** The range exists so a
+  firewall can admit *inbound* media from the rtpengine hosts; the NG socket is
+  an outbound control flow to rtpengine's 22222, and spending range ports on it
+  would halve the tap capacity for no gain.
+- **A port held by another process is skipped, up to 64 tries per bind**, and
+  counted in `mss_media_ports_bind_conflicts_total`. Refusing the session
+  because one port in the range is squatted would be worse than moving on.
+- **Ports are returned on `Drop`, after the capture thread joins.**
+  `close_session` joins the media thread, then releases the leases and logs
+  `released_ports`, so a port is never re-handed-out while a socket still holds
+  it. Drain closes sessions the same way, so a drained pod frees its range.
+- **An empty string means unset** for all three variables (and now for
+  `MSS_DRAIN_TIMEOUT_SECS` too): a compose/Kubernetes passthrough of an unset
+  variable arrives as `""`, and that must mean the default, not a warning.
+
+**What it does not prove:** the advertised address is the same as the bind
+address in the lab, because rtpengine sends the tap copy to whatever MSS
+advertised — a genuinely different address is proved only by the SDP tests
+(`a_tap_answer_carries_the_advertised_address_not_the_bind_address`,
+`an_inline_answer_carries_the_advertised_address_while_the_socket_binds_locally`)
+and needs a NAT/hostNetwork deployment to see live. Exhaustion is unit- and
+in-process-verified (an inline session refused on a one-port range, then served
+after a close), never hit live. No hostPort/hostNetwork manifest yet — that is
+G6.
+
 ## Open defects and soft spots
 
 | # | Item | Where | Severity |

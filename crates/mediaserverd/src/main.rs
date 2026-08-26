@@ -6,6 +6,7 @@ mod drain;
 mod event_pump;
 mod hub;
 mod inline_leg;
+mod media_ports;
 mod media_rt;
 mod metrics;
 mod ng_transport;
@@ -295,10 +296,16 @@ fn auth_policy_from_env() -> AuthPolicy {
 }
 
 fn local_media_address() -> IpAddr {
-    std::env::var(LOCAL_MEDIA_IP_ENV)
+    let address = std::env::var(LOCAL_MEDIA_IP_ENV)
         .ok()
         .and_then(|configured| configured.parse().ok())
-        .unwrap_or(IpAddr::from([0, 0, 0, 0]))
+        .unwrap_or(IpAddr::from([0, 0, 0, 0]));
+    info!(
+        env = LOCAL_MEDIA_IP_ENV,
+        address = %address,
+        "media and ng sockets bind to this address"
+    );
+    address
 }
 
 async fn serve_control_plane(
@@ -331,11 +338,15 @@ async fn serve_control_plane(
         );
     }
     let opus_rate = opus_decode_rate_hz();
+    let local_media = local_media_address();
+    let media_ports = media_ports::MediaPortAllocator::from_env();
     let plane = Arc::new(TapPlane::new(TapPlaneConfig {
         default_node: std::env::var(RTPENGINE_NODE_ENV)
             .ok()
             .and_then(|configured| configured.parse().ok()),
-        local_media_address: local_media_address(),
+        local_media_address: local_media,
+        advertised_media_address: media_ports::advertise_address(local_media),
+        media_ports: Arc::clone(&media_ports),
         format: tap_format(opus_rate),
         transcode_at_tap: capabilities.transcode_at_tap(),
         opus_decode_rate_hz: opus_rate,
@@ -413,6 +424,7 @@ async fn serve_control_plane(
                         .map(|(_, counters)| Arc::clone(counters)),
                     keeper: keeper_counters.clone(),
                     drain: Arc::clone(&drain_state),
+                    ports: Arc::clone(&media_ports),
                 };
                 tokio::spawn(metrics::serve(metrics_listener, sources));
             }
