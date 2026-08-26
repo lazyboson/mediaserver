@@ -149,6 +149,8 @@ can be neutralised in a ConfigMap without deleting it.
 | Variable | Default | Meaning | When to change | Added by |
 | --- | --- | --- | --- | --- |
 | `MSS_REDIS_URL` | unset | `redis://…` for ownership leases (TTL 15 s, renewed by heartbeat). Unset = **no HA**: sessions live and die with their pod. Configured but unreachable = **refuse to start** | always set it for more than one pod | [item 3](tasks.md) |
+| `MSS_DISCOVERY_REDIS_KEY_PREFIX` | unset (= off) | Turns on the **rtpengine node discovery map** below. When set, a `CreateSession` that names no `rtpengine_node` reads `<prefix><SIP Call-ID>` from Redis before falling back to `MSS_RTPENGINE_NODE`. One `GET` per create, nothing cached | set it once your proxy publishes the map; leave it unset and every session uses the default node | [item 50](tasks.md) |
+| `MSS_DISCOVERY_REDIS_URL` | unset (= `MSS_REDIS_URL`) | A **separate** Redis for the discovery map, for when the proxy publishes into its own instance. Unreachable at startup = discovery is switched off with a WARN, never a refusal to start | when the proxy's Redis is not the registry's. If neither this nor `MSS_REDIS_URL` is set, the prefix is ignored with a WARN | [item 50](tasks.md) |
 | `MSS_KAFKA_BROKERS` | unset | Comma-separated bootstrap brokers for `MediaEvent`. Unset = events stay in-process, so nothing downstream sees them. Set but naming no broker, or unreachable = **refuse to start** | always set it once anything consumes events | M4 |
 | `MSS_EVENTS_TOPIC` | `mss.events` | The topic events are published to | a per-environment topic name | M4 |
 | `MSS_EVENTS_PARTITIONS` | `4` | Partition count used when the topic has to be created. Events are keyed by `external_id`, so per-session order survives any partition count | more partitions for more consumer parallelism | M4 |
@@ -306,6 +308,119 @@ Two consequences worth knowing before a pilot:
   group writes `…/<participant>.leg_a.wav` — a downstream job keyed on
   `.customer.wav` will not find it. That is the intended failure: better a
   missing file than a confidently mislabelled speaker.
+
+## Which rtpengine anchors the call — the optional discovery map
+
+`CreateSession` can name the node (`rtpengine_node`), and a control plane that
+already knows it should keep doing that: it is the cheapest and most explicit
+path. But a caller that only knows the SIP Call-ID — the `telcompat` façade is
+one, since `StartStream` carries `sipCallId` and no node — otherwise lands on
+`MSS_RTPENGINE_NODE`, and in a deployment with more than one rtpengine that is a
+guess. Your **proxy already knows the answer**: it picked the instance. Let it
+publish that fact.
+
+Set `MSS_DISCOVERY_REDIS_KEY_PREFIX` and MSS reads one key per create:
+
+| | |
+| --- | --- |
+| Key | `<prefix><SIP Call-ID>` — e.g. `mss:call-node:a84b4c76e66710@host` |
+| Value, minimum | `172.31.99.10:22222` — a bare `ip:port` |
+| Value, richer | `{"node":"172.31.99.10:22222","caller_tag":"<caller from-tag>","from_tags":["<caller>","<callee>"]}` |
+| TTL | yours to choose. Longer than your longest call; the proxy deletes the key on BYE |
+
+Order of resolution, per `CreateSession`: **the node in the request** wins;
+otherwise the map; otherwise `MSS_RTPENGINE_NODE`. Nothing is cached between
+creates — a map that changes mid-call is read fresh by the next session, and
+there is no cache to invalidate.
+
+What the two value forms buy:
+
+- `node` alone saves the guess. MSS still asks rtpengine `query` for the call's
+  participants, as it does today;
+- `from_tags` **also saves that `query`** when both legs are named: the tap is
+  subscribed straight from the map;
+- `caller_tag` is what makes the attribution `explicit` (`customer`/`agent`).
+  **A tag list without `caller_tag` stays `unknown`** — tracks are `leg_a` /
+  `leg_b`, exactly as in *Leg attribution* above. The map may not silently
+  decide who called: if your proxy knows the caller, mark it.
+
+Failure is always a fallback, never a refusal: an unreachable Redis, a missing
+key or an unreadable value all leave the session on the default node with a WARN
+in the log. Three counters make it auditable — and they appear on `/metrics`
+**only when discovery is configured**:
+
+| Metric | Meaning |
+| --- | --- |
+| `mss_discovery_hits_total` | the map named the node |
+| `mss_discovery_misses_total` | no key for this call-id; the default node was used |
+| `mss_discovery_errors_total` | Redis unreachable, or the value was not an `ip:port` / node object |
+
+### The OpenSIPS side — copy this
+
+`cachedb_redis` writes the key where MSS reads it. `$ci` is the Call-ID, `$ft`
+the caller's from-tag, `$tt` the callee's. The prefix and the TTL are the two
+knobs; keep the prefix identical to `MSS_DISCOVERY_REDIS_KEY_PREFIX`.
+
+```
+loadmodule "cachedb_redis.so"
+modparam("cachedb_redis", "cachedb_url", "redis://10.0.0.20:6379/")
+
+# Two knobs live in this snippet, spelled out at every call site because
+# OpenSIPS cannot concatenate a #!define into a string:
+#   the key prefix  "mss:call-node:"  == MSS_DISCOVERY_REDIS_KEY_PREFIX
+#   the TTL         14400 seconds     >  your longest call
+
+route {
+    ...
+    if (is_method("INVITE") && !has_totag()) {
+        rtpengine_offer();
+        # the node is known here: publish it with the caller's tag
+        cache_store("redis", "mss:call-node:$ci",
+                    "{\"node\":\"10.0.0.10:22222\",\"caller_tag\":\"$ft\"}",
+                    14400);
+    }
+    if (has_totag() && is_method("BYE")) {
+        rtpengine_delete();
+        cache_remove("redis", "mss:call-node:$ci");
+    }
+}
+
+onreply_route[...] {
+    if (has_body("application/sdp")) {
+        rtpengine_answer();
+        # now BOTH tags are known -- rewriting the key here saves MSS a `query`
+        cache_store("redis", "mss:call-node:$ci",
+                    "{\"node\":\"10.0.0.10:22222\",\"caller_tag\":\"$ft\",\"from_tags\":[\"$ft\",\"$tt\"]}",
+                    14400);
+    }
+}
+
+failure_route[...] {
+    cache_remove("redis", "mss:call-node:$ci");
+}
+```
+
+Two practical notes. **Pick the node from the same variable your rtpengine
+module selected**, not a literal, if your proxy load-balances across a set —
+otherwise the map is confidently wrong, which is worse than absent. And check
+your OpenSIPS image actually ships the module: `ls
+/usr/lib/x86_64-linux-gnu/opensips/modules | grep cachedb`. The pinned
+`opensips/opensips:3.4` lab image does **not** (it has `cachedb_local.so` and
+`cachedb_sql.so` only, and apt.opensips.org no longer carries a 3.4 component
+for bullseye), so `lab/opensips/opensips.cfg` publishes the same key and value
+through `exec.so` + `lab/opensips/discovery_publish.py` instead. The bytes in
+Redis are identical; only the writer differs.
+
+Verified live (2026-08-26, `lab/node_discovery_drill.sh`) with the pod's default
+node pointed at a black hole (`172.31.99.199:22222`) so nothing but the map
+could work: the proxy published
+`{"node":"172.31.99.10:22222","caller_tag":"hosttest","from_tags":["hosttest","y3HmFyeQae04N"]}`
+on the answer; `mss_ctl create <id> <call-id> -` with **no node and no
+from-tags** tapped 1192 datagrams in 12 s with `attribution=explicit` and
+`mss_discovery_hits_total 1`; an unmapped call-id counted one miss and was
+**refused** on the black-hole default (`no reply from rtpengine at
+172.31.99.199:22222 after 3 attempts`) rather than guessing; the BYE removed the
+key.
 
 ## Digit menus — drive them from the event bus
 

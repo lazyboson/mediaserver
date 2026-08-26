@@ -1,6 +1,7 @@
 use crate::conference::{Conference, ConferenceMember, ConferenceShared, ConferenceTotals};
 use crate::consumer_ws::{self, ConsumerConfig};
 use crate::digits::DigitQueue;
+use crate::discovery::NodeDiscovery;
 use crate::hub::{
     Hub, HubClient, Subscription, SubscriptionControl, SubscriptionMetrics, TapEvent,
     TrackSelection,
@@ -78,6 +79,12 @@ pub struct TapPlaneConfig {
     pub sdp_session_id: u64,
     pub recording: RecordingSupport,
     pub capabilities: Arc<NodeCapabilityLog>,
+}
+
+struct ResolvedNode {
+    node: SocketAddr,
+    view: SessionView,
+    caller_named: bool,
 }
 
 struct SessionHandles {
@@ -441,6 +448,7 @@ pub struct TapPlane {
     conferences: Mutex<HashMap<String, Conference>>,
     metrics: TapPlaneMetrics,
     observations: OnceLock<Weak<dyn ObservationSink>>,
+    discovery: OnceLock<Arc<NodeDiscovery>>,
     uploads: Arc<UploadTracker>,
 }
 
@@ -456,6 +464,7 @@ impl TapPlane {
             conferences: Mutex::new(HashMap::new()),
             metrics,
             observations: OnceLock::new(),
+            discovery: OnceLock::new(),
             uploads,
         }
     }
@@ -472,6 +481,19 @@ impl TapPlane {
         if self.observations.set(sink).is_err() {
             warn!("this tap plane already reports its observations somewhere");
         }
+    }
+
+    pub fn discover_through(&self, discovery: Arc<NodeDiscovery>) {
+        let prefix = discovery.prefix().to_string();
+        if self.discovery.set(discovery).is_err() {
+            warn!("this tap plane already resolves rtpengine nodes through a discovery map");
+            return;
+        }
+        info!(
+            prefix = %prefix,
+            "a call whose CreateSession names no rtpengine node is looked up in the \
+             discovery map under this key prefix"
+        );
     }
 
     pub fn live_sessions(&self) -> usize {
@@ -513,13 +535,62 @@ impl TapPlane {
         })
     }
 
+    async fn resolve_node(&self, mut view: SessionView) -> Result<ResolvedNode, MediaPlaneError> {
+        let mut caller_named = !view.from_tags.is_empty();
+        if !view.rtpengine_node.is_empty() {
+            let node = self.node_for(&view)?;
+            return Ok(ResolvedNode {
+                node,
+                view,
+                caller_named,
+            });
+        }
+        let discovered = match self.discovery.get() {
+            Some(discovery) => discovery.resolve(&view.call_id).await,
+            None => None,
+        };
+        let Some(discovered) = discovered else {
+            let node = self.node_for(&view)?;
+            return Ok(ResolvedNode {
+                node,
+                view,
+                caller_named,
+            });
+        };
+        if view.from_tags.is_empty() && !discovered.from_tags.is_empty() {
+            view.from_tags = discovered.from_tags;
+            view.from_tags.truncate(MAX_TAPPED_LEGS);
+            caller_named = discovered.caller_named;
+        }
+        Ok(ResolvedNode {
+            node: discovered.node,
+            view,
+            caller_named,
+        })
+    }
+
     async fn complete_from_tags(
         &self,
         transport: &NgTransport,
         mut view: SessionView,
+        caller_named: bool,
     ) -> Result<SessionView, MediaPlaneError> {
+        let seeded = !view.from_tags.is_empty();
         if view.from_tags.len() >= MAX_TAPPED_LEGS {
-            view.attribution = Attribution::Explicit;
+            view.attribution = if caller_named {
+                Attribution::Explicit
+            } else {
+                Attribution::Unknown
+            };
+            if !caller_named {
+                warn!(
+                    call_id = %view.call_id,
+                    from_tags = ?view.from_tags,
+                    "both legs of this call are known but not which one called: this tap \
+                     will not claim a direction and its tracks are leg_a and leg_b. Mark the \
+                     caller in the discovery map to get customer and agent"
+                );
+            }
             return Ok(view);
         }
         let reply = transport
@@ -534,7 +605,6 @@ impl TapPlane {
                 view.call_id
             )));
         }
-        let caller_known = !view.from_tags.is_empty();
         let ordered = order_participants(&stamped);
         for tag in ordered.tags {
             if view.from_tags.len() >= MAX_TAPPED_LEGS {
@@ -544,8 +614,10 @@ impl TapPlane {
                 view.from_tags.push(tag);
             }
         }
-        view.attribution = if caller_known {
+        view.attribution = if caller_named {
             Attribution::Explicit
+        } else if seeded {
+            Attribution::Unknown
         } else {
             ordered.attribution
         };
@@ -1003,7 +1075,11 @@ impl TapPlane {
         if view.call_id.is_empty() {
             return Err(MediaPlaneError("a tap needs the call-id".to_string()));
         }
-        let node = self.node_for(&view)?;
+        let ResolvedNode {
+            node,
+            view,
+            caller_named,
+        } = self.resolve_node(view).await?;
         let configured = self.config.format;
         let transcoding = self.config.transcode_at_tap;
 
@@ -1023,7 +1099,9 @@ impl TapPlane {
             .report_first_contact(node, &transport)
             .await;
 
-        let view = self.complete_from_tags(&transport, view).await?;
+        let view = self
+            .complete_from_tags(&transport, view, caller_named)
+            .await?;
 
         let reply = transport
             .subscribe_request(&SubscribeRequest {
@@ -3078,6 +3156,152 @@ mod tests {
             attachments: Vec::new(),
             authoritative: None,
         }
+    }
+
+    fn plane_with_default_node(node: &str) -> TapPlane {
+        TapPlane::new(TapPlaneConfig {
+            default_node: Some(node.parse().expect("a default node")),
+            local_media_address: IpAddr::from([127, 0, 0, 1]),
+            advertised_media_address: IpAddr::from([127, 0, 0, 1]),
+            media_ports: MediaPortAllocator::ephemeral(),
+            format: AudioFormat::pcmu_8k_20ms(),
+            transcode_at_tap: true,
+            opus_decode_rate_hz: 16000,
+            cookie_prefix: 1,
+            sdp_session_id: 1,
+            recording: RecordingSupport::default(),
+            capabilities: Arc::new(NodeCapabilityLog::new(true)),
+        })
+    }
+
+    fn mapped(
+        plane: &TapPlane,
+        map: crate::discovery::FixedNodeMap,
+    ) -> Arc<crate::discovery::DiscoveryCounters> {
+        let counters = Arc::new(crate::discovery::DiscoveryCounters::default());
+        plane.discover_through(Arc::new(crate::discovery::NodeDiscovery::new(
+            Arc::new(map),
+            "mss:call-node:".to_string(),
+            Arc::clone(&counters),
+        )));
+        counters
+    }
+
+    fn tap_without_a_node() -> SessionView {
+        SessionView {
+            from_tags: Vec::new(),
+            attribution: Attribution::Unknown,
+            ..session(SessionKind::Tap, "")
+        }
+    }
+
+    #[tokio::test]
+    async fn a_mapped_call_goes_to_the_mapped_node_not_the_default_one() {
+        let plane = plane_with_default_node("10.0.0.9:22222");
+        let counters = mapped(
+            &plane,
+            crate::discovery::FixedNodeMap::holding(
+                r#"{"node":"10.0.0.5:22222","caller_tag":"caller-tag"}"#,
+            ),
+        );
+        let resolved = plane
+            .resolve_node(tap_without_a_node())
+            .await
+            .expect("the map answers");
+        assert_eq!(resolved.node.to_string(), "10.0.0.5:22222");
+        assert_eq!(resolved.view.from_tags, vec!["caller-tag".to_string()]);
+        assert!(resolved.caller_named);
+        assert_eq!(counters.hits.load(std::sync::atomic::Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn an_unmapped_call_falls_back_to_the_default_node() {
+        let plane = plane_with_default_node("10.0.0.9:22222");
+        let counters = mapped(&plane, crate::discovery::FixedNodeMap::empty());
+        let resolved = plane
+            .resolve_node(tap_without_a_node())
+            .await
+            .expect("the default node answers");
+        assert_eq!(resolved.node.to_string(), "10.0.0.9:22222");
+        assert!(resolved.view.from_tags.is_empty());
+        assert!(!resolved.caller_named);
+        assert_eq!(
+            counters.misses.load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unreachable_map_never_fails_the_session() {
+        let plane = plane_with_default_node("10.0.0.9:22222");
+        let counters = mapped(&plane, crate::discovery::FixedNodeMap::unreachable());
+        let resolved = plane
+            .resolve_node(tap_without_a_node())
+            .await
+            .expect("a broken map is not fatal");
+        assert_eq!(resolved.node.to_string(), "10.0.0.9:22222");
+        assert_eq!(
+            counters.errors.load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn a_caller_that_names_its_node_is_never_looked_up() {
+        let plane = plane_with_default_node("10.0.0.9:22222");
+        let counters = mapped(
+            &plane,
+            crate::discovery::FixedNodeMap::holding("10.0.0.5:22222"),
+        );
+        let resolved = plane
+            .resolve_node(session(SessionKind::Tap, "10.0.0.7:22222"))
+            .await
+            .expect("the named node stands");
+        assert_eq!(resolved.node.to_string(), "10.0.0.7:22222");
+        assert!(resolved.caller_named);
+        assert_eq!(counters.hits.load(std::sync::atomic::Ordering::Relaxed), 0);
+        assert_eq!(
+            counters.misses.load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn the_map_never_overrides_from_tags_the_caller_gave() {
+        let plane = plane_with_default_node("10.0.0.9:22222");
+        mapped(
+            &plane,
+            crate::discovery::FixedNodeMap::holding(
+                r#"{"node":"10.0.0.5:22222","caller_tag":"mapped-tag"}"#,
+            ),
+        );
+        let resolved = plane
+            .resolve_node(session(SessionKind::Tap, ""))
+            .await
+            .expect("the map answers");
+        assert_eq!(resolved.node.to_string(), "10.0.0.5:22222");
+        assert_eq!(resolved.view.from_tags, vec!["from-a".to_string()]);
+        assert!(resolved.caller_named);
+    }
+
+    #[tokio::test]
+    async fn tags_from_a_map_that_names_no_caller_claim_no_direction() {
+        let plane = plane_with_default_node("10.0.0.9:22222");
+        mapped(
+            &plane,
+            crate::discovery::FixedNodeMap::holding(
+                r#"{"node":"10.0.0.5:22222","from_tags":["one","two","three"]}"#,
+            ),
+        );
+        let resolved = plane
+            .resolve_node(tap_without_a_node())
+            .await
+            .expect("the map answers");
+        assert_eq!(
+            resolved.view.from_tags,
+            vec!["one".to_string(), "two".to_string()]
+        );
+        assert!(!resolved.caller_named);
     }
 
     fn inline_session(offer: &str) -> SessionView {

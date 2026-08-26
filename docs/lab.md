@@ -2213,3 +2213,55 @@ event.
 - **The concurrency bound is not exercised here** — one recording at a time. That
   is `background_uploads_run_no_wider_than_their_configured_concurrency`, in
   process.
+
+## node_discovery_drill.sh — the proxy tells MSS which rtpengine to ask (2026-08-26)
+
+Item 51 (G11) lets a `CreateSession` that names no rtpengine node read the node
+out of Redis, where the proxy published it. The lab proxy publishes it for real
+— through `exec.so` + `lab/opensips/discovery_publish.py`, because
+`opensips/opensips:3.4` ships **no `cachedb_redis.so`** and apt.opensips.org no
+longer carries a 3.4 component for bullseye. The bytes written are identical to
+the `cache_store` snippet in [deploy.md](deploy.md).
+
+The trick that makes the drill a proof rather than a coincidence: the pod's
+**default** node is pointed at a black hole, so a tap can only work if the node
+came from the map.
+
+```sh
+export DOCKER_API_VERSION=1.43 DISCOVERY=on
+export MSS_DISCOVERY_REDIS_KEY_PREFIX=mss:call-node:
+export MSS_RTPENGINE_NODE=172.31.99.199:22222
+docker compose -f lab/docker-compose.microsip.yml \
+  -f lab/docker-compose.webrtc.yml up -d --force-recreate \
+  rtpengine opensips freeswitch redis redpanda minio minio-init \
+  call-watcher mss-control
+./lab/node_discovery_drill.sh
+```
+
+A real SIP call through OpenSIPS (`lab/host_test_caller.py`), then:
+
+| | |
+| --- | --- |
+| `redis-cli GET mss:call-node:<call-id>` | `{"node":"172.31.99.10:22222","caller_tag":"hosttest","from_tags":["hosttest","y3HmFyeQae04N"]}` |
+| `mss_ctl create <id> <call-id> -` (no node, no from-tags) | **1192 ingest datagrams in 12 s**, `attribution=explicit` |
+| counters | `mss_discovery_hits_total 1`, misses 0, errors 0 |
+| a call-id nobody published | one **miss**, then `Unavailable: no reply from rtpengine at 172.31.99.199:22222 after 3 attempts` |
+| after the BYE | `GET` → `(nil)` |
+
+Both tags came from the map, so that tap issued **no `query`** — visible as the
+absence of a query line in the pod log, and the reason `from_tags` is in the
+value format at all.
+
+The toggle is **off by default**: `DISCOVERY` unset renders `$var(discovery) =
+"off"` into `/tmp/opensips.cfg` and `MSS_DISCOVERY_REDIS_KEY_PREFIX` unset makes
+the pod expose no `mss_discovery_` series at all. Both were checked after the
+run, so every other drill sees the lab it has always seen.
+
+### What this does not prove
+
+- **Nothing ran against a real `cachedb_redis`.** The lab image cannot load the
+  module, so the OpenSIPS snippet in deploy.md is documentation; what was tested
+  is the key, the value and MSS's half.
+- **No multi-node placement.** The map named the one rtpengine the lab anchors
+  calls on. A deployment with several instances is the case the map exists for,
+  and it is still deployment-gated.

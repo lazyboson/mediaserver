@@ -1,3 +1,4 @@
+use crate::discovery::DiscoveryCounters;
 use crate::drain::DrainState;
 use crate::event_pump::PumpCounters;
 use crate::health::{Readiness, HEALTHZ_PATH, READYZ_PATH};
@@ -24,6 +25,7 @@ pub struct MetricsSources {
     pub controller: Arc<SessionController>,
     pub pump: Option<Arc<PumpCounters>>,
     pub keeper: Option<Arc<KeeperCounters>>,
+    pub discovery: Option<Arc<DiscoveryCounters>>,
     pub drain: Arc<DrainState>,
     pub ports: Arc<MediaPortAllocator>,
     pub readiness: Arc<Readiness>,
@@ -645,6 +647,24 @@ pub fn render(sources: &MetricsSources) -> String {
         );
     }
 
+    if let Some(discovery) = &sources.discovery {
+        counter(
+            "mss_discovery_hits_total",
+            "Calls whose rtpengine node came from the discovery map",
+            discovery.hits.load(Ordering::Relaxed),
+        );
+        counter(
+            "mss_discovery_misses_total",
+            "Calls the discovery map held no node for; the default node was used",
+            discovery.misses.load(Ordering::Relaxed),
+        );
+        counter(
+            "mss_discovery_errors_total",
+            "Discovery lookups that failed or returned something unreadable",
+            discovery.errors.load(Ordering::Relaxed),
+        );
+    }
+
     let ports = sources.ports.counters();
     for (name, help, kind, value) in [
         (
@@ -815,6 +835,7 @@ mod tests {
             controller: Arc::new(SessionController::new("test-pod")),
             pump: Some(Arc::new(PumpCounters::default())),
             keeper: Some(Arc::new(KeeperCounters::default())),
+            discovery: Some(Arc::new(DiscoveryCounters::default())),
             drain: Arc::clone(&drain),
             ports: crate::media_ports::MediaPortAllocator::ephemeral(),
             readiness: crate::health::Readiness::shared(drain),
@@ -906,11 +927,26 @@ mod tests {
     }
 
     #[test]
+    fn the_discovery_counters_are_exposed_when_a_node_map_is_configured() {
+        let sources = sources();
+        let discovery = sources.discovery.as_ref().expect("a map is configured");
+        discovery.hits.fetch_add(3, Ordering::Relaxed);
+        discovery.misses.fetch_add(2, Ordering::Relaxed);
+        discovery.errors.fetch_add(1, Ordering::Relaxed);
+        let text = render(&sources);
+        assert!(text.contains("mss_discovery_hits_total 3"));
+        assert!(text.contains("mss_discovery_misses_total 2"));
+        assert!(text.contains("mss_discovery_errors_total 1"));
+    }
+
+    #[test]
     fn absent_optional_sources_leave_their_series_out_rather_than_lying_zero() {
         let mut sources = sources();
         sources.pump = None;
         sources.keeper = None;
+        sources.discovery = None;
         let text = render(&sources);
+        assert!(!text.contains("mss_discovery_hits_total"));
         assert!(!text.contains("mss_events_published_total"));
         assert!(!text.contains("mss_events_retry_depth"));
         assert!(!text.contains("mss_registry_persisted_total"));
