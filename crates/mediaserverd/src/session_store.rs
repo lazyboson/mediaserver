@@ -84,6 +84,8 @@ pub trait SessionStore: Send + Sync + 'static {
 
     async fn renew(&self, external_id: &str, owner: &str) -> Result<bool, StoreError>;
 
+    async fn release_lease(&self, external_id: &str, owner: &str) -> Result<bool, StoreError>;
+
     async fn claim_unleased(
         &self,
         owner: &str,
@@ -198,6 +200,24 @@ impl SessionStore for RedisSessionStore {
         Ok(true)
     }
 
+    async fn release_lease(&self, external_id: &str, owner: &str) -> Result<bool, StoreError> {
+        let mut connection = self.connection().await?;
+        let held: Option<String> = redis::cmd("GET")
+            .arg(self.lease_key(external_id))
+            .query_async(&mut connection)
+            .await
+            .map_err(|error| StoreError::Backend(error.to_string()))?;
+        if held.as_deref() != Some(owner) {
+            return Ok(false);
+        }
+        redis::cmd("DEL")
+            .arg(self.lease_key(external_id))
+            .query_async::<i64>(&mut connection)
+            .await
+            .map_err(|error| StoreError::Backend(error.to_string()))?;
+        Ok(true)
+    }
+
     async fn claim_unleased(
         &self,
         owner: &str,
@@ -300,6 +320,17 @@ impl SessionStore for MemorySessionStore {
     async fn renew(&self, external_id: &str, owner: &str) -> Result<bool, StoreError> {
         match self.leases.lock().unwrap().get(external_id) {
             Some(held) if held == owner => Ok(true),
+            _ => Ok(false),
+        }
+    }
+
+    async fn release_lease(&self, external_id: &str, owner: &str) -> Result<bool, StoreError> {
+        let mut leases = self.leases.lock().unwrap();
+        match leases.get(external_id) {
+            Some(held) if held == owner => {
+                leases.remove(external_id);
+                Ok(true)
+            }
             _ => Ok(false),
         }
     }

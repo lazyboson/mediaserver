@@ -31,6 +31,7 @@ pub struct KeeperCounters {
     pub orphans_unsubscribed: AtomicU64,
     pub orphans_still_subscribed: AtomicU64,
     pub surrendered: AtomicU64,
+    pub handed_off: AtomicU64,
 }
 
 #[control_api::async_trait]
@@ -89,7 +90,43 @@ impl RegistryKeeper {
         self.adopt_orphans().await;
     }
 
-    pub async fn run(self) {
+    pub async fn hand_off_leases(&self) -> usize {
+        let mine: Vec<String> = {
+            let mut held = self.persisted_here.lock().unwrap();
+            std::mem::take(&mut *held).into_iter().collect()
+        };
+        let mut handed_off = 0;
+        for external_id in mine {
+            match self.store.release_lease(&external_id, &self.owner).await {
+                Ok(true) => {
+                    self.counters.handed_off.fetch_add(1, Ordering::Relaxed);
+                    handed_off += 1;
+                    info!(
+                        %external_id,
+                        owner = %self.owner,
+                        "lease released for adoption; another pod can take this session now \
+                         instead of waiting for the lease to expire"
+                    );
+                }
+                Ok(false) => info!(
+                    %external_id,
+                    owner = %self.owner,
+                    "this pod no longer held the lease; nothing to hand off"
+                ),
+                Err(error) => {
+                    self.counters.failed.fetch_add(1, Ordering::Relaxed);
+                    warn!(
+                        %external_id,
+                        %error,
+                        "could not release this lease; adoption waits for it to expire"
+                    );
+                }
+            }
+        }
+        handed_off
+    }
+
+    pub async fn run(self: Arc<RegistryKeeper>) {
         let mut renew = tokio::time::interval(RENEW_EVERY);
         let mut adopt = tokio::time::interval(ADOPT_EVERY);
         info!(owner = %self.owner, "session registry keeper started");
@@ -1242,5 +1279,39 @@ mod tests {
             "an ended call left behind in the registry would be adopted as a phantom tap"
         );
         assert_eq!(keeper.counters().released.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn a_draining_pod_hands_its_leases_over_without_deleting_the_records() {
+        let store = Arc::new(MemorySessionStore::default());
+        let (controller, _) = pod("pod-a");
+        tap_with_consumer(&controller, "req-1").await;
+        let keeper = RegistryKeeper::new(controller.clone(), store.clone(), "pod-a");
+        keeper.tick().await;
+        assert_eq!(store.lease_holder("req-1").as_deref(), Some("pod-a"));
+
+        assert_eq!(keeper.hand_off_leases().await, 1);
+        assert_eq!(keeper.counters().handed_off.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            store.lease_holder("req-1"),
+            None,
+            "the lease must be free at once so an adopter does not wait for the ttl"
+        );
+        assert_eq!(
+            store.stored().len(),
+            1,
+            "a drained session is adoptable, so its record must survive"
+        );
+
+        let adopted = store.claim_unleased("pod-b", 8).await.unwrap();
+        assert_eq!(adopted.len(), 1);
+        assert_eq!(adopted[0].external_id, "req-1");
+
+        assert_eq!(
+            keeper.hand_off_leases().await,
+            0,
+            "handing off twice must not touch a lease the successor now holds"
+        );
+        assert_eq!(store.lease_holder("req-1").as_deref(), Some("pod-b"));
     }
 }

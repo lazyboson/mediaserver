@@ -1,3 +1,4 @@
+use crate::drain::DrainState;
 use crate::event_pump::PumpCounters;
 use crate::registry_keeper::KeeperCounters;
 use crate::tap_plane::TapPlaneMetrics;
@@ -18,6 +19,7 @@ pub struct MetricsSources {
     pub controller: Arc<SessionController>,
     pub pump: Option<Arc<PumpCounters>>,
     pub keeper: Option<Arc<KeeperCounters>>,
+    pub drain: Arc<DrainState>,
 }
 
 pub fn render(sources: &MetricsSources) -> String {
@@ -550,7 +552,23 @@ pub fn render(sources: &MetricsSources) -> String {
             "Sessions this pod gave up because another pod holds their lease",
             keeper.surrendered.load(Ordering::Relaxed),
         );
+        counter(
+            "mss_registry_handed_off_total",
+            "Leases released at shutdown so an adopter does not wait for the ttl",
+            keeper.handed_off.load(Ordering::Relaxed),
+        );
     }
+
+    let _ = writeln!(
+        out,
+        "# HELP mss_draining Whether this pod is draining and refusing new sessions"
+    );
+    let _ = writeln!(out, "# TYPE mss_draining gauge");
+    let _ = writeln!(
+        out,
+        "mss_draining {}",
+        u8::from(sources.drain.is_draining())
+    );
 
     let _ = writeln!(
         out,
@@ -643,6 +661,7 @@ mod tests {
             controller: Arc::new(SessionController::new("test-pod")),
             pump: Some(Arc::new(PumpCounters::default())),
             keeper: Some(Arc::new(KeeperCounters::default())),
+            drain: DrainState::shared(),
         }
     }
 
@@ -737,6 +756,14 @@ mod tests {
         assert!(!text.contains("mss_events_retry_depth"));
         assert!(!text.contains("mss_registry_persisted_total"));
         assert!(text.contains("mss_sessions_live"));
+    }
+
+    #[test]
+    fn the_drain_gauge_follows_the_flag_a_readiness_probe_will_read() {
+        let sources = sources();
+        assert!(render(&sources).contains("mss_draining 0"));
+        sources.drain.begin();
+        assert!(render(&sources).contains("mss_draining 1"));
     }
 
     #[tokio::test]

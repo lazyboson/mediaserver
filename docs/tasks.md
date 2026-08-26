@@ -4,7 +4,7 @@ Living work list. [roadmap.md](roadmap.md) holds the *why* and the phase exit
 criteria; this file holds the *what next*, ordered, with a definition of done
 for each item. Update it in the same PR that changes the state of an item.
 
-Status as of **2026-08-24**.
+Status as of **2026-08-26**.
 
 ## Milestones
 
@@ -2309,6 +2309,104 @@ item 29's drill is too short to spill. See the defect row.
 the monitor and the room object both hang off one member's session (D20);
 `deaf` and `hold` have item 40's socket tests only; PCMU 8 kHz/20 ms only.
 
+
+### 42. SIGTERM: drain on the signal Kubernetes actually sends (G1) — ✅ DONE (2026-08-26)
+
+**The bug this closes.** `main.rs` waited on `tokio::signal::ctrl_c()` only, so
+the only signal that started a shutdown was **SIGINT**. Kubernetes sends
+**SIGTERM**, and mediaserverd runs as PID 1 in its container, where an unhandled
+signal is *ignored* — so every rollout, scale-down and eviction ended in SIGKILL
+after `terminationGracePeriodSeconds`, exit 137: no lease release, no consumer
+stop frame, no recording upload, no unsubscribe. That is the pod-loss path of
+item 11 (a **14.41 s** consumer gap, plus the D14 orphan subscription) running on
+*every planned* restart.
+
+**What landed.** A new `crates/mediaserverd/src/drain.rs`:
+
+- `next_shutdown_signal()` selects over `ctrl_c()` and
+  `SignalKind::terminate()`, and names which arrived; both the control-plane and
+  the idle mode use it.
+- `DrainState` is the readiness `AtomicBool` (**G4 wires `/readyz` to it**),
+  exported now as the gauge `mss_draining`.
+- `run_drain(steps, budget)` runs the sequence against a `DrainSteps` trait, so
+  it is unit-testable with fakes, and bounds every step against one deadline:
+  **`MSS_DRAIN_TIMEOUT_SECS` (default 30)**. `exit_on_second_signal()` makes a
+  second signal an immediate `exit(0)`.
+
+The sequence, and who does the work:
+
+| Step | What it does |
+| --- | --- |
+| `stop-accepting` | `DrainState::begin()` (readiness off) + `SessionController::begin_drain()`: `CreateSession` and `Attach` answer `UNAVAILABLE: this pod is draining`, `MediaStream` refuses new streams and sends `Stop` to live ones, `WatchEvents` ends, and the tonic listener stops accepting |
+| `hand-off-leases` | aborts the keeper's renew task, then `RegistryKeeper::hand_off_leases()` → the new `SessionStore::release_lease` (DEL the lease key, **keep** the session record) so an adopter takes the call on its next sweep instead of after the 15 s TTL. Counter `mss_registry_handed_off_total` |
+| `close-sessions` | `destroy_session` per live session, which is the existing polite path: consumers get their WS `stop` frame / gRPC `Stop` (D3), recordings are finished — uploaded, or spilled for the next boot's salvage (D9) — and the tap is unsubscribed |
+| `control-plane-idle` | awaits the tonic server task, so in-flight RPCs and streams end before the process does |
+| `flush-events` | the existing 10 s `await_empty_backlog` window on the Kafka pump |
+
+**Measured live (2026-08-26), `lab/drain_drill.sh`** — a real MicroSIP call
+through OpenSIPS/rtpengine/FreeSWITCH, tapped by pod A with a WS consumer, pod B
+idle on the same Redis, then `docker stop -t 60` (SIGTERM; `-t 60` because
+docker's default 10 s is shorter than the drain window). Pod A's PID 1 is
+`mediaserverd` itself — `cargo run` exec-replaces itself — which is what makes
+the measurement about the daemon and not about cargo; the drill asserts it.
+
+```
+08:27:33.448 INFO shutdown signal received; draining the control plane signal=SIGTERM live_taps=1 drain_budget_secs=30
+08:27:33.448 INFO readiness is off and no new session or attachment will be taken here live_taps=1
+08:27:33.449 INFO drain step finished step=stop-accepting elapsed_ms=0
+08:27:33.450 INFO lease released for adoption ... external_id=draindrill-1787732824 owner=lab-control
+08:27:33.450 INFO drain step finished step=hand-off-leases elapsed_ms=1
+08:27:33.450 INFO the consumer websocket was closed after its stop frame media_sent=2022
+08:27:33.452 INFO tap leg finished track=Customer datagrams=1007 jitter_lost=0 recv_errors=0
+08:27:33.452 INFO tap leg finished track=Agent datagrams=1017 jitter_lost=0 recv_errors=0
+08:27:33.452 INFO session closed for shutdown: consumers stopped, recording finished, tap unsubscribed
+08:27:33.452 INFO drain step finished step=close-sessions elapsed_ms=2
+08:27:33.452 INFO the control plane listener closed
+08:27:33.452 INFO drain step finished step=control-plane-idle elapsed_ms=0
+08:27:33.478 INFO drain step finished step=flush-events elapsed_ms=25
+08:27:33.478 INFO drain complete elapsed_ms=30 leases_handed_off=1 sessions_closed=1 unsent_events=0
+08:27:33.478 INFO session registry totals at shutdown persisted=4 handed_off=1 lost=0 failed=0
+08:27:33.479 INFO event bus totals at shutdown published=3 failed=0 dropped=0 unsent=0
+08:27:33.483 INFO mediaserverd stopped
+```
+
+- **exit code 0**, `docker stop` returned in **0.44 s** — the whole drain took
+  **30 ms** of its 30 s budget, so the budget is a ceiling, not a cost.
+- **pod B adopted 2.7 s after the signal** (2.2 s after pod A exited) and
+  re-dialed the same WS endpoint; the lease moved `lab-control` →
+  `lab-control-b`.
+- the consumer's **audio gap was 1.96 s**, against **14.41 s** for the same
+  drill's SIGKILL sibling (item 11) — the same instrument, `lab/gap_consumer.py`,
+  and one artifact spanning the handover (2022 frames, then 12752).
+
+**Found and fixed on the way.** `SessionController::begin_drain` used
+`watch::Sender::send`, which is a **no-op when no receiver is alive** — a pod
+with no active `MediaStream` could be told to drain and stay `draining=false`.
+Now `send_replace`, which always updates. Caught by the new control-api test,
+not by the lab.
+
+**Decisions** (defaults preserve today's behavior exactly):
+
+- **Leases are handed off before taps are unsubscribed.** That allows a brief
+  double subscription (the adopter subscribes with its own to-tag while ours is
+  still up) and rules out a *gap*, which is the worse of the two; our
+  unsubscribe names our own to-tag, so it cannot disturb the adopter's.
+- **Budget shares:** lease hand-off is capped at `budget/4` and the event flush
+  keeps a reserve of `min(10 s, budget/3)`, so a hung Redis cannot eat the window
+  that closes consumers and finishes recordings. Unit-tested with fakes.
+- **Exit is always 0**, including when the window expires and when a second
+  signal cuts the drain short: a rollout must not read a shutdown as a crash
+  loop, and an unfinished recording upload is already covered by the spill +
+  next-boot salvage (D9).
+- **Spilling is not its own step.** `close-sessions` finishes each recording,
+  which uploads or spills on failure; a separate "spill everything" step would
+  duplicate `recorder.rs`'s own fallback.
+- `MSS_DRAIN_TIMEOUT_SECS=0` is legal and means "stop accepting and exit".
+
+**What it does not prove:** one pod stopped, not a rolling replace of many; no
+Kubernetes (the `terminationGracePeriodSeconds >= MSS_DRAIN_TIMEOUT_SECS`
+manifest is G6's); the timeout-expiry branches are fake-verified only, since the
+live drain finished in 30 ms.
 
 ## Open defects and soft spots
 

@@ -170,7 +170,7 @@ impl SessionController {
     }
 
     pub fn begin_drain(&self) {
-        let _ = self.draining.send(true);
+        self.draining.send_replace(true);
     }
 
     pub fn with_media_plane(mut self, media: Arc<dyn MediaPlane>) -> Self {
@@ -254,6 +254,17 @@ impl SessionController {
 
     pub fn drain_watch(&self) -> watch::Receiver<bool> {
         self.draining.subscribe()
+    }
+
+    pub fn is_draining(&self) -> bool {
+        *self.draining.borrow()
+    }
+
+    fn refuse_while_draining(&self) -> Result<(), Status> {
+        if self.is_draining() {
+            return Err(Status::unavailable("this pod is draining"));
+        }
+        Ok(())
     }
 
     pub(crate) async fn open_stream(
@@ -454,6 +465,7 @@ impl MediaControl for SessionController {
         &self,
         request: Request<proto::CreateSessionRequest>,
     ) -> Result<Response<proto::Session>, Status> {
+        self.refuse_while_draining()?;
         let message = request.into_inner();
         if message.external_id.is_empty() {
             return Err(Status::invalid_argument("external_id is required"));
@@ -543,6 +555,7 @@ impl MediaControl for SessionController {
         &self,
         request: Request<proto::AttachRequest>,
     ) -> Result<Response<proto::Attachment>, Status> {
+        self.refuse_while_draining()?;
         let message = request.into_inner();
         let session = self.resolve(message.session)?;
         let transport = transport(message.transport)?;

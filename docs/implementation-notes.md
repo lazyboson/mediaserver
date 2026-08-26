@@ -2103,7 +2103,8 @@ code. What differs:
 Three modes, in priority order: the Phase-0 tap spike when its env vars are
 set (unchanged scaffolding), the **control plane** when
 `MSS_CONTROL_LISTEN` is an `ip:port`, and otherwise an idle process that
-waits for a signal. `MSS_RTPENGINE_NODE` becomes the default node for
+waits for a signal — **SIGTERM or SIGINT** since item 42, which also gave the
+control-plane mode the bounded drain sequence in `drain.rs`. `MSS_RTPENGINE_NODE` becomes the default node for
 sessions that do not name one, `MSS_TAP_LOCAL_IP` the media address, and
 `MSS_POD_NAME` the `owner_pod` reported by `DescribeSession`.
 
@@ -2121,6 +2122,76 @@ identity), `pause`, `detach`, `play` and `destroy`.
 `crates/control-api/examples/mss_stream_probe.rs` is its data-plane sibling:
 it attaches a `GRPC_STREAM` consumer, subscribes, and writes what it hears
 as a wav per track with rms and peak — the tool the item-10 lab proof used.
+
+### drain.rs — the shutdown sequence (item 42, G1, 2026-08-26)
+
+The module exists because a graceful shutdown is a *sequence with a deadline*,
+and a sequence is only trustworthy if it can be tested without a lab. So the
+steps are a trait (`DrainSteps`) and the ordering + budgeting is a pure function
+over it (`run_drain`), with `ControlPlaneDrain` in `main.rs` as the only real
+implementation. The unit tests use a fake that records call order and can hang
+on any one step; time is `tokio::time::Instant` throughout (**not**
+`std::time::Instant` — the tests run under `start_paused`, where the std clock
+does not move and every budget assertion would be meaningless).
+
+- `next_shutdown_signal()` selects over `ctrl_c()` and
+  `SignalKind::terminate()`. Both mediaserverd modes use it — the control plane
+  and the idle "no `MSS_CONTROL_LISTEN`" process. A platform without SIGTERM
+  degrades to SIGINT with a warning rather than failing to start.
+- `DrainState` is a single `AtomicBool` behind an `Arc`. It is deliberately not
+  the controller's `watch` channel: a readiness probe wants a cheap synchronous
+  read from an HTTP handler. `metrics.rs` renders it as `mss_draining`, and G4
+  will answer `/readyz` from the same flag.
+- `exit_on_second_signal()` spawns a task that `exit(0)`s on the next signal.
+  Registering a second SIGTERM stream is fine; tokio's handler is process-wide
+  and never unregisters, so an impatient operator gets an immediate exit rather
+  than the default disposition.
+- Budget arithmetic: one deadline for the whole drain, and each step gets
+  `remaining - reserve`, capped. Lease hand-off is capped at `budget/4` and the
+  event flush holds a reserve of `min(10 s, budget/3)`. The point is that a hung
+  Redis (or a hung anything early) cannot consume the window that closes
+  consumers and finishes recordings. A step that expires or is skipped is named
+  in the log and in `DrainReport`; the process still exits 0, because the pod is
+  being replaced either way.
+
+Why the step order is what it is: the lease is handed off **before** the taps are
+unsubscribed, so the adopter can re-subscribe while our copy is still flowing.
+That allows a brief double subscription rather than a gap; rtpengine gives each
+subscription its own to-tag, so our unsubscribe cannot touch the adopter's. The
+alternative order guarantees a hole in the consumer's audio, which is the defect
+item 11 measured at 14.41 s.
+
+Spilling live recordings is not a step of its own. `close-sessions` calls
+`destroy_session`, which is `TapPlane::close_session` — it ends every attachment
+(the D3 polite path), and a recording attachment's `finish()` uploads or, on
+failure, spills to `MSS_RECORDING_SPILL_DIR` for the next boot's
+`recording_spill::salvage`. A separate spill step would duplicate that fallback
+and race it.
+
+### Related changes in the modules around it (item 42)
+
+- `session_store.rs` gained `SessionStore::release_lease(external_id, owner)`:
+  DEL the lease key when we still hold it, **keep** the session record and the
+  index entry. `forget` (an ended call) and `release_lease` (a call that should
+  move) are different operations and the drill's assertions depend on the
+  difference.
+- `registry_keeper.rs` gained `hand_off_leases()`, which drains
+  `persisted_here` through `release_lease` and counts
+  `mss_registry_handed_off_total`. `run` now takes `Arc<Self>` so `main.rs` can
+  keep the keeper alive after aborting its renew task — the abort must come
+  first, or a later `persist_and_renew` tick would `forget` records the adopter
+  now holds.
+- `control-api`: `create_session` and `attach` answer
+  `UNAVAILABLE: this pod is draining` (`describe`/`destroy`/`detach` keep
+  working — a draining pod must still be able to close its own work).
+  `begin_drain` now uses `watch::Sender::send_replace`: `send` is a **no-op when
+  no receiver is alive**, so a pod with no live `MediaStream` could be told to
+  drain and stay `draining=false`. That was a real latent bug in the existing
+  `serve_authenticated_until` shutdown path, found by a unit test.
+- `main.rs`: the tonic server now runs as a task whose shutdown future waits on
+  the controller's drain watch, rather than being awaited inline with a `ctrl_c`
+  future inside it. Awaiting it inline meant a long-lived `MediaStream` could
+  hold the whole shutdown open with nothing bounding it.
 
 ### hub.rs — the fan-out core (M3), first increment
 The per-session pub/sub the roadmap calls the fan-out hub. Two-worlds
