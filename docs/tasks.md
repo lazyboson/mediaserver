@@ -2601,6 +2601,90 @@ and `docker stop`, not by a kubelet (the manifests with `readinessProbe`/
 failing live (Redpanda stayed up; the failure path is unit-tested only); and a
 readiness flap under load has not been soaked.
 
+### 45. Preflight — check a target environment before deploying (G5) — ✅ DONE (2026-08-26)
+
+**The gap this closes.** Everything MSS needs from a deployment — an rtpengine
+that supports `subscribe request`, a media range rtpengine can actually reach, a
+Redis that expires keys, a Kafka topic, a writable bucket, a synchronised clock —
+was discoverable only by deploying mediaserverd and reading its logs when a call
+failed. The first session on real gear would have spent itself on someone else's
+firewall.
+
+**What landed.** `lab/preflight.sh`: POSIX sh front end (arg parsing, `MSS_*`
+defaults) plus one python3 **standard-library** engine, because a jump host has no
+`pip`. It calls `lab/kernel_probe.sh` for the kernel verdict and reuses the
+bencode/NG patterns from `ng_probe.py` / `ng_subscribe_probe.py` / `call_driver.py`
+rather than growing a second copy of them.
+
+Thirteen lines, each `PASS`/`FAIL`/`SKIP` with one sentence of why; non-zero exit
+on any `FAIL`; `--json` for a machine-readable report. The full table, both run
+transcripts and every flag are in [deploy.md](deploy.md#preflight--check-the-environment-before-deploying-into-it).
+
+- `ng_ping`, `ng_subscribe`, `ng_tap_media`, `ng_cleanup` — the tap handshake is
+  performed, not inferred: the tool **fabricates its own throwaway call**
+  (`offer`/`answer`, call-id `mss-preflight-<pid>-<epoch>`), subscribes to it,
+  pumps ~1 s of PCMU and counts what comes back on the subscription socket, then
+  `unsubscribe`/`delete` and a `query` that must answer *Unknown call-id*. Unique
+  cookie prefix per run and per command (defect D12).
+- `rtpengine_version` — SKIP by default, saying in one line that it **cannot be
+  asked over NG** and naming the three places to read it on the host (H2 stays
+  open, but is now self-explaining).
+- `redis` — `SET NX EX 30` / `TTL` / `DEL` over raw RESP; that *is* the registry
+  lease. `kafka` — TCP to each broker. `s3` — put/head/delete of a probe object
+  with SigV4 signed in `hmac`/`hashlib`, then a HEAD proving it is gone.
+- `media_ports` — the range's real capacity (even ports only) and a bind test.
+  `media_udp` — with `--ssh <rtpengine-host>`, a datagram sent *from* rtpengine's
+  host into the range. `clock` — chrony/timedatectl, 100 ms tolerance.
+
+**Measured live in the lab (2026-08-26)**, run inside `mss-microsip_lab` from a
+`python:3-slim` container because the NG port is not published to the WSL host:
+
+```
+green (exit 0):  10 PASS, 0 FAIL, 3 SKIP
+   ng_tap_media  49 tapped RTP datagrams arrived at 172.31.99.2:36965 of 98 pumped
+   s3            put/head/delete on MinIO via stdlib SigV4, HEAD -> 404 afterwards
+   redis         SET NX / TTL 30s / DEL round-tripped
+red (exit 1):    3 PASS, 3 FAIL, 6 SKIP  (--ng ...:22223, --bucket wrong-bucket-name)
+   FAIL ng_ping            no reply in 3 tries over 6 s
+   FAIL kernel_forwarding  kernel_probe.sh could not reach rtpengine
+   FAIL s3                 PUT -> HTTP 404 NoSuchBucket
+third run:       kafka_topic PASS (probe record produced to a topic and read back,
+                 with kafka-python-ng installed) and media_udp PASS (datagram from
+                 the "rtpengine host" arrived on 40100, via an ssh shim)
+after all three: rtpengine answered "Unknown call-id" for every fabricated call-id
+                 and the bucket held no probe object
+```
+
+**Decisions** (recorded here so nobody relitigates them from the code):
+
+- **Userspace-only forwarding is a PASS**, not a FAIL. MSS taps a userspace relay
+  just as well; the difference is rtpengine's CPU per call (architecture §8.1).
+  `kernel_probe.sh` exit 2 ("cannot tell") is a SKIP, exit 3 (unreachable) a FAIL.
+- **A SKIP always names the command that would answer the question.** "Probably
+  fine" is not a preflight result; the summary line says every SKIP is an
+  unchecked assumption.
+- **The Kafka wire protocol is not hand-rolled.** `kafka_topic` produces and reads
+  back only if a `kafka` client is importable; otherwise it SKIPs pointing at
+  `rpk topic describe` on a broker host. A second implementation of what rskafka
+  already does would be a liability, not a check.
+- **S3 is SigV4 in the standard library**, ~60 lines, because it is the only way
+  to check a bucket from a host with no boto3 and no CLI; `aws` is the fallback
+  when no keys are passed (it can read a role or a profile) and the line always
+  says which path was used.
+- **The version check is advisory and `ng_subscribe` is the authority.** Doing the
+  handshake beats reading a number, and rtpengine will not give the number anyway.
+- **The tap check pumps real RTP.** A subscription that is accepted but delivers
+  nothing is the exact failure a firewall or a wrong `MSS_MEDIA_ADVERTISE_IP`
+  produces, and it is invisible to a handshake-only probe.
+
+**What it does not prove:** no real deployment — every run was against the lab
+(one rtpengine, MinIO, Redpanda, Redis on one Docker network); the `--ssh`
+transport itself was exercised through a **shim** that ran the remote command
+locally, so argument passing and the sender snippet are proven but a real
+`ssh` hop is not; `clock` has never run anywhere with chrony present; the `aws`
+and `mc` fallbacks are code-reviewed, not run; and a probe record on the
+configured topic is the one side effect the tool cannot take back.
+
 ## Open defects and soft spots
 
 | # | Item | Where | Severity |
@@ -2644,7 +2728,7 @@ the worked example of each handoff.
 | # | Handoff | What MSS already provides | What the integrator owes |
 | --- | --- | --- | --- |
 | H1 | **An event consumer for `mss.events`** | typed `MediaEvent` on one Kafka topic, keyed by `external_id`, gapless per-session `seq`, at-least-once since D5 (so dedupe by `(external_id, seq)`), `legacy_eligible` marking the authoritative attachment | a consumer that renders those events onto whatever the existing control plane already understands. *Worked example:* the reference deployment's translator, which maps them onto its legacy positional `eventTopic` format — written, awaiting review and merge in its own repository (item 1) |
-| H2 | **The deployed rtpengine version check** | `subscribe` verified against lab rtpengine 14.1.1.8; `lab/kernel_probe.sh` prints the finding on any host | read the version from the process, the package or rtpengine's CLI interface (`--listen-cli`) on the target host. **It cannot be asked over NG** — rtpengine has no NG `version` command, in this build or upstream (item 23). If the deployed build lacks `subscribe`, the ingest model needs an upgrade path first |
+| H2 | **The deployed rtpengine version check** | `subscribe` verified against lab rtpengine 14.1.1.8; `lab/kernel_probe.sh` prints the finding on any host, and `lab/preflight.sh` prints it as one `rtpengine_version` line | read the version from the process, the package or rtpengine's CLI interface (`--listen-cli`) on the target host. **It cannot be asked over NG** — rtpengine has no NG `version` command, in this build or upstream (item 23). If the deployed build lacks `subscribe`, the ingest model needs an upgrade path first |
 | H3 | **rtpengine-side per-tap cost on the target metal** | the MSS-side cost is measured; `lab/kernel_probe.sh` plus the read-only checklist in architecture §8.1 is the instrument | run it on the real box: `relayedpackets_kernel` vs `_user` and `media_kernel` vs `media_userspace` across baseline / taps-with-transcode / taps-without-transcode. This sets the rtpengine capacity plan. D14 is fixed (item 25), so a pod restart mid-probe no longer pollutes the numbers |
 | H4 | **End-to-end barge-in through the integrator's stack** | every MSS-owned hop is measured: consumer `SpeechReport` → bus → `StopPlayback` at **p50 3.5 ms** (item 5), and inline `Clear` → silence at the peer's ear at **p50 12.2 ms**, one ptime (item 35) | the tail is theirs: their event consumer (H1) and their prompt player. Measure the whole path against their perceptual budget |
 | H5 | **The SIP proxy's B2B integration for inline legs** | `CreateSession{kind=INLINE, sdp_offer}` returns a real SDP answer and the leg speaks and listens on real sockets; a `group` seats it in a conference | offer/answer plumbing from their proxy or B2BUA into that API. No inline leg in this repository has met a **SIP** endpoint — every inline and conference measurement is against an RTP peer with no signalling |

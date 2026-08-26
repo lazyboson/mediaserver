@@ -2112,3 +2112,46 @@ assertions are measuring their own distortion.
   from item 40 only.
 - Only PCMU at 8 kHz/20 ms. No per-leg resampler exists, and a conference
   refuses a rate/ptime mismatch by name.
+
+## preflight.sh — the environment check, tried on the lab (2026-08-26)
+
+`lab/preflight.sh` (item 45, G5) is not a drill: it is the tool an operator runs
+on a jump host *before* deploying mediaserverd, and the lab is simply the first
+environment it was pointed at. The check table, every flag and both run
+transcripts live in [deploy.md](deploy.md#preflight--check-the-environment-before-deploying-into-it);
+what belongs here is how to run it against this lab and what the lab could not
+exercise.
+
+The NG port is not published to the WSL host, so run it inside the lab network:
+
+```sh
+DOCKER_API_VERSION=1.43 docker run --rm --network mss-microsip_lab \
+  -v "$PWD/lab":/lab:ro -w /lab python:3-slim sh /lab/preflight.sh \
+  --ng 172.31.99.10:22222 --redis redis://172.31.99.61:6379 \
+  --kafka 172.31.99.60:9092 --s3-endpoint http://172.31.99.62:9000 \
+  --bucket lab-recordings --access-key minioadmin --secret-key minioadmin \
+  --media-ports 40100-40139 --rtpengine-version 14.1.1.8
+```
+
+**10 PASS, 0 FAIL, 3 SKIP, exit 0.** The interesting line is `ng_tap_media`: the
+tool fabricates its own two-legged call through rtpengine, subscribes to the
+caller's from-tag, pumps ~1 s of PCMU into both legs and counted **49 datagrams**
+arriving on its subscription socket — the same mechanism `tap_live_call.sh` uses,
+compressed into a check that needs no lab and no mediaserverd. Then it
+unsubscribes, deletes, and `query` answers *Unknown call-id*.
+
+Pointing it at the wrong NG port and a bucket that does not exist turned it red
+(`3 PASS, 3 FAIL, 6 SKIP`, exit 1) with `NoSuchBucket` quoted from MinIO's own
+error body.
+
+### What the lab container cannot exercise, and what was done about it
+
+- **No kafka client library** in `python:3-slim`, so `kafka_topic` SKIPs by
+  design. A third run with `pip install kafka-python-ng` produced a probe record
+  to `mss.preflight.probe` and read it back at partition 0 offset 0 — then the
+  topic was deleted again, because a preflight should not litter a broker.
+- **No ssh, and no second host to ssh to.** `media_udp` was proved through a
+  shim on `PATH` named `ssh` that runs the command locally: the listener, the
+  remote sender snippet and the argument passing are real, the ssh hop is not.
+- **No chrony, no timedatectl** in a container — `clock` SKIPs and says so. That
+  check is only meaningful on the host mediaserverd will run on.
