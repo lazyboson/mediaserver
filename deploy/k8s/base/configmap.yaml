@@ -1,0 +1,97 @@
+# Every MSS_* variable mediaserverd reads that is not a credential. The
+# authority is crates/mediaserverd/src (the *_ENV consts); docs/deploy.md is the
+# prose version of this file. An EMPTY value means "unset" for every knob that
+# has an unset state, so a variable can be neutralised here without deleting it.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mediaserverd-env
+  labels:
+    app.kubernetes.io/name: mediaserver
+data:
+  # --- Listeners -------------------------------------------------------------
+  # MediaControl + TelCompat + the gRPC MediaStream data plane, all on one port.
+  # Unset means "idle": the daemon starts, probes rtpengine and serves nothing.
+  MSS_CONTROL_LISTEN: "0.0.0.0:50051"
+  # /healthz, /readyz and /metrics. Unset means counters stay in the logs and
+  # the probes in this Deployment have nothing to talk to.
+  MSS_METRICS_LISTEN: "0.0.0.0:9464"
+
+  # --- rtpengine -------------------------------------------------------------
+  # The default NG control socket, used when CreateSession names no node. MSS
+  # pings it at startup and re-probes it on MSS_HEALTH_PROBE_INTERVAL_SECS.
+  MSS_RTPENGINE_NODE: "10.0.0.5:22222"
+  # "on" (default) asks rtpengine to transcode the tap into MSS_TAP_FORMAT;
+  # "off" takes the call's own codec, which is the only setting that can keep a
+  # tapped call on rtpengine's kernel fast path (architecture 8.1). With "off",
+  # a codec MSS cannot decode is refused by name at subscribe time.
+  MSS_TAP_TRANSCODE: "on"
+  # pcmu (default) | pcma | opus -- what the tap is decoded as.
+  MSS_TAP_FORMAT: "pcmu"
+  # 8000 | 12000 | 16000 | 24000 | 48000; default 16000. Opus taps only.
+  MSS_OPUS_DECODE_RATE_HZ: "16000"
+
+  # --- Media addressing ------------------------------------------------------
+  # What media and NG sockets BIND. 0.0.0.0 is the default and is right for a
+  # pod network; on hostNetwork set it to the node address (see that overlay).
+  MSS_TAP_LOCAL_IP: "0.0.0.0"
+  # What MSS puts in every SDP it hands a peer (the tap's subscribe answer and
+  # an inline leg's answer). Empty = the bind address. Set it whenever the
+  # address rtpengine must reach is not the address the pod binds. Both
+  # overlays set it from the node IP through the downward API.
+  MSS_MEDIA_ADVERTISE_IP: ""
+  # The inclusive UDP range every media socket binds inside. EVEN PORTS ONLY
+  # are handed out, so N ports serve N/2 tapped legs -- a two-party call takes
+  # two. Empty/unset = an ephemeral port per socket, which no firewall can
+  # describe. Both overlays set a real range.
+  MSS_MEDIA_PORT_MIN: ""
+  MSS_MEDIA_PORT_MAX: ""
+
+  # --- Session registry (HA) -------------------------------------------------
+  # Ownership leases, so another pod adopts a tap when this one dies. Unset =
+  # sessions live and die with this pod.
+  MSS_REDIS_URL: "redis://redis.mediaserver.svc.cluster.local:6379"
+
+  # --- Event bus -------------------------------------------------------------
+  # Comma-separated bootstrap brokers. Unset = events stay in-process, which
+  # means nothing downstream sees a MediaEvent. A configured-but-unreachable
+  # bus makes the daemon REFUSE TO START, on purpose.
+  MSS_KAFKA_BROKERS: "kafka.mediaserver.svc.cluster.local:9092"
+  MSS_EVENTS_TOPIC: "mss.events"
+  # Partition count used when the topic has to be created; default 4.
+  MSS_EVENTS_PARTITIONS: "4"
+
+  # --- Recording -------------------------------------------------------------
+  # The bucket holding ${accountID}/${recordingID}.${format}. Unset = file-s3
+  # attachments are refused; unusable = refuse to start.
+  MSS_RECORDING_BUCKET: "call-recordings"
+  # Leave empty for AWS proper; set it for MinIO or any other S3 API.
+  MSS_RECORDING_S3_ENDPOINT: ""
+  MSS_RECORDING_S3_REGION: "us-east-1"
+  # Closed segments spill here so a container restart does not lose them
+  # (defect D9). Must be a writable volume -- the root filesystem is read-only
+  # and the process runs as uid 65532.
+  MSS_RECORDING_SPILL_DIR: "/var/lib/mediaserverd/spill"
+  # How often a live recording spills, in seconds; default 30. This is the
+  # worst-case audio loss when the container dies mid-call.
+  MSS_RECORDING_SPILL_SECONDS: "30"
+
+  # --- Lifecycle -------------------------------------------------------------
+  # Ceiling on the whole shutdown drain. terminationGracePeriodSeconds in the
+  # Deployment must stay AT OR ABOVE this value.
+  MSS_DRAIN_TIMEOUT_SECS: "30"
+  # How often the background watchers re-probe Redis, Kafka and rtpengine for
+  # /readyz; default 10. A failing dependency is re-probed sooner (1, 2, 4, 8 s).
+  MSS_HEALTH_PROBE_INTERVAL_SECS: "10"
+
+  # --- Logging ---------------------------------------------------------------
+  # tracing-subscriber EnvFilter; the logs are JSON either way.
+  RUST_LOG: "info"
+
+  # NEVER set MSS_TAP_CALL_ID here. It switches the binary out of the daemon
+  # into the one-shot phase-0 tap spike: it taps that one call, writes a file
+  # and exits, and serves no API at all. Same for its companions
+  # (MSS_TAP_FROM_TAGS, MSS_TAP_OUTPUT, MSS_TAP_SECONDS, MSS_TAP_DATAGRAM_LOG_DIR,
+  # MSS_LISTENERS, MSS_CONSUMER_URL, MSS_CONSUMER_ACCOUNT_ID,
+  # MSS_CONSUMER_STREAM_SID, MSS_CONSUMER_TRACKS, MSS_INJECT_TARGET) -- they are
+  # lab instruments, documented in docs/lab.md, and they do nothing without it.

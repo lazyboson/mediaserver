@@ -1,0 +1,17 @@
+# A voluntary eviction of one pod costs its callers an audio gap while another
+# pod adopts the taps (measured: 1.96 s after a SIGTERM drain, 14.41 s after a
+# SIGKILL). Two at once costs the whole fleet's calls at the same time, so hold
+# the drain to one pod: maxUnavailable 1, not minAvailable, so the budget still
+# means "one at a time" after an HPA scale-out.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: mediaserverd
+  labels:
+    app.kubernetes.io/name: mediaserver
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: mediaserver
+      app.kubernetes.io/component: media-plane

@@ -1,0 +1,23 @@
+# mediaserverd on the node's network stack, with a wide media range. See
+# deployment-hostnetwork.yaml for the trade-off against ../hostport, and
+# docs/deploy.md for the firewall matrix.
+#
+# There is no NetworkPolicy in this overlay on purpose: a hostNetwork pod is not
+# on the pod network, so most of what a policy could say about it is not
+# enforced. The firewall for this variant lives on the node -- iptables, the
+# security group, or whatever fronts it. The matrix in docs/deploy.md is written
+# so it can be handed to whoever owns that.
+#
+# EGRESS is unchanged from the base: NG out to each rtpengine's 22222/udp,
+# Redis, Kafka and S3 out as ordinary TCP. On hostNetwork all of it leaves with
+# the node's source address, which is often what an external firewall is
+# already written against.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - ../../base
+
+patches:
+  - path: deployment-hostnetwork.yaml
+  - path: media-range.yaml

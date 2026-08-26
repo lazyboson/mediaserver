@@ -1,0 +1,25 @@
+# Requires the Prometheus Operator CRDs. Without them, drop this file and the
+# PrometheusRule from kustomization.yaml and scrape
+# mediaserverd-scrape:9464/metrics however you already scrape things -- nothing
+# in mediaserverd depends on the operator.
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: mediaserverd
+  labels:
+    app.kubernetes.io/name: mediaserver
+    # Most Prometheus instances select ServiceMonitors by a label like this
+    # one. Match yours or the monitor is quietly ignored.
+    release: prometheus
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: mediaserver
+      app.kubernetes.io/component: metrics
+  endpoints:
+    - port: metrics
+      path: /metrics
+      # The alert rules use rate(...[5m]) windows, so anything slower than 30 s
+      # makes a short drop burst invisible.
+      interval: 15s
+      scrapeTimeout: 10s
