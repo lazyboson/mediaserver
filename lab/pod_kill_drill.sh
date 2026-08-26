@@ -20,6 +20,24 @@
 # The compose "mediaserverd" service (the Phase-0 spike) must stay DOWN: it
 # taps whatever call it finds from its own process.
 #
+# With RECORD=1 (item 53, defect D9) the call also carries a FILE_S3 recording,
+# so the drill measures what a pod death costs a recording: pod A spills its
+# closed segments into the recording bucket under the reserved _spill/ prefix,
+# the adopter reads them back, and the final object must be within one spill
+# interval plus the adoption gap of the tapped length. That needs the pods
+# started with MSS_RECORDING_SPILL_TO=s3 (and a short
+# MSS_RECORDING_SPILL_SECONDS, or nothing spills inside the drill's window):
+#
+#   printf 'MSS_RECORDING_SPILL_TO=s3\nMSS_RECORDING_SPILL_SECONDS=5\n' >>lab/.env
+#   DOCKER_API_VERSION=1.43 docker compose -f lab/docker-compose.microsip.yml \
+#     up -d --force-recreate mss-control mss-control-b mss-control-c
+#   RECORD=1 ./lab/pod_kill_drill.sh
+#
+# Mind the lab's own shortcut: all three pods mount the same ./out, so
+# MSS_RECORDING_SPILL_DIR is cross-pod readable *here* and a disk spill would
+# look like it works. The preflight below refuses RECORD=1 unless the pod's own
+# log says the journal lives in the bucket.
+#
 # lab/gap_consumer.py runs on the host, not in a container, because it has to
 # outlive pod A and be dialable by both pods. The pods reach it at
 # host.docker.internal (CONSUMER_HOST): under Docker Desktop on WSL2 the lab
@@ -47,11 +65,23 @@ RTPENGINE=${RTPENGINE:-mss-microsip-rtpengine-1}
 LAB_NETWORK=${LAB_NETWORK:-mss-microsip_lab}
 CONSUMER_HOST=${CONSUMER_HOST:-host.docker.internal}
 CONSUMER_PORT=${CONSUMER_PORT:-8095}
-CALL_SECONDS=${CALL_SECONDS:-150}
-TAP_SECONDS=${TAP_SECONDS:-20}
+RECORD=${RECORD:-0}
+if [ "$RECORD" = 1 ]; then
+  CALL_SECONDS=${CALL_SECONDS:-190}
+  TAP_SECONDS=${TAP_SECONDS:-30}
+else
+  CALL_SECONDS=${CALL_SECONDS:-150}
+  TAP_SECONDS=${TAP_SECONDS:-20}
+fi
 ADOPT_TIMEOUT=${ADOPT_TIMEOUT:-60}
 SETTLE_SECONDS=${SETTLE_SECONDS:-25}
 DIAL=${DIAL:-9000}
+SPILL_SECONDS=${SPILL_SECONDS:-5}
+SPILL_PREFIX=${SPILL_PREFIX:-_spill/}
+RECORD_ACCOUNT=${RECORD_ACCOUNT:-acct-kill}
+RECORD_RATE=${RECORD_RATE:-8000}
+RECORD_CHANNELS=${RECORD_CHANNELS:-2}
+BUCKET=${BUCKET:-lab-recordings}
 DOCKER_API_VERSION=${DOCKER_API_VERSION:-1.43}
 export DOCKER_API_VERSION
 
@@ -63,6 +93,13 @@ CALL_ID=""
 FROM_TAGS=""
 GAP=""
 CALLER=""
+RECORDER=""
+RECORDING=${RECORDING:-rec-$STAMP}
+ENDPOINT="$RECORD_ACCOUNT/$RECORDING.wav"
+TAP_STARTED_AT=""
+KILLED_AT=""
+ADOPTED_AT=""
+DESTROYED_AT=""
 
 mkdir -p "$OUT"
 say() { echo "drill: $*" | tee -a "$LOG"; }
@@ -111,6 +148,21 @@ for endpoint in "$METRICS_A" "$METRICS_B" $METRICS_C; do
     exit 1
   fi
 done
+MINIO=${MINIO:-$(docker ps --filter name=minio --format '{{.Names}}' | head -1)}
+if [ "$RECORD" = 1 ]; then
+  if ! docker logs "$POD_A" 2>&1 |
+       grep -q 'spill into the recording bucket itself'; then
+    say "RECORD=1 needs the pods started with MSS_RECORDING_SPILL_TO=s3, or a \
+cross-pod adopter reads nothing (and this lab's shared ./out mount would hide \
+that). See the header of this script."
+    exit 1
+  fi
+  if [ -z "$MINIO" ]; then
+    say "RECORD=1 needs minio up to read the object back"
+    exit 1
+  fi
+  say "recording this call to $ENDPOINT, spill prefix $SPILL_PREFIX in bucket $BUCKET"
+fi
 BASE_ADOPTED_B=$(metric "$METRICS_B" mss_registry_adopted_total)
 BASE_LOST_B=$(metric "$METRICS_B" mss_registry_lost_total)
 BASE_ADOPTED_C=0
@@ -176,6 +228,13 @@ cargo run --quiet -p control-api --example mss_ctl -- \
     "$CONTROL_A" create "$EXTERNAL_ID" "$CALL_ID" "$FROM_TAGS" 2>&1 | tee -a "$LOG"
 cargo run --quiet -p control-api --example mss_ctl -- \
     "$CONTROL_A" attach "$EXTERNAL_ID" "$CONSUMER" gapmeter authoritative 2>&1 | tee -a "$LOG"
+if [ "$RECORD" = 1 ]; then
+  RECORDER=$(cargo run --quiet -p control-api --example mss_ctl -- \
+    "$CONTROL_A" record "$EXTERNAL_ID" "$ENDPOINT" 2>&1 | tee -a "$LOG" |
+    sed -n 's/.*attachment_id: "\([^"]*\)".*/\1/p')
+  say "recorder attachment $RECORDER on pod A"
+fi
+TAP_STARTED_AT=$(date +%s.%N)
 
 say "letting pod A's tap run for ${TAP_SECONDS}s"
 sleep "$TAP_SECONDS"
@@ -187,6 +246,16 @@ say "lease before the kill: owner=$(docker exec "$REDIS" redis-cli --raw \
 say "pod A delivered $(metric "$METRICS_A" mss_consumer_delivered_total) frames, \
 sessions_live=$(metric "$METRICS_A" mss_sessions_live) \
 legs_live=$(metric "$METRICS_A" mss_legs_live)"
+BASE_SEGMENTS_A=0
+if [ "$RECORD" = 1 ]; then
+  BASE_SEGMENTS_A=$(metric "$METRICS_A" mss_recording_spill_segments_total)
+  say "pod A spilled $BASE_SEGMENTS_A closed segments before the kill, \
+recordings_live=$(metric "$METRICS_A" mss_recordings_live)"
+  if [ "$BASE_SEGMENTS_A" = "0" ]; then
+    say "nothing had spilled yet: raise TAP_SECONDS or lower \
+MSS_RECORDING_SPILL_SECONDS, or this drill measures nothing about D9"
+  fi
+fi
 
 # --- the kill: SIGKILL to the container, which is a node loss -------------
 docker logs "$POD_A" >"$OUT/pod-a-$STAMP.log" 2>&1 || true
@@ -255,6 +324,7 @@ wait "$CALLER" 2>/dev/null || true
 CALLER=""
 cargo run --quiet -p control-api --example mss_ctl -- \
     "$WINNER" destroy "$EXTERNAL_ID" 2>&1 | tee -a "$LOG" || true
+DESTROYED_AT=$(date +%s.%N)
 tags after-destroy
 
 # rtpengine's teardown summary is the instrument that settles the orphan
@@ -280,6 +350,51 @@ docker logs "$POD_B" >"$OUT/pod-b-$STAMP.log" 2>&1 || true
 grep -h 'tap leg finished' "$OUT/pod-b-$STAMP.log" "$OUT/pod-c-$STAMP.log" 2>/dev/null |
   tail -4 | tee -a "$LOG" || true
 
+RECORD_VERDICT=""
+if [ "$RECORD" = 1 ]; then
+  say "waiting for the adopter's upload to settle"
+  waited=0
+  while [ "$waited" -lt 60 ]; do
+    if docker exec "$MINIO" sh -c \
+        "mc alias set lab http://127.0.0.1:9000 minioadmin minioadmin >/dev/null &&
+         mc stat lab/$BUCKET/$ENDPOINT" >"$OUT/rec-stat-$STAMP.txt" 2>&1; then
+      break
+    fi
+    waited=$((waited + 1))
+    sleep 1
+  done
+  cat "$OUT/rec-stat-$STAMP.txt" | tee -a "$LOG"
+  SIZE=$(sed -n 's/^Size *: *//p' "$OUT/rec-stat-$STAMP.txt" | head -1)
+  BYTES=$(docker exec "$MINIO" sh -c \
+    "mc alias set lab http://127.0.0.1:9000 minioadmin minioadmin >/dev/null &&
+     mc ls --json lab/$BUCKET/$ENDPOINT" 2>/dev/null |
+    sed -n 's/.*"size":\([0-9]*\).*/\1/p' | head -1)
+  BYTES=${BYTES:-0}
+  RECORDED=$(echo "$BYTES $RECORD_RATE $RECORD_CHANNELS" |
+    awk '{ if ($1 > 44) printf "%.2f", ($1 - 44) / (2 * $3 * $2); else print "0" }')
+  TAPPED=$(echo "$DESTROYED_AT $TAP_STARTED_AT" | awk '{printf "%.2f", $1 - $2}')
+  GAP_SECONDS=$(echo "$ADOPTED_AT $KILLED_AT" | awk '{printf "%.2f", $1 - $2}')
+  ALLOWED=$(echo "$SPILL_SECONDS $GAP_SECONDS" | awk '{printf "%.2f", $1 + $2 + 2}')
+  MISSING=$(echo "$TAPPED $RECORDED" | awk '{printf "%.2f", $1 - $2}')
+  say "recording $ENDPOINT: size=${SIZE:-$BYTES bytes} -> ${RECORDED}s of audio \
+against ${TAPPED}s tapped; missing ${MISSING}s, allowed ${ALLOWED}s \
+(one ${SPILL_SECONDS}s spill interval + the ${GAP_SECONDS}s adoption gap + 2s slack)"
+  say "the adopter's recording counters: \
+frames_lost_on_adopt=$(metric "$WINNER_METRICS" mss_recording_frames_lost_on_adopt_total) \
+spill_segments=$(metric "$WINNER_METRICS" mss_recording_spill_segments_total) \
+spill_lost_ownership=$(metric "$WINNER_METRICS" mss_recording_spill_lost_ownership_total) \
+spill_foreign_manifests=$(metric "$WINNER_METRICS" mss_recording_spill_foreign_manifests) \
+uploads=$(metric "$WINNER_METRICS" mss_recording_uploads_total) \
+upload_failures=$(metric "$WINNER_METRICS" mss_recording_upload_failures_total)"
+  say "what is left under the reserved spill namespace (it must be empty, \
+because the adopter finished the object and discarded the journal):"
+  docker exec "$MINIO" sh -c \
+    "mc alias set lab http://127.0.0.1:9000 minioadmin minioadmin >/dev/null &&
+     mc ls -r lab/$BUCKET/$SPILL_PREFIX" 2>&1 | tee -a "$LOG" || true
+  RECORD_VERDICT=$(echo "$MISSING $ALLOWED" |
+    awk '{ if ($1 <= $2) print "PASS"; else print "FAILED" }')
+fi
+
 say "=== the three assertions ==="
 say "1. exactly one adopter: $ADOPTERS (pod B $BASE_ADOPTED_B -> \
 $(metric "$METRICS_B" mss_registry_adopted_total), pod C $BASE_ADOPTED_C -> \
@@ -292,6 +407,12 @@ after-adoption=$AFTER after-destroy=$SUBSCRIPTIONS. after-adoption 2 means \
 pod A's subscription was left behind; and tapped-by-A reads 0 because a lone \
 subscription is invisible to query (see the final-packet-stats block above, \
 which is the honest instrument)"
+if [ "$RECORD" = 1 ]; then
+  say "4. the recording survived the kill: $RECORD_VERDICT -- ${RECORDED}s of \
+${TAPPED}s, missing ${MISSING}s against an allowance of ${ALLOWED}s. Put this \
+number in lab.md; it is the live pod-kill-with-a-recorder drill D9 has owed \
+since item 30"
+fi
 say "done. artifacts in $OUT: gap-$STAMP-*.wav, gap-$STAMP-summary.json, $LOG"
 say "restart pod A with: docker compose -f $HERE/docker-compose.microsip.yml \
 up -d mss-control"

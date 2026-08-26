@@ -3282,58 +3282,105 @@ on 2026-08-26 and that these items rely on:
   anywhere in that state; the control world has no housekeeping tick (only
   `RegistryKeeper::run` and `health::watch` recur).
 
-### 53. Spill to the recording bucket, so any pod can resume a recording (D9)
-**Where:** `crates/mediaserverd/src/{recording_spill.rs,recorder.rs,registry_keeper.rs,main.rs}`,
-`docs/deploy.md`, `lab/pod_kill_drill.sh`.
-**What:** give the segment journal a second backend that writes its
-`manifest.json` and `NN-seq.pcm` chunks into the **recording bucket itself**
-under a reserved prefix, so an adopter on any pod reads the dead pod's closed
-segments back exactly as the same pod does today.
-**Decisions, made:**
-- `MSS_RECORDING_SPILL_TO=disk|s3`, default `disk` (today's behaviour to the
-  byte; `disk` with no `MSS_RECORDING_SPILL_DIR` still means "no spill"). `s3`
-  spills under `MSS_RECORDING_SPILL_PREFIX` (default `_spill/`) in the
-  recording bucket: `<prefix><account>/<recording>/<first-target-object-key
-  with '/' kept>/manifest.json` and chunks beside it — the same layout the disk
-  journal uses, so `SpillManifest` is unchanged. The prefix is a reserved
-  namespace: document it in deploy.md beside the frozen identity, with a
-  bucket lifecycle rule (expire `_spill/` after 7 days) as the retention
-  policy MSS does not implement.
-- One trait, `SpillStore { write, read, list_manifests, remove }`, two
-  implementations: `DiskSpill` (extract from today's code, no behaviour
-  change) and `ObjectSpill` over `RecordingSink`, which gains `get`, `list`
-  and `delete` (object_store has all three; extend every fake). Journal I/O
-  stays off the recorder's hot path exactly as now (`spawn_blocking` for disk,
-  awaited put for s3, both bounded by a timeout; a failed spill is counted,
-  never fatal).
-- **Ownership is in the manifest.** `SpillManifest.owner` already exists. An
-  adopter rewrites it to itself before its first `append`; `append` on the
-  original pod re-reads the manifest and, if `owner` is no longer itself,
-  stops spilling and counts `mss_recording_spill_lost_ownership_total` — a
-  partitioned-but-alive pod cannot corrupt an adopted journal.
-- `PersistedRecording.owner` stops gating read-back: `recorder::run`'s resume
-  path (`recorder.rs:1015–1045`) reads back whatever the store holds for that
-  journal and pads only the frames that are neither in memory nor spilled.
-  `frames_lost_on_adopt` therefore falls to at most `MSS_RECORDING_SPILL_SECONDS`
-  on **any** pod — write that as the invariant in the test name.
-- Startup salvage (`recording_spill::salvage`, `main.rs:379`) lists manifests
-  in the configured store and salvages only those whose `owner` is this pod,
-  as today; a manifest with a foreign owner is counted
-  (`mss_recording_spill_foreign_manifests`) and left alone — adoption, not
-  salvage, is the cross-pod path.
-**Verify:** (1) `MemorySink` shared between two `RecordingPlane`/keeper fakes in
-`registry_keeper.rs` tests: pod A records and spills twice, dies, pod B adopts
-and finishes — the object holds every spilled frame and `frames_lost_on_adopt`
-≤ one spill interval; the ownership-steal test; a salvage test that leaves a
-foreign manifest untouched. (2) `tests/minio_upload.rs` gains an env-gated case
-spilling to real MinIO and reading back. (3) `lab/pod_kill_drill.sh` gains
-`RECORD=1`: a `FILE_S3` attachment on the tapped call, `kill -9` the owner,
-assert the final object's duration is within one spill interval plus the
-adoption gap of the call's length, and record the number in lab.md — this is
-the "live pod-kill drill with a recorder attached" D9 has owed since item 30.
-**Done when:** the D9 row reads closed but for retention, deploy.md documents
-`MSS_RECORDING_SPILL_TO`, the prefix and the lifecycle rule, and the drill
-number is in lab.md.
+### 53. Spill to the recording bucket, so any pod can resume a recording (D9) — ✅ DONE (2026-08-26)
+
+**What shipped.** The segment journal grew a backend seam and a second backend,
+and nothing above it changed shape.
+
+- `SpillStore` in `recording_spill.rs` — `write` / `read` / `read_manifest` /
+  `list_manifests` / `remove` / `describe` — with `DiskSpill` (today's code
+  extracted, byte-for-byte the same layout and the same `spawn_blocking` calls)
+  and `ObjectSpill` over `RecordingSink`. A journal is named by the first
+  target's object key, which is the identity the disk layout already used, so
+  `SpillManifest` is unchanged and a journal written before this commit is still
+  read back.
+- `MSS_RECORDING_SPILL_TO=disk|s3` (default `disk`, so the default deployment
+  behaves exactly as before; `disk` with no `MSS_RECORDING_SPILL_DIR` still means
+  "no spill") and `MSS_RECORDING_SPILL_PREFIX` (default `_spill/`). Under `s3`
+  the journal is `_spill/<first object key>/manifest.json` plus
+  `<target index>-<seq>.pcm` beside it, in the recording bucket, written through
+  the same sink the finished object goes to.
+- `RecordingSink` gained `get`, `list` and `delete` beside `put`/`exists` (no new
+  dependency — `object_store` 0.14 has all three), plus
+  `UploadError::Missing` so a first-ever manifest read is an answer rather than a
+  logged failure. Every fake implements them: `MemorySink` (recorder.rs),
+  `BucketSink` / `NowhereSink` (tap_plane.rs).
+- Metrics `mss_recording_spill_lost_ownership_total` and
+  `mss_recording_spill_foreign_manifests`, in `metrics.rs` and in deploy.md's new
+  "Recording spill series" table.
+- `lab/pod_kill_drill.sh` gained `RECORD=1`: a `FILE_S3` attachment on the tapped
+  call, and after the kill and the adopter's destroy it reads the object's size
+  back out of MinIO, turns it into seconds and compares against the tapped
+  length with an allowance of one spill interval plus the measured adoption gap
+  — printed as a fourth assertion. The three lab pods gained
+  `MSS_RECORDING_SPILL_TO` / `_PREFIX` / `_SECONDS` passthrough, and the drill
+  **refuses `RECORD=1`** unless pod A's own log says the journal is in the
+  bucket, because the lab mounts one `./out` into all three pods and a disk
+  spill would otherwise look cross-pod when it is not.
+
+**Decisions, as specified and as built.**
+
+- **Ownership is in the manifest.** An adopter's `SegmentJournal::open` rewrites
+  `owner` to itself and **writes the manifest at once** — the claim is a write in
+  `open`, not a side effect of the first `append`, because the original pod's
+  next `append` has to see it. Every `append` re-reads the manifest first; if
+  `owner` is no longer this pod the append is refused, `surrendered()` goes true,
+  `spill_closed_segment` counts `spill_lost_ownership`, drops the journal handle
+  and keeps recording into memory. Dropping the handle also means the partitioned
+  pod never `discard`s the adopted journal.
+- **`PersistedRecording.owner` gates nothing any more.** It is still persisted
+  and still handed to the adopter as `mss.recording.spillOwner`, but only as a
+  log field: `recorder::run`'s resume path reads back whatever the configured
+  store holds and pads only the frames that are in neither memory nor the store.
+  `frames_lost_on_adopt` therefore falls to at most one
+  `MSS_RECORDING_SPILL_SECONDS` on **any** pod.
+- **Journal I/O stayed off the hot path.** Disk stays on `spawn_blocking`; every
+  object-store call is awaited under a 10 s `SPILL_TIMEOUT` and a timeout is
+  counted like any other failed spill, never fatal — the audio stays in memory
+  and the next tick retries.
+- **Startup salvage stays same-pod.** `recording_spill::salvage` lists manifests
+  through the store and leaves a manifest whose `owner` is another pod alone,
+  counting `spill_foreign_manifests`: with a shared store, salvaging a journal
+  another pod is still writing would race it. Adoption, not salvage, is the
+  cross-pod path.
+
+**Verified — unit tests only, against the in-crate fakes. Nothing here ran
+against real storage or a real pod.** The lab Docker stack was down for this
+session (Docker Desktop not running), so `tests/minio_upload.rs` and the drill
+were written but **not executed**.
+
+| Test | What it proves |
+| --- | --- |
+| `an_adopter_on_any_pod_loses_at_most_one_spill_interval_when_the_journal_is_in_the_bucket` | one `MemorySink` shared by two `RecordingSupport`s ("pod-a", "pod-b"): pod A records, spills twice and is killed mid-call (its recorder task is aborted, so nothing is uploaded and nothing is discarded); pod B opens the same journal out of the bucket, finishes and uploads. The object opens with **every frame pod A spilled**, the unspilled remainder is silence, pod B's own audio follows, `frames_lost_on_adopt` is within one spill interval, and the reserved `_spill/` namespace is empty afterwards |
+| `a_pod_that_lost_its_journal_to_an_adopter_stops_spilling_into_it` | the ownership steal: pod A appends, pod B adopts (which claims the manifest) and appends, pod A's next append is **refused** and reported as `surrendered()`, and the journal holds A's then B's frames with none of A's post-steal audio |
+| `salvage_leaves_another_pods_journal_in_the_bucket_alone` | a startup salvage on "pod-a" over a journal owned by "pod-z" uploads nothing, counts one `spill_foreign_manifests`, and leaves the journal where its owner can still finish it |
+| `the_reserved_spill_namespace_always_ends_in_one_separator` | the prefix normalisation and the `_spill/` default deploy.md documents |
+| the pre-existing disk spill tests (stitch, salvage, no-clobber, the padded-member tail) | the `disk` backend is unchanged by the extraction — they pass untouched |
+
+Gate: `cargo test --workspace` 296 mediaserverd unit tests + every other target
+green, `cargo fmt --all --check` clean, `cargo clippy --all-targets -D warnings`
+clean, the comment scan empty, `cargo deny check all` clean.
+
+**Owed, and it is the honest half of this item.**
+
+1. `tests/minio_upload.rs::a_journal_spilled_to_a_real_bucket_is_read_back_by_another_pod`
+   is written and env-gated on `MSS_TEST_S3_ENDPOINT`; it has **never run**. It
+   spills two segments as "pod-a" into real MinIO, adopts as "pod-b", finishes,
+   and asserts the object's three tones in order and an empty `_spill/`. Run it
+   the next time the lab is up: `MSS_TEST_S3_ENDPOINT=http://127.0.0.1:9000
+   cargo test -p mediaserverd --test minio_upload`.
+2. `RECORD=1 ./lab/pod_kill_drill.sh` — the live pod-kill-with-a-recorder drill
+   D9 has owed since item 30. Its number goes in [lab.md](lab.md), and D9's row
+   stays honest until it does.
+
+**Residual.** No retention: MSS deletes a journal when its recording lands and
+skips a foreign one, so what accumulates under `_spill/` is the journals of
+recordings that finished on **no** pod, and nothing expires them. deploy.md now
+asks the operator for a bucket lifecycle rule (expire `_spill/` after 7 days) and
+says plainly that MSS implements none. Also unchanged: the unspilled tail is
+still lost (that is what the spill interval buys), `MAX_RECORDING` is still 2 h,
+and a `kill -9` between detach and upload still loses the `UploadCompleted`
+event (D11's residual) even though the audio is now salvageable from any pod.
 
 ### 54. Recording groups as a shared record, not one pod's memory (D16)
 **Where:** `crates/mediaserverd/src/{session_store.rs,tap_plane.rs,registry_keeper.rs,recorder.rs}`,
@@ -3551,7 +3598,7 @@ sample, visible only as a growing `mss_rtpengine_sample_age_seconds`.
 | ~~D2~~ | ~~`stop_playback` stops **all** playback on the call~~ — **fixed 2026-08-23 (item 27)**: the registry remembers each playback's `target_tag` and `stop_playback` sends NG `stop media` with that `from-tag` (`all: all` only when the playback itself was for everyone). Measured on the lab node with `lab/ng_stop_media_probe.py`, three consistent runs: with a player on each participant, `stop media {from-tag: tagA}` left tagA at **1 packet** (a tail) and tagB still at **75 packets per 1.5 s**; an `all: all` player stopped with one from-tag keeps playing to the *other* participant (1 vs 75), which is why "no target" still maps to `all: all`. **Residual, now measured rather than assumed:** a second `play media` at the *same* from-tag is accepted, and one `stop media` for that from-tag clears the participant entirely (1 packet in a 3 s window) — rtpengine has no playback identifier, so two playbacks aimed at one participant cannot be stopped independently. MSS is now as precise as the protocol allows | `tap_plane.rs`, `registry.rs` | closed (residual documented) |
 | ~~D3~~ | ~~`close_attachment` **aborts** the consumer task instead of closing the websocket politely (no `stop` frame)~~ — **fixed 2026-08-23 (item 27)**: `TapPlane::end_attachment` ends the hub subscription and lets the consumer finish, so a WS consumer sends its Twilio `stop` frame and a gRPC consumer gets a `StreamStop` naming the reason ("the attachment was detached" / "the call ended"); a consumer that will not finish inside `POLITE_CLOSE` (2 s) is still aborted, with a warning. `close_session` takes the same path, so an ordinary hangup is polite too. Replay-verified (the task runs to completion instead of being aborted; the `Stop` frame reaches a real gRPC consumer over the wire); not observed against a live consumer | `tap_plane.rs` | closed |
 | ~~D4~~ | ~~`WS_TWILIO` and `GRPC_STREAM` attachments are served; `FILE_S3` (phase 2) and `RTP_INLINE` (phase 3) are refused by name~~ — **`FILE_S3` now served (2026-08-22, item 15)**: the recorder is a hub consumer with the frozen identity, pause-segmenting and `object_store` upload. `RTP_INLINE` is still refused by name as an **attachment transport**, and item 33 (2026-08-23) did not change that: an inline leg is a session *kind*, and a consumer reaches one over `GRPC_STREAM`/`WS_TWILIO` like any other — the INJECT direction is P3-3. `RTP_INLINE` may end up never being needed | `tap_plane.rs` | partly closed — the transport stays unused |
-| 🔶 D9 | ~~A recording lives in the recording pod's memory until the call ends: a pod death loses the buffered audio and no upload is resumed~~ — **partly closed 2026-08-23 (item 30)**: closed segments now spill to `MSS_RECORDING_SPILL_DIR` every `MSS_RECORDING_SPILL_SECONDS` (default 30) and on pause, the final upload stitches spill + memory tail into the one frozen key, this pod's leftovers are salvaged on its next start (never over an object that already exists), and an adopter recovers what it can read while padding and counting the rest (`mss_recording_frames_lost_on_adopt_total`). **Residual, by construction:** the spill dir is per-pod local disk, so a **cross-pod** adopter still cannot read the dead pod's segments — worst-case loss falls from the whole call to the spill interval *on the same pod*, and stays the whole prefix across pods until the spill lives somewhere every pod can read (same fix as D16). No retention policy on the spill dir. Replay/fake-verified only; no live pod-kill drill with a recorder attached. `MAX_RECORDING` (2 h) is unchanged | `recorder.rs`, `recording_spill.rs`, `registry_keeper.rs` | medium — cross-pod half open |
+| ~~D9~~ | ~~A recording lives in the recording pod's memory until the call ends~~ — **closed but for retention, 2026-08-26 (item 53)**: closed segments spill every `MSS_RECORDING_SPILL_SECONDS` (default 30) and on pause, and with `MSS_RECORDING_SPILL_TO=s3` the journal lives in the **recording bucket** under the reserved `_spill/` prefix, so an adopter on **any** pod reads the dead pod's closed segments back and pads only the unspilled tail — `mss_recording_frames_lost_on_adopt_total` is bounded by one spill interval wherever the session lands, not by the pod. Ownership lives in the manifest: an adopter claims it on open, and a partitioned-but-alive pod's next append is refused and counted (`mss_recording_spill_lost_ownership_total`) instead of corrupting the journal; startup salvage leaves a foreign manifest alone (`mss_recording_spill_foreign_manifests`). The default is still `disk`, where the same-pod guarantee from item 30 holds and a cross-pod adopter still recovers nothing. **What remains: (a) retention** — nothing expires the journals of recordings that finished on no pod, so deploy.md asks the operator for a lifecycle rule on `_spill/` (expire after 7 days); **(b) the live drill** — every claim here is proved against the in-crate fakes only, `tests/minio_upload.rs`'s spill case and `RECORD=1 lab/pod_kill_drill.sh` are written but have never run. `MAX_RECORDING` (2 h) is unchanged | `recorder.rs`, `recording_spill.rs`, `registry_keeper.rs` | closed (retention + the drill owed) |
 | ~~D11~~ | ~~`StopRecording`/`Detach` **blocks until the upload finishes** (bounded 60 s/90 s), because `observe` needs a live session and a backgrounded upload would lose `UploadCompleted` on every hangup~~ — **fixed 2026-08-26 (item 50)**: the recorder splits into a capture phase that publishes `RecordingStopped` and releases the caller (bounded by `STOP_TIMEOUT`, 5 s, no I/O) and a background upload phase bounded by `MSS_RECORDING_UPLOAD_CONCURRENCY` (default 4). The event is not lost because the registry keeps the session record in a `finishing` state until its uploads settle — not adoptable, not listable, external id freed at once — so the late `UploadCompleted`/the new `UploadFailed` gets the next `seq` in that session's own sequence, gaplessly and in order. Live: `Detach` **11 ms** and `DestroySession` **10 ms** against a `docker pause`d MinIO that held the upload **12.07 s**, `uploads_in_flight 1` with `sessions_live 0`, then `UploadCompleted` at seq 10 after `SessionEnded` at seq 9. **Residual:** `UploadFailed` is replay-proved only, and a `kill -9` between detach and upload still loses the event (the audio is salvaged, per D9) | `recorder.rs`, `recording_uploads.rs`, `registry.rs` | closed (residual documented) |
 | ~~D10~~ | ~~Pause is honoured by the recorder only; a paused `WS_TWILIO`/`GRPC_STREAM` attachment keeps receiving media~~ — **fixed 2026-08-23 (item 27)**: the hub checks a per-subscription pause flag before every frame, so `StreamPause` really stops feeding an ASR; skipped frames are counted (`mss_consumer_suppressed_while_paused_total`) and resume starts at the current tap position rather than replaying a backlog. A gRPC attachment paused before its consumer subscribes stays paused when the stream opens. Recorder pause behaviour is unchanged. Replay-verified through `update_attachment`; not observed live | `tap_plane.rs`, `hub.rs` | closed |
 | ~~D5~~ | ~~Event delivery is **at-most-once**; a broker outage drops events~~ — **fixed 2026-08-22 (item 13)**: bounded retry backlog, order preserved, drop-oldest counted. Now **at-least-once**, so the translator must dedupe by `(external_id, seq)`; a backlog past its 8192 cap or a pod death still loses events | `event_pump.rs` | closed |

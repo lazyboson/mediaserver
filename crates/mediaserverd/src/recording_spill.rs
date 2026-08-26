@@ -1,13 +1,19 @@
-use crate::recorder::{wav_bytes, RecordedAudio, RecordingSupport};
+use crate::recorder::{wav_bytes, RecordedAudio, RecordingSink, RecordingSupport, UploadError};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
+use std::time::Duration;
 use tracing::{info, warn};
 
 pub const JOURNAL_DIR: &str = "journal";
+pub const DEFAULT_SPILL_PREFIX: &str = "_spill/";
+pub const SPILL_TIMEOUT: Duration = Duration::from_secs(10);
 const MANIFEST_FILE: &str = "manifest.json";
 const MANIFEST_TEMP: &str = "manifest.json.writing";
 const CHUNK_EXTENSION: &str = "pcm";
+const MANIFEST_CONTENT_TYPE: &str = "application/json";
+const CHUNK_CONTENT_TYPE: &str = "application/octet-stream";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SpilledTarget {
@@ -38,10 +44,254 @@ impl SpillManifest {
     }
 }
 
+#[control_api::async_trait]
+pub trait SpillStore: Send + Sync + 'static {
+    async fn write(
+        &self,
+        journal: &str,
+        manifest: Vec<u8>,
+        chunks: Vec<(String, Vec<i16>)>,
+    ) -> std::io::Result<()>;
+
+    async fn read(&self, journal: &str, chunks: &[String]) -> Vec<i16>;
+
+    async fn read_manifest(&self, journal: &str) -> Option<SpillManifest>;
+
+    async fn list_manifests(&self) -> Vec<(String, SpillManifest)>;
+
+    async fn remove(&self, journal: &str);
+
+    fn describe(&self, journal: &str) -> String;
+}
+
+pub struct DiskSpill {
+    root: PathBuf,
+}
+
+impl DiskSpill {
+    pub fn new(root: PathBuf) -> DiskSpill {
+        DiskSpill { root }
+    }
+
+    fn dir(&self, journal: &str) -> PathBuf {
+        self.root.join(JOURNAL_DIR).join(journal)
+    }
+}
+
+#[control_api::async_trait]
+impl SpillStore for DiskSpill {
+    async fn write(
+        &self,
+        journal: &str,
+        manifest: Vec<u8>,
+        chunks: Vec<(String, Vec<i16>)>,
+    ) -> std::io::Result<()> {
+        let dir = self.dir(journal);
+        let written: Vec<(PathBuf, Vec<i16>)> = chunks
+            .into_iter()
+            .map(|(name, samples)| (dir.join(name), samples))
+            .collect();
+        tokio::task::spawn_blocking(move || write_segment(&dir, &manifest, written))
+            .await
+            .unwrap_or_else(|error| {
+                Err(std::io::Error::other(format!(
+                    "the spill thread died: {error}"
+                )))
+            })
+    }
+
+    async fn read(&self, journal: &str, chunks: &[String]) -> Vec<i16> {
+        let dir = self.dir(journal);
+        let paths: Vec<PathBuf> = chunks.iter().map(|name| dir.join(name)).collect();
+        tokio::task::spawn_blocking(move || read_chunks(&paths))
+            .await
+            .unwrap_or_else(|error| {
+                warn!(%error, "the spill reader thread died");
+                Vec::new()
+            })
+    }
+
+    async fn read_manifest(&self, journal: &str) -> Option<SpillManifest> {
+        let path = self.dir(journal).join(MANIFEST_FILE);
+        tokio::task::spawn_blocking(move || read_manifest(&path))
+            .await
+            .ok()
+            .flatten()
+    }
+
+    async fn list_manifests(&self) -> Vec<(String, SpillManifest)> {
+        let root = self.root.join(JOURNAL_DIR);
+        tokio::task::spawn_blocking(move || collect_manifests(&root))
+            .await
+            .unwrap_or_default()
+    }
+
+    async fn remove(&self, journal: &str) {
+        let dir = self.dir(journal);
+        let removed = tokio::task::spawn_blocking(move || std::fs::remove_dir_all(&dir)).await;
+        if let Ok(Err(error)) = removed {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                warn!(%error, "a spill journal could not be removed");
+            }
+        }
+    }
+
+    fn describe(&self, journal: &str) -> String {
+        self.dir(journal).display().to_string()
+    }
+}
+
+pub struct ObjectSpill {
+    sink: Arc<dyn RecordingSink>,
+    prefix: String,
+}
+
+impl ObjectSpill {
+    pub fn new(sink: Arc<dyn RecordingSink>, prefix: &str) -> ObjectSpill {
+        ObjectSpill {
+            sink,
+            prefix: normalized_prefix(prefix),
+        }
+    }
+
+    fn key(&self, journal: &str, name: &str) -> String {
+        format!("{}{journal}/{name}", self.prefix)
+    }
+}
+
+pub fn normalized_prefix(prefix: &str) -> String {
+    let trimmed = prefix.trim().trim_start_matches('/');
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    if trimmed.ends_with('/') {
+        trimmed.to_string()
+    } else {
+        format!("{trimmed}/")
+    }
+}
+
+#[control_api::async_trait]
+impl SpillStore for ObjectSpill {
+    async fn write(
+        &self,
+        journal: &str,
+        manifest: Vec<u8>,
+        chunks: Vec<(String, Vec<i16>)>,
+    ) -> std::io::Result<()> {
+        for (name, samples) in chunks {
+            let key = self.key(journal, &name);
+            let body = pcm_bytes(&samples);
+            bounded(self.sink.put(&key, CHUNK_CONTENT_TYPE, body))
+                .await
+                .map_err(|error| std::io::Error::other(format!("{key}: {error}")))?;
+        }
+        let key = self.key(journal, MANIFEST_FILE);
+        bounded(self.sink.put(&key, MANIFEST_CONTENT_TYPE, manifest))
+            .await
+            .map_err(|error| std::io::Error::other(format!("{key}: {error}")))?;
+        Ok(())
+    }
+
+    async fn read(&self, journal: &str, chunks: &[String]) -> Vec<i16> {
+        let mut samples = Vec::new();
+        for name in chunks {
+            let key = self.key(journal, name);
+            match bounded(self.sink.get(&key)).await {
+                Ok(bytes) => samples.extend(
+                    bytes
+                        .chunks_exact(2)
+                        .map(|pair| i16::from_le_bytes([pair[0], pair[1]])),
+                ),
+                Err(error) => warn!(
+                    %key,
+                    %error,
+                    "a spilled recording segment could not be read back from the recording \
+                     bucket; its audio is missing"
+                ),
+            }
+        }
+        samples
+    }
+
+    async fn read_manifest(&self, journal: &str) -> Option<SpillManifest> {
+        let key = self.key(journal, MANIFEST_FILE);
+        let body = match bounded(self.sink.get(&key)).await {
+            Ok(body) => body,
+            Err(UploadError::Missing(_)) => return None,
+            Err(error) => {
+                warn!(%key, %error, "a spill manifest in the recording bucket is unreachable");
+                return None;
+            }
+        };
+        decode_manifest(&key, &body)
+    }
+
+    async fn list_manifests(&self) -> Vec<(String, SpillManifest)> {
+        let listed = match bounded(self.sink.list(&self.prefix)).await {
+            Ok(listed) => listed,
+            Err(error) => {
+                warn!(
+                    prefix = %self.prefix,
+                    %error,
+                    "the reserved spill namespace could not be listed; nothing is salvaged"
+                );
+                return Vec::new();
+            }
+        };
+        let suffix = format!("/{MANIFEST_FILE}");
+        let mut found = Vec::new();
+        for key in listed {
+            let Some(journal) = key
+                .strip_prefix(&self.prefix)
+                .and_then(|rest| rest.strip_suffix(&suffix))
+            else {
+                continue;
+            };
+            if let Some(manifest) = self.read_manifest(journal).await {
+                found.push((journal.to_string(), manifest));
+            }
+        }
+        found
+    }
+
+    async fn remove(&self, journal: &str) {
+        let under = format!("{}{journal}/", self.prefix);
+        let listed = match bounded(self.sink.list(&under)).await {
+            Ok(listed) => listed,
+            Err(error) => {
+                warn!(prefix = %under, %error, "a spill journal could not be listed for removal");
+                return;
+            }
+        };
+        for key in listed {
+            if let Err(error) = bounded(self.sink.delete(&key)).await {
+                warn!(%key, %error, "a spilled recording segment could not be deleted");
+            }
+        }
+    }
+
+    fn describe(&self, journal: &str) -> String {
+        format!("{}{journal} in {}", self.prefix, self.sink.describe())
+    }
+}
+
+async fn bounded<T>(
+    work: impl std::future::Future<Output = Result<T, UploadError>>,
+) -> Result<T, UploadError> {
+    match tokio::time::timeout(SPILL_TIMEOUT, work).await {
+        Ok(outcome) => outcome,
+        Err(_) => Err(UploadError::TimedOut(SPILL_TIMEOUT)),
+    }
+}
+
 pub struct SegmentJournal {
-    dir: PathBuf,
+    store: Arc<dyn SpillStore>,
+    journal: String,
+    owner: String,
     manifest: SpillManifest,
     sequence: usize,
+    surrendered: bool,
 }
 
 impl SegmentJournal {
@@ -52,19 +302,23 @@ impl SegmentJournal {
         sample_rate_hz: u32,
         targets: &[(String, u16)],
     ) -> Option<SegmentJournal> {
-        let root = support.spill_dir.as_ref()?;
+        let store = support.journal.clone()?;
         let (first, _) = targets.first()?;
-        let dir = root.join(JOURNAL_DIR).join(first);
+        let journal = first.clone();
         let keys: Vec<String> = targets.iter().map(|(key, _)| key.clone()).collect();
-        let held = read_manifest(&dir.join(MANIFEST_FILE));
+        let held = store.read_manifest(&journal).await;
+        let mut adopted_from = None;
         let manifest = match held {
             Some(held) if held.continues(recording_id, sample_rate_hz, &keys) => {
                 info!(
-                    dir = %dir.display(),
+                    journal = %store.describe(&journal),
                     frames = held.frames,
                     previous_owner = %held.owner,
-                    "this recording continues a spill journal left on local disk"
+                    "this recording continues a spill journal a pod left behind"
                 );
+                if held.owner != owner {
+                    adopted_from = Some(held.owner.clone());
+                }
                 SpillManifest {
                     owner: owner.to_string(),
                     ..held
@@ -73,14 +327,12 @@ impl SegmentJournal {
             other => {
                 if other.is_some() {
                     warn!(
-                        dir = %dir.display(),
+                        journal = %store.describe(&journal),
                         "a spill journal under this object key belongs to another recording; \
                          it is replaced and its audio is unreachable"
                     );
                 }
-                let cleared = dir.clone();
-                let _ =
-                    tokio::task::spawn_blocking(move || std::fs::remove_dir_all(&cleared)).await;
+                store.remove(&journal).await;
                 SpillManifest {
                     recording_id: recording_id.to_string(),
                     sample_rate_hz,
@@ -97,15 +349,37 @@ impl SegmentJournal {
                 }
             }
         };
+        if let Some(previous) = adopted_from {
+            match serde_json::to_vec_pretty(&manifest) {
+                Ok(body) => match store.write(&journal, body, Vec::new()).await {
+                    Ok(()) => info!(
+                        journal = %store.describe(&journal),
+                        previous_owner = %previous,
+                        "this pod has taken ownership of the spill journal it adopted, so the \
+                         pod that left it behind stops writing to it"
+                    ),
+                    Err(error) => warn!(
+                        journal = %store.describe(&journal),
+                        %error,
+                        "the adopted spill journal could not be claimed; the pod that left it \
+                         behind may still be writing to it"
+                    ),
+                },
+                Err(error) => warn!(%error, "an adopted spill manifest could not be re-encoded"),
+            }
+        }
         let sequence = manifest
             .targets
             .first()
             .map(|target| target.chunks.len())
             .unwrap_or_default();
         Some(SegmentJournal {
-            dir,
+            store,
+            journal,
+            owner: owner.to_string(),
             manifest,
             sequence,
+            surrendered: false,
         })
     }
 
@@ -113,8 +387,12 @@ impl SegmentJournal {
         self.manifest.frames
     }
 
-    pub fn dir(&self) -> &Path {
-        &self.dir
+    pub fn surrendered(&self) -> bool {
+        self.surrendered
+    }
+
+    pub fn describe(&self) -> String {
+        self.store.describe(&self.journal)
     }
 
     pub async fn append(
@@ -127,11 +405,20 @@ impl SegmentJournal {
                 "a spilled segment does not carry one rendering per recording target",
             ));
         }
-        let mut written = Vec::with_capacity(rendered.len());
+        if let Some(held) = self.store.read_manifest(&self.journal).await {
+            if held.owner != self.owner {
+                self.surrendered = true;
+                return Err(std::io::Error::other(format!(
+                    "this spill journal now belongs to {}, so this pod stops writing it",
+                    held.owner
+                )));
+            }
+        }
+        let mut chunks = Vec::with_capacity(rendered.len());
         let mut names = Vec::with_capacity(rendered.len());
         for (index, audio) in rendered.into_iter().enumerate() {
             let name = format!("{index}-{:06}.{CHUNK_EXTENSION}", self.sequence);
-            written.push((self.dir.join(&name), audio.samples));
+            chunks.push((name.clone(), audio.samples));
             names.push(name);
         }
         let mut next = self.manifest.clone();
@@ -139,15 +426,8 @@ impl SegmentJournal {
         for (target, name) in next.targets.iter_mut().zip(names) {
             target.chunks.push(name);
         }
-        let dir = self.dir.clone();
         let body = serde_json::to_vec_pretty(&next).map_err(std::io::Error::other)?;
-        tokio::task::spawn_blocking(move || write_segment(&dir, &body, written))
-            .await
-            .unwrap_or_else(|error| {
-                Err(std::io::Error::other(format!(
-                    "the spill thread died: {error}"
-                )))
-            })?;
+        self.store.write(&self.journal, body, chunks).await?;
         self.manifest = next;
         self.sequence += 1;
         Ok(())
@@ -157,28 +437,11 @@ impl SegmentJournal {
         let Some(target) = self.manifest.targets.get(index) else {
             return Vec::new();
         };
-        let paths: Vec<PathBuf> = target
-            .chunks
-            .iter()
-            .map(|name| self.dir.join(name))
-            .collect();
-        let key = target.key.clone();
-        tokio::task::spawn_blocking(move || read_chunks(&paths))
-            .await
-            .unwrap_or_else(|error| {
-                warn!(%key, %error, "the spill reader thread died");
-                Vec::new()
-            })
+        self.store.read(&self.journal, &target.chunks).await
     }
 
     pub async fn discard(self) {
-        let dir = self.dir;
-        let removed = tokio::task::spawn_blocking(move || std::fs::remove_dir_all(&dir)).await;
-        if let Ok(Err(error)) = removed {
-            if error.kind() != std::io::ErrorKind::NotFound {
-                warn!(%error, "a spill journal could not be removed after its upload");
-            }
-        }
+        self.store.remove(&self.journal).await;
     }
 }
 
@@ -223,13 +486,12 @@ fn read_chunks(paths: &[PathBuf]) -> Vec<i16> {
     samples
 }
 
-fn read_manifest(path: &Path) -> Option<SpillManifest> {
-    let body = std::fs::read(path).ok()?;
-    match serde_json::from_slice::<SpillManifest>(&body) {
+fn decode_manifest(named: &str, body: &[u8]) -> Option<SpillManifest> {
+    match serde_json::from_slice::<SpillManifest>(body) {
         Ok(manifest) => Some(manifest),
         Err(error) => {
             warn!(
-                path = %path.display(),
+                journal = %named,
                 %error,
                 "a spill manifest is unreadable; the segments beside it are unreachable"
             );
@@ -238,32 +500,51 @@ fn read_manifest(path: &Path) -> Option<SpillManifest> {
     }
 }
 
+fn read_manifest(path: &Path) -> Option<SpillManifest> {
+    let body = std::fs::read(path).ok()?;
+    decode_manifest(&path.display().to_string(), &body)
+}
+
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct SalvageSummary {
     pub uploaded: u64,
     pub already_present: u64,
     pub failed: u64,
+    pub foreign: u64,
 }
 
 pub async fn salvage(support: &RecordingSupport) -> SalvageSummary {
     let mut summary = SalvageSummary::default();
-    let Some(root) = support.spill_dir.clone() else {
+    let Some(store) = support.journal.clone() else {
         return summary;
     };
     let Some(sink) = support.sink.clone() else {
         return summary;
     };
-    let journals = tokio::task::spawn_blocking(move || collect_manifests(&root.join(JOURNAL_DIR)))
-        .await
-        .unwrap_or_default();
+    let journals = store.list_manifests().await;
     if journals.is_empty() {
         return summary;
     }
     info!(
         journals = journals.len(),
-        "recording segments were left on local disk by an earlier life of this pod"
+        "recording segments were left behind by a pod that stopped mid-call"
     );
-    for (dir, manifest) in journals {
+    for (journal, manifest) in journals {
+        if manifest.owner != support.owner {
+            summary.foreign += 1;
+            support
+                .counters
+                .spill_foreign_manifests
+                .fetch_add(1, Ordering::Relaxed);
+            info!(
+                journal = %store.describe(&journal),
+                owner = %manifest.owner,
+                frames = manifest.frames,
+                "this spill journal belongs to another pod; adoption, not salvage, is the \
+                 cross-pod path, so it is left alone"
+            );
+            continue;
+        }
         let mut salvaged_all = true;
         for target in manifest.targets.iter() {
             match sink.exists(&target.key).await {
@@ -275,10 +556,10 @@ pub async fn salvage(support: &RecordingSupport) -> SalvageSummary {
                         .fetch_add(1, Ordering::Relaxed);
                     warn!(
                         key = %target.key,
-                        dir = %dir.display(),
+                        journal = %store.describe(&journal),
                         frames = manifest.frames,
                         "this recording was already uploaded, so the segments spilled here are \
-                         not reuploaded; they stay on disk for an operator to judge"
+                         not reuploaded; they stay where they are for an operator to judge"
                     );
                     salvaged_all = false;
                     continue;
@@ -295,10 +576,7 @@ pub async fn salvage(support: &RecordingSupport) -> SalvageSummary {
                     continue;
                 }
             }
-            let paths: Vec<PathBuf> = target.chunks.iter().map(|name| dir.join(name)).collect();
-            let samples = tokio::task::spawn_blocking(move || read_chunks(&paths))
-                .await
-                .unwrap_or_default();
+            let samples = store.read(&journal, &target.chunks).await;
             if samples.is_empty() {
                 summary.failed += 1;
                 support
@@ -341,8 +619,8 @@ pub async fn salvage(support: &RecordingSupport) -> SalvageSummary {
                         %uri,
                         recording_id = %manifest.recording_id,
                         frames = manifest.frames,
-                        "a recording whose pod died was salvaged from local disk; the audio the \
-                         dead pod had not spilled is still missing"
+                        "a recording whose pod died was salvaged from its spill journal; the \
+                         audio the dead pod had not spilled is still missing"
                     );
                 }
                 Err(error) => {
@@ -357,13 +635,13 @@ pub async fn salvage(support: &RecordingSupport) -> SalvageSummary {
             }
         }
         if salvaged_all {
-            let _ = tokio::task::spawn_blocking(move || std::fs::remove_dir_all(&dir)).await;
+            store.remove(&journal).await;
         }
     }
     summary
 }
 
-fn collect_manifests(root: &Path) -> Vec<(PathBuf, SpillManifest)> {
+fn collect_manifests(root: &Path) -> Vec<(String, SpillManifest)> {
     let mut found = Vec::new();
     let mut pending = vec![root.to_path_buf()];
     while let Some(dir) = pending.pop() {
@@ -376,7 +654,9 @@ fn collect_manifests(root: &Path) -> Vec<(PathBuf, SpillManifest)> {
                 pending.push(path);
             } else if path.file_name().is_some_and(|name| name == MANIFEST_FILE) {
                 if let Some(manifest) = read_manifest(&path) {
-                    found.push((dir.clone(), manifest));
+                    if let Ok(relative) = dir.strip_prefix(root) {
+                        found.push((relative.to_string_lossy().replace('\\', "/"), manifest));
+                    }
                 }
             }
         }
