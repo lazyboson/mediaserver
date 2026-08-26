@@ -3229,6 +3229,290 @@ TTL or name the node on `CreateSession`. Nothing here is proved on a **real**
 `deploy.md` is documentation, not a tested artifact; the key/value it writes is
 what was tested.
 
+### 52. TLS options (G12) — ⏸ PARKED on branch `feat/tls-options` (2026-08-26)
+Built and verified (tonic TLS + mutual TLS on the gRPC port, rskafka TLS and
+SASL, a TLS-capable `redis` client, redacted Redis URLs in logs, the lab tools
+following through `connect_endpoint`), but **not on `main`**: the first
+deployment runs every MSS hop inside one Kubernetes cluster, so the decision
+was to keep the plaintext surface and the smaller dependency tree. The branch
+holds one commit (`6621c27`) with its own `tasks.md`/`implementation-notes.md`/
+`deploy.md` write-up; rebase and merge it the day a hop leaves the cluster.
+Until then the security posture is network policy, documented in
+[deploy.md](deploy.md).
+
+## Multi-pod recording and conference ownership — the last lab-closable defects
+
+Items 53–57 close D9 (cross-pod half), D16, D20 and D22 and the one residual
+from item 23. They are ordered so that each builds on the one before; run them
+one per PR on `feat/multipod-recording`. **Read [CLAUDE.md](../CLAUDE.md),
+[session-playbook.md](session-playbook.md) and the "road from here" rules above
+first.** Every item ends with the five-command gate, an
+[implementation-notes.md](implementation-notes.md) section, this file's item
+and defect rows updated, and a commit whose message says what was measured
+against a fake and what against real MinIO/Redis. Facts the code map established
+on 2026-08-26 and that these items rely on:
+
+- Inline sessions are **never adopted** (`PersistedSession::is_rebuildable`,
+  `session_store.rs:74`), and conference members are inline sessions. So
+  cross-pod recovery of a *conference* is not a goal of any item here; what
+  must survive a pod loss is a **tapped** session's recording and its
+  membership in a recording group.
+- The spill journal (`recording_spill.rs`) already has a clean seam —
+  `SegmentJournal::{open, append, read_back, discard}` plus
+  `recording_spill::salvage` — and `RecordingSink` (`recorder.rs:528`) is the
+  trait every fake implements (`MemorySink`, `BucketSink`, `NowhereSink`).
+- The recording group lives only in `TapPlane::groups`
+  (`tap_plane.rs:447`) with `opened_at: Instant`; nothing about groups or
+  conferences is in Redis. `registry_keeper::rebuild` skips grouped
+  attachments (`grouped_not_adopted`, `registry_keeper.rs:378–389`).
+- A `Conference` (`conference.rs:114`) has **no open instant**; the mix thread
+  keeps a local `started: Instant` and publishes the mixed track on each
+  member's own clock (`seated_at_frame`, `conference.rs:350/659`).
+- `SESSION_KIND_MIX = 3` exists in `proto/mediacontrol.proto` and is refused
+  by `TapPlane::open_session` (`tap_plane.rs:1996`) — it is free to become the
+  room session.
+- Member verbs reach the mix through `MemberControl::from_metadata`
+  (`session-core/src/mix.rs:162`) → `TapPlane::control_member`
+  (`tap_plane.rs:1702`) → `Conference::control` (`conference.rs:221`), mirror
+  first, then `ConferenceCommand::Control` to the owner thread. No timestamps
+  anywhere in that state; the control world has no housekeeping tick (only
+  `RegistryKeeper::run` and `health::watch` recur).
+
+### 53. Spill to the recording bucket, so any pod can resume a recording (D9)
+**Where:** `crates/mediaserverd/src/{recording_spill.rs,recorder.rs,registry_keeper.rs,main.rs}`,
+`docs/deploy.md`, `lab/pod_kill_drill.sh`.
+**What:** give the segment journal a second backend that writes its
+`manifest.json` and `NN-seq.pcm` chunks into the **recording bucket itself**
+under a reserved prefix, so an adopter on any pod reads the dead pod's closed
+segments back exactly as the same pod does today.
+**Decisions, made:**
+- `MSS_RECORDING_SPILL_TO=disk|s3`, default `disk` (today's behaviour to the
+  byte; `disk` with no `MSS_RECORDING_SPILL_DIR` still means "no spill"). `s3`
+  spills under `MSS_RECORDING_SPILL_PREFIX` (default `_spill/`) in the
+  recording bucket: `<prefix><account>/<recording>/<first-target-object-key
+  with '/' kept>/manifest.json` and chunks beside it — the same layout the disk
+  journal uses, so `SpillManifest` is unchanged. The prefix is a reserved
+  namespace: document it in deploy.md beside the frozen identity, with a
+  bucket lifecycle rule (expire `_spill/` after 7 days) as the retention
+  policy MSS does not implement.
+- One trait, `SpillStore { write, read, list_manifests, remove }`, two
+  implementations: `DiskSpill` (extract from today's code, no behaviour
+  change) and `ObjectSpill` over `RecordingSink`, which gains `get`, `list`
+  and `delete` (object_store has all three; extend every fake). Journal I/O
+  stays off the recorder's hot path exactly as now (`spawn_blocking` for disk,
+  awaited put for s3, both bounded by a timeout; a failed spill is counted,
+  never fatal).
+- **Ownership is in the manifest.** `SpillManifest.owner` already exists. An
+  adopter rewrites it to itself before its first `append`; `append` on the
+  original pod re-reads the manifest and, if `owner` is no longer itself,
+  stops spilling and counts `mss_recording_spill_lost_ownership_total` — a
+  partitioned-but-alive pod cannot corrupt an adopted journal.
+- `PersistedRecording.owner` stops gating read-back: `recorder::run`'s resume
+  path (`recorder.rs:1015–1045`) reads back whatever the store holds for that
+  journal and pads only the frames that are neither in memory nor spilled.
+  `frames_lost_on_adopt` therefore falls to at most `MSS_RECORDING_SPILL_SECONDS`
+  on **any** pod — write that as the invariant in the test name.
+- Startup salvage (`recording_spill::salvage`, `main.rs:379`) lists manifests
+  in the configured store and salvages only those whose `owner` is this pod,
+  as today; a manifest with a foreign owner is counted
+  (`mss_recording_spill_foreign_manifests`) and left alone — adoption, not
+  salvage, is the cross-pod path.
+**Verify:** (1) `MemorySink` shared between two `RecordingPlane`/keeper fakes in
+`registry_keeper.rs` tests: pod A records and spills twice, dies, pod B adopts
+and finishes — the object holds every spilled frame and `frames_lost_on_adopt`
+≤ one spill interval; the ownership-steal test; a salvage test that leaves a
+foreign manifest untouched. (2) `tests/minio_upload.rs` gains an env-gated case
+spilling to real MinIO and reading back. (3) `lab/pod_kill_drill.sh` gains
+`RECORD=1`: a `FILE_S3` attachment on the tapped call, `kill -9` the owner,
+assert the final object's duration is within one spill interval plus the
+adoption gap of the call's length, and record the number in lab.md — this is
+the "live pod-kill drill with a recorder attached" D9 has owed since item 30.
+**Done when:** the D9 row reads closed but for retention, deploy.md documents
+`MSS_RECORDING_SPILL_TO`, the prefix and the lifecycle rule, and the drill
+number is in lab.md.
+
+### 54. Recording groups as a shared record, not one pod's memory (D16)
+**Where:** `crates/mediaserverd/src/{session_store.rs,tap_plane.rs,registry_keeper.rs,recorder.rs}`,
+`lab/group_recording_drill.sh`.
+**What:** move what a `RecordingGroup` *is* — its `recording_id`, format, open
+instant and participant set — into the session store, so a member can join
+from any pod, an adopter can rejoin, and a reused name on a second pod finds
+the existing group instead of starting a second half-recording.
+**Decisions, made:**
+- Keys beside the session keys, same namespace prefix:
+  `mss:group:<account>/<group>` → JSON `{recording_id, format,
+  opened_at_unix_ms, created_by}` created with `SET NX` (loser reads the
+  winner back, so two first-members on two pods agree on one anchor);
+  `mss:group:<account>/<group>:members` → hash `participant label → owner
+  pod`, `HSETNX` is the duplicate-participant refusal, `HDEL` on leave, both
+  keys `DEL`ed when the hash empties (best effort) and `EXPIRE`d at
+  `MAX_RECORDING + 1 h` on every join as the backstop. Add
+  `open_or_join_group` / `leave_group` to `SessionStore`; `MemorySessionStore`
+  implements them so every TapPlane test keeps running without Redis.
+- **The anchor becomes wall-clock.** `RecordingGroup.opened_at` is
+  `SystemTime` (unix ms in the record); `RecorderSpec.group_anchor` and
+  `recorder::absorb`'s lead computation follow. Cross-pod alignment is then
+  as good as the nodes' clock sync — say so in deploy.md (Kubernetes nodes
+  run NTP; a skew of *s* misaligns two participants by *s*). The
+  `resume_ms > 0` rule that clears `group_anchor` stays: the spilled frames
+  already carry the lead silence.
+- `TapPlane::groups` stays as the in-process cache and the source of the
+  `groups_live`/`group_members_live` gauges; the store is consulted first on
+  every `join_group`, and a store error is a **refusal** of the grouped
+  attachment (counted), never a silent local group — a half-group is worse
+  than no group.
+- `registry_keeper::rebuild` stops skipping grouped attachments: it passes
+  `group` through and `join_group` finds the record. Delete
+  `grouped_not_adopted` and its metric; update deploy.md's metric table and
+  `deploy/prometheus-alerts.yaml` if the counter is referenced.
+- The conference-anchor rule: when the first member of a new group is a
+  conference member, the group's `opened_at` is the conference's
+  `opened_at_wall` (added in item 55; if 54 lands first, leave a named
+  `TODO`-free seam — a function `group_anchor_for(session)` that returns
+  `SystemTime::now()` — and item 55 fills it).
+**Verify:** two `MemorySessionStore`-backed planes sharing one store: member A
+on plane 1, member B on plane 2, both objects padded to the same anchor; a
+reused group name on plane 2 after plane 1 dropped its cache joins, does not
+recreate; adoption test in `registry_keeper.rs` where a grouped attachment is
+rebuilt and its file length matches the survivor's; `tests/redis_registry.rs`
+gains the `SET NX` race (two joins concurrently, one record). Lab:
+`group_recording_drill.sh` gains `PODS=2` placing the two sessions on two
+pods (the stack already runs three) and asserts one prefix, two objects, equal
+lengths.
+**Done when:** D16 reads closed, `grouped_not_adopted` is gone from code and
+docs, and the two-pod drill number is in lab.md.
+
+### 55. The room is a session: conference-owned recording (D20)
+**Where:** `crates/mediaserverd/src/{conference.rs,tap_plane.rs}`,
+`crates/control-api/src/{controller.rs,convert.rs}`, `crates/session-core`,
+`proto/mediacontrol.proto` (fields only), `crates/control-api/examples/mss_ctl.rs`,
+`lab/conference_drill.sh`, `docs/architecture.md` Appendix B.
+**What:** let `CreateSession{kind=MIX, group=<name>}` create (or adopt, if a
+member already opened it) the **room itself** as a session with no leg: its
+`opened_at` is the conference's, a `FILE_S3 only=mixed` attachment on it
+records the room from open to close regardless of who comes and goes, and
+`DescribeSession` on it is the room's view.
+**Decisions, made:**
+- `Conference` gains `opened_at: Instant` and `opened_at_wall: SystemTime`,
+  stamped when the conference is created — by whichever arrives first, the
+  room session or the first member. It also gains a **room hub**: a hub with no
+  leg into which the mix thread publishes the full sum on the **conference
+  clock** (`timestamp_ms = frames * ptime`, frames counted from `opened_at`),
+  distinct from the per-member minus-self publishes. The room session's
+  `LiveSession` points at that hub, so every existing attachment kind works on
+  it unchanged: `FILE_S3 only=mixed` records it, a gRPC/WS consumer monitors
+  it, and an `INJECT` on it is a room prompt (`StartPlayback{target_tag=all}`
+  keeps working from a member too — do not remove a verb).
+- **t=0 of a room recording is the room's open.** `RecorderSpec.group_anchor =
+  opened_at_wall` for any recording on the room session, so a recorder
+  attached late pads back to the open with the existing `lead_with_silence`
+  seam; the per-participant group of the same conference anchors on the same
+  instant through item 54's `group_anchor_for`, and the two shapes are
+  sample-aligned by construction. `RecordingShape` stays `conference-mixed`.
+- **Lifetime:** the room session ends on `EndSession`, or automatically when
+  the conference has seated at least one member and then empties, after
+  `MSS_CONFERENCE_LINGER_SECS` (default 0). A room session created before any
+  member joins does not auto-end. Ending the room session ends its
+  attachments (the recording uploads) and, if no member remains, tears the
+  conference down; ending it while members remain leaves them mixing. The room
+  session is inline-like for adoption: `is_rebuildable` false, documented in
+  deploy.md's HA table.
+- A `FILE_S3 only=mixed` attachment on a **member** keeps working exactly as
+  today (D20 stays *possible* there, and the D20 row says the room session is
+  the way to not have it). The grouped-mixed refusal stays.
+- Proto: no new RPC or enum value. `Session` gains `opened_at_unix_ms` (field
+  15) so a controller can align its own timeline; `ConferenceView` gains
+  `room_session` (the room's external id if one exists). `mss_ctl create
+  --kind mix --group <name>`.
+- session-core: a MIX session has no `call_id`/`from_tags`/`sdp_offer`; the
+  registry's kind-specific validation admits it with `group` non-empty and
+  refuses it otherwise, with a named error.
+**Verify:** tap_plane socket tests: a room session opened *before* any member
+records silence up to the first join and the members' tones after; opened
+*after* two members, its object starts at the room's open (lead silence equals
+the time since open) and equals the per-participant group's length; a member
+leaving does not end the room object; the room object closes on `EndSession`
+and on the last member leaving with linger 0. `WiredRoom` test: `DescribeSession`
+on the room returns `opened_at_unix_ms` and the member list. Lab:
+`conference_drill.sh` records the room through a room session instead of
+through A and asserts (`conference_report.py lengths`) the room object and the
+three participant objects share one length to within one frame, with A
+leaving before the end.
+**Done when:** D20 reads closed, Appendix B's parity table names the room
+session, and the drill's length comparison is in lab.md.
+
+### 56. Member state with a lease (D22)
+**Where:** `crates/session-core/src/{mix.rs,event.rs,registry.rs}`,
+`crates/mediaserverd/src/{conference.rs,tap_plane.rs,main.rs,metrics.rs}`,
+`crates/control-api/src/convert.rs`, `proto/mediacontrol.proto` (fields only),
+`docs/deploy.md`.
+**What:** let a controller say how long a `member_mute`/`member_deaf`/
+`member_hold` should hold without being refreshed, so a controller that dies
+between `on` and `off` leaves a member muted for that long, not for the life of
+the room.
+**Decisions, made:**
+- A fourth metadata key, `member_state_ttl_ms`, applying to every flag set
+  `on` in the same `Attach`/`UpdateAttachment`; absent or `0` means no lease —
+  **today's behaviour unchanged**. `MSS_MEMBER_STATE_TTL_SECS` is the
+  deployment default applied when the request carries none (default `0`).
+  Refresh is any request that sets the flag `on` again with a TTL; `off` clears
+  the flag and its deadline. Parsed in `MemberControl::from_metadata` (a bad
+  value is a `MixRouteError::MemberFlag`-style refusal by name).
+- The deadline lives in the **control-world mirror** (`MirroredMember` gains
+  `mute_until/deaf_until/hold_until: Option<Instant>`) and expiry is applied
+  through the same path as `off`: a new control-world housekeeping task in
+  `main.rs` (`tokio::time::interval`, 500 ms) calls `TapPlane::sweep_member_state(now)`,
+  which collects expired flags under the conferences lock, calls
+  `Conference::control` with `Some(false)` for each, and returns
+  `(session, MemberControl)` pairs that the caller turns into events. The
+  mix thread is untouched except for receiving the resulting `Control`
+  commands — no timers in the media world.
+- Event: `EventKind::MemberControlled` gains `cause: MemberControlCause
+  { Requested, Expired }`; the proto payload gains `cause` with `REQUESTED`
+  as the zero value so existing consumers read unchanged. The registry emits
+  the expired event with the session's next `seq` like any other.
+- Read-back: `MemberState` gains `mute_expires_in_ms`, `deaf_expires_in_ms`,
+  `hold_expires_in_ms` (0 = no lease), filled from the mirror.
+- Metric: `mss_conference_member_state_expired_total`.
+**Verify:** `mix.rs` parser tests for the new key; a tap_plane socket test
+where a mute with a 300 ms TTL is heard to lift (the member's tone returns to
+every ear and to the mixed track) without any `off`, the `MemberControlled
+{cause: Expired}` event is observed, and a refresh before expiry keeps it
+muted; a `WiredRoom` test reading `mute_expires_in_ms` back; the no-TTL test
+proving nothing changed. Lab: `conference_drill.sh` mute phase gains a TTL
+variant (`MUTE_TTL_MS`) and lets it expire instead of sending `off`.
+**Done when:** D22 reads closed, deploy.md documents the key and the env
+default with the refresh loop a UI should run, and Appendix B's no-lease
+paragraph is rewritten.
+
+### 57. The kernel verdict, and rtpengine's relay split, as metrics (item 23 residual; serves H3)
+**Where:** `crates/mediaserverd/src/{rtpengine_capability.rs,health.rs,metrics.rs}`,
+`deploy/prometheus-alerts.yaml`, `docs/deploy.md`.
+**What:** every rtpengine `statistics` probe already taken for `/readyz`
+(`NgNodeProbe::probe`, every `MSS_HEALTH_PROBE_INTERVAL_SECS`) leaves its
+findings only in a log line. Keep the last sample per node and export it, so
+handoff H3's three-moment comparison can be read off Prometheus instead of a
+shell on the rtpengine host.
+**Decisions, made:**
+- `NodeCapabilityLog` keeps `last: Mutex<HashMap<SocketAddr, NodeSample>>`
+  with the verdict, `relayedpackets_kernel/_user`, `media_kernel/_userspace/_mixed`,
+  `transcodedmedia`, live sessions and the sample's `Instant`. `forget` clears it.
+- Labelled series in the `mss_dependency_ready{…}` style:
+  `mss_rtpengine_tap_kernel_verdict{node,verdict} 1` (one series per node, the
+  four `TapKernelVerdict` names as label values), `mss_rtpengine_relayed_packets_kernel{node}`,
+  `mss_rtpengine_relayed_packets_user{node}`, `mss_rtpengine_media_kernel{node}`,
+  `mss_rtpengine_media_userspace{node}`, `mss_rtpengine_media_mixed{node}`,
+  `mss_rtpengine_transcoded_media{node}`, `mss_rtpengine_sample_age_seconds{node}`.
+- Alert: `MssTapsFellOutOfKernel` — `verdict="TranscodedTapsAreProcessedInUserspace"`
+  or `media_userspace` rising while `media_kernel` is flat for 10 min, with the
+  §8.1 checklist as the runbook link.
+**Verify:** metrics unit test with a constructed `NodeCapabilityLog` holding two
+nodes; a lab run against the compose rtpengine showing
+`verdict="ThisNodeIsNotUsingTheKernelModule"` and non-zero `_user` counters.
+**Done when:** the series appear in deploy.md's metric table, the item 23
+"log-only" residual is struck, and H3's row points at the metrics as the
+first instrument and the shell probe as the second.
+
 ## Open defects and soft spots
 
 | # | Item | Where | Severity |
