@@ -1,16 +1,18 @@
-use crate::hub::{Hub, TapEvent};
+use crate::hub::{Hub, HubClient, TapEvent};
 use crate::inline_leg::InlineEgress;
 use crate::tap_spike::{TapLeg, MAX_DATAGRAM};
 use crossbeam_queue::ArrayQueue;
 use media_core::{
     AudioFormat, ContributorId, Gain, ListenerId, MixError, MixMatrix, Party, SpeechGate, Track,
 };
-use session_core::mix::{MemberControl, MemberRouteView, MemberStateView, MixRoute, MixTarget};
+use session_core::mix::{
+    MemberControl, MemberRouteView, MemberStateView, MixRoute, MixSource, MixTarget,
+};
 use session_core::{AttachmentId, SessionId};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 use tracing::{info, warn};
 
 pub const COMMAND_CAPACITY: usize = 64;
@@ -36,6 +38,9 @@ pub struct ConferenceTotals {
     pub members_deaf: u64,
     pub members_held: u64,
     pub prompt_frames: u64,
+    pub rooms_live: u64,
+    pub rooms_auto_ended: u64,
+    pub member_state_expired: u64,
 }
 
 #[derive(Default)]
@@ -56,6 +61,9 @@ pub struct ConferenceShared {
     pub members_deaf: AtomicU64,
     pub members_held: AtomicU64,
     pub prompt_frames: AtomicU64,
+    pub rooms_live: AtomicU64,
+    pub rooms_auto_ended: AtomicU64,
+    pub member_state_expired: AtomicU64,
 }
 
 impl ConferenceTotals {
@@ -77,6 +85,9 @@ impl ConferenceTotals {
         self.members_deaf += read(&shared.members_deaf);
         self.members_held += read(&shared.members_held);
         self.prompt_frames += read(&shared.prompt_frames);
+        self.rooms_live += read(&shared.rooms_live);
+        self.rooms_auto_ended += read(&shared.rooms_auto_ended);
+        self.member_state_expired += read(&shared.member_state_expired);
     }
 }
 
@@ -107,13 +118,49 @@ struct MirroredMember {
     mute: bool,
     deaf: bool,
     hold: bool,
+    mute_until: Option<Instant>,
+    deaf_until: Option<Instant>,
+    hold_until: Option<Instant>,
     route: MixRoute,
     route_owner: Option<AttachmentId>,
+}
+
+impl MirroredMember {
+    fn lease_expired(held: bool, until: Option<Instant>, now: Instant) -> bool {
+        held && until.is_some_and(|deadline| deadline <= now)
+    }
+
+    fn expired_flags(&self, now: Instant) -> MemberControl {
+        MemberControl::releasing(
+            MirroredMember::lease_expired(self.mute, self.mute_until, now),
+            MirroredMember::lease_expired(self.deaf, self.deaf_until, now),
+            MirroredMember::lease_expired(self.hold, self.hold_until, now),
+        )
+    }
+
+    fn remaining_ms(until: Option<Instant>, now: Instant) -> u64 {
+        until
+            .map(|deadline| deadline.saturating_duration_since(now).as_millis() as u64)
+            .unwrap_or(0)
+    }
+}
+
+pub struct RoomSeat {
+    pub session: SessionId,
+    pub external_id: String,
+}
+
+pub enum RoomFate {
+    Mixing,
+    Emptied,
+    Stopped(JoinHandle<()>),
 }
 
 pub struct Conference {
     name: String,
     format: AudioFormat,
+    opened_at: Instant,
+    opened_at_wall: SystemTime,
     commands: Arc<ArrayQueue<ConferenceCommand>>,
     prompts: Arc<ArrayQueue<Vec<i16>>>,
     prompt_flush: Arc<AtomicBool>,
@@ -121,6 +168,10 @@ pub struct Conference {
     shared: Arc<ConferenceShared>,
     thread: Option<JoinHandle<()>>,
     members: Vec<MirroredMember>,
+    room: Option<RoomSeat>,
+    room_hub: HubClient,
+    seated_ever: bool,
+    linger: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl Conference {
@@ -133,6 +184,8 @@ impl Conference {
         let prompt_flush = Arc::new(AtomicBool::new(false));
         let stop = Arc::new(AtomicBool::new(false));
         let shared = Arc::new(ConferenceShared::default());
+        let (room_hub, room_client) = Hub::new();
+        let opened_at = Instant::now();
         let mixed = Mixed {
             name: name.to_string(),
             format,
@@ -142,6 +195,8 @@ impl Conference {
             prompt_flush: Arc::clone(&prompt_flush),
             shared: Arc::clone(&shared),
             stop: Arc::clone(&stop),
+            room_hub,
+            opened_at,
         };
         let thread = std::thread::Builder::new()
             .name(format!("mss-conf-{name}"))
@@ -150,6 +205,8 @@ impl Conference {
         Ok(Conference {
             name: name.to_string(),
             format,
+            opened_at,
+            opened_at_wall: SystemTime::now(),
             commands,
             prompts,
             prompt_flush,
@@ -157,7 +214,76 @@ impl Conference {
             shared,
             thread: Some(thread),
             members: Vec::new(),
+            room: None,
+            room_hub: room_client,
+            seated_ever: false,
+            linger: None,
         })
+    }
+
+    pub fn format(&self) -> AudioFormat {
+        self.format
+    }
+
+    pub fn opened_at_wall(&self) -> SystemTime {
+        self.opened_at_wall
+    }
+
+    pub fn open_for(&self) -> Duration {
+        self.opened_at.elapsed()
+    }
+
+    pub fn room_hub(&self) -> HubClient {
+        self.room_hub.clone()
+    }
+
+    pub fn room(&self) -> Option<&RoomSeat> {
+        self.room.as_ref()
+    }
+
+    pub fn seat_room(&mut self, seat: RoomSeat) -> Result<(), ConferenceError> {
+        if let Some(held) = &self.room {
+            return Err(ConferenceError::RoomTaken(held.external_id.clone()));
+        }
+        self.room = Some(seat);
+        self.shared.rooms_live.store(1, Ordering::Relaxed);
+        self.cancel_linger();
+        Ok(())
+    }
+
+    pub fn unseat_room(&mut self) -> Option<JoinHandle<()>> {
+        self.room = None;
+        self.shared.rooms_live.store(0, Ordering::Relaxed);
+        self.cancel_linger();
+        if self.members.is_empty() {
+            return self.stop_now();
+        }
+        None
+    }
+
+    pub fn emptied(&self) -> bool {
+        self.members.is_empty() && self.seated_ever
+    }
+
+    pub fn stop_now(&mut self) -> Option<JoinHandle<()>> {
+        self.cancel_linger();
+        self.stop.store(true, Ordering::Relaxed);
+        self.thread.take()
+    }
+
+    pub fn count_auto_end(&self) {
+        self.shared.rooms_auto_ended.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn linger_until(&mut self, task: tokio::task::JoinHandle<()>) {
+        self.cancel_linger();
+        self.linger = Some(task);
+    }
+
+    fn cancel_linger(&mut self) {
+        if let Some(task) = self.linger.take() {
+            task.abort();
+        }
     }
 
     pub fn shared(&self) -> Arc<ConferenceShared> {
@@ -187,6 +313,7 @@ impl Conference {
     pub fn seat(&mut self, member: ConferenceMember) -> Result<(), ConferenceError> {
         let session = member.session;
         let external_id = member.external_id.clone();
+        self.cancel_linger();
         self.commands
             .push(ConferenceCommand::Join(Box::new(member)))
             .map_err(|_| ConferenceError::Busy)?;
@@ -196,9 +323,13 @@ impl Conference {
             mute: false,
             deaf: false,
             hold: false,
+            mute_until: None,
+            deaf_until: None,
+            hold_until: None,
             route: MixRoute::private(),
             route_owner: None,
         });
+        self.seated_ever = true;
         Ok(())
     }
 
@@ -223,21 +354,81 @@ impl Conference {
         session: SessionId,
         control: MemberControl,
     ) -> Result<(), ConferenceError> {
-        let mirrored = self
-            .mirrored(session)
+        self.control_at(session, control, Instant::now())
+    }
+
+    pub fn control_at(
+        &mut self,
+        session: SessionId,
+        control: MemberControl,
+        now: Instant,
+    ) -> Result<(), ConferenceError> {
+        let lease = control
+            .ttl_ms
+            .filter(|ms| *ms > 0)
+            .map(|ms| now + Duration::from_millis(ms));
+        let seat = self
+            .members
+            .iter()
+            .position(|held| held.session == session)
             .ok_or(ConferenceError::NotSeated(session))?;
+        self.commands
+            .push(ConferenceCommand::Control { session, control })
+            .map_err(|_| ConferenceError::Busy)?;
+        let mirrored = &mut self.members[seat];
         if let Some(mute) = control.mute {
             mirrored.mute = mute;
+            mirrored.mute_until = mute.then_some(lease).flatten();
         }
         if let Some(deaf) = control.deaf {
             mirrored.deaf = deaf;
+            mirrored.deaf_until = deaf.then_some(lease).flatten();
         }
         if let Some(hold) = control.hold {
             mirrored.hold = hold;
+            mirrored.hold_until = hold.then_some(lease).flatten();
         }
-        self.commands
-            .push(ConferenceCommand::Control { session, control })
-            .map_err(|_| ConferenceError::Busy)
+        Ok(())
+    }
+
+    pub fn expire_member_state(&mut self, now: Instant) -> Vec<(SessionId, MemberControl)> {
+        let due: Vec<(SessionId, MemberControl)> = self
+            .members
+            .iter()
+            .map(|held| (held.session, held.expired_flags(now)))
+            .filter(|(_, expired)| !expired.is_empty())
+            .collect();
+        let mut released = Vec::new();
+        for (session, expired) in due {
+            match self.control_at(session, expired, now) {
+                Ok(()) => {
+                    let flags = [expired.mute, expired.deaf, expired.hold]
+                        .into_iter()
+                        .filter(Option::is_some)
+                        .count() as u64;
+                    self.shared
+                        .member_state_expired
+                        .fetch_add(flags, Ordering::Relaxed);
+                    info!(
+                        %session,
+                        conference = %self.name,
+                        mute = ?expired.mute,
+                        deaf = ?expired.deaf,
+                        hold = ?expired.hold,
+                        "a member state lease ran out, so this pod lifted the flag itself"
+                    );
+                    released.push((session, expired));
+                }
+                Err(error) => warn!(
+                    %session,
+                    conference = %self.name,
+                    %error,
+                    "a member state lease ran out and the conference would not take the release; \
+                     the next sweep retries it"
+                ),
+            }
+        }
+        released
     }
 
     pub fn member_state(&self, session: SessionId) -> Option<MemberStateView> {
@@ -250,19 +441,45 @@ impl Conference {
                 attachment: member.route_owner,
             }]
         };
+        let now = Instant::now();
         Some(MemberStateView {
+            seated: true,
+            mute: member.mute,
+            deaf: member.deaf,
+            hold: member.hold,
+            mute_expires_in_ms: MirroredMember::remaining_ms(member.mute_until, now),
+            deaf_expires_in_ms: MirroredMember::remaining_ms(member.deaf_until, now),
+            hold_expires_in_ms: MirroredMember::remaining_ms(member.hold_until, now),
+            source: member.route.source,
+            routes,
+            ..self.room_state()
+        })
+    }
+
+    pub fn room_state(&self) -> MemberStateView {
+        MemberStateView {
             conference: self.name.clone(),
             members: self
                 .members
                 .iter()
                 .map(|held| held.external_id.clone())
                 .collect(),
-            mute: member.mute,
-            deaf: member.deaf,
-            hold: member.hold,
-            source: member.route.source,
-            routes,
-        })
+            room_session: self
+                .room
+                .as_ref()
+                .map(|seat| seat.external_id.clone())
+                .unwrap_or_default(),
+            opened_at: self.opened_at_wall,
+            seated: false,
+            mute: false,
+            deaf: false,
+            hold: false,
+            mute_expires_in_ms: 0,
+            deaf_expires_in_ms: 0,
+            hold_expires_in_ms: 0,
+            source: MixSource::default(),
+            routes: Vec::new(),
+        }
     }
 
     fn mirrored(&mut self, session: SessionId) -> Option<&mut MirroredMember> {
@@ -283,7 +500,7 @@ impl Conference {
         self.prompt_flush.store(true, Ordering::Relaxed);
     }
 
-    pub fn unseat(&mut self, session: SessionId) -> Option<JoinHandle<()>> {
+    pub fn unseat(&mut self, session: SessionId) -> RoomFate {
         self.members.retain(|held| held.session != session);
         if self
             .commands
@@ -293,11 +510,16 @@ impl Conference {
             warn!(%session, "the conference command queue is full; stopping the mix instead");
             self.members.clear();
         }
-        if self.members.is_empty() {
-            self.stop.store(true, Ordering::Relaxed);
-            return self.thread.take();
+        if !self.members.is_empty() {
+            return RoomFate::Mixing;
         }
-        None
+        if self.room.is_some() {
+            return RoomFate::Emptied;
+        }
+        match self.stop_now() {
+            Some(thread) => RoomFate::Stopped(thread),
+            None => RoomFate::Emptied,
+        }
     }
 }
 
@@ -329,6 +551,8 @@ pub enum ConferenceError {
     PromptQueue,
     #[error("{0} is not seated in this conference")]
     NotSeated(SessionId),
+    #[error("this conference is already owned by room session {0}")]
+    RoomTaken(String),
     #[error("conference thread: {0}")]
     Thread(String),
 }
@@ -342,6 +566,8 @@ struct Mixed {
     prompt_flush: Arc<AtomicBool>,
     shared: Arc<ConferenceShared>,
     stop: Arc<AtomicBool>,
+    room_hub: Hub,
+    opened_at: Instant,
 }
 
 struct Seated {
@@ -426,7 +652,7 @@ impl ChunkFeed {
 }
 
 impl Mixed {
-    fn run(self) {
+    fn run(mut self) {
         let mut matrix = match MixMatrix::with_capacity(
             self.frame_samples,
             SpeechGate::default(),
@@ -446,7 +672,7 @@ impl Mixed {
         let ptime = Duration::from_millis(self.format.ptime_ms.max(1) as u64);
         let poll = ptime / 4;
         let mut buf = [0u8; MAX_DATAGRAM];
-        let started = Instant::now();
+        let started = self.opened_at;
         let mut next_release = started + ptime;
         let mut seated: Vec<Seated> = Vec::new();
         let mut frames = 0u64;
@@ -589,6 +815,7 @@ impl Mixed {
                 .members_held
                 .store(count(|held| held.hold), Ordering::Relaxed);
 
+            self.room_hub.poll_commands();
             for member in seated.iter_mut() {
                 member.hub.poll_commands();
                 member.leg.poll_ssrc_tracks();
@@ -651,6 +878,10 @@ impl Mixed {
 
                 let output = matrix.mix();
                 let conference_frame = output.frame(monitor);
+                if let Some(mixed) = conference_frame {
+                    self.room_hub
+                        .publish(TapEvent::media(Track::Mixed, frames * ptime_ms, mixed));
+                }
                 for member in seated.iter_mut() {
                     if let Some(ear) = output.frame(member.party.listener) {
                         member.egress.queue_frame(ear);
@@ -699,6 +930,7 @@ impl Mixed {
         let stats = matrix.stats();
         info!(
             conference = %self.name,
+            room_frames_published = self.room_hub.published(),
             mixed_frames = frames,
             elapsed_ms = started.elapsed().as_millis() as u64,
             ticks = stats.ticks,

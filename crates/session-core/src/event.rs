@@ -61,6 +61,18 @@ pub enum Observation {
         attribution: Attribution,
         tracks: Vec<String>,
     },
+    MemberStateExpired {
+        mute: bool,
+        deaf: bool,
+        hold: bool,
+    },
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum MemberControlCause {
+    #[default]
+    Requested,
+    Expired,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -136,6 +148,7 @@ pub enum EventKind {
         mute: bool,
         deaf: bool,
         hold: bool,
+        cause: MemberControlCause,
     },
     AttachmentDown {
         label: String,

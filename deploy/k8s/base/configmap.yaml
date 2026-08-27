@@ -73,8 +73,18 @@ data:
   # and the process runs as uid 65532.
   MSS_RECORDING_SPILL_DIR: "/var/lib/mediaserverd/spill"
   # How often a live recording spills, in seconds; default 30. This is the
-  # worst-case audio loss when the container dies mid-call.
+  # worst-case audio loss when the pod dies mid-call -- on the same pod with
+  # SPILL_TO=disk, and on any pod with SPILL_TO=s3.
   MSS_RECORDING_SPILL_SECONDS: "30"
+  # Where the segment journal lives: "disk" (the SPILL_DIR above, per pod, so a
+  # cross-pod adopter reads nothing) or "s3" (inside the recording bucket under
+  # the reserved prefix below, so any pod can finish a recording a dead pod
+  # started -- item 53, defect D9). More than one pod means s3.
+  MSS_RECORDING_SPILL_TO: "s3"
+  # The reserved key prefix the s3 journal is written under. Nothing else may
+  # write there, and it needs a bucket lifecycle rule -- expire after 7 days --
+  # because MSS implements no retention for journals nobody ever finished.
+  MSS_RECORDING_SPILL_PREFIX: "_spill/"
   # Detach/StopRecording never waits for an upload (defect D11): it answers as
   # soon as the segment is closed, and this bounds how many of those uploads run
   # at once -- and so the memory, one rendered WAV each. Default 4.

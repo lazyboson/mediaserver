@@ -54,6 +54,11 @@ const TAP_FORMAT_ENV: &str = "MSS_TAP_FORMAT";
 const OPUS_DECODE_RATE_DEFAULT_HZ: u32 = 16000;
 const AUTH_TOKEN_ENV: &str = "MSS_AUTH_TOKEN";
 const RECORDING_BUCKET_ENV: &str = "MSS_RECORDING_BUCKET";
+const CONFERENCE_LINGER_ENV: &str = "MSS_CONFERENCE_LINGER_SECS";
+const DEFAULT_CONFERENCE_LINGER: std::time::Duration = std::time::Duration::from_secs(0);
+const MEMBER_STATE_TTL_ENV: &str = "MSS_MEMBER_STATE_TTL_SECS";
+const DEFAULT_MEMBER_STATE_TTL: std::time::Duration = std::time::Duration::from_secs(0);
+const MEMBER_STATE_SWEEP: std::time::Duration = std::time::Duration::from_millis(500);
 const DEFAULT_POD_NAME: &str = "mediaserverd";
 
 fn main() {
@@ -274,6 +279,64 @@ fn tap_format(opus_decode_rate_hz: u32) -> AudioFormat {
     }
 }
 
+fn conference_linger() -> std::time::Duration {
+    let Ok(configured) = std::env::var(CONFERENCE_LINGER_ENV) else {
+        return DEFAULT_CONFERENCE_LINGER;
+    };
+    match configured.trim().parse::<u64>() {
+        Ok(seconds) => {
+            let linger = std::time::Duration::from_secs(seconds);
+            info!(
+                env = CONFERENCE_LINGER_ENV,
+                seconds,
+                "an emptied conference with a room session is held open this long before the \
+                 room session ends itself"
+            );
+            linger
+        }
+        Err(_) => {
+            warn!(
+                env = CONFERENCE_LINGER_ENV,
+                configured = %configured,
+                fallback_secs = DEFAULT_CONFERENCE_LINGER.as_secs(),
+                "a conference linger is a whole number of seconds"
+            );
+            DEFAULT_CONFERENCE_LINGER
+        }
+    }
+}
+
+fn member_state_ttl() -> std::time::Duration {
+    let Ok(configured) = std::env::var(MEMBER_STATE_TTL_ENV) else {
+        return DEFAULT_MEMBER_STATE_TTL;
+    };
+    if configured.trim().is_empty() {
+        return DEFAULT_MEMBER_STATE_TTL;
+    }
+    match configured.trim().parse::<u64>() {
+        Ok(seconds) => {
+            let ttl = std::time::Duration::from_secs(seconds);
+            info!(
+                env = MEMBER_STATE_TTL_ENV,
+                seconds,
+                "a member_mute, member_deaf or member_hold that names no member_state_ttl_ms \
+                 holds for this long before this pod lifts it; 0 means it holds until a \
+                 controller says otherwise"
+            );
+            ttl
+        }
+        Err(_) => {
+            warn!(
+                env = MEMBER_STATE_TTL_ENV,
+                configured = %configured,
+                fallback_secs = DEFAULT_MEMBER_STATE_TTL.as_secs(),
+                "a member state lease is a whole number of seconds"
+            );
+            DEFAULT_MEMBER_STATE_TTL
+        }
+    }
+}
+
 fn opus_decode_rate_hz() -> u32 {
     let Ok(configured) = std::env::var(OPUS_DECODE_RATE_ENV) else {
         return OPUS_DECODE_RATE_DEFAULT_HZ;
@@ -401,10 +464,13 @@ async fn serve_control_plane(
         cookie_prefix: cookie_prefix(),
         sdp_session_id: cookie_prefix(),
         recording,
-        capabilities,
+        capabilities: Arc::clone(&capabilities),
+        conference_linger: conference_linger(),
+        member_state_ttl: member_state_ttl(),
     }));
     let draining = Arc::clone(&plane);
     let observing = Arc::clone(&plane);
+    observing.linger_through(Arc::downgrade(&observing));
     let tap_metrics = plane.metrics();
     let mut controller = SessionController::new(owner.clone()).with_media_plane(plane);
 
@@ -458,6 +524,8 @@ async fn serve_control_plane(
                 probe_interval,
             );
             registry_store = Some(Arc::clone(&store));
+            observing
+                .share_groups_through(Arc::clone(&store) as Arc<dyn session_store::SessionStore>);
             let keeper = Arc::new(
                 registry_keeper::RegistryKeeper::new(
                     Arc::clone(&controller),
@@ -508,6 +576,7 @@ async fn serve_control_plane(
                     drain: Arc::clone(&drain_state),
                     ports: Arc::clone(&media_ports),
                     readiness: Arc::clone(&readiness),
+                    capabilities: Arc::clone(&capabilities),
                 };
                 tokio::spawn(metrics::serve(metrics_listener, sources));
             }
@@ -529,6 +598,28 @@ async fn serve_control_plane(
             "no metrics listen address configured; counters stay in logs"
         ),
     }
+
+    let sweeping = Arc::clone(&observing);
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(MEMBER_STATE_SWEEP);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tick.tick().await;
+            let released = sweeping.sweep_member_state(std::time::Instant::now());
+            if !released.is_empty() {
+                info!(
+                    released = released.len(),
+                    "member state leases ran out and were lifted through the same path an \
+                     explicit off takes"
+                );
+            }
+        }
+    });
+    info!(
+        sweep_ms = MEMBER_STATE_SWEEP.as_millis() as u64,
+        "the control world checks member state leases on this interval; the mix thread keeps \
+         no timer of its own"
+    );
 
     let auth = auth_policy_from_env();
     let mut until_draining = controller.drain_watch();

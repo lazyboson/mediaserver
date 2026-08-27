@@ -158,6 +158,33 @@ can be neutralised in a ConfigMap without deleting it.
 Events are **at-least-once** since defect D5: a consumer must dedupe by
 `(external_id, seq)`. `seq` is gapless per session, so a hole is visible.
 
+#### What MSS keeps in Redis
+
+Everything lives under one namespace prefix (`mss:`). Nothing here is a cache
+you may clear while calls are up.
+
+| Key | Shape | Written by | Expiry |
+| --- | --- | --- | --- |
+| `mss:session:<externalId>` | JSON `PersistedSession` — call-id, from-tags, rtpengine node, tap to-tag, every attachment | the owning pod's keeper tick | none; deleted when the session ends |
+| `mss:lease:<externalId>` | the owner pod's name, `SET NX` | the owner, renewed every 5 s | **15 s** — its expiry is what makes a session adoptable |
+| `mss:sessions` | a set of every known `externalId` | the owner | none; members are removed on destroy |
+| `mss:group:<accountId>/<group>` | JSON `{recording_id, format, opened_at_unix_ms, created_by}`, created with `SET NX` so the loser of a race reads the winner back | the **first** member of a recording group, on any pod | **3 h** (`MAX_RECORDING` + 1 h), refreshed on every join |
+| `mss:group:<accountId>/<group>:members` | hash `object key → owner pod`; `HSETNX` is the duplicate-participant refusal | every member, on its own pod | 3 h, refreshed on every join; both keys are deleted when the hash empties |
+| `<MSS_DISCOVERY_REDIS_KEY_PREFIX><SIP Call-ID>` | the rtpengine node map below — **written by your proxy**, only read by MSS | your proxy | yours |
+
+The two `mss:group:` keys are what make a recording group a shared record
+instead of one pod's memory (item 54): a member can join from any pod, an
+adopted member rejoins the group it was already in, and a group name reused on
+a second pod finds the existing group instead of opening a second
+half-recording under the same object prefix. Because the group's open instant
+is now **wall-clock** (unix ms in the record) rather than one pod's monotonic
+clock, cross-pod time alignment of a group's participant objects is only as
+good as the nodes' clock sync: **a skew of *s* between two nodes misaligns
+their two participants by *s***. Kubernetes nodes run NTP, so this is normally
+single-digit milliseconds — but if you disable it, alignment goes with it. A
+pod that has `MSS_REDIS_URL` unset keeps groups in its own memory, which is
+correct for a single pod and wrong for two.
+
 ### Recording
 
 | Variable | Default | Meaning | When to change | Added by |
@@ -168,13 +195,39 @@ Events are **at-least-once** since defect D5: a consumer must dedupe by
 | `MSS_RECORDING_S3_ACCESS_KEY_ID` / `…_SECRET_ACCESS_KEY` | unset | Static credentials. Leave **both** out to let the object store client pick up an instance/IRSA/workload-identity role instead; a half-set pair is the failure that looks like a bug | prefer a role; use keys where there is none | M5 |
 | `MSS_RECORDING_SPILL_DIR` | unset (memory only) | Closed segments spill here so a container restart does not lose them (defect D9), and this pod's leftovers are salvaged on its next start — never over an object that already exists | always set it, to a writable volume. The root filesystem is read-only and the process runs as uid 65532, so it must be a mount | [item 30](tasks.md) |
 | `MSS_RECORDING_UPLOAD_CONCURRENCY` | `4` | How many finished recordings upload at once. `Detach`/`StopRecording` never waits for an upload ([item 50](tasks.md), D11): it returns as soon as the segment is closed and `RecordingStopped` is published, and the upload runs on in the background. This bounds how many run at a time — and therefore the memory, since each holds one rendered WAV. Empty = unset = the default | raise it only if `mss_recording_uploads_in_flight` sits at the cap while calls end faster than uploads finish; lower it to protect a slow object store | [item 50](tasks.md) |
-| `MSS_RECORDING_SPILL_SECONDS` | `30` | How often a live recording spills. This **is** the worst-case audio loss when a container dies mid-call on the same pod | lower for shorter worst-case loss, at more IO | [item 30](tasks.md) |
+| `MSS_RECORDING_SPILL_SECONDS` | `30` | How often a live recording spills. This **is** the worst-case audio loss when a pod dies mid-call — on the same pod always, and on **any** pod with `MSS_RECORDING_SPILL_TO=s3` | lower for shorter worst-case loss, at more IO | [item 30](tasks.md), [item 53](tasks.md) |
+| `MSS_RECORDING_SPILL_TO` | `disk` | Where the segment journal lives. `disk` is per-pod local disk (`MSS_RECORDING_SPILL_DIR`; unset there still means "no spill"), so a **cross-pod** adopter reads nothing. `s3` puts the journal in the recording bucket itself under `MSS_RECORDING_SPILL_PREFIX`, so any pod can finish a recording a dead pod started. Anything else logs a warning and means `disk` | set `s3` whenever you run more than one pod and care about recordings surviving a node loss | [item 53](tasks.md) |
+| `MSS_RECORDING_SPILL_PREFIX` | `_spill/` | The **reserved** key prefix inside the recording bucket that `MSS_RECORDING_SPILL_TO=s3` writes journals under (a missing trailing `/` is added). Nothing but MSS may write there, and nothing outside it is ever written by the spill | change it only if `_spill/` collides with keys you already have | [item 53](tasks.md) |
+
+**The bucket holds two namespaces, and only one of them is a contract.**
+`${accountID}/${recordingID}.${format}` (and
+`${accountID}/${recordingID}/${participant}.${format}` for a recording group) is
+the frozen recording identity — Constitution, Article VII. Everything under
+`MSS_RECORDING_SPILL_PREFIX` (`_spill/` by default) is MSS's own scratch space:
+raw little-endian PCM chunks and a `manifest.json` per unfinished recording, of
+no use to a consumer, deleted by MSS as soon as the recording reaches its real
+key. Two operational consequences:
+
+- **Do not point a downstream consumer at the whole bucket.** Filter to the
+  identity scheme, or give `_spill/` its own exclusion, or your pipeline will
+  try to play headerless `.pcm` files.
+- **Give `_spill/` a lifecycle rule: expire objects after 7 days.** MSS deletes a
+  journal when its recording lands and skips a foreign one on startup salvage, so
+  what accumulates is only the journals of recordings that never finished on any
+  pod. **MSS implements no retention of its own** — this rule is the retention
+  policy, and it is yours to configure. On S3 it is one lifecycle
+  configuration with `Filter.Prefix: _spill/` and `Expiration.Days: 7`; on MinIO,
+  `mc ilm rule add --expire-days 7 --prefix _spill/ lab/<bucket>`. Seven days is
+  the number to start from: it is far past any `MAX_RECORDING` (2 h) and short
+  enough that a bad week does not become a storage bill.
 
 ### Lifecycle
 
 | Variable | Default | Meaning | When to change | Added by |
 | --- | --- | --- | --- | --- |
 | `MSS_DRAIN_TIMEOUT_SECS` | `30` | Ceiling on the whole shutdown drain: stop accepting, hand registry leases to an adopter, close every session politely (consumer stop frames, recordings finished, taps unsubscribed), flush the event backlog. The process exits **0** whether or not the window is used up; a second SIGTERM/SIGINT exits at once. `0` means "stop accepting and exit". Set `terminationGracePeriodSeconds` **at or above** it — with `docker stop`, whose default grace is 10 s, pass `-t` above it | raise it if long calls need longer to close politely; the grace period must follow | [item 42](tasks.md) |
+| `MSS_CONFERENCE_LINGER_SECS` | `0` | How long a conference whose **room session** is open is held after its last member leaves. `0` (the default) ends the room session on the last leave — its room recording is closed and uploaded there and then. A non-zero value keeps the mix running and the room session open for that long, so a member who rejoins inside the window lands back in the same room, on the same clock, still recording into the same object; a rejoin cancels the wait. A conference with **no** room session is unaffected: its last member out always closes it | raise it a few seconds if your call flow drops the last leg and dials back in (a transfer, a re-INVITE the proxy handles by re-dialling) and you want one recording rather than two | [item 55](tasks.md) |
+| `MSS_MEMBER_STATE_TTL_SECS` | `0` | The **default lease** on a conference member flag: how long a `member_mute` / `member_deaf` / `member_hold` set `on` holds without being refreshed when the request itself names no `member_state_ttl_ms`. `0` (the default) means no lease — the flag holds until an explicit `off`, exactly as it did before item 56. A request may always override this per call, and an explicit `member_state_ttl_ms=0` outranks it | set it to a little longer than your UI's refresh interval (say `30`) when a tenant drives mute from a screen, so a controller that dies costs one lease rather than the life of the conference. Leave it `0` when member state is owned by a policy engine that will reconcile it | [item 56](tasks.md) |
 | `MSS_HEALTH_PROBE_INTERVAL_SECS` | `10` | How often the background watchers re-probe each **configured** dependency for `/readyz`: Redis `PING`, a Kafka partition-offset read, NG `ping`. A failing dependency is re-probed sooner — 1 s, 2, 4, 8, then this interval — so a restarted dependency is picked up quickly; a probe that hangs is a failure after 15 s. The request path never probes, so this bounds only how stale a `/readyz` answer can be | lower for a faster readiness reaction, raise to cut chatter | [item 44](tasks.md) |
 
 ### Lab instruments — never set these in a deployment
@@ -258,7 +311,7 @@ Two deliberate choices in that block:
   not as a slow API. Bound the pod with requests and node-level allocation.
 - **The spill volume is an `emptyDir`, not a PVC.** It only has to survive a
   container restart: a cross-pod adopter cannot read another pod's disk either
-  way. Size it at (spill interval) × (concurrent recordings) × 16 kB/s per
+  way, which is what `MSS_RECORDING_SPILL_TO=s3` is for. Size it at (spill interval) × (concurrent recordings) × 16 kB/s per
   8 kHz 16-bit channel — about 1 MB per channel-minute — with headroom for a
   bucket outage.
 
@@ -468,15 +521,123 @@ A pod killed with SIGKILL between the detach and the upload loses that event; th
 audio is recovered by the salvage pass, without an event. A **graceful** drain
 does not: it waits for the uploads (step 4 of the rollout sequence below).
 
+## Conference recording — record the room off the room, not off a member
+
+A conference records two ways, and both may run at once:
+
+- **the room, as one mono object** — `Attach{transport=FILE_S3,
+  selector.only="mixed", endpoint="<account>/<recording>.wav"}`;
+- **every participant, one object each** — a recording **group** over the member
+  sessions with `selector.only="customer"`, which writes
+  `<account>/<recording>/<label>.wav` per member.
+
+Attach the room object to the **room session**:
+
+```
+CreateSession{external_id="room-42", kind=SESSION_KIND_MIX, group="<conference>"}
+Attach{session="room-42", transport=FILE_S3, selector.only="mixed",
+       endpoint="acct-7/rec-42.wav"}
+```
+
+`mss_ctl <endpoint> create room-42 --kind mix --group <conference>` does the
+first line from a shell, and `mss_ctl … record room-42 acct-7/rec-42.wav room ""
+mixed` the second.
+
+A room session has no leg, no SDP, no media ports and no `call_id`; its `group`
+names the conference it **is**, and it is refused by name if it carries any of
+those things or no group. Whichever arrives first — the room session or the first
+member — opens the conference, so the room object can be opened before anybody
+joins (it records the wait as silence) or after (it is padded back to the
+conference's open). `DescribeSession` on it returns `opened_at_unix_ms` — the
+**conference's** open, the t=0 every recording of that room shares, including the
+per-participant group — and `conference.members`; every member's own
+`DescribeSession` names the room session back in `conference.room_session`.
+
+The room session ends on `DestroySession`, or by itself once the conference has
+held at least one member and then emptied (`MSS_CONFERENCE_LINGER_SECS`). Ending
+it uploads the room object; members that are still mixing are left alone.
+`StartPlayback` on it with no target is a **room prompt**, and an
+`Attach{SINK, only="mixed"}` on it is a monitor of the room that costs no leg.
+
+Recording the room off **a member's** session still works and is still supported
+— but that object ends when that member leaves, even though the conference keeps
+mixing, and its t=0 is its attach moment. That is D20, and the room session is
+the way not to have it.
+
 ## Conference member state — read it back before you trust it
 
 `DescribeSession` on a conference member's session reports that member's live
 `mute`/`deaf`/`hold`, its mix routes (target, source, whether the recording feed
 carries it, and the attachment that owns each) and the room it sits in — group
 name, member count and every member's external id — so a UI can reconcile a whole
-room from any one member, with no extra RPC. Member state has **no lease**: if
-your controller dies between `mute on` and `mute off` the member stays muted for
-the life of the conference, so reconcile on reconnect rather than assuming.
+room from any one member, with no extra RPC.
+
+### The lease, and the refresh loop a UI should run
+
+By default a member flag holds until an explicit `off`: if your controller dies
+between `mute on` and `mute off`, the member stays muted for the life of the
+conference. Since item 56 a request may bound that with a **lease**.
+
+- **`member_state_ttl_ms`** is a fourth metadata key on the same `Attach` /
+  `UpdateAttachment` that carries the verbs. It applies to **every flag set `on`
+  in that request**, and is a whole number of milliseconds; anything else is
+  refused by name. Absent, or `0`, means no lease.
+- **`MSS_MEMBER_STATE_TTL_SECS`** is the deployment default for a request that
+  names no `member_state_ttl_ms`. An explicit `0` in the request outranks it.
+- **A refresh is any request that sets the flag `on` again with a TTL** — the
+  same `UpdateAttachment`, resent. There is no separate renew verb, and
+  resending the identical metadata is enough: MSS moves the deadline out even
+  though the declared state did not change (so no `MemberControlled` event is
+  published for a refresh that changed nothing).
+- **`off` clears the flag and its deadline** and is still how you lift a mute
+  early.
+- **Reading it back:** `DescribeSession` fills
+  `MemberState.{mute,deaf,hold}_expires_in_ms` with the milliseconds left. `0`
+  means no lease, which is also what an unset flag reports.
+- **When a lease runs out** the pod lifts the flag itself, through exactly the
+  path an explicit `off` takes, and publishes `MemberControlled` with
+  `cause = MEMBER_CONTROL_CAUSE_EXPIRED` and the member's whole remaining state
+  (a hold that was never leased stays `true`). `REQUESTED` is the zero value, so
+  a consumer written before item 56 reads every controller-driven event
+  unchanged. `mss_conference_member_state_expired_total` counts the flags lifted.
+
+**The loop a UI should run:** pick a TTL comfortably longer than your refresh
+interval — 30 s TTL refreshed every 10 s is a reasonable shape — resend the
+`UpdateAttachment` on that interval while the screen holds the member muted, and
+send `off` when the operator unmutes. Then a browser tab that closes, a pod that
+restarts or a controller that crashes costs at most one TTL of unwanted mute
+instead of the rest of the call. Watch
+`mss_conference_member_state_expired_total`: in a healthy deployment it stays
+near zero, because refreshes arrive before the deadlines do.
+
+**Two limits worth knowing.** The lease is **pod-local** — it lives in the
+control-world mirror beside the flag, so it does not survive a pod loss and does
+not move with a member (conferences are pod-bound anyway). And the deadline is
+checked by a control-world sweep every 500 ms, so a flag lifts up to half a
+second after its lease runs out; nothing in the media path holds a timer.
+
+## Attachment metadata — the `mss.` prefix is reserved
+
+`Attach` and `UpdateAttachment` carry a free-form `metadata` map, and MSS reads
+a handful of keys out of it: `accountId`, `streamSid`, `callSid`, `recordId`,
+`fileFormat`, `recordingChannels`, `sipCallId`, `callerTag`, and the conference
+verbs `mix_target` / `mix_monitor` / `mix_source` / `member_mute` /
+`member_deaf` / `member_hold` / `member_state_ttl_ms`. Everything else is yours
+and is passed through untouched — **except any key beginning `mss.`**, which is refused with
+`INVALID_ARGUMENT` naming the key.
+
+That prefix is how mediaserverd's own session registry talks to itself: when a
+pod adopts a session, `RegistryKeeper::rebuild` re-issues the attachment with
+`mss.recording.resumeMs` (how much audio the dead pod had recorded, which
+becomes leading silence) and `mss.recording.spillOwner` (the pod whose spill
+journal to read, and the fact that this attach may take back its
+recording-group seat). A client that could set those could silence-pad any
+recording or claim another pod's seat in a recording group, so the guard sits
+on the wire: the keeper reaches the controller in-process and is unaffected,
+and the same refusal covers the legacy `telsvc` façade, whose `StartStream`
+copies caller metadata straight through. If you are carrying your own
+namespaced keys, use anything but `mss.` — `tenant.`, your product's name,
+whatever — and nothing changes for you.
 
 ## High availability: what is adoptable and what is not
 
@@ -491,8 +652,10 @@ simply ask again. Nothing else in the system has that property.
 | **Attachments MSS dials out to** (`WS_TWILIO`, `file-s3`) | yes | re-established by the adopter along with the tap |
 | **Attachments that dial into MSS** (`GRPC_STREAM`) | no, by construction | the consumer's HTTP/2 connection died with the pod; it must reattach. This is why the Service is headless — a client resolving all pod IPs notices |
 | **Inline legs** (Phase 3) | **no** | the peer's SDP points at a socket that no longer exists. This fails like any media endpoint failure and needs recovery at call-control level |
-| **Conferences** (Phase 4) | **no** | the mixer is pod-local; a room does not move. Defect D16 — pod-local groups — is open pending a placement decision |
-| **Recordings** | **partly** | closed segments spill to per-pod local disk, so a **same-pod** restart loses at most `MSS_RECORDING_SPILL_SECONDS`. A **cross-pod** adopter cannot read that disk: it recovers what it can, pads the rest, and counts it in `mss_recording_frames_lost_on_adopt_total`. Defect D9's residual |
+| **Conferences** (Phase 4) | **no** | the mixer is pod-local; a room does not move. This fails like an inline leg, because a conference member *is* one |
+| **A room session** (`kind=MIX`) | **no** | it owns a mix thread on the pod that opened it, so it is pod-bound exactly like an inline leg: the registry releases the record rather than adopting it (`is_rebuildable` is false), and its room recording is recovered the way any recording is (spill, below), not by moving the room |
+| **Recording groups** | **yes, with `MSS_REDIS_URL` set** | the group is a record in Redis (`mss:group:…` above), not one pod's memory: a member's adopted session rejoins the group, a member may attach on any pod, and the group's wall-clock anchor keeps every participant object aligned across pods. Without Redis a group is pod-local, and a member adopted elsewhere opens an ungrouped file. What placement still does not do (D8) is *choose* one pod for a group — it no longer has to |
+| **Recordings** | **yes, with `MSS_RECORDING_SPILL_TO=s3`** | closed segments spill every `MSS_RECORDING_SPILL_SECONDS` into the recording bucket, the adopting pod reads them back and pads only what the dead pod had not spilled yet, so the worst case is one spill interval on **any** pod (`mss_recording_frames_lost_on_adopt_total` says how much). With the default `disk` that guarantee holds only for a **same-pod** restart, because a cross-pod adopter cannot read the dead pod's disk — it recovers nothing and pads the whole recording. Either way the journals of recordings that never finished need a bucket lifecycle rule on `_spill/`: MSS implements no retention. Never measured on a live pod kill with a recorder attached — see [item 53](tasks.md) |
 | **Events** | yes | at-least-once with a bounded retry backlog; a pod death or an overfull backlog still loses events, and the gapless per-session `seq` makes the hole visible |
 
 Run at least two pods, spread across nodes (the base prefers it; both overlays
@@ -593,6 +756,64 @@ silently ignored. No operator? Drop both files and scrape
 `mediaserverd-scrape:9464/metrics` however you already scrape things; nothing in
 mediaserverd depends on the operator.
 
+### Recording spill series (item 53)
+
+Read these three together when a pod dies mid-recording:
+
+| Series | Meaning |
+| --- | --- |
+| `mss_recording_spill_segments_total` | closed segments written to the journal while the call was still up. **Zero on a pod that is recording is the alarm**: nothing is spilling, so a pod death costs the whole recording |
+| `mss_recording_spill_failures_total` | segments the journal refused (disk full, bucket unreachable, past the 10 s spill timeout). The audio stays in memory and the next tick retries, so a few are survivable and a rising rate is not |
+| `mss_recording_frames_lost_on_adopt_total` | recorded frames an adopting pod could read from neither memory nor the journal, and turned into silence. With `MSS_RECORDING_SPILL_TO=s3` this should stay under one spill interval per adoption; with `disk` a cross-pod adoption shows up here as the whole recording |
+| `mss_recording_spill_lost_ownership_total` | closed segments **not** spilled because another pod had already adopted the journal. Non-zero means a partitioned-but-alive pod was still recording a call it no longer owns — the registry's `mss_registry_lost_total` should say the same thing |
+| `mss_recording_spill_foreign_manifests` | journals this pod's startup salvage left alone because their manifest names another owner. Expected and healthy after a rolling restart; a number that only grows means journals nobody is finishing, which is what the `_spill/` lifecycle rule is for |
+| `mss_recording_salvaged_total` / `…_salvage_skipped_total` / `…_salvage_failures_total` | what this pod's start did with its *own* leftover journals: uploaded, left alone because the object already existed, or failed |
+
+### Recording group series (item 54)
+
+A recording group writes one object per participant under one prefix. These
+three say whether the group is healthy; all three exist whether or not Redis is
+configured, because the gauges are per pod.
+
+| Series | Meaning |
+| --- | --- |
+| `mss_recording_groups_live` | recording groups with at least one member **on this pod**. Sum across pods to see a cross-pod group counted once per pod that holds a member of it |
+| `mss_recording_group_members_live` | members of those groups on this pod. One per `FILE_S3` attachment that named a group |
+| `mss_recording_group_joins_refused_total` | grouped attachments refused, by one of four reasons the log names: a participant label already writing that object (now including one held **by another pod**), a member naming a different `recordingID` or format inside an existing group, a non-empty group on any transport but `FILE_S3`, and — since item 54 — a **session registry MSS could not read**. That last one is deliberate: a member that cannot see the group would open a second half-recording under the same prefix, so it is refused instead |
+
+### Conference member state series (item 56)
+
+| Series | Meaning |
+| --- | --- |
+| `mss_conference_member_controls_total` | times a member was muted, deafened, put on hold or released — every write, whether a controller asked or a lease expired |
+| `mss_conference_member_state_expired_total` | **member flags this pod lifted by itself** because their lease ran out unrefreshed. One per flag, not per member: a mute and a deaf expiring together count two. A rising rate means controllers are setting leases and not refreshing them — either their refresh loop is broken or `MSS_MEMBER_STATE_TTL_SECS` is shorter than the interaction it is bounding. Flat at zero on a pod whose clients send no TTL is expected |
+| `mss_conference_muted_members` / `mss_conference_deaf_members` / `mss_conference_held_members` | how many members are in that state right now, on this pod. These say *how many*, never *who* — `DescribeSession` per member says who |
+
+### rtpengine node series (item 57)
+
+Every `/readyz` rtpengine probe (`MSS_HEALTH_PROBE_INTERVAL_SECS`) also takes an
+NG `statistics` sample and exports it, so handoff **H3**'s three-moment
+comparison can be read off Prometheus instead of a shell on the rtpengine host.
+The series exist only for nodes this pod has actually probed, and they are the
+*node's own* counters, not MSS's — two pods tapping one rtpengine report the
+same numbers.
+
+| Series | Means |
+| --- | --- |
+| `mss_rtpengine_tap_kernel_verdict{node,verdict}` | 1 on the one verdict that held at the last probe. Label values are the four verdicts: `TranscodedTapsAreProcessedInUserspace`, `TapsMayRideTheKernelPath`, `ThisNodeIsNotUsingTheKernelModule`, `Undetermined` |
+| `mss_rtpengine_relayed_packets_kernel{node}` | packets this node has relayed in the kernel module since it started |
+| `mss_rtpengine_relayed_packets_user{node}` | packets it has relayed in userspace since it started |
+| `mss_rtpengine_media_kernel{node}` | media streams in the kernel module right now |
+| `mss_rtpengine_media_userspace{node}` | media streams in userspace right now |
+| `mss_rtpengine_media_mixed{node}` | media streams counted in both right now |
+| `mss_rtpengine_transcoded_media{node}` | media streams this node is transcoding right now |
+| `mss_rtpengine_sessions_live{node}` | sessions this node is managing right now |
+| `mss_rtpengine_sample_age_seconds{node}` | seconds since the probe that produced the sample. It grows past the probe interval when `statistics` stops answering — read it before trusting the rest |
+
+`MssTapsFellOutOfKernel` fires on the transcoding verdict, or on userspace media
+growing for 10 min while kernel media stays flat; its runbook is
+[architecture §8.1](architecture.md#81-running-mss-against-a-kernel-module-rtpengine).
+
 ## Running against a kernel-module rtpengine
 
 Whether a tap drags the tapped legs out of rtpengine's kernel fast path is
@@ -606,7 +827,10 @@ the version cannot be asked over NG are all in
 [architecture §8.1](architecture.md#81-running-mss-against-a-kernel-module-rtpengine).
 The short form: set `MSS_TAP_TRANSCODE=off`, confirm codec coverage first, run
 `lab/kernel_probe.sh <host> <port>` at baseline **and** with taps running, and
-read the daemon's own `rtpengine node capabilities on first contact` line.
+read the daemon's own `rtpengine node capabilities on first contact` line —
+or, since item 57, read the verdict and the relay split off `/metrics`
+(`mss_rtpengine_tap_kernel_verdict`, `mss_rtpengine_relayed_packets_kernel`
+vs `_user`), which is refreshed on every health probe rather than once.
 
 ## Preflight — check the environment before deploying into it
 
@@ -784,9 +1008,11 @@ capacity plan. The full read-only checklist is
 object landed at exactly `${accountID}/${recordingID}.${format}` — that identity
 is frozen, and anything reading recordings downstream depends on it. Then pause
 and resume mid-call and confirm the segmenting. Then kill the container mid-call
-and confirm the spill salvage on restart. Note the residual honestly: a
-**cross-pod** adopter cannot read the dead pod's spill directory (defect D9), and
-byte-parity against a FreeSWITCH recording is handoff **H6**.
+and confirm the spill salvage on restart. Then, with
+`MSS_RECORDING_SPILL_TO=s3`, kill a pod mid-recording and confirm another pod
+finishes the object with at most `MSS_RECORDING_SPILL_SECONDS` missing — that is
+the cross-pod half of D9, and it has never been measured on real gear or in the
+lab. Byte-parity against a FreeSWITCH recording is handoff **H6**.
 
 **5. Drain and adopt, on purpose, before it happens by accident.** With a tapped
 call up: `kubectl -n mediaserver delete pod <pod>`. Expect the drain sequence in

@@ -1,5 +1,7 @@
 use crate::hub::{Subscription, TapEvent};
-use crate::recording_spill::SegmentJournal;
+use crate::recording_spill::{
+    DiskSpill, ObjectSpill, SegmentJournal, SpillStore, SpillWritten, SPILL_TIMEOUT,
+};
 use control_api::ObservationSink;
 use media_core::Track;
 use object_store::aws::AmazonS3Builder;
@@ -8,13 +10,12 @@ use session_core::{Observation, SessionId};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 use tokio::sync::{mpsc, oneshot, OwnedSemaphorePermit, Semaphore};
 use tracing::{info, warn};
 
 pub const IDENTITY_SCHEME: &str = "${accountID}/${recordingID}.${format}";
-pub const RESUME_MS_METADATA_KEY: &str = "mss.recording.resumeMs";
-pub const SPILL_OWNER_METADATA_KEY: &str = "mss.recording.spillOwner";
+pub use session_core::{RESUME_MS_METADATA_KEY, SPILL_OWNER_METADATA_KEY};
 pub const MAX_RECORDING: Duration = Duration::from_secs(2 * 3600);
 pub const UPLOAD_TIMEOUT: Duration = Duration::from_secs(60);
 pub const STOP_TIMEOUT: Duration = Duration::from_secs(5);
@@ -32,6 +33,8 @@ const ACCESS_KEY_ENV: &str = "MSS_RECORDING_S3_ACCESS_KEY_ID";
 const SECRET_KEY_ENV: &str = "MSS_RECORDING_S3_SECRET_ACCESS_KEY";
 const SPILL_DIR_ENV: &str = "MSS_RECORDING_SPILL_DIR";
 const SPILL_SECONDS_ENV: &str = "MSS_RECORDING_SPILL_SECONDS";
+pub const SPILL_TO_ENV: &str = "MSS_RECORDING_SPILL_TO";
+pub const SPILL_PREFIX_ENV: &str = "MSS_RECORDING_SPILL_PREFIX";
 pub const UPLOAD_CONCURRENCY_ENV: &str = "MSS_RECORDING_UPLOAD_CONCURRENCY";
 const DEFAULT_REGION: &str = "us-east-1";
 const UPLOAD_RETRIES: usize = 3;
@@ -261,6 +264,7 @@ pub struct Segmenter {
     anchor_ms: Option<u64>,
     segment_start: usize,
     spilled_frames: usize,
+    sealed_frames: usize,
     paused: bool,
     stats: SegmenterStats,
 }
@@ -278,6 +282,7 @@ impl Segmenter {
             anchor_ms: None,
             segment_start: 0,
             spilled_frames: 0,
+            sealed_frames: 0,
             paused: false,
             stats: SegmenterStats {
                 segments: 1,
@@ -329,7 +334,16 @@ impl Segmenter {
         )
     }
 
+    pub fn seal(&mut self, frames: usize) {
+        self.sealed_frames = frames;
+    }
+
+    pub fn unseal(&mut self) {
+        self.sealed_frames = 0;
+    }
+
     pub fn close_segment(&mut self, frames: usize) {
+        self.sealed_frames = 0;
         let frames_per_ms = (self.sample_rate_hz / 1000) as usize;
         if frames == 0 || frames_per_ms == 0 {
             return;
@@ -359,7 +373,11 @@ impl Segmenter {
             self.stats.frames_out_of_order += 1;
         }
         let offset_frames = timestamp_ms.saturating_sub(anchor) * self.sample_rate_hz as u64 / 1000;
-        let position = self.segment_start.saturating_add(offset_frames as usize);
+        let mut position = self.segment_start.saturating_add(offset_frames as usize);
+        if position < self.sealed_frames {
+            self.stats.frames_out_of_order += 1;
+            position = self.sealed_frames;
+        }
         if self.spilled_frames + position + samples.len() > self.max_frames {
             self.stats.frames_beyond_cap += 1;
             return;
@@ -522,6 +540,8 @@ pub enum UploadError {
     Refused(String),
     #[error("the upload did not finish within {0:?}")]
     TimedOut(Duration),
+    #[error("{0} is not in storage")]
+    Missing(String),
 }
 
 #[control_api::async_trait]
@@ -534,6 +554,12 @@ pub trait RecordingSink: Send + Sync + 'static {
     ) -> Result<String, UploadError>;
 
     async fn exists(&self, key: &str) -> Result<bool, UploadError>;
+
+    async fn get(&self, key: &str) -> Result<Vec<u8>, UploadError>;
+
+    async fn list(&self, prefix: &str) -> Result<Vec<String>, UploadError>;
+
+    async fn delete(&self, key: &str) -> Result<(), UploadError>;
 
     fn describe(&self) -> String;
 }
@@ -631,6 +657,52 @@ impl RecordingSink for S3RecordingSink {
         }
     }
 
+    async fn get(&self, key: &str) -> Result<Vec<u8>, UploadError> {
+        let path = object_store::path::Path::parse(key)
+            .map_err(|error| UploadError::Key(key.to_string(), error.to_string()))?;
+        let fetched = match self.store.get(&path).await {
+            Ok(fetched) => fetched,
+            Err(object_store::Error::NotFound { .. }) => {
+                return Err(UploadError::Missing(key.to_string()))
+            }
+            Err(error) => return Err(UploadError::Refused(error.to_string())),
+        };
+        let bytes = fetched
+            .bytes()
+            .await
+            .map_err(|error| UploadError::Refused(error.to_string()))?;
+        Ok(bytes.to_vec())
+    }
+
+    async fn list(&self, prefix: &str) -> Result<Vec<String>, UploadError> {
+        let trimmed = prefix.trim_end_matches('/');
+        let under = if trimmed.is_empty() {
+            None
+        } else {
+            Some(
+                object_store::path::Path::parse(trimmed)
+                    .map_err(|error| UploadError::Key(prefix.to_string(), error.to_string()))?,
+            )
+        };
+        let mut listing = self.store.list(under.as_ref());
+        let mut keys = Vec::new();
+        while let Some(entry) = futures_util::StreamExt::next(&mut listing).await {
+            let meta = entry.map_err(|error| UploadError::Refused(error.to_string()))?;
+            keys.push(meta.location.as_ref().to_string());
+        }
+        Ok(keys)
+    }
+
+    async fn delete(&self, key: &str) -> Result<(), UploadError> {
+        let path = object_store::path::Path::parse(key)
+            .map_err(|error| UploadError::Key(key.to_string(), error.to_string()))?;
+        match self.store.delete(&path).await {
+            Ok(()) => Ok(()),
+            Err(object_store::Error::NotFound { .. }) => Ok(()),
+            Err(error) => Err(UploadError::Refused(error.to_string())),
+        }
+    }
+
     fn describe(&self) -> String {
         match &self.endpoint {
             Some(endpoint) => format!("bucket {} at {endpoint}", self.bucket),
@@ -652,6 +724,8 @@ pub struct RecorderCounters {
     pub spilled: AtomicU64,
     pub segments_spilled: AtomicU64,
     pub segment_spill_failures: AtomicU64,
+    pub spill_lost_ownership: AtomicU64,
+    pub spill_foreign_manifests: AtomicU64,
     pub salvaged: AtomicU64,
     pub salvage_skipped: AtomicU64,
     pub salvage_failures: AtomicU64,
@@ -669,6 +743,7 @@ pub struct RecorderCounters {
 pub struct RecordingSupport {
     pub sink: Option<Arc<dyn RecordingSink>>,
     pub spill_dir: Option<PathBuf>,
+    pub journal: Option<Arc<dyn SpillStore>>,
     pub spill_every: Duration,
     pub counters: Arc<RecorderCounters>,
     pub owner: String,
@@ -680,6 +755,7 @@ impl Default for RecordingSupport {
         RecordingSupport {
             sink: None,
             spill_dir: None,
+            journal: None,
             spill_every: SPILL_EVERY,
             counters: Arc::new(RecorderCounters::default()),
             owner: String::new(),
@@ -722,6 +798,36 @@ pub fn upload_concurrency_from_env() -> usize {
     }
 }
 
+fn disk_journal(dir: PathBuf) -> Arc<dyn SpillStore> {
+    Arc::new(DiskSpill::new(dir))
+}
+
+fn spill_to_object_store_from_env() -> bool {
+    let configured = std::env::var(SPILL_TO_ENV).unwrap_or_default();
+    match configured.trim().to_ascii_lowercase().as_str() {
+        "" | "disk" => false,
+        "s3" => true,
+        other => {
+            warn!(
+                env = SPILL_TO_ENV,
+                configured = %other,
+                "a recording spill goes to disk or to s3; falling back to disk"
+            );
+            false
+        }
+    }
+}
+
+fn spill_prefix_from_env() -> String {
+    let configured = std::env::var(SPILL_PREFIX_ENV).unwrap_or_default();
+    let normalized = crate::recording_spill::normalized_prefix(&configured);
+    if normalized.is_empty() {
+        crate::recording_spill::DEFAULT_SPILL_PREFIX.to_string()
+    } else {
+        normalized
+    }
+}
+
 impl RecordingSupport {
     pub fn from_env(owner: &str) -> Result<RecordingSupport, UploadError> {
         let upload_permits = Arc::new(Semaphore::new(upload_concurrency_from_env()));
@@ -732,9 +838,19 @@ impl RecordingSupport {
             .filter(|seconds| *seconds > 0)
             .map(Duration::from_secs)
             .unwrap_or(SPILL_EVERY);
+        let to_object_store = spill_to_object_store_from_env();
         let Ok(bucket) = std::env::var(BUCKET_ENV) else {
+            if to_object_store {
+                warn!(
+                    env = SPILL_TO_ENV,
+                    bucket = BUCKET_ENV,
+                    "the recording bucket is where the spill journal was asked to live, and no \
+                     bucket is configured; nothing spills"
+                );
+            }
             return Ok(RecordingSupport {
                 sink: None,
+                journal: spill_dir.clone().map(disk_journal),
                 spill_dir,
                 spill_every,
                 counters: Arc::new(RecorderCounters::default()),
@@ -758,14 +874,29 @@ impl RecordingSupport {
             }
             _ => None,
         };
-        let sink = S3RecordingSink::new(bucket, region, endpoint, credentials)?;
+        let sink: Arc<dyn RecordingSink> =
+            Arc::new(S3RecordingSink::new(bucket, region, endpoint, credentials)?);
+        let journal: Option<Arc<dyn SpillStore>> = if to_object_store {
+            let prefix = spill_prefix_from_env();
+            info!(
+                env = SPILL_TO_ENV,
+                prefix = %prefix,
+                "closed recording segments spill into the recording bucket itself, so any pod \
+                 can read back what a dead pod held"
+            );
+            Some(Arc::new(ObjectSpill::new(Arc::clone(&sink), &prefix)))
+        } else {
+            spill_dir.clone().map(disk_journal)
+        };
         info!(
             storage = %sink.describe(),
             spill_dir = ?spill_dir,
+            spill_in_bucket = to_object_store,
             "recording uploads are configured"
         );
         Ok(RecordingSupport {
-            sink: Some(Arc::new(sink)),
+            sink: Some(sink),
+            journal,
             spill_dir,
             spill_every,
             counters: Arc::new(RecorderCounters::default()),
@@ -782,7 +913,7 @@ pub struct RecorderSpec {
     pub targets: Vec<RecordingTarget>,
     pub sample_rate_hz: u32,
     pub max_duration: Duration,
-    pub group_anchor: Option<Instant>,
+    pub group_anchor: Option<SystemTime>,
     pub resume_ms: u64,
 }
 
@@ -1031,13 +1162,14 @@ async fn run(
             recovered_ms,
             missing_ms,
             padded,
-            "this recording was adopted from another pod; the audio the dead pod held is gone              and only what it had spilled to a disk this pod can read is recovered"
+            "this recording was adopted from another pod; only what the dead pod had spilled              to a store this pod can read is recovered, and the rest is counted silence"
         );
     }
     let mut segment_close = tokio::time::interval_at(
         tokio::time::Instant::now() + support.spill_every,
         support.spill_every,
     );
+    let mut in_flight: Option<InFlightSpill> = None;
 
     loop {
         tokio::select! {
@@ -1055,14 +1187,7 @@ async fn run(
                 Some(RecorderCommand::Pause) => {
                     if segmenter.pause() {
                         counters.pauses.fetch_add(1, Ordering::Relaxed);
-                        spill_closed_segment(
-                            &mut journal,
-                            &mut segmenter,
-                            &spec,
-                            &counters,
-                            &progress,
-                        )
-                        .await;
+                        begin_spill(&mut in_flight, &journal, &mut segmenter, &spec, &counters);
                         observe(
                             &observer,
                             spec.session,
@@ -1089,9 +1214,21 @@ async fn run(
                 }
                 Some(RecorderCommand::Finish) | None => break,
             },
-            _ = segment_close.tick(), if journal.is_some() => {
-                spill_closed_segment(&mut journal, &mut segmenter, &spec, &counters, &progress)
-                    .await;
+            written = spill_landed(&mut in_flight), if in_flight.is_some() => {
+                if let Some(pending) = in_flight.take() {
+                    settle_spill(
+                        written,
+                        pending.frames,
+                        &mut journal,
+                        &mut segmenter,
+                        &spec,
+                        &counters,
+                        &progress,
+                    );
+                }
+            }
+            _ = segment_close.tick(), if journal.is_some() && in_flight.is_none() => {
+                begin_spill(&mut in_flight, &journal, &mut segmenter, &spec, &counters);
             }
         }
     }
@@ -1137,6 +1274,29 @@ async fn run(
             "nobody waited for this recording's stop report; its upload runs on regardless"
         );
     }
+    if let Some(mut pending) = in_flight.take() {
+        let written = match tokio::time::timeout(SPILL_TIMEOUT, pending.landed()).await {
+            Ok(written) => written,
+            Err(_) => SpillWritten::Failed(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!(
+                    "the spill write still pending when the recording stopped did not land \
+                     within {} ms",
+                    SPILL_TIMEOUT.as_millis()
+                ),
+            )),
+        };
+        settle_spill(
+            written,
+            pending.frames,
+            &mut journal,
+            &mut segmenter,
+            &spec,
+            &counters,
+            &progress,
+        );
+    }
+    let stats = segmenter.stats();
     let permit = acquire_upload_slot(&support, &recording_id).await;
 
     let rate = spec.sample_rate_hz;
@@ -1235,9 +1395,9 @@ async fn run(
         } else {
             warn!(
                 %recording_id,
-                journal = %held.dir().display(),
-                "this recording did not reach storage; its spilled segments stay on disk for \
-                 the next start of this pod to salvage"
+                journal = %held.describe(),
+                "this recording did not reach storage; its spilled segments stay in the spill \
+                 store for the next start of this pod to salvage"
             );
         }
     }
@@ -1370,14 +1530,46 @@ fn channels_of(layout: Layout) -> u16 {
     }
 }
 
-async fn spill_closed_segment(
-    journal: &mut Option<SegmentJournal>,
+struct InFlightSpill {
+    frames: usize,
+    task: tokio::task::JoinHandle<SpillWritten>,
+}
+
+impl InFlightSpill {
+    async fn landed(&mut self) -> SpillWritten {
+        match (&mut self.task).await {
+            Ok(written) => written,
+            Err(error) => SpillWritten::Failed(std::io::Error::other(format!(
+                "the spill write task died: {error}"
+            ))),
+        }
+    }
+}
+
+impl Drop for InFlightSpill {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+async fn spill_landed(in_flight: &mut Option<InFlightSpill>) -> SpillWritten {
+    match in_flight.as_mut() {
+        Some(pending) => pending.landed().await,
+        None => std::future::pending().await,
+    }
+}
+
+fn begin_spill(
+    in_flight: &mut Option<InFlightSpill>,
+    journal: &Option<SegmentJournal>,
     segmenter: &mut Segmenter,
     spec: &RecorderSpec,
     counters: &RecorderCounters,
-    progress: &RecordingProgress,
 ) {
-    let Some(held) = journal.as_mut() else {
+    if in_flight.is_some() {
+        return;
+    }
+    let Some(held) = journal.as_ref() else {
         return;
     };
     let frames = segmenter.closable_frames();
@@ -1389,14 +1581,13 @@ async fn spill_closed_segment(
         .iter()
         .map(|target| segmenter.render_closable(frames, target.layout))
         .collect();
-    match held.append(rendered, frames as u64).await {
-        Ok(()) => {
-            segmenter.close_segment(frames);
-            counters.segments_spilled.fetch_add(1, Ordering::Relaxed);
-            progress.spilled_ms.store(
-                held.frames_on_disk() * 1000 / spec.sample_rate_hz.max(1) as u64,
-                Ordering::Relaxed,
-            );
+    match held.begin_append(rendered, frames as u64) {
+        Ok(write) => {
+            segmenter.seal(frames);
+            *in_flight = Some(InFlightSpill {
+                frames,
+                task: tokio::spawn(write.perform()),
+            });
         }
         Err(error) => {
             counters
@@ -1405,14 +1596,66 @@ async fn spill_closed_segment(
             warn!(
                 recording_id = %spec.recording_id,
                 %error,
-                "a closed recording segment could not be spilled to disk; it stays in memory \
-                 and dies with this pod"
+                "a closed recording segment could not be prepared for the spill store; it \
+                 stays in memory"
             );
         }
     }
 }
 
-fn absorb(segmenter: &mut Segmenter, event: TapEvent, group_anchor: &mut Option<Instant>) {
+fn settle_spill(
+    written: SpillWritten,
+    frames: usize,
+    journal: &mut Option<SegmentJournal>,
+    segmenter: &mut Segmenter,
+    spec: &RecorderSpec,
+    counters: &RecorderCounters,
+    progress: &RecordingProgress,
+) {
+    let Some(held) = journal.as_mut() else {
+        segmenter.unseal();
+        return;
+    };
+    match written {
+        SpillWritten::Landed(manifest) => {
+            held.commit(manifest);
+            segmenter.close_segment(frames);
+            counters.segments_spilled.fetch_add(1, Ordering::Relaxed);
+            progress.spilled_ms.store(
+                held.frames_on_disk() * 1000 / spec.sample_rate_hz.max(1) as u64,
+                Ordering::Relaxed,
+            );
+        }
+        SpillWritten::Surrendered(owner) => {
+            segmenter.unseal();
+            counters
+                .spill_lost_ownership
+                .fetch_add(1, Ordering::Relaxed);
+            warn!(
+                recording_id = %spec.recording_id,
+                journal = %held.describe(),
+                new_owner = %owner,
+                "another pod has adopted this recording's spill journal, so this pod stops \
+                 writing it and will not delete it; the audio it still holds stays in memory"
+            );
+            *journal = None;
+        }
+        SpillWritten::Failed(error) => {
+            segmenter.unseal();
+            counters
+                .segment_spill_failures
+                .fetch_add(1, Ordering::Relaxed);
+            warn!(
+                recording_id = %spec.recording_id,
+                %error,
+                "a closed recording segment could not be spilled; it stays in memory and dies \
+                 with this pod"
+            );
+        }
+    }
+}
+
+fn absorb(segmenter: &mut Segmenter, event: TapEvent, group_anchor: &mut Option<SystemTime>) {
     if let TapEvent::Media {
         track,
         timestamp_ms,
@@ -1421,7 +1664,7 @@ fn absorb(segmenter: &mut Segmenter, event: TapEvent, group_anchor: &mut Option<
     } = event
     {
         if let Some(anchor) = group_anchor.take() {
-            let lead = Instant::now().saturating_duration_since(anchor);
+            let lead = SystemTime::now().duration_since(anchor).unwrap_or_default();
             if segmenter.lead_with_silence(lead) {
                 info!(
                     lead_silence_ms = lead.as_millis() as u64,
@@ -1459,37 +1702,40 @@ mod tests {
 
     struct MemorySink {
         puts: Mutex<Vec<(String, Vec<u8>)>>,
-        refuse: bool,
+        refuse: std::sync::atomic::AtomicBool,
         stall: bool,
         slow_by: Duration,
     }
 
     impl MemorySink {
         fn accepting() -> MemorySink {
-            MemorySink {
-                puts: Mutex::new(Vec::new()),
-                refuse: false,
-                stall: false,
-                slow_by: Duration::ZERO,
-            }
+            MemorySink::slow(Duration::ZERO)
         }
 
         fn refusing() -> MemorySink {
-            MemorySink {
-                puts: Mutex::new(Vec::new()),
-                refuse: true,
-                stall: false,
-                slow_by: Duration::ZERO,
-            }
+            MemorySink::slow_refusing(Duration::ZERO)
         }
 
         fn slow(slow_by: Duration) -> MemorySink {
             MemorySink {
                 puts: Mutex::new(Vec::new()),
-                refuse: false,
+                refuse: std::sync::atomic::AtomicBool::new(false),
                 stall: false,
                 slow_by,
             }
+        }
+
+        fn slow_refusing(slow_by: Duration) -> MemorySink {
+            MemorySink {
+                puts: Mutex::new(Vec::new()),
+                refuse: std::sync::atomic::AtomicBool::new(true),
+                stall: false,
+                slow_by,
+            }
+        }
+
+        fn accept_from_now_on(&self) {
+            self.refuse.store(false, Ordering::Relaxed);
         }
 
         fn last(&self) -> Option<(String, Vec<u8>)> {
@@ -1524,17 +1770,25 @@ mod tests {
             content_type: &'static str,
             body: Vec<u8>,
         ) -> Result<String, UploadError> {
-            assert_eq!(content_type, "audio/wav");
+            assert!(
+                matches!(
+                    content_type,
+                    "audio/wav" | "application/json" | "application/octet-stream"
+                ),
+                "{content_type} is not a content type this recorder writes"
+            );
             if !self.slow_by.is_zero() {
                 tokio::time::sleep(self.slow_by).await;
             }
             if self.stall {
                 tokio::time::sleep(UPLOAD_TIMEOUT * 3).await;
             }
-            if self.refuse {
+            if self.refuse.load(Ordering::Relaxed) {
                 return Err(UploadError::Refused("the bucket said no".to_string()));
             }
-            self.puts.lock().unwrap().push((key.to_string(), body));
+            let mut held = self.puts.lock().unwrap();
+            held.retain(|(stored, _)| stored != key);
+            held.push((key.to_string(), body));
             Ok(format!("s3:{URI_SCHEME_SEPARATOR}lab-recordings/{key}"))
         }
 
@@ -1545,6 +1799,32 @@ mod tests {
                 .unwrap()
                 .iter()
                 .any(|(held, _)| held == key))
+        }
+
+        async fn get(&self, key: &str) -> Result<Vec<u8>, UploadError> {
+            self.puts
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|(held, _)| held == key)
+                .map(|(_, body)| body.clone())
+                .ok_or_else(|| UploadError::Missing(key.to_string()))
+        }
+
+        async fn list(&self, prefix: &str) -> Result<Vec<String>, UploadError> {
+            Ok(self
+                .puts
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(held, _)| held.starts_with(prefix))
+                .map(|(held, _)| held.clone())
+                .collect())
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), UploadError> {
+            self.puts.lock().unwrap().retain(|(held, _)| held != key);
+            Ok(())
         }
 
         fn describe(&self) -> String {
@@ -1764,10 +2044,31 @@ mod tests {
     fn support(sink: Arc<dyn RecordingSink>, spill_dir: Option<PathBuf>) -> RecordingSupport {
         RecordingSupport {
             sink: Some(sink),
+            journal: spill_dir.clone().map(disk_journal),
             spill_dir,
             spill_every: SPILL_EVERY,
             counters: Arc::new(RecorderCounters::default()),
             owner: "pod-a".to_string(),
+            upload_permits: Arc::new(Semaphore::new(DEFAULT_UPLOAD_CONCURRENCY)),
+        }
+    }
+
+    fn support_spilling_to_the_bucket(
+        sink: Arc<MemorySink>,
+        owner: &str,
+        every: Duration,
+    ) -> RecordingSupport {
+        let journal: Arc<dyn SpillStore> = Arc::new(crate::recording_spill::ObjectSpill::new(
+            Arc::clone(&sink) as Arc<dyn RecordingSink>,
+            crate::recording_spill::DEFAULT_SPILL_PREFIX,
+        ));
+        RecordingSupport {
+            sink: Some(sink as Arc<dyn RecordingSink>),
+            journal: Some(journal),
+            spill_dir: None,
+            spill_every: every,
+            counters: Arc::new(RecorderCounters::default()),
+            owner: owner.to_string(),
             upload_permits: Arc::new(Semaphore::new(DEFAULT_UPLOAD_CONCURRENCY)),
         }
     }
@@ -1848,6 +2149,58 @@ mod tests {
         assert_eq!(segmenter.total_frames(), 3 * FRAME);
         assert_eq!(segmenter.duration_ms(), 60);
         assert_eq!(segmenter.stats().segments_spilled, 1);
+    }
+
+    #[test]
+    fn a_frame_that_lands_inside_a_sealed_prefix_is_kept_at_the_boundary() {
+        let mut segmenter = segmenter();
+        segmenter.accept(Track::Customer, 0, &tone(5));
+        segmenter.accept(Track::Customer, 20, &tone(6));
+        let sealed = segmenter.closable_frames();
+        segmenter.seal(sealed);
+
+        segmenter.accept(Track::Agent, 0, &tone(9));
+        segmenter.accept(Track::Customer, 40, &tone(7));
+        assert_eq!(
+            segmenter.stats().frames_out_of_order,
+            1,
+            "a frame for audio already handed to the store is late, and is counted as such"
+        );
+        let sealed_prefix = segmenter.render_closable(sealed, Layout::Stereo);
+        assert!(
+            sealed_prefix
+                .samples
+                .iter()
+                .skip(1)
+                .step_by(2)
+                .all(|s| *s == 0),
+            "the prefix a write is carrying must not change under it"
+        );
+
+        segmenter.close_segment(sealed);
+        let tail = segmenter.render(Layout::Stereo);
+        assert_eq!(tail.samples.len(), 2 * FRAME, "one stereo frame of tail");
+        assert_eq!(
+            tail.samples[0], 7,
+            "the customer frame lands where its timestamp says"
+        );
+        assert_eq!(
+            tail.samples[1], 9,
+            "the late agent frame opens the next segment instead of vanishing"
+        );
+
+        let mut unsealed = Segmenter::new(RATE, MAX_RECORDING);
+        unsealed.accept(Track::Customer, 0, &tone(5));
+        unsealed.accept(Track::Customer, 20, &tone(6));
+        unsealed.seal(unsealed.closable_frames());
+        unsealed.unseal();
+        unsealed.accept(Track::Agent, 0, &tone(9));
+        assert_eq!(unsealed.stats().frames_out_of_order, 0);
+        assert_eq!(
+            unsealed.render(Layout::Stereo).samples[1],
+            9,
+            "once a write has failed the prefix is ordinary memory again"
+        );
     }
 
     #[test]
@@ -2006,6 +2359,7 @@ mod tests {
                 uploaded: 0,
                 already_present: 1,
                 failed: 0,
+                foreign: 0,
             }
         );
         assert_eq!(
@@ -2373,7 +2727,7 @@ mod tests {
     fn group_spec_anchored(labels: &[(&str, Layout)], lead: Duration) -> RecorderSpec {
         RecorderSpec {
             group_anchor: Some(
-                std::time::Instant::now()
+                SystemTime::now()
                     .checked_sub(lead)
                     .expect("this machine's clock has no room for a lead"),
             ),
@@ -2918,6 +3272,459 @@ mod tests {
         assert_eq!(samples.len(), lead + FRAME * 5);
         assert!(samples[..lead].iter().all(|sample| *sample == 0));
         assert!(samples[lead..].iter().all(|sample| *sample == 500));
+    }
+
+    fn mono_spec(resume_ms: u64) -> RecorderSpec {
+        RecorderSpec {
+            targets: vec![RecordingTarget {
+                key: identity().object_key(),
+                layout: Layout::Mono(Track::Customer),
+            }],
+            resume_ms,
+            ..spec()
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_adopter_on_any_pod_loses_at_most_one_spill_interval_when_the_journal_is_in_the_bucket(
+    ) {
+        let sink = Arc::new(MemorySink::accepting());
+        let every = Duration::from_millis(20);
+        let first = support_spilling_to_the_bucket(Arc::clone(&sink), "pod-a", every);
+        let dying = Arc::clone(&first.counters);
+        let (mut dying_hub, client) = Hub::new();
+        let subscription = client.attach(64, TrackSelection::All).unwrap();
+        dying_hub.poll_commands();
+        let handle = spawn(mono_spec(0), subscription, first, None);
+        let progress = handle.progress();
+
+        for at in 0..3u64 {
+            dying_hub.publish(TapEvent::media(Track::Customer, at * 20, &tone(11)));
+        }
+        wait_for_segments(&dying, 1).await;
+        for at in 3..5u64 {
+            dying_hub.publish(TapEvent::media(Track::Customer, at * 20, &tone(11)));
+        }
+        wait_for_segments(&dying, 2).await;
+        handle.task.abort();
+        drop(dying_hub);
+        let resume_ms = progress.recorded_ms();
+        assert!(
+            resume_ms >= 100,
+            "pod A recorded {resume_ms} ms before it died"
+        );
+
+        let second = support_spilling_to_the_bucket(Arc::clone(&sink), "pod-b", every);
+        let adopting = Arc::clone(&second.counters);
+        let (mut live, client) = Hub::new();
+        let subscription = client.attach(64, TrackSelection::All).unwrap();
+        live.poll_commands();
+        let handle = spawn(mono_spec(resume_ms), subscription, second, None);
+        live.publish(TapEvent::media(Track::Customer, 0, &tone(22)));
+        let outcome = handle
+            .finish()
+            .await
+            .settle()
+            .await
+            .expect("the adopting pod had no outcome");
+        drop(live);
+
+        let resume_frames = (resume_ms * RATE as u64 / 1000) as usize;
+        let lost = adopting.frames_lost_on_adopt.load(Ordering::Relaxed) as usize;
+        let interval_frames = every.as_millis() as usize * RATE as usize / 1000;
+        assert!(
+            lost <= interval_frames.max(FRAME),
+            "the adopting pod lost {lost} frames, more than one spill interval"
+        );
+        assert_eq!(outcome.frames, resume_frames + FRAME, "{outcome:?}");
+        let body = sink.body(&identity().object_key());
+        let samples = samples_of(&body);
+        assert_eq!(samples.len(), resume_frames + FRAME);
+        let recovered = resume_frames - lost;
+        assert!(
+            recovered >= 5 * FRAME,
+            "only {recovered} frames were read back"
+        );
+        assert!(
+            samples[..recovered].iter().all(|sample| *sample == 11),
+            "the dead pod's spilled audio is not at the front of the object"
+        );
+        assert!(
+            samples[recovered..resume_frames]
+                .iter()
+                .all(|sample| *sample == 0),
+            "what neither pod held must be silence, not another pod's audio"
+        );
+        assert!(
+            samples[resume_frames..].iter().all(|sample| *sample == 22),
+            "the adopting pod's own audio must follow the recovered prefix"
+        );
+        assert!(
+            sink.keys()
+                .iter()
+                .all(|key| !key.starts_with(crate::recording_spill::DEFAULT_SPILL_PREFIX)),
+            "an uploaded recording must leave nothing in the reserved spill namespace: {:?}",
+            sink.keys()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_pod_that_lost_its_journal_to_an_adopter_stops_spilling_into_it() {
+        let sink = Arc::new(MemorySink::accepting());
+        let first = support_spilling_to_the_bucket(Arc::clone(&sink), "pod-a", SPILL_EVERY);
+        let second = support_spilling_to_the_bucket(Arc::clone(&sink), "pod-b", SPILL_EVERY);
+        let key = identity().object_key();
+        let mut dying = crate::recording_spill::SegmentJournal::open(
+            &first,
+            "rec-99",
+            &first.owner,
+            RATE,
+            &[(key.clone(), 1)],
+        )
+        .await
+        .expect("a journal needs a spill store");
+        dying
+            .append(
+                vec![RecordedAudio {
+                    channels: 1,
+                    samples: vec![11; FRAME],
+                }],
+                FRAME as u64,
+            )
+            .await
+            .expect("the first pod could not spill");
+
+        let mut adopter = crate::recording_spill::SegmentJournal::open(
+            &second,
+            "rec-99",
+            &second.owner,
+            RATE,
+            &[(key.clone(), 1)],
+        )
+        .await
+        .expect("the adopter found no journal");
+        assert_eq!(
+            adopter.frames_on_disk(),
+            FRAME as u64,
+            "the adopter must read the dead pod's frame count out of the manifest"
+        );
+        adopter
+            .append(
+                vec![RecordedAudio {
+                    channels: 1,
+                    samples: vec![22; FRAME],
+                }],
+                FRAME as u64,
+            )
+            .await
+            .expect("the adopter could not spill");
+
+        let refused = dying
+            .append(
+                vec![RecordedAudio {
+                    channels: 1,
+                    samples: vec![33; FRAME],
+                }],
+                FRAME as u64,
+            )
+            .await;
+        assert!(
+            refused.is_err(),
+            "a partitioned pod overwrote an adopted journal"
+        );
+        assert!(
+            dying.surrendered(),
+            "the refusal must be reported as lost ownership, not as a spill failure"
+        );
+
+        let held = adopter.read_back(0).await;
+        assert_eq!(held.len(), 2 * FRAME);
+        assert_eq!(held[0], 11);
+        assert_eq!(held[FRAME], 22);
+        assert!(
+            !held.contains(&33),
+            "the partitioned pod's audio reached an adopted journal"
+        );
+    }
+
+    #[tokio::test]
+    async fn salvage_leaves_another_pods_journal_in_the_bucket_alone() {
+        let sink = Arc::new(MemorySink::accepting());
+        let foreign = support_spilling_to_the_bucket(Arc::clone(&sink), "pod-z", SPILL_EVERY);
+        let key = identity().object_key();
+        let mut journal = crate::recording_spill::SegmentJournal::open(
+            &foreign,
+            "rec-99",
+            &foreign.owner,
+            RATE,
+            &[(key.clone(), 1)],
+        )
+        .await
+        .expect("a journal needs a spill store");
+        journal
+            .append(
+                vec![RecordedAudio {
+                    channels: 1,
+                    samples: vec![11; FRAME],
+                }],
+                FRAME as u64,
+            )
+            .await
+            .unwrap();
+        drop(journal);
+
+        let ours = support_spilling_to_the_bucket(Arc::clone(&sink), "pod-a", SPILL_EVERY);
+        let summary = crate::recording_spill::salvage(&ours).await;
+
+        assert_eq!(summary.foreign, 1, "{summary:?}");
+        assert_eq!(summary.uploaded, 0, "{summary:?}");
+        assert_eq!(
+            ours.counters
+                .spill_foreign_manifests
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert!(
+            !sink.keys().contains(&key),
+            "salvage uploaded a recording another pod is still writing"
+        );
+        assert!(
+            sink.keys()
+                .iter()
+                .any(|held| held.starts_with(crate::recording_spill::DEFAULT_SPILL_PREFIX)),
+            "a foreign journal must be left where its owner can still finish it"
+        );
+    }
+
+    const PTIME: Duration = Duration::from_millis(20);
+
+    async fn publish_at_ptime(hub: &mut Hub, from: u64, frames: u64, value: i16) {
+        for at in from..from + frames {
+            hub.publish(TapEvent::media(Track::Customer, at * 20, &tone(value)));
+            tokio::time::sleep(PTIME).await;
+        }
+    }
+
+    async fn wait_for_spill_failures(counters: &RecorderCounters, failures: u64) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while counters.segment_spill_failures.load(Ordering::Relaxed) < failures {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "only {} spill writes failed",
+                counters.segment_spill_failures.load(Ordering::Relaxed)
+            );
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_slow_spill_store_never_costs_the_recording_a_frame() {
+        const FRAMES_SENT: u64 = 500;
+        let slow_by = Duration::from_secs(3);
+        let sink = Arc::new(MemorySink::slow(slow_by));
+        let support =
+            support_spilling_to_the_bucket(Arc::clone(&sink), "pod-a", Duration::from_millis(100));
+        let counters = Arc::clone(&support.counters);
+        let (mut hub, client) = Hub::new();
+        let subscription = client
+            .attach(crate::hub::CONSUMER_QUEUE_FRAMES, TrackSelection::All)
+            .unwrap();
+        let queue = subscription.metrics();
+        hub.poll_commands();
+        let handle = spawn(mono_spec(0), subscription, support, None);
+
+        publish_at_ptime(&mut hub, 0, FRAMES_SENT, 33).await;
+
+        assert!(
+            counters.segments_spilled.load(Ordering::Relaxed) >= 1,
+            "a {slow_by:?} spill write must have landed while the frames kept coming"
+        );
+        assert_eq!(
+            queue.dropped_oldest(),
+            0,
+            "the recorder stopped draining its subscription while a spill write was pending"
+        );
+
+        let outcome = handle
+            .finish()
+            .await
+            .settle()
+            .await
+            .expect("the recorder had no outcome");
+        drop(hub);
+
+        assert_eq!(queue.dropped_oldest(), 0);
+        assert_eq!(outcome.frames, FRAMES_SENT as usize * FRAME, "{outcome:?}");
+        assert_eq!(outcome.stats.frames_written, FRAMES_SENT);
+        let body = sink.body(&identity().object_key());
+        assert_eq!(frames_of(&body), FRAMES_SENT as usize * FRAME);
+        assert!(
+            samples_of(&body).iter().all(|sample| *sample == 33),
+            "every frame sent must be in the object, in order and unbroken"
+        );
+        assert!(
+            sink.keys()
+                .iter()
+                .all(|key| !key.starts_with(crate::recording_spill::DEFAULT_SPILL_PREFIX)),
+            "an uploaded recording must leave nothing in the reserved spill namespace: {:?}",
+            sink.keys()
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_spill_write_that_fails_leaves_its_frames_in_memory_for_the_next_tick() {
+        let sink = Arc::new(MemorySink::slow_refusing(Duration::from_millis(500)));
+        let support =
+            support_spilling_to_the_bucket(Arc::clone(&sink), "pod-a", Duration::from_millis(100));
+        let counters = Arc::clone(&support.counters);
+        let (mut hub, client) = Hub::new();
+        let subscription = client
+            .attach(crate::hub::CONSUMER_QUEUE_FRAMES, TrackSelection::All)
+            .unwrap();
+        let queue = subscription.metrics();
+        hub.poll_commands();
+        let handle = spawn(mono_spec(0), subscription, support, None);
+        let progress = handle.progress();
+
+        publish_at_ptime(&mut hub, 0, 30, 44).await;
+        wait_for_spill_failures(&counters, 1).await;
+        assert_eq!(counters.segments_spilled.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            progress.spilled_ms(),
+            0,
+            "a refused write must not be counted as spilled"
+        );
+        assert_eq!(
+            progress.recorded_ms(),
+            600,
+            "the refused frames are still recorded"
+        );
+
+        sink.accept_from_now_on();
+        publish_at_ptime(&mut hub, 30, 30, 44).await;
+        wait_for_segments(&counters, 1).await;
+        assert!(
+            progress.spilled_ms() >= 600,
+            "the retry must carry the frames the refused write held and everything since; \
+             it carried {} ms",
+            progress.spilled_ms()
+        );
+        publish_at_ptime(&mut hub, 60, 5, 44).await;
+
+        let outcome = handle
+            .finish()
+            .await
+            .settle()
+            .await
+            .expect("the recorder had no outcome");
+        drop(hub);
+
+        assert_eq!(queue.dropped_oldest(), 0);
+        assert_eq!(counters.segment_spill_failures.load(Ordering::Relaxed), 1);
+        assert_eq!(outcome.frames, 65 * FRAME, "{outcome:?}");
+        let body = sink.body(&identity().object_key());
+        assert_eq!(frames_of(&body), 65 * FRAME);
+        assert!(
+            samples_of(&body).iter().all(|sample| *sample == 44),
+            "the frames a failed write held must reach the object through the retry"
+        );
+        assert!(
+            sink.keys()
+                .iter()
+                .all(|key| !key.starts_with(crate::recording_spill::DEFAULT_SPILL_PREFIX)),
+            "an uploaded recording must leave nothing in the reserved spill namespace: {:?}",
+            sink.keys()
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn finishing_while_a_spill_write_is_failing_still_uploads_every_frame() {
+        let journal_sink = Arc::new(MemorySink::slow_refusing(Duration::from_secs(1)));
+        let sink = Arc::new(MemorySink::accepting());
+        let journal: Arc<dyn SpillStore> = Arc::new(crate::recording_spill::ObjectSpill::new(
+            Arc::clone(&journal_sink) as Arc<dyn RecordingSink>,
+            crate::recording_spill::DEFAULT_SPILL_PREFIX,
+        ));
+        let support = RecordingSupport {
+            sink: Some(Arc::clone(&sink) as Arc<dyn RecordingSink>),
+            journal: Some(journal),
+            spill_dir: None,
+            spill_every: Duration::from_millis(100),
+            counters: Arc::new(RecorderCounters::default()),
+            owner: "pod-a".to_string(),
+            upload_permits: Arc::new(Semaphore::new(DEFAULT_UPLOAD_CONCURRENCY)),
+        };
+        let counters = Arc::clone(&support.counters);
+        let (mut hub, client) = Hub::new();
+        let subscription = client
+            .attach(crate::hub::CONSUMER_QUEUE_FRAMES, TrackSelection::All)
+            .unwrap();
+        let queue = subscription.metrics();
+        hub.poll_commands();
+        let handle = spawn(mono_spec(0), subscription, support, None);
+
+        publish_at_ptime(&mut hub, 0, 20, 55).await;
+        assert_eq!(
+            counters.segment_spill_failures.load(Ordering::Relaxed),
+            0,
+            "the doomed write must still be in flight when the recording stops"
+        );
+        assert_eq!(counters.segments_spilled.load(Ordering::Relaxed), 0);
+
+        let asked = tokio::time::Instant::now();
+        let finished = handle.finish().await;
+        assert!(
+            asked.elapsed() < Duration::from_millis(700),
+            "the stop report waited {:?} on a pending spill write",
+            asked.elapsed()
+        );
+        let stopped = finished.stopped.clone().expect("a stop report");
+        assert_eq!(stopped.frames, 20 * FRAME);
+
+        let outcome = finished
+            .settle()
+            .await
+            .expect("the recorder had no outcome");
+        drop(hub);
+
+        assert_eq!(queue.dropped_oldest(), 0);
+        assert_eq!(counters.segment_spill_failures.load(Ordering::Relaxed), 1);
+        assert_eq!(counters.segments_spilled.load(Ordering::Relaxed), 0);
+        assert_eq!(outcome.stats.segments_spilled, 0);
+        assert_eq!(outcome.frames, 20 * FRAME, "{outcome:?}");
+        let body = sink.body(&identity().object_key());
+        assert_eq!(frames_of(&body), 20 * FRAME);
+        assert!(
+            samples_of(&body).iter().all(|sample| *sample == 55),
+            "the frames the failed write held must still be in the object"
+        );
+        assert!(
+            journal_sink.keys().is_empty(),
+            "nothing landed in the spill store: {:?}",
+            journal_sink.keys()
+        );
+    }
+
+    #[test]
+    fn the_reserved_spill_namespace_always_ends_in_one_separator() {
+        assert_eq!(
+            crate::recording_spill::normalized_prefix("_spill"),
+            "_spill/"
+        );
+        assert_eq!(
+            crate::recording_spill::normalized_prefix("/_spill/"),
+            "_spill/"
+        );
+        assert_eq!(
+            crate::recording_spill::normalized_prefix(" journals/held/ "),
+            "journals/held/"
+        );
+        assert!(crate::recording_spill::normalized_prefix("  ").is_empty());
+        assert_eq!(
+            crate::recording_spill::DEFAULT_SPILL_PREFIX,
+            "_spill/",
+            "the default reserved namespace is documented in deploy.md and must not drift"
+        );
     }
 
     #[test]
