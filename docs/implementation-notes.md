@@ -3059,6 +3059,18 @@ recorder.rs — native conference recording* above for the two shapes, the
   empties between frames, so a command waits at most one ptime; the payoff is
   that the segment boundary is where the caller asked for it and the tests are
   deterministic without sleeps.
+- **A spill write never holds the recorder's hub drain (review fix to item 53,
+  2026-08-27).** Closing a segment used to `await` the journal's `append` on the
+  loop, bounded only by `SPILL_TIMEOUT` (10 s); the hub subscription behind it is
+  `CONSUMER_QUEUE_FRAMES` = 200 frames, drop-oldest, so under
+  `MSS_RECORDING_SPILL_TO=s3` a bucket that was slow but inside the timeout cost
+  up to 6 s of the recording itself every spill interval — the "blocking I/O on
+  the pump" class architecture §7.1 forbids. The write is now a spawned task and
+  the loop only renders, seals and commits; see *the write is off the recorder's
+  loop* under `recording_spill.rs` below for the seam, the seal and the finish
+  path. `a_slow_spill_store_never_costs_the_recording_a_frame` is the proof: a
+  3 s-per-put store, a real 200-frame subscription, 500 frames at ptime, zero
+  dropped — the same test against the old loop dropped exactly 100.
 - **Events, in the frozen order.** `RecordingStarted` is raised by `TapPlane`
   when the attachment opens (so it is synchronous with `Attach`);
   `RecordingPaused{paused, duration_ms}` on both pause edges;
@@ -3268,10 +3280,11 @@ the recording bucket, and the recorder above it did not change shape at all.
   `RecordingSink` the finished object goes to: `_spill/<first object
   key>/manifest.json` and `_spill/<first object key>/<target index>-<seq>.pcm`.
   Chunks go up first and the manifest last, so a manifest never names a chunk
-  that is not there. Every call is bounded by `SPILL_TIMEOUT` (10 s) — the
-  recorder task awaits it, so an unbounded put would stall the tap's consumer
-  queue; a timeout is counted like any other failed spill and the audio stays in
-  memory for the next tick. The prefix is **reserved**: nothing else may be
+  that is not there. Every call is bounded by `SPILL_TIMEOUT` (10 s), and the
+  whole write once more by the same bound in `SpillWrite::perform`; a timeout is
+  counted like any other failed spill and the audio stays in memory for the next
+  tick. The recorder task does **not** await it — see the next block. The prefix
+  is **reserved**: nothing else may be
   written under it, and it is documented in deploy.md beside the frozen
   identity, with a bucket lifecycle rule (expire `_spill/` after 7 days) as the
   retention policy MSS still does not implement.
@@ -3280,6 +3293,81 @@ the recording bucket, and the recorder above it did not change shape at all.
   returns plain keys). `UploadError::Missing` is the "not there" answer `get`
   needs, so a first-ever `read_manifest` is not logged as a failure.
   `S3RecordingSink` maps `NotFound` to it for both `get` and `delete`.
+
+**The write is off the recorder's loop (review fix, 2026-08-27).** The first
+cut of this item awaited `SegmentJournal::append` inline on the `segment_close`
+tick and on `Pause`. While that await was pending the recorder drained nothing
+from its hub subscription — `CONSUMER_QUEUE_FRAMES` = 200 frames, 4 s at 20 ms,
+drop-oldest — so a bucket that was slow but inside `SPILL_TIMEOUT` cost up to
+6 s of audio from the recording itself, every spill interval; disk had the same
+shape and merely completed in milliseconds. The invariant now is **a spill write
+never holds the recorder's hub drain**, and it is built as follows:
+
+- **The journal's append is split at its I/O.** `SegmentJournal::begin_append`
+  is synchronous: it validates, names the chunks from the current `sequence`,
+  builds the next manifest and returns an owned `SpillWrite` (store handle,
+  journal name, owner, next manifest, encoded manifest body, chunks).
+  `SpillWrite::perform` is the I/O — the ownership re-read, then `store.write`
+  — under `SPILL_TIMEOUT`, and returns `SpillWritten::{Landed(manifest),
+  Surrendered(owner), Failed(error)}`. `SegmentJournal::commit(manifest)` is the
+  book-keeping (`manifest = landed; sequence += 1`). `append` still exists as
+  `begin_append → perform → commit` and behaves exactly as before, but it and
+  `surrendered()` are `#[cfg(test)]` now — production consumes
+  `SpillWritten::Surrendered` directly — which is what keeps the ownership,
+  salvage and adoption tests (and `tests/minio_upload.rs`) untouched.
+- **The recorder spawns the write and keeps draining.** On a tick with no write
+  pending, `begin_spill` renders the closable prefix (`render_closable`, in
+  memory, no mutation), calls `begin_append`, **seals** that many frames in the
+  segmenter and hands `perform()` to `tokio::spawn`, remembering the frame count
+  as an `InFlightSpill`. `close_segment` is **not** called yet: the frames stay
+  in memory, the segmenter keeps accepting, and `closable_frames()` only grows,
+  so the sealed count stays valid. `run`'s `select!` gained an arm that receives
+  the outcome: `Landed` → `commit`, `close_segment(frames)` for exactly the
+  written count, `segments_spilled` and `spilled_ms` as before; `Failed` →
+  counted, frames stay in memory, the next tick retries with a larger prefix;
+  `Surrendered` → `spill_lost_ownership`, journal handle dropped, as before.
+  **At most one write is in flight per recording**; a tick while one is pending
+  is a no-op (`if journal.is_some() && in_flight.is_none()` on the arm).
+- **`Pause` goes through the same mechanism**, not an inline await: the pause
+  edge calls `begin_spill` and, if a write is already pending, does nothing —
+  the paused frames are the whole closable buffer, and the next tick or the
+  finish path carries them. A `Resume` or `Finish` queued behind a pause is
+  therefore never deaf behind a bucket (session-playbook §7).
+- **The seal.** `Segmenter::seal(frames)` marks the prefix a write is carrying;
+  `accept` shifts a frame whose position would land inside it to the seal
+  boundary and counts it in `frames_out_of_order`, which is exactly where the
+  old inline close would have put a straggler for the same tick (its timestamp
+  fell before the advanced anchor, so it saturated to the segment start).
+  `unseal()` on a failed or surrendered write, and `close_segment` clears it.
+  `a_frame_that_lands_inside_a_sealed_prefix_is_kept_at_the_boundary` pins both
+  halves.
+- **Finish.** The capture loop breaks, drains `try_next`, publishes
+  `RecordingStopped` and sends the `StopReport` **first** — the report is still
+  a segment close and no I/O, so `STOP_TIMEOUT` still holds — then awaits the
+  pending write under `SPILL_TIMEOUT` (aborting it on expiry) and settles it
+  before `read_back`, so the stitch never races a chunk. If it landed, the
+  frames are closed and read back from the store; if it failed, they are still
+  in memory and rendered as the tail: the object is complete either way. The
+  `RecordingOutcome.stats` are re-read after that settle, so
+  `segments_spilled` there counts a write that landed at finish; the
+  `StopReport.stats` snapshot predates it by design.
+- **Abort on drop.** `InFlightSpill` aborts its task when dropped, so a recorder
+  task that is itself aborted (the pod-loss tests, a kill mid-write) cancels its
+  write rather than leaving an orphan that could overwrite an adopter's freshly
+  claimed manifest — the same cancellation the inline await gave for free.
+
+Tests, all under paused tokio time on a real `Hub` subscription of
+`CONSUMER_QUEUE_FRAMES` (moved from `tap_plane.rs` to `hub.rs`, beside the
+subscription it sizes, so the tests can name it) with frames published at ptime: `a_slow_spill_store_never_costs_the_recording_a_frame` (3 s
+per put, 500 frames, `dropped_oldest` stays 0, the object holds all 500; the same
+test against the inline await dropped 100),
+`a_spill_write_that_fails_leaves_its_frames_in_memory_for_the_next_tick` (a
+refused write is counted, `spilled_ms` stays 0, the retry carries ≥ 600 ms, the
+object is complete) and
+`finishing_while_a_spill_write_is_failing_still_uploads_every_frame` (stop while
+a doomed write is pending: the stop report does not wait on it, the failure is
+counted before the outcome, nothing lands in the spill store, the object is
+complete). Every pre-existing spill, adoption and salvage test passes untouched.
 
 **Ownership lives in the manifest, and it is what makes this safe.**
 `SpillManifest.owner` already existed. `SegmentJournal::open` on an adopting pod

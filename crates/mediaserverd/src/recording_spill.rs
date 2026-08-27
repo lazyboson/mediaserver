@@ -285,12 +285,59 @@ async fn bounded<T>(
     }
 }
 
+pub struct SpillWrite {
+    store: Arc<dyn SpillStore>,
+    journal: String,
+    owner: String,
+    next: SpillManifest,
+    body: Vec<u8>,
+    chunks: Vec<(String, Vec<i16>)>,
+}
+
+pub enum SpillWritten {
+    Landed(SpillManifest),
+    Surrendered(String),
+    Failed(std::io::Error),
+}
+
+impl SpillWrite {
+    pub async fn perform(self) -> SpillWritten {
+        match tokio::time::timeout(SPILL_TIMEOUT, self.run()).await {
+            Ok(written) => written,
+            Err(_) => SpillWritten::Failed(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!(
+                    "the spill write did not finish within {} ms",
+                    SPILL_TIMEOUT.as_millis()
+                ),
+            )),
+        }
+    }
+
+    async fn run(self) -> SpillWritten {
+        if let Some(held) = self.store.read_manifest(&self.journal).await {
+            if held.owner != self.owner {
+                return SpillWritten::Surrendered(held.owner);
+            }
+        }
+        match self
+            .store
+            .write(&self.journal, self.body, self.chunks)
+            .await
+        {
+            Ok(()) => SpillWritten::Landed(self.next),
+            Err(error) => SpillWritten::Failed(error),
+        }
+    }
+}
+
 pub struct SegmentJournal {
     store: Arc<dyn SpillStore>,
     journal: String,
     owner: String,
     manifest: SpillManifest,
     sequence: usize,
+    #[cfg(test)]
     surrendered: bool,
 }
 
@@ -379,6 +426,7 @@ impl SegmentJournal {
             owner: owner.to_string(),
             manifest,
             sequence,
+            #[cfg(test)]
             surrendered: false,
         })
     }
@@ -387,6 +435,7 @@ impl SegmentJournal {
         self.manifest.frames
     }
 
+    #[cfg(test)]
     pub fn surrendered(&self) -> bool {
         self.surrendered
     }
@@ -395,24 +444,15 @@ impl SegmentJournal {
         self.store.describe(&self.journal)
     }
 
-    pub async fn append(
-        &mut self,
+    pub fn begin_append(
+        &self,
         rendered: Vec<RecordedAudio>,
         frames: u64,
-    ) -> std::io::Result<()> {
+    ) -> std::io::Result<SpillWrite> {
         if rendered.len() != self.manifest.targets.len() {
             return Err(std::io::Error::other(
                 "a spilled segment does not carry one rendering per recording target",
             ));
-        }
-        if let Some(held) = self.store.read_manifest(&self.journal).await {
-            if held.owner != self.owner {
-                self.surrendered = true;
-                return Err(std::io::Error::other(format!(
-                    "this spill journal now belongs to {}, so this pod stops writing it",
-                    held.owner
-                )));
-            }
         }
         let mut chunks = Vec::with_capacity(rendered.len());
         let mut names = Vec::with_capacity(rendered.len());
@@ -427,10 +467,40 @@ impl SegmentJournal {
             target.chunks.push(name);
         }
         let body = serde_json::to_vec_pretty(&next).map_err(std::io::Error::other)?;
-        self.store.write(&self.journal, body, chunks).await?;
-        self.manifest = next;
+        Ok(SpillWrite {
+            store: Arc::clone(&self.store),
+            journal: self.journal.clone(),
+            owner: self.owner.clone(),
+            next,
+            body,
+            chunks,
+        })
+    }
+
+    pub fn commit(&mut self, landed: SpillManifest) {
+        self.manifest = landed;
         self.sequence += 1;
-        Ok(())
+    }
+
+    #[cfg(test)]
+    pub async fn append(
+        &mut self,
+        rendered: Vec<RecordedAudio>,
+        frames: u64,
+    ) -> std::io::Result<()> {
+        match self.begin_append(rendered, frames)?.perform().await {
+            SpillWritten::Landed(manifest) => {
+                self.commit(manifest);
+                Ok(())
+            }
+            SpillWritten::Surrendered(owner) => {
+                self.surrendered = true;
+                Err(std::io::Error::other(format!(
+                    "this spill journal now belongs to {owner}, so this pod stops writing it"
+                )))
+            }
+            SpillWritten::Failed(error) => Err(error),
+        }
     }
 
     pub async fn read_back(&self, index: usize) -> Vec<i16> {

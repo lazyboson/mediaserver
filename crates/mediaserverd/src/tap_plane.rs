@@ -4,7 +4,7 @@ use crate::digits::DigitQueue;
 use crate::discovery::NodeDiscovery;
 use crate::hub::{
     Hub, HubClient, Subscription, SubscriptionControl, SubscriptionMetrics, TapEvent,
-    TrackSelection,
+    TrackSelection, CONSUMER_QUEUE_FRAMES,
 };
 use crate::inline_leg::{
     egress_ssrc, InlineEgress, InlineEgressHandle, InlineEgressShared, InlineEgressTotals,
@@ -56,7 +56,6 @@ pub const STALL_AFTER: Duration = Duration::from_secs(10);
 const TARGET_DEPTH_PACKETS: u16 = 3;
 const MAX_TAPPED_STREAMS: usize = 2;
 const MAX_TAPPED_LEGS: usize = 2;
-const CONSUMER_QUEUE_FRAMES: usize = 200;
 const TEXT_QUEUE_DEPTH: usize = 32;
 const GRPC_FRAME_QUEUE: usize = 64;
 const RETAIN_NO_LOCAL_AUDIO: Duration = Duration::ZERO;
