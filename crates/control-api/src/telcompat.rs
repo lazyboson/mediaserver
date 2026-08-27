@@ -126,6 +126,9 @@ impl TelCompat {
         external_id: &str,
         spec: SinkSpec,
     ) -> Result<proto::Attachment, Status> {
+        if let Some(reason) = session_core::reserved_metadata_refusal(&spec.metadata) {
+            return Err(Status::invalid_argument(reason));
+        }
         self.ensure_session(external_id, spec.identity.clone())
             .await?;
         let label = spec.label;

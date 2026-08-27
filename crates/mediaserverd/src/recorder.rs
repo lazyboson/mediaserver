@@ -15,8 +15,7 @@ use tokio::sync::{mpsc, oneshot, OwnedSemaphorePermit, Semaphore};
 use tracing::{info, warn};
 
 pub const IDENTITY_SCHEME: &str = "${accountID}/${recordingID}.${format}";
-pub const RESUME_MS_METADATA_KEY: &str = "mss.recording.resumeMs";
-pub const SPILL_OWNER_METADATA_KEY: &str = "mss.recording.spillOwner";
+pub use session_core::{RESUME_MS_METADATA_KEY, SPILL_OWNER_METADATA_KEY};
 pub const MAX_RECORDING: Duration = Duration::from_secs(2 * 3600);
 pub const UPLOAD_TIMEOUT: Duration = Duration::from_secs(60);
 pub const STOP_TIMEOUT: Duration = Duration::from_secs(5);

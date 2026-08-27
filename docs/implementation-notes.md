@@ -932,6 +932,44 @@ so the service is testable without booting the daemon.
 our vocabulary — the type is `SessionController`, after architecture.md
 §3.1. tonic is a dependency, not a concept.
 
+### server.rs — `WireFacing`, because the keeper and a client share one `attach`
+
+`RegistryKeeper` rebuilds an adopted attachment by calling the very same
+`SessionController::attach(Request<AttachRequest>)` the gRPC server serves, and
+it passes its own state through the attachment metadata:
+`mss.recording.resumeMs` (item 30) and `mss.recording.spillOwner` (items 53 and
+54). Nothing refused those keys on the wire, so any authenticated client could
+send them — silence-padding a recording, and since item 54 setting `take_over`
+and claiming another pod's recording-group seat. The bearer token is
+cluster-internal, so this was low severity, but it was the only door into
+`take_over`.
+
+`WireFacing(Arc<SessionController>)` closes it. It implements `MediaControl` by
+delegation and, in `attach` and `update_attachment` only, refuses
+`INVALID_ARGUMENT` naming any metadata key that starts with
+`RESERVED_METADATA_PREFIX` (`mss.`). `serve_authenticated_until` — and through
+it every other `serve_*` — hands `MediaControlServer` a `WireFacing`; **the
+keeper and every other in-process caller keep the bare
+`Arc<SessionController>`**, which is exactly why the keeper's rebuild tests
+carry those keys and stay green. That contrast is the proof the guard is at the
+right layer.
+
+The prefix and the two key constants live in `session-core/src/metadata.rs`
+(with `reserved_metadata_key` / `reserved_metadata_refusal`, both pure and unit
+tested there) because control-api cannot see `mediaserverd`; `recorder.rs`
+re-exports the two names it already used, so `recorder::RESUME_MS_METADATA_KEY`
+and `registry_keeper`'s `is_resume_key` did not move. `mss.` rather than
+`mss.recording.` was safe to reserve: a session-core test pins every
+client-facing key this API documents — the eight telcompat/Twilio ones and the
+six `mix_*`/`member_*` verbs — as still allowed, so the wider prefix costs
+nothing and leaves room for the next internal key.
+
+**TelCompat needed the same guard, and it is not `WireFacing`'s job.** The
+façade is served over the same socket but reaches the controller *in-process*,
+and `stream_metadata` copies `request.metadata.clone()` — caller-supplied —
+into the attach. So `TelCompat::attach_sink`, the single funnel for every
+façade attach, calls `reserved_metadata_refusal` itself.
+
 ### Build: no protoc, deliberately
 
 `build.rs` compiles the protos with **`protox`** (a pure-Rust protobuf
@@ -1369,6 +1407,15 @@ Counters (`persisted`, `renewed`, `lost`, `adopted`, `unrebuildable`,
 they owned one session and one gave up; a rising `orphans_still_subscribed`
 means rtpengine is copying a call to a pod that is gone — the two worth
 alerting on.
+
+The resume metadata (`mss.recording.resumeMs`, `mss.recording.spillOwner`) is
+**derived on every adoption and never accumulated**: `resume_metadata` strips
+both keys off the persisted record before re-adding them from the recording
+journal, so a session adopted three times does not carry three generations of
+hints. Since the 2026-08-27 hardening those two keys are also **refused on the
+wire** — the `mss.` prefix is reserved, see `server.rs` — `WireFacing` above.
+The keeper is unaffected because it calls the controller in-process, which is
+what its rebuild tests assert by still carrying them.
 
 Config: `MSS_REDIS_URL`; unset means sessions live and die with the pod
 (logged), and a configured-but-unreachable Redis **refuses to start** rather
