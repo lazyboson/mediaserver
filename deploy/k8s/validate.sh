@@ -11,15 +11,16 @@
 #   3. a python pass asserts the things a schema does not: that mediaserverd's
 #      container has both probes on the metrics port, that
 #      terminationGracePeriodSeconds clears MSS_DRAIN_TIMEOUT_SECS, that the
-#      hostPort entries and MSS_MEDIA_PORT_MIN..MAX describe the same range, and
-#      that no Secret ships a real-looking value.
+#      hostPort entries and MSS_MEDIA_PORT_MIN..MAX describe the same range, that
+#      a filesystem recording store writes to a mounted RWX volume, and that no
+#      Secret ships a real-looking value.
 #
 # `kubectl apply --dry-run=client` is NOT one of them: it needs a live API
 # server for its schemas, so it fails with a connection error and proves nothing.
 set -eu
 
 here=$(dirname "$0")
-overlays="base overlays/hostport overlays/hostnetwork"
+overlays="base overlays/hostport overlays/hostnetwork overlays/filesystem-recording"
 rendered=$(mktemp -d)
 trap 'rm -rf "$rendered"' EXIT
 status=0

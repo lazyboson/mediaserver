@@ -1,0 +1,20 @@
+# One variable picks the store; the root is where the frozen identity
+# ${accountID}/${recordingID}.${format} is written, verbatim, as a tree.
+#
+# The bucket variables are blanked rather than left set: mediaserverd ignores
+# them under this store and says so in one warning at startup, and a blank value
+# means "unset" everywhere in this ConfigMap.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mediaserverd-env
+data:
+  MSS_RECORDING_STORE: "filesystem"
+  MSS_RECORDING_ROOT: "/var/lib/mediaserverd/recordings"
+  MSS_RECORDING_BUCKET: ""
+  MSS_RECORDING_S3_ENDPOINT: ""
+  MSS_RECORDING_S3_REGION: ""
+  # "store" is the clearer name for what "s3" always meant: the recording store,
+  # whichever one this is. The journal lands under <root>/_spill/, on the shared
+  # volume, so a pod on another node finishes what a dead pod started.
+  MSS_RECORDING_SPILL_TO: "store"
