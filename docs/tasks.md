@@ -3361,6 +3361,36 @@ Gate: `cargo test --workspace` 296 mediaserverd unit tests + every other target
 green, `cargo fmt --all --check` clean, `cargo clippy --all-targets -D warnings`
 clean, the comment scan empty, `cargo deny check all` clean.
 
+**Review fix (2026-08-27) — the spill write was on the recorder's loop.**
+`spill_closed_segment` awaited `SegmentJournal::append` inline on the
+`segment_close` tick and on `Pause`, bounded only by `SPILL_TIMEOUT` (10 s).
+While that await was pending the recorder drained nothing from its hub
+subscription, which is `CONSUMER_QUEUE_FRAMES` = 200 frames (4 s at 20 ms,
+drop-oldest), so with `MSS_RECORDING_SPILL_TO=s3` a bucket that was slow but
+inside the timeout cost up to **6 s of audio from the recording itself, every
+spill interval** — the "blocking I/O on the pump" class architecture §7.1 exists
+to forbid; disk spill had the same shape and merely finished in milliseconds.
+**Invariant now: a spill write never holds the recorder's hub drain.** The
+peek-then-commit seam is kept and the write taken off the loop: `begin_append`
+(sync) returns an owned `SpillWrite`, `perform` (the I/O, under `SPILL_TIMEOUT`)
+runs on a spawned task, and the loop's new `select!` arm applies the outcome —
+`commit` + `close_segment` for exactly the written count, or the frames stay in
+memory and the next tick retries with a larger prefix. At most one write is in
+flight per recording; a tick while one is pending is a no-op; `Pause` uses the
+same mechanism instead of an inline await; the finish path sends the stop report
+first and then awaits the pending write (same timeout) before `read_back`. The
+segmenter **seals** the prefix a write is carrying so a straggler frame for that
+range is kept at the boundary, where the old inline close put it. Verified on a
+real 200-frame `Hub` subscription with frames at ptime under paused tokio time:
+`a_slow_spill_store_never_costs_the_recording_a_frame` (3 s per put, 500 frames,
+zero dropped and all 500 in the object — the same test dropped exactly 100
+against the old loop), `a_spill_write_that_fails_leaves_its_frames_in_memory_for_the_next_tick`,
+`finishing_while_a_spill_write_is_failing_still_uploads_every_frame` and
+`a_frame_that_lands_inside_a_sealed_prefix_is_kept_at_the_boundary`; every
+existing spill, adoption and salvage test unchanged and green. Details under
+*the write is off the recorder's loop* in
+[implementation-notes.md](implementation-notes.md).
+
 **Owed, and it is the honest half of this item.**
 
 1. `tests/minio_upload.rs::a_journal_spilled_to_a_real_bucket_is_read_back_by_another_pod`

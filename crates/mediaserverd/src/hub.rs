@@ -5,6 +5,7 @@ use std::sync::Arc;
 use tokio::sync::Notify;
 
 pub const MAX_FRAME_SAMPLES: usize = 480;
+pub const CONSUMER_QUEUE_FRAMES: usize = 200;
 const COMMAND_CAPACITY: usize = 64;
 const INJECTED_CAPACITY: usize = 16;
 const INJECT_SILENCE: [i16; 480] = [0; 480];
