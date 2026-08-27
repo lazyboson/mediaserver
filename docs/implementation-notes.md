@@ -3725,6 +3725,91 @@ a pod that dies between its last spill and the adopter's `open`, and the
 expires — retention is the operator's, and that is D9's remaining residual
 together with the live drill.
 
+### recorder.rs — the recording store is a flag: S3 or a filesystem (item 58, 2026-08-27)
+
+`RecordingSink` had one production implementation, so "which store" had never
+been a decision. It is now one variable, and nothing above the trait knows which
+one it got.
+
+- **`decide_store(store, root, object_store_variables_set)`** is the whole
+  policy, and it is a **pure function** — the env vars are read by `from_env`
+  and passed in, so the matrix is unit-tested without touching the process
+  environment (there is no env lock in this crate; every existing env test
+  set/removes and hopes). It returns `StoreDecision { store, ignored }`:
+  `RecordingStore::ObjectStore` for unset/empty/`s3` (case- and
+  whitespace-insensitive), `RecordingStore::Filesystem(root)` for `filesystem`
+  with an absolute `MSS_RECORDING_ROOT`, and `UploadError::Configuration`
+  otherwise — an unknown store, or `filesystem` with no root or a relative one.
+  `from_env` propagates that error, and `main.rs` already refuses to start on it,
+  the same path an unusable bucket takes. `ignored` is the cross-set variables:
+  the bucket/S3 names under `filesystem`, `MSS_RECORDING_ROOT` under `s3`. They
+  are named in **one** `warn!` and then ignored; that list is what the test
+  asserts, not the log line.
+- **`probe_recording_root`** is the startup probe: `create_dir_all`, write
+  `.mss-recording-store-probe.part`, rename it over
+  `.mss-recording-store-probe`, delete it. Write-but-cannot-rename is a real
+  failure mode of some FUSE and SMB mounts, and it would otherwise surface as
+  every recording failing mid-call. It is plain `std::fs` on purpose: it runs
+  once, before the listener binds, and keeps `from_env` synchronous.
+- **`FilesystemRecordingSink`** is `tokio::fs`, not `object_store`'s `fs`
+  backend, whose path rules (percent-encoding, its own notion of a valid path)
+  are not ours. `put` creates parents, writes a sibling
+  `.<basename>.<owner>.<part>` file, `sync_all`s it and **renames** it over the
+  final name, so a watcher never reads a half file; the owner in the name is the
+  pod (`MSS_POD_NAME`, non-alphanumerics folded to `_`), so two pods writing the
+  same key cannot share a temp file. A failed write removes its part file. The
+  returned URI is `file://<root>/<key>`, which is what `UploadCompleted.uri`
+  carries — the attachment transport stays `file-s3`/`TRANSPORT_FILE_S3`, frozen
+  (Constitution VII), and the URI scheme is what says which store answered.
+- **Keys are validated, not trusted**: empty, absolute, backslash-separated, and
+  any empty/`.`/`..`/control-character segment are `UploadError::Key`, so no key
+  can name a path outside the root. `get` on a missing file is
+  `UploadError::Missing`, which is exactly what `ObjectSpill::read_manifest`
+  distinguishes from a real failure.
+- **`list(prefix)` matches the S3 sink's contract**, which `ObjectSpill` and
+  `salvage` depend on: the trailing `/` is trimmed, the remainder names a
+  directory that is walked recursively, and the keys come back **relative to the
+  root** with `/` separators — the same shape `meta.location.as_ref()` gives.
+  A missing prefix is an empty list, and `.<name>.part` names are skipped, so a
+  half-written file is invisible to salvage as well as to a watcher. Keys are
+  sorted, which the S3 listing effectively is too.
+- **`delete`** treats NotFound as success (as the S3 sink does) and then prunes
+  now-empty parent directories up to the root, so a removed `_spill/` journal
+  does not leave a skeleton of directories behind.
+- **No new no-overwrite rule.** `exists` is consulted in exactly one place —
+  `recording_spill::salvage` — so that is where "never over an object that
+  already exists" lives, unchanged; the sink itself is last-write-wins like
+  `put_opts`. `a_second_put_replaces_the_file_because_the_no_overwrite_rule_lives_in_salvage`
+  is the test that pins which layer owns the rule.
+- **`MSS_RECORDING_SPILL_TO`** accepts `store` as a synonym for `s3` (`disk`
+  unchanged), and with the filesystem store `ObjectSpill` is built over the
+  filesystem sink exactly as it is over S3 — the journal lands at
+  `<root>/_spill/…` on the shared volume, so cross-pod adoption works there too.
+  `a_journal_spilled_onto_the_filesystem_store_is_salvaged_into_the_identity_path`
+  runs a real `SegmentJournal` → `salvage` round trip on a temp directory and
+  reads the WAV back from `<root>/acct-42/rec-99.wav`.
+
+**Verified against a real temporary directory** (`std::env::temp_dir()` plus the
+existing `scratch()` helper, cleaned up per test): the five sink methods, the
+`.part` file invisible to `list` and gone after `put`, refused escaping keys, the
+journal round trip and salvage, the probe (including a root under a plain file),
+and the `decide_store` matrix. **The lab drill did not run** — no Docker daemon
+on this machine, so nothing here has been observed on a live call; the WAV
+assertion is the unit test's, not `track_dump.py`'s.
+
+**Operationally:** `lab/preflight.sh --recording-root DIR` runs the same
+write/fsync/rename/delete probe from outside (and SKIPs the S3 check when the
+store is `filesystem`), `deploy/k8s/overlays/filesystem-recording` is the
+variable plus an RWX PVC at `/var/lib/mediaserverd/recordings`, and
+`validate_fields.py` now asserts that a `filesystem` store's root is a mounted
+volume backed by a `ReadWriteMany` claim — with RWO the second pod does not
+schedule and adoption silently recovers nothing.
+
+**What is not solved by choosing a filesystem:** retention (nothing expires
+finished recordings or `_spill/` journals, exactly as in a bucket), and the fact
+that a full or hung volume fails every pod at once. S3 remains the default and
+the recommendation.
+
 ### Recording groups — N sessions, one recording (item 21, landed 2026-08-23)
 
 A FreeSWITCH conference is N SIP dialogs = N rtpengine calls = N MSS sessions
