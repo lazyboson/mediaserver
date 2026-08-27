@@ -2270,12 +2270,12 @@ run, so every other drill sees the lab it has always seen.
   calls on. A deployment with several instances is the case the map exists for,
   and it is still deployment-gated.
 
-## The whole suite on a second box, and the nine things that stopped it (2026-08-27)
+## The whole suite on a second box, and the twelve things that stopped it (2026-08-27)
 
 Every measurement above was taken on the box that built this project. This is
 the first run of the suite somewhere else: a 2-vCPU / 3.6 GB Debian 11 host with
 docker, no Rust, no rtpengine and no FreeSWITCH of its own. Nothing in the media
-path needed changing. **Nine environment and drill defects did**, and each one
+path needed changing. **Twelve environment and drill defects did**, and each one
 is worth knowing because each one presented as a product failure.
 
 ### What the box had to be given
@@ -2288,7 +2288,7 @@ Redpanda needs `--memory=512M --reserve-memory=0M` on a host this small;
 unbounded it reserves most of the machine and leaves nothing for FreeSWITCH,
 rtpengine, MinIO and a Rust daemon.
 
-### The nine, and what each cost
+### The twelve, and what each cost
 
 | # | What it looked like | What it was |
 | --- | --- | --- |
@@ -2301,6 +2301,9 @@ rtpengine, MinIO and a Rust daemon.
 | 7 | a parity comparison that FAILED still exited 0 | `recording_parity.py`'s status died in a pipe into `tee`, finished off by `|| true`. The drill propagates it now |
 | 8 | `leave/monitor: no frames arrived in the window` | item 55 made the room a session, but this drill's **monitor** was left attached to party A — then A is the member who leaves. Hosted on `$ROOM_SESSION` the whole drill passes |
 | 9 | `preflight.sh` printed a Python traceback | An unbindable `--local-ip` reached `socket.bind()` inside `check_ng`. A tool whose contract is "every line is PASS, FAIL or SKIP" now reports FAIL and names the cause |
+| 10 | `media_port_drill.sh` failed its idle-pod precondition | `barge_drill.sh` destroyed its session by **session id**, but `mss_ctl` wraps `argv[2]` in `SessionRef::ExternalId` -- the destroy found nothing, the error went to `/dev/null`, and the leaked session still held two ports when the next drill started |
+| 11 | `PODS=2 group_recording_drill.sh`: "listen tcp4 127.0.0.1:19092: bind: address already in use" | Its second pod defaulted to host port **19092**, which is where this lab publishes redpanda's EXTERNAL kafka listener. The default could never bind while the lab it needs was up; it is 19094/19095 now |
+| 12 | `RECORD=1 pod_kill_drill.sh` refused to start, saying the pods needed `MSS_RECORDING_SPILL_TO=s3` when they had it | The gate grepped the pod's log for "spill into the recording **bucket** itself"; the daemon says **store**, and has since item 58 made the store a flag. It matches the structured `"spill_in_store":true` field now, so prose can move without blocking a drill |
 
 Defect 8 is the interesting one: the D20 row in [tasks.md](tasks.md) recorded
 that item 55's rewritten drill **had never run**. This was its first execution,
@@ -2327,6 +2330,24 @@ Every headline number in this file reproduced on unfamiliar hardware.
 `event_outage_drill.sh` must be run as `./lab/event_outage_drill.sh`, not
 `sh lab/...`: its shebang is bash and it uses `set -o pipefail`, which dash
 rejects.
+
+### The runs the defect list had owed
+
+Defects 11 and 12 were each blocking one run that [tasks.md](tasks.md) records
+as never having happened. With them fixed, both ran.
+
+**D9, the live pod kill with a recorder attached** (`RECORD=1
+lab/pod_kill_drill.sh`, pods started with `MSS_RECORDING_SPILL_TO=s3`). Pod A
+spilled one closed segment, took a SIGKILL with no lease release, and pod C
+adopted the session. The object came back at **170.80 s of the 185.57 s
+tapped -- missing 14.77 s against an allowance of 19.25 s** (one 5 s spill
+interval + the 12.25 s adoption gap + 2 s of slack), with
+`frames_lost_on_adopt=0`, four spill segments, one upload, no failures, no lost
+ownership and no foreign manifests. The reserved `_spill/` namespace was empty
+afterwards, because the adopter finished the object and discarded the journal.
+So the claim item 53 made against fakes -- that a pod death costs the spill
+interval rather than the call -- now has a live number, and it is the adoption
+gap that dominates it, not the spill.
 
 ### FS parity: what a tone source can and cannot show
 
