@@ -226,6 +226,7 @@ key. Two operational consequences:
 | Variable | Default | Meaning | When to change | Added by |
 | --- | --- | --- | --- | --- |
 | `MSS_DRAIN_TIMEOUT_SECS` | `30` | Ceiling on the whole shutdown drain: stop accepting, hand registry leases to an adopter, close every session politely (consumer stop frames, recordings finished, taps unsubscribed), flush the event backlog. The process exits **0** whether or not the window is used up; a second SIGTERM/SIGINT exits at once. `0` means "stop accepting and exit". Set `terminationGracePeriodSeconds` **at or above** it — with `docker stop`, whose default grace is 10 s, pass `-t` above it | raise it if long calls need longer to close politely; the grace period must follow | [item 42](tasks.md) |
+| `MSS_CONFERENCE_LINGER_SECS` | `0` | How long a conference whose **room session** is open is held after its last member leaves. `0` (the default) ends the room session on the last leave — its room recording is closed and uploaded there and then. A non-zero value keeps the mix running and the room session open for that long, so a member who rejoins inside the window lands back in the same room, on the same clock, still recording into the same object; a rejoin cancels the wait. A conference with **no** room session is unaffected: its last member out always closes it | raise it a few seconds if your call flow drops the last leg and dials back in (a transfer, a re-INVITE the proxy handles by re-dialling) and you want one recording rather than two | [item 55](tasks.md) |
 | `MSS_HEALTH_PROBE_INTERVAL_SECS` | `10` | How often the background watchers re-probe each **configured** dependency for `/readyz`: Redis `PING`, a Kafka partition-offset read, NG `ping`. A failing dependency is re-probed sooner — 1 s, 2, 4, 8, then this interval — so a restarted dependency is picked up quickly; a probe that hangs is a failure after 15 s. The request path never probes, so this bounds only how stale a `/readyz` answer can be | lower for a faster readiness reaction, raise to cut chatter | [item 44](tasks.md) |
 
 ### Lab instruments — never set these in a deployment
@@ -519,6 +520,49 @@ A pod killed with SIGKILL between the detach and the upload loses that event; th
 audio is recovered by the salvage pass, without an event. A **graceful** drain
 does not: it waits for the uploads (step 4 of the rollout sequence below).
 
+## Conference recording — record the room off the room, not off a member
+
+A conference records two ways, and both may run at once:
+
+- **the room, as one mono object** — `Attach{transport=FILE_S3,
+  selector.only="mixed", endpoint="<account>/<recording>.wav"}`;
+- **every participant, one object each** — a recording **group** over the member
+  sessions with `selector.only="customer"`, which writes
+  `<account>/<recording>/<label>.wav` per member.
+
+Attach the room object to the **room session**:
+
+```
+CreateSession{external_id="room-42", kind=SESSION_KIND_MIX, group="<conference>"}
+Attach{session="room-42", transport=FILE_S3, selector.only="mixed",
+       endpoint="acct-7/rec-42.wav"}
+```
+
+`mss_ctl <endpoint> create room-42 --kind mix --group <conference>` does the
+first line from a shell, and `mss_ctl … record room-42 acct-7/rec-42.wav room ""
+mixed` the second.
+
+A room session has no leg, no SDP, no media ports and no `call_id`; its `group`
+names the conference it **is**, and it is refused by name if it carries any of
+those things or no group. Whichever arrives first — the room session or the first
+member — opens the conference, so the room object can be opened before anybody
+joins (it records the wait as silence) or after (it is padded back to the
+conference's open). `DescribeSession` on it returns `opened_at_unix_ms` — the
+**conference's** open, the t=0 every recording of that room shares, including the
+per-participant group — and `conference.members`; every member's own
+`DescribeSession` names the room session back in `conference.room_session`.
+
+The room session ends on `DestroySession`, or by itself once the conference has
+held at least one member and then emptied (`MSS_CONFERENCE_LINGER_SECS`). Ending
+it uploads the room object; members that are still mixing are left alone.
+`StartPlayback` on it with no target is a **room prompt**, and an
+`Attach{SINK, only="mixed"}` on it is a monitor of the room that costs no leg.
+
+Recording the room off **a member's** session still works and is still supported
+— but that object ends when that member leaves, even though the conference keeps
+mixing, and its t=0 is its attach moment. That is D20, and the room session is
+the way not to have it.
+
 ## Conference member state — read it back before you trust it
 
 `DescribeSession` on a conference member's session reports that member's live
@@ -566,6 +610,7 @@ simply ask again. Nothing else in the system has that property.
 | **Attachments that dial into MSS** (`GRPC_STREAM`) | no, by construction | the consumer's HTTP/2 connection died with the pod; it must reattach. This is why the Service is headless — a client resolving all pod IPs notices |
 | **Inline legs** (Phase 3) | **no** | the peer's SDP points at a socket that no longer exists. This fails like any media endpoint failure and needs recovery at call-control level |
 | **Conferences** (Phase 4) | **no** | the mixer is pod-local; a room does not move. This fails like an inline leg, because a conference member *is* one |
+| **A room session** (`kind=MIX`) | **no** | it owns a mix thread on the pod that opened it, so it is pod-bound exactly like an inline leg: the registry releases the record rather than adopting it (`is_rebuildable` is false), and its room recording is recovered the way any recording is (spill, below), not by moving the room |
 | **Recording groups** | **yes, with `MSS_REDIS_URL` set** | the group is a record in Redis (`mss:group:…` above), not one pod's memory: a member's adopted session rejoins the group, a member may attach on any pod, and the group's wall-clock anchor keeps every participant object aligned across pods. Without Redis a group is pod-local, and a member adopted elsewhere opens an ungrouped file. What placement still does not do (D8) is *choose* one pod for a group — it no longer has to |
 | **Recordings** | **yes, with `MSS_RECORDING_SPILL_TO=s3`** | closed segments spill every `MSS_RECORDING_SPILL_SECONDS` into the recording bucket, the adopting pod reads them back and pads only what the dead pod had not spilled yet, so the worst case is one spill interval on **any** pod (`mss_recording_frames_lost_on_adopt_total` says how much). With the default `disk` that guarantee holds only for a **same-pod** restart, because a cross-pod adopter cannot read the dead pod's disk — it recovers nothing and pads the whole recording. Either way the journals of recordings that never finished need a bucket lifecycle rule on `_spill/`: MSS implements no retention. Never measured on a live pod kill with a recorder attached — see [item 53](tasks.md) |
 | **Events** | yes | at-least-once with a bounded retry backlog; a pod death or an overfull backlog still loses events, and the gapless per-session `seq` makes the hole visible |

@@ -4,6 +4,10 @@ use control_api::proto::media_control_client::MediaControlClient;
 const USAGE: &str = "\
 mss_ctl <endpoint> create <external-id> <call-id> <from-tag|-> [rtpengine-node]
    a from-tag of - lets MSS resolve the call's participants from rtpengine
+mss_ctl <endpoint> create <external-id> --kind mix --group <conference>
+   creates the conference ROOM as a session with no leg: its clock is the
+   conference's, and a record attachment on it records the room from the
+   conference's open to its close, whoever comes and goes (D20)
 mss_ctl <endpoint> inline <external-id> <call-id> <sdp-offer-file> [conference-group]
    creates an INLINE session: MSS binds an rtp socket, answers the offer and
    prints the answer sdp for the caller to put in its SIP dialog
@@ -45,6 +49,28 @@ fn track_selector(track: Option<&String>) -> proto::TrackSelector {
     }
 }
 
+fn flagged(args: &[String]) -> (std::collections::BTreeMap<String, String>, Vec<String>) {
+    let mut flags = std::collections::BTreeMap::new();
+    let mut positional = Vec::new();
+    let mut at = 0;
+    while at < args.len() {
+        match args[at].strip_prefix("--") {
+            Some(name) => {
+                flags.insert(
+                    name.to_string(),
+                    args.get(at + 1).cloned().unwrap_or_default(),
+                );
+                at += 2;
+            }
+            None => {
+                positional.push(args[at].clone());
+                at += 1;
+            }
+        }
+    }
+    (flags, positional)
+}
+
 fn reference(external_id: &str) -> proto::SessionRef {
     proto::SessionRef {
         id: Some(proto::session_ref::Id::ExternalId(external_id.to_string())),
@@ -79,26 +105,46 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let outcome = match args[1].as_str() {
         "create" => {
-            if args.len() < 5 {
+            let (flags, positional) = flagged(&args[2..]);
+            let room = flags.get("kind").map(String::as_str) == Some("mix");
+            let group = flags.get("group").cloned().unwrap_or_default();
+            if positional.is_empty()
+                || (room && group.is_empty())
+                || (!room && positional.len() < 3)
+            {
                 eprintln!("{USAGE}");
                 std::process::exit(2);
             }
-            client
-                .create_session(proto::CreateSessionRequest {
-                    external_id: args[2].clone(),
-                    kind: proto::SessionKind::Tap as i32,
-                    call_id: args[3].clone(),
-                    from_tags: if args[4] == "-" {
-                        Vec::new()
-                    } else {
-                        args[4].split(',').map(str::to_string).collect()
-                    },
-                    rtpengine_node: args.get(5).cloned().unwrap_or_default(),
+            let request = match room {
+                true => proto::CreateSessionRequest {
+                    external_id: positional[0].clone(),
+                    kind: proto::SessionKind::Mix as i32,
+                    call_id: String::new(),
+                    from_tags: Vec::new(),
+                    rtpengine_node: String::new(),
                     mix: false,
                     idempotency_key: String::new(),
                     sdp_offer: String::new(),
-                    group: String::new(),
-                })
+                    group,
+                },
+                false => proto::CreateSessionRequest {
+                    external_id: positional[0].clone(),
+                    kind: proto::SessionKind::Tap as i32,
+                    call_id: positional[1].clone(),
+                    from_tags: if positional[2] == "-" {
+                        Vec::new()
+                    } else {
+                        positional[2].split(',').map(str::to_string).collect()
+                    },
+                    rtpengine_node: positional.get(3).cloned().unwrap_or_default(),
+                    mix: false,
+                    idempotency_key: String::new(),
+                    sdp_offer: String::new(),
+                    group,
+                },
+            };
+            client
+                .create_session(request)
                 .await
                 .map(|response| format!("{:?}", response.into_inner()))
         }

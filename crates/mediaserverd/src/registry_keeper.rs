@@ -254,15 +254,17 @@ impl RegistryKeeper {
             if self.controller.holds_external_id(&session.external_id) {
                 continue;
             }
-            if session.is_inline() {
+            if session.is_pod_bound() {
                 self.counters
                     .inline_not_adopted
                     .fetch_add(1, Ordering::Relaxed);
                 warn!(
                     external_id = %session.external_id,
-                    "an inline leg is an rtp endpoint on the pod that answered its offer, so \
-                     no other pod can adopt it: the peer is sending to a socket that died. \
-                     Releasing it; recovery is call control's job, not the registry's"
+                    room = session.is_room(),
+                    "an inline leg is an rtp endpoint on the pod that answered its offer, and \
+                     a room session is the mix that pod is running, so no other pod can adopt \
+                     either: the peer is sending to a socket that died and the mix it fed is \
+                     gone. Releasing it; recovery is call control's job, not the registry's"
                 );
                 let _ = self.store.forget(&session.external_id).await;
                 continue;

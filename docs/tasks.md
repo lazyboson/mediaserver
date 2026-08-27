@@ -3273,13 +3273,18 @@ on 2026-08-26 and that these items rely on:
   Redis. **Item 54 changed the group half of that**: the group is a record
   under `mss:group:…`, `opened_at` is a `SystemTime`, `registry_keeper::rebuild`
   no longer skips grouped attachments and `grouped_not_adopted` is gone.
-  Conferences are still nowhere in Redis, which is item 55's business.
-- A `Conference` (`conference.rs:114`) has **no open instant**; the mix thread
-  keeps a local `started: Instant` and publishes the mixed track on each
-  member's own clock (`seated_at_frame`, `conference.rs:350/659`).
-- `SESSION_KIND_MIX = 3` exists in `proto/mediacontrol.proto` and is refused
-  by `TapPlane::open_session` (`tap_plane.rs:1996`) — it is free to become the
-  room session.
+  **Conferences are still nowhere in Redis, and item 55 left them there on
+  purpose**: a room became a *session* (`kind=MIX`), not a shared record, because
+  a mix thread cannot move between pods — a room session is pod-bound exactly
+  like the inline legs it mixes.
+- A `Conference` had **no open instant** before item 55; it now stamps
+  `opened_at: Instant` (the mix thread's release epoch) and
+  `opened_at_wall: SystemTime`, publishes the room hub on the **conference**
+  clock and every member's `mixed` track on that member's own
+  (`seated_at_frame`).
+- `SESSION_KIND_MIX = 3` existed in `proto/mediacontrol.proto` and was refused
+  by `TapPlane::open_session`; **item 55 made it the room session**
+  (`open_room_session`), so that refusal is gone.
 - Member verbs reach the mix through `MemberControl::from_metadata`
   (`session-core/src/mix.rs:162`) → `TapPlane::control_member`
   (`tap_plane.rs:1702`) → `Conference::control` (`conference.rs:221`), mirror
@@ -3611,64 +3616,151 @@ lengths.
 **Done when:** D16 reads closed, `grouped_not_adopted` is gone from code and
 docs, and the two-pod drill number is in lab.md.
 
-### 55. The room is a session: conference-owned recording (D20)
-**Where:** `crates/mediaserverd/src/{conference.rs,tap_plane.rs}`,
-`crates/control-api/src/{controller.rs,convert.rs}`, `crates/session-core`,
-`proto/mediacontrol.proto` (fields only), `crates/control-api/examples/mss_ctl.rs`,
-`lab/conference_drill.sh`, `docs/architecture.md` Appendix B.
-**What:** let `CreateSession{kind=MIX, group=<name>}` create (or adopt, if a
-member already opened it) the **room itself** as a session with no leg: its
-`opened_at` is the conference's, a `FILE_S3 only=mixed` attachment on it
-records the room from open to close regardless of who comes and goes, and
-`DescribeSession` on it is the room's view.
-**Decisions, made:**
-- `Conference` gains `opened_at: Instant` and `opened_at_wall: SystemTime`,
-  stamped when the conference is created — by whichever arrives first, the
-  room session or the first member. It also gains a **room hub**: a hub with no
-  leg into which the mix thread publishes the full sum on the **conference
-  clock** (`timestamp_ms = frames * ptime`, frames counted from `opened_at`),
-  distinct from the per-member minus-self publishes. The room session's
-  `LiveSession` points at that hub, so every existing attachment kind works on
-  it unchanged: `FILE_S3 only=mixed` records it, a gRPC/WS consumer monitors
-  it, and an `INJECT` on it is a room prompt (`StartPlayback{target_tag=all}`
-  keeps working from a member too — do not remove a verb).
-- **t=0 of a room recording is the room's open.** `RecorderSpec.group_anchor =
-  opened_at_wall` for any recording on the room session, so a recorder
-  attached late pads back to the open with the existing `lead_with_silence`
-  seam; the per-participant group of the same conference anchors on the same
-  instant through item 54's `group_anchor_for`, and the two shapes are
-  sample-aligned by construction. `RecordingShape` stays `conference-mixed`.
-- **Lifetime:** the room session ends on `EndSession`, or automatically when
-  the conference has seated at least one member and then empties, after
-  `MSS_CONFERENCE_LINGER_SECS` (default 0). A room session created before any
-  member joins does not auto-end. Ending the room session ends its
-  attachments (the recording uploads) and, if no member remains, tears the
-  conference down; ending it while members remain leaves them mixing. The room
-  session is inline-like for adoption: `is_rebuildable` false, documented in
-  deploy.md's HA table.
-- A `FILE_S3 only=mixed` attachment on a **member** keeps working exactly as
-  today (D20 stays *possible* there, and the D20 row says the room session is
-  the way to not have it). The grouped-mixed refusal stays.
-- Proto: no new RPC or enum value. `Session` gains `opened_at_unix_ms` (field
-  15) so a controller can align its own timeline; `ConferenceView` gains
-  `room_session` (the room's external id if one exists). `mss_ctl create
-  --kind mix --group <name>`.
-- session-core: a MIX session has no `call_id`/`from_tags`/`sdp_offer`; the
-  registry's kind-specific validation admits it with `group` non-empty and
-  refuses it otherwise, with a named error.
-**Verify:** tap_plane socket tests: a room session opened *before* any member
-records silence up to the first join and the members' tones after; opened
-*after* two members, its object starts at the room's open (lead silence equals
-the time since open) and equals the per-participant group's length; a member
-leaving does not end the room object; the room object closes on `EndSession`
-and on the last member leaving with linger 0. `WiredRoom` test: `DescribeSession`
-on the room returns `opened_at_unix_ms` and the member list. Lab:
-`conference_drill.sh` records the room through a room session instead of
-through A and asserts (`conference_report.py lengths`) the room object and the
-three participant objects share one length to within one frame, with A
-leaving before the end.
-**Done when:** D20 reads closed, Appendix B's parity table names the room
-session, and the drill's length comparison is in lab.md.
+### 55. The room is a session: conference-owned recording (D20) — ✅ DONE (2026-08-27)
+
+**What shipped.** `CreateSession{kind=MIX, group=<conference>}` creates — or
+adopts, if a member opened the conference first — the **room itself** as a
+session with no leg, and a `FILE_S3 only=mixed` attachment on it records the room
+from the conference's open to its close however the members come and go. No new
+RPC, no new enum value, two additive proto fields.
+
+- `Conference` stamps `opened_at: Instant` (which is now the mix thread's release
+  epoch) and `opened_at_wall: SystemTime` at `start`, and owns a **room hub** —
+  one more `Hub`, its `Hub` half moved into `Mixed`, its `HubClient` kept on the
+  control-plane handle. Each tick the mix thread polls it beside every member's
+  and publishes the monitor listener's full sum into it on the **conference
+  clock** (`frames * ptime_ms`), one bounded `force_push`, no allocation and
+  nothing to block on. The room session's `LiveSession` points at that hub, so
+  every attachment kind works on it unchanged.
+- **A conference with no member still mixes**, so a room recording opened before
+  anybody joins records the wait as real silence rather than needing a pad. A
+  room-opened conference takes the pod's tap format, since there is no leg to
+  negotiate one.
+- **t=0 is the conference's open, for both shapes.** An ungrouped recording on
+  the room session gets `RecorderSpec.group_anchor = opened_at_wall`, and item
+  54's `group_anchor_for(session)` — the seam it left — now returns the
+  conference's open for any session seated in one, so the per-participant group
+  of the same conference anchors on the same instant. The two shapes are
+  sample-aligned by construction instead of by being attached together.
+  `RecordingShape` still says `conference-mixed`.
+- **Lifetime.** `Conference::unseat` returns `RoomFate::{Mixing, Emptied,
+  Stopped}`: with no room session the last leg out still closes the conference,
+  and with one the conference is held. The room session then ends on
+  `EndSession`, or by itself once the conference has held a member and emptied,
+  after `MSS_CONFERENCE_LINGER_SECS` (default **0**, which ends it synchronously
+  on the last leave). Ending it ends its attachments (the recording uploads) and
+  stops the mix only if no member remains; members that remain keep mixing.
+- **Read-back.** `Session.opened_at_unix_ms = 15` (the *conference's* open for a
+  MIX session, the registry's own stamp otherwise — `SessionRecord` now stamps
+  every session) and `ConferenceView.room_session = 4`. `DescribeSession` on the
+  room reports `conference` and **not** `member` (a room is not a member of
+  itself); every member reports the room session back, so a controller can find
+  where the room recording belongs from any leg. Next free `Session` field is
+  **16**; next free `MediaEvent` payload tag is still **28**.
+- `mss_ctl create <id> --kind mix --group <conference>` (the `create` subcommand
+  learned flags; its positional TAP form is untouched), plus
+  `mss_conference_rooms_live` and `mss_conference_rooms_auto_ended_total`.
+
+**Decisions, as specified and as built.**
+
+- **The room session is inline-like for adoption.** `PersistedSession::is_room()`
+  (kind 3) joins `is_inline()` under `is_pod_bound()`, and `is_rebuildable()`
+  now excludes it **explicitly** — it was already false through the empty
+  `call_id`, an accident this turns into a rule — so `adopt_orphans` releases a
+  room record with a message that says why. deploy.md's HA table has the row.
+- **The linger is a spawned sleep, not a housekeeping tick,** because this daemon
+  has none: one `tokio::spawn(sleep)` per emptied conference, its handle parked
+  in `Conference::linger`, aborted by `seat` (a member that rejoins cancels it)
+  and re-checked under the lock on expiry. Linger 0 ends the room inline on the
+  last leave and spawns nothing. The task needs the plane, so `main.rs` hands it
+  a `Weak<TapPlane>` of itself (`linger_through`, the `observe_through` idiom);
+  **with no weak self set, a non-zero linger warns and the room stays open until
+  the API ends it** — the safe direction. Item 56 may generalise this into a
+  sweep; nothing here builds one.
+- **Ending a control-plane session from the media plane needed one new seam:**
+  `ObservationSink::session_finished(session, reason)`, defaulted to a no-op and
+  implemented by `SessionController` as `destroy_session`, so an auto-ended room
+  publishes `AttachmentDown`/`SessionEnded` in its own gapless sequence and frees
+  its external id. It is the only such call, and it exists because a room session
+  has no hangup of its own to be told about.
+- **A room session's shape is validated in session-core,** not in the controller:
+  `room_session_shape` requires a non-empty `group` and refuses a `call_id`,
+  `from_tags` or `sdp_offer` by name (`ControlError::RoomSessionShape` →
+  `INVALID_ARGUMENT`). The controller's own rules only had to stop refusing a
+  `group` on a MIX and start refusing an offer on one.
+- **A group on the room session is refused by name** (a room has no participant
+  seat), and item 39's grouped-mixed refusal on a *member* is unchanged.
+  Recording the room off a member still works — D20 stays *possible* there, and
+  the row now says the room session is the way not to have it.
+- **Playback on the room is the room's.** `playback_reach` takes the session
+  kind: on a room an empty target or `all` is the room prompt and `own` is
+  refused by name (a room has no ear). `StartPlayback{target_tag=all}` from a
+  member is untouched — no verb was removed — and because the generic
+  non-inline INJECT path turns an utterance plus a `Mark` into a `StartPlayback`
+  blob on its own session, an **INJECT attachment on the room session is a room
+  prompt** too. It is utterance-and-`Mark` shaped, not the continuous
+  full-duplex pacer an inline leg gets; that is the honest scope of "an INJECT on
+  it is a room prompt" and it is a residual below, not a claim.
+- Route and member verbs on the room session are refused by
+  `Conference::{route,control}`'s existing `NotSeated`, since the room is not a
+  member of itself.
+
+**Verified — in-process over real UDP sockets, against the in-crate recording
+fakes. The lab Docker stack was down for this session (Docker Desktop not
+running), so the drill did not run.**
+
+| Test | What it proves |
+| --- | --- |
+| `tap_plane::a_room_session_opened_before_anybody_joins_records_the_wait_and_then_the_room` | a room session opens the conference with no member, its object opens with **≥ 250 ms of zeros** and then carries 1000+2000 summed (2700–3300); ending the room session leaves the members mixing and still hearing each other |
+| `tap_plane::a_room_recording_attached_late_starts_at_the_rooms_open_and_matches_its_participants` | the other order: two members mix for ~0.5 s, *then* the room session adopts the conference. The room object **and** a participant group opened at the same late moment both open with ≥ 250 ms of lead and agree in length to within half a second — one anchor, two shapes |
+| `tap_plane::the_room_object_outlives_a_member_and_closes_when_the_last_one_leaves` | D20 itself: one member leaves, the room object is still live and **nothing has been uploaded**; the object carries both members in its first third and bob alone after she left; the last member out ends the room session, uploads the object, counts `rooms_auto_ended = 1` and publishes `session_finished` naming the last member |
+| `tap_plane::an_emptied_room_lingers_and_a_member_that_rejoins_cancels_the_linger` | with `MSS_CONFERENCE_LINGER_SECS` = 300 ms: the conference is held after its only member leaves, a member that rejoins inside the window cancels the wait (still mixing two linger-widths later), and the next emptying ends the room session when the linger expires |
+| `tap_plane::a_room_session_is_refused_a_recording_group_and_a_second_owner` | the two refusals, by name: a group on the room session, and a second `kind=MIX` session for a conference that already has one |
+| `tap_plane::a_room_session_that_names_no_conference_is_refused_rather_than_half_opened` | the old "phase-4 is not built" refusal, replaced: a MIX with no group opens no conference and leaves no session behind |
+| `tap_plane::describing_a_room_session_reads_the_conferences_open_and_its_members` (`WiredRoom`, over a real gRPC socket) | `DescribeSession` on the room: no `member`, a `conference` naming both members and `room_session=the-room`, and `opened_at_unix_ms` **at least 100 ms earlier than the moment the room session was created** — i.e. the conference's open, not its own. Every member reports `room_session` back, and it goes empty when the room session ends while they keep mixing |
+| `session-core::registry::a_room_session_is_a_conference_with_a_group_and_no_call_identity_of_its_own` | the shape rule and its four refusals, plus `opened_at` being stamped |
+| `control-api::media_control::a_room_session_is_a_group_with_no_leg_and_reports_the_conferences_open` | the same rules as `INVALID_ARGUMENT` over the API, and `opened_at_unix_ms` on the wire |
+| `session_store::a_room_session_is_bound_to_the_pod_that_mixes_it_and_is_never_adopted` | `is_room` / `is_pod_bound` / `is_rebuildable`, including a room record that *does* carry a call identity |
+
+Gate, run as separate commands: `cargo test --workspace` green (311
+mediaserverd unit tests, 67 session-core, 29 control-api `media_control`),
+`cargo fmt --all --check` clean, `cargo clippy --all-targets -- -D warnings`
+clean, the comment scan empty, `cargo deny check all` — advisories, bans,
+licenses, sources ok.
+
+**Owed.**
+
+1. **`lab/conference_drill.sh` has not run.** It is updated per the spec and
+   `sh -n` clean: the room object now hangs off a room session
+   (`mss_ctl create conf-<stamp>-room --kind mix --group <conference>`, opened
+   *before* the peers), a new **leave** phase hangs A up while B and C keep
+   talking, the ear expectations for that phase are in the manifest, and the
+   length comparison is now `room.wav` against `party-b.wav` and `party-c.wav`
+   (one length, `LENGTH_TOLERANCE_MS`) plus a new check that `party-a.wav` is
+   shorter than the room object by most of the time A was gone — which is the
+   D20 assertion in one number. Run it the next time the lab is up and put the
+   numbers in [lab.md](lab.md).
+2. Nothing here has been judged by a human ear, and no **SIP** peer has ever
+   been in a conference (still item 41's residual).
+
+**Residual.**
+
+- An INJECT attachment on the room session is a *prompt* path (utterance +
+  `Mark` → `StartPlayback` blob, capped by `MAX_UTTERANCE_SAMPLES` and the room's
+  prompt queue), not the continuous full-duplex inject an inline leg gets. Long
+  form room audio still belongs on an INJECT attachment on a member with
+  `mix_target=all`.
+- A room-opened conference fixes its rate and ptime from the **pod's** tap
+  format, so a member that negotiated something else is refused by name; open
+  the conference from its first leg if the room's format must follow the call.
+- A room session is not adoptable and a conference is still pod-local (D16's
+  residual, D8): the room's recording survives a pod loss only as far as the
+  spill does, and the room itself does not move.
+- With a non-zero linger and no `linger_through` (any embedder that builds a
+  `TapPlane` without handing it a `Weak` of itself), an emptied room stays open
+  until the API ends it. `main.rs` always sets it.
+- Member state still has no lease (D22, item 56), and the room session is not an
+  owner for one: it holds no member state of its own.
 
 ### 56. Member state with a lease (D22)
 **Where:** `crates/session-core/src/{mix.rs,event.rs,registry.rs}`,
@@ -3787,7 +3879,7 @@ sample, visible only as a growing `mss_rtpengine_sample_age_seconds`.
 | ~~D15~~ | ~~An adopted attachment loses its **negotiated format**: `rebuild` passes `format: None`, so a consumer that attached as L16/16k comes back at the session default.~~ — **fixed 2026-08-23 (item 26)**: `PersistedAttachment.format` (`Option<PersistedFormat>`, `serde(default)`, the wire shape used for the other persisted enums) is written every keeper tick and replayed on adoption; a record without it still decodes and still means the default. Unit-tested (roundtrip, legacy record, an L16/16k gRPC consumer and a default WS consumer re-opened side by side on the adopting pod) and run against the lab's real Redis; **never observed live** — that needs a pod kill with a gRPC L16 consumer attached | `session_store.rs`, `registry_keeper.rs` | closed |
 | ~~D14~~ | ~~**A dead pod's rtpengine subscription is never torn down.**~~ — **fixed 2026-08-23 (item 25)**: `PersistedSession` now carries the tap's `to-tag` (`subscription_tag`, `serde(default)` so older records still decode), the adopter sends NG `unsubscribe` for it **before** re-subscribing (after winning the atomic claim), and a pod that loses its lease destroys the session locally so a partitioned-but-alive owner unsubscribes its own tap instead of double-tapping. `upsert` also stopped rewriting the lease key unconditionally (now `SET NX`) — it had made a lease unloseable, so the partitioned case could never be detected. New counters `mss_registry_orphans_unsubscribed_total`, `mss_registry_orphans_still_subscribed_total`, `mss_registry_surrendered_total`. **Verified in unit tests, against a fake rtpengine socket (the `unsubscribe` bytes) and against the lab's real Redis — not re-measured on a live pod kill**; the residual is that a refused `unsubscribe` still leaks one tap, counted rather than retried | `session_store.rs`, `registry_keeper.rs`, `tap_plane.rs` | closed |
 | ~~D23~~ | ~~**A padded recording-group member lost its pad's worth of audio off the tail.** `Segmenter::close_segment` subtracted the closed frames from `segment_start` (the lead-silence offset) *and* advanced `anchor_ms` by the same frames, so every spill moved a late joiner's timeline forward by the pad twice~~ — **found and fixed 2026-08-24 (item 41)**: the anchor now advances only by `frames - segment_start`. Invisible to every earlier test because an ungrouped recording has `segment_start == 0` and item 29's group drill (5 s stagger, 20 s run) never reached the 30 s spill. Live in the conference drill: `party-c.wav` **55.88 s against 66.16/66.24** before, **72.10 against 71.96/72.02** after, with the 10.66 s pad still at the front. Guarded by `a_padded_member_keeps_its_whole_tail_across_a_spill`, which fails by exactly the lead if the fix is reverted | `recorder.rs` | closed |
-| D20 | **A room recording belongs to a member, not to the conference.** The mixed-track `FILE_S3` attachment hangs off one member session, so the object ends when *that* member leaves even though the conference keeps mixing — and its t=0 is its attach moment, not the conference's open, so it aligns with the per-participant objects only if both are attached together. Fix shape: a conference-scoped recording owner (an attachment on the conference rather than on a leg) with the conference's `opened_at` as its anchor | `tap_plane.rs`, `conference.rs` | medium once a tenant records conferences whose members come and go |
+| ~~D20~~ | ~~**A room recording belongs to a member, not to the conference.**~~ — **fixed 2026-08-27 (item 55)**: `CreateSession{kind=MIX, group=<conference>}` opens the room itself as a session with no leg. The conference stamps its own open (`opened_at_wall`) and publishes its full sum into a **room hub** on the conference clock; a `FILE_S3 only=mixed` attachment on the room session records from that open to the room's close, so a member leaving no longer ends the object — and `group_anchor_for` now gives the per-participant group the **same** anchor, which makes the two shapes sample-aligned whenever they are attached. The room session ends on `EndSession` or by itself once the conference has held a member and emptied (`MSS_CONFERENCE_LINGER_SECS`, default 0), uploading its object; `DescribeSession` on it reports the conference's `opened_at_unix_ms` and its members, and every member names the room back (`ConferenceView.room_session`). **Verified over in-process UDP sockets and the recording fakes only** — including the room object outliving the member who left, and a room recording opened before anybody joined; `lab/conference_drill.sh` is rewritten to record through the room session, with a **leave** phase and a length comparison that is exactly this defect, and has **never run** (the lab stack was down). **What remains:** that run, and the residuals in item 55 — an INJECT on the room is a prompt path rather than a full-duplex one, a room-opened conference fixes its format from the pod's tap format, and a room is still pod-local and never adopted | `tap_plane.rs`, `conference.rs` | closed (the drill owed) |
 | ~~D21~~ | ~~**DTMF digits never reach the event bus.** A tapped or inline leg's digits are delivered to consumers (WS `dtmf` frames, gRPC `DtmfFrame`) and counted in `mss_ingest_dtmf_digits_total`, but nothing publishes `Observation::Dtmf`, so `mss.events` carries no digit~~ — **fixed 2026-08-26 (item 48)**: every press on a tap leg or an inline leg is published as a session-level `MediaEvent` carrying `digit`, `track` (attribution-aware, so `leg_a`/`leg_b` when unproven), `duration_ms` (through the negotiated RTP clock) and the event's `rtp_timestamp`. **No capability and no consumer**: unlike `SpeechReport`, which a consumer *claims* and which is gated on `CAPABILITY_EVENTS`, a digit is a property of the call MSS decoded itself, so it goes out whenever the session exists. RFC 4733's three end retransmissions stay one event. The capture thread hands presses to the control plane over a bounded lock-free queue that counts refusals (`mss_dtmf_events_dropped_total`) rather than blocking the media path. Live-proved with no consumer attached (`lab/dtmf_event_drill.sh`). **Residual, by design:** MSS interprets no digit — no menu, no collection, no inter-digit timer (item 40: conference control is API-first) — and nothing rate-limits presses beyond the queue's drop counter | `digits.rs`, `tap_spike.rs`, `tap_plane.rs`, `registry.rs` | closed |
 | D22 | 🔶 **Member state has no owner and no lease** — read-back landed (item 49, 2026-08-26): `DescribeSession` on a member session reports its `mute`/`deaf`/`hold`, its mix routes and the room's members, read from the control-world mirror. What remains: `member_mute`/`member_deaf`/`member_hold` still outlive the attachment that set them (item 40) with no expiry, so a controller that dies between `on` and `off` leaves a member muted for the life of the conference — recoverable now by reconciling the room on reconnect, but nothing reclaims it. A lease needs an owner this API does not model (item 40 rejected the attachment as owner) | `conference.rs`, `tap_plane.rs`, `registry.rs` | medium once a tenant drives mute from a UI |
 | ~~D16~~ | ~~**A recording group is one pod's memory.**~~ — **fixed 2026-08-27 (item 54)**: the group moved into the session store. `mss:group:<account>/<group>` (`SET NX`, so two first-members on two pods agree on one recording and one anchor) plus a `mss:group:…:members` hash keyed by object key and valued by owner pod (`HSETNX` is the duplicate-participant refusal, and it can now name the pod holding the seat), both expiring at `MAX_RECORDING + 1 h`. A member may attach on **any** pod, `registry_keeper::rebuild` **rebuilds** a grouped attachment with its group instead of skipping it (`grouped_not_adopted` is deleted), and a reused group name joins the existing group instead of opening a second half-recording under the same prefix. The group's open instant became **wall-clock** (`SystemTime`) so two pods can share it, which makes cross-pod alignment as good as the nodes' NTP — deploy.md says so beside the new key table. A store MSS cannot read is a **refusal** of the grouped attachment, counted, never a silent local group. **Verified against `MemorySessionStore` and the in-crate recording fakes only** — including two planes sharing one store whose second pod's object opens with the lead silence back to the first pod's anchor; the env-gated Redis `SET NX` race test and `PODS=2 lab/group_recording_drill.sh` are written but have **never run**. **What remains:** those two runs, and placement (D8) — which is now an optimisation rather than a correctness requirement | `session_store.rs`, `tap_plane.rs`, `registry_keeper.rs`, `recorder.rs` | closed (two runs owed) |
