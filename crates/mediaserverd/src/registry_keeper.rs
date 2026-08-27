@@ -26,7 +26,6 @@ pub struct KeeperCounters {
     pub unrebuildable: AtomicU64,
     pub released: AtomicU64,
     pub failed: AtomicU64,
-    pub grouped_not_adopted: AtomicU64,
     pub inline_not_adopted: AtomicU64,
     pub orphans_unsubscribed: AtomicU64,
     pub orphans_still_subscribed: AtomicU64,
@@ -375,20 +374,6 @@ impl RegistryKeeper {
             .await?;
 
         for attachment in &session.attachments {
-            if !attachment.group.is_empty() {
-                self.counters
-                    .grouped_not_adopted
-                    .fetch_add(1, Ordering::Relaxed);
-                warn!(
-                    external_id = %session.external_id,
-                    label = %attachment.label,
-                    group = %attachment.group,
-                    "a recording group lives in one pod's memory, so this member is not \
-                     restored on the adopting pod; the group's other members keep recording \
-                     where they are and this participant's file ends at the pod that died"
-                );
-                continue;
-            }
             let restored = self
                 .controller
                 .attach(Request::new(proto::AttachRequest {
@@ -538,6 +523,7 @@ mod tests {
     struct RecordingPlane {
         opened: Mutex<Vec<String>>,
         attached: Mutex<Vec<String>>,
+        groups: Mutex<Vec<String>>,
         formats: Mutex<Vec<(String, AudioFormat)>>,
         metadata: Mutex<Vec<(String, std::collections::BTreeMap<String, String>)>>,
         journal: Arc<Mutex<Vec<String>>>,
@@ -599,6 +585,9 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push(format!("{}@{}", view.label, view.endpoint));
+            if !view.group.is_empty() {
+                self.groups.lock().unwrap().push(view.group.clone());
+            }
             self.metadata
                 .lock()
                 .unwrap()
@@ -950,7 +939,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_grouped_recording_is_persisted_but_refused_on_the_adopting_pod() {
+    async fn a_grouped_recording_is_rebuilt_on_the_adopting_pod_with_its_group() {
         let store = Arc::new(MemorySessionStore::default());
         let (first_pod, _) = pod("pod-a");
         tap_with_consumer(&first_pod, "req-1").await;
@@ -969,16 +958,17 @@ mod tests {
 
         assert_eq!(keeper.counters().adopted.load(Ordering::Relaxed), 1);
         assert_eq!(
-            keeper
-                .counters()
-                .grouped_not_adopted
-                .load(Ordering::Relaxed),
-            1
+            second_plane.attached.lock().unwrap().as_slice(),
+            [
+                "rtt@wss-rtt-endpoint".to_string(),
+                "alice@acct-1/rec-1.wav".to_string()
+            ],
+            "a recording group lives in the session store, so its member rejoins it here"
         );
         assert_eq!(
-            second_plane.attached.lock().unwrap().as_slice(),
-            ["rtt@wss-rtt-endpoint".to_string()],
-            "a recording group is per pod, so its member must not be rebuilt elsewhere"
+            second_plane.groups.lock().unwrap().as_slice(),
+            ["conf-9".to_string()],
+            "the adopting pod must ask to rejoin the same group, not start an ungrouped file"
         );
     }
 

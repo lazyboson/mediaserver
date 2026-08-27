@@ -19,7 +19,7 @@ use crate::recorder::{
 use crate::recording_uploads::UploadTracker;
 use crate::registry_keeper::TapSubscriptions;
 use crate::rtpengine_capability::NodeCapabilityLog;
-use crate::session_store::PersistedRecording;
+use crate::session_store::{GroupJoin, GroupRecord, PersistedRecording, SessionStore};
 use crate::tap_spike::{
     capture, capture_with_egress, SharedLegStats, SsrcTrackPublisher, SsrcTracks, TapLeg,
     MAX_SSRC_TRACKS,
@@ -45,7 +45,7 @@ use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
@@ -152,7 +152,7 @@ impl std::fmt::Display for GroupKey {
 struct RecordingGroup {
     recording_id: String,
     format: RecordingFormat,
-    opened_at: Instant,
+    opened_at: SystemTime,
     members: HashMap<AttachmentId, Vec<String>>,
 }
 
@@ -452,6 +452,7 @@ pub struct TapPlane {
     metrics: TapPlaneMetrics,
     observations: OnceLock<Weak<dyn ObservationSink>>,
     discovery: OnceLock<Arc<NodeDiscovery>>,
+    group_store: OnceLock<Arc<dyn SessionStore>>,
     uploads: Arc<UploadTracker>,
 }
 
@@ -468,6 +469,7 @@ impl TapPlane {
             metrics,
             observations: OnceLock::new(),
             discovery: OnceLock::new(),
+            group_store: OnceLock::new(),
             uploads,
         }
     }
@@ -484,6 +486,17 @@ impl TapPlane {
         if self.observations.set(sink).is_err() {
             warn!("this tap plane already reports its observations somewhere");
         }
+    }
+
+    pub fn share_groups_through(&self, store: Arc<dyn SessionStore>) {
+        if self.group_store.set(store).is_err() {
+            warn!("this tap plane already shares its recording groups through a session store");
+            return;
+        }
+        info!(
+            "recording groups are shared through the session registry, so a member can join \
+             from any pod and an adopted member rejoins the group it was already in"
+        );
     }
 
     pub fn discover_through(&self, discovery: Arc<NodeDiscovery>) {
@@ -774,7 +787,7 @@ impl TapPlane {
         Ok(())
     }
 
-    fn open_recording_attachment(&self, view: AttachmentView) -> Result<(), MediaPlaneError> {
+    async fn open_recording_attachment(&self, view: AttachmentView) -> Result<(), MediaPlaneError> {
         let identity = RecordingIdentity::parse(&view.endpoint).map_err(|error| {
             MediaPlaneError(format!(
                 "{error}; a file-s3 endpoint is the frozen recording identity {}",
@@ -815,7 +828,12 @@ impl TapPlane {
                 account_id: identity.account_id.clone(),
                 group: view.group.clone(),
             };
-            let anchor = self.join_group(&key, view.id, &identity, &targets)?;
+            let take_over = view
+                .metadata
+                .contains_key(recorder::SPILL_OWNER_METADATA_KEY);
+            let anchor = self
+                .join_group(&key, view.id, view.session, &identity, &targets, take_over)
+                .await?;
             Some((key, targets, anchor))
         };
         let rate = self.config.format.sample_rate_hz;
@@ -860,7 +878,7 @@ impl TapPlane {
             Some(subscription) => subscription,
             None => {
                 if let Some(key) = &member_of {
-                    self.leave_group(key, view.id);
+                    self.leave_group(key, view.id).await;
                 }
                 return Err(MediaPlaneError(
                     "the hub would not take another consumer".to_string(),
@@ -937,74 +955,196 @@ impl TapPlane {
         Ok(())
     }
 
-    fn join_group(
+    fn group_anchor_for(&self, _session: SessionId) -> SystemTime {
+        SystemTime::now()
+    }
+
+    fn refuse_group_join(
+        &self,
+        key: &GroupKey,
+        attachment: AttachmentId,
+        reason: String,
+    ) -> MediaPlaneError {
+        self.config
+            .recording
+            .counters
+            .group_joins_refused
+            .fetch_add(1, Ordering::Relaxed);
+        warn!(group = %key, %attachment, %reason, "this recording group refused a member");
+        MediaPlaneError(reason)
+    }
+
+    fn group_precheck(
+        &self,
+        key: &GroupKey,
+        identity: &RecordingIdentity,
+        participants: &[String],
+    ) -> Result<(), String> {
+        let held = self
+            .groups
+            .lock()
+            .map_err(|_| "the recording group table is poisoned".to_string())?;
+        let Some(group) = held.get(key) else {
+            return Ok(());
+        };
+        if group.recording_id != identity.recording_id {
+            return Err(records_another_recording(
+                key,
+                &identity.account_id,
+                &group.recording_id,
+                group.format.extension(),
+            ));
+        }
+        for participant in participants {
+            if group.holds(participant) {
+                return Err(participant_already_held(key, participant, None));
+            }
+        }
+        Ok(())
+    }
+
+    fn seat_group_member(
         &self,
         key: &GroupKey,
         attachment: AttachmentId,
         identity: &RecordingIdentity,
-        targets: &[RecordingTarget],
-    ) -> Result<Instant, MediaPlaneError> {
+        participants: &[String],
+        opened_at: SystemTime,
+    ) -> Result<SystemTime, String> {
         let counters = &self.config.recording.counters;
         let mut held = self
             .groups
             .lock()
-            .map_err(|_| MediaPlaneError("the recording group table is poisoned".to_string()))?;
-        let refuse = |reason: String| {
-            counters.group_joins_refused.fetch_add(1, Ordering::Relaxed);
-            warn!(group = %key, %attachment, %reason, "this recording group refused a member");
-            MediaPlaneError(reason)
-        };
+            .map_err(|_| "the recording group table is poisoned".to_string())?;
         let group = match held.get_mut(key) {
             Some(group) => {
                 if group.recording_id != identity.recording_id {
-                    return Err(refuse(format!(
-                        "recording group {key} is already recording {} and one group writes \
-                         one recording; attach with {}/{}.{} or a different group",
-                        group.recording_id,
-                        identity.account_id,
-                        group.recording_id,
-                        group.format.extension()
-                    )));
+                    return Err(records_another_recording(
+                        key,
+                        &identity.account_id,
+                        &group.recording_id,
+                        group.format.extension(),
+                    ));
                 }
                 group
             }
             None => {
                 counters.groups_live.fetch_add(1, Ordering::Relaxed);
-                info!(group = %key, recording_id = %identity.recording_id, "opened a recording group");
+                info!(
+                    group = %key,
+                    recording_id = %identity.recording_id,
+                    opened_at_unix_ms = opened_at
+                        .duration_since(SystemTime::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis() as u64,
+                    "opened a recording group"
+                );
                 held.entry(key.clone()).or_insert(RecordingGroup {
                     recording_id: identity.recording_id.clone(),
                     format: identity.format,
-                    opened_at: Instant::now(),
+                    opened_at,
                     members: HashMap::new(),
                 })
             }
         };
-        for target in targets {
-            if group.holds(&target.key) {
-                return Err(refuse(format!(
-                    "recording group {key} already has a participant writing {}; \
-                     each member needs a label of its own",
-                    target.key
-                )));
+        for participant in participants {
+            if group.holds(participant) {
+                return Err(participant_already_held(key, participant, None));
             }
         }
-        group.members.insert(
-            attachment,
-            targets.iter().map(|target| target.key.clone()).collect(),
-        );
+        group.members.insert(attachment, participants.to_vec());
         counters.group_members_live.fetch_add(1, Ordering::Relaxed);
         Ok(group.opened_at)
     }
 
-    fn leave_group(&self, key: &GroupKey, attachment: AttachmentId) {
+    async fn join_group(
+        &self,
+        key: &GroupKey,
+        attachment: AttachmentId,
+        session: SessionId,
+        identity: &RecordingIdentity,
+        targets: &[RecordingTarget],
+        take_over: bool,
+    ) -> Result<SystemTime, MediaPlaneError> {
+        let participants: Vec<String> = targets.iter().map(|target| target.key.clone()).collect();
+        if let Err(reason) = self.group_precheck(key, identity, &participants) {
+            return Err(self.refuse_group_join(key, attachment, reason));
+        }
+        let store = self.group_store.get().cloned();
+        let shared = key.to_string();
+        let anchor = match &store {
+            Some(store) => {
+                let proposed = GroupRecord::opening_at(
+                    self.group_anchor_for(session),
+                    &identity.recording_id,
+                    identity.format.extension(),
+                    &self.config.recording.owner,
+                );
+                match store
+                    .open_or_join_group(&shared, &proposed, &participants, take_over)
+                    .await
+                {
+                    Ok(GroupJoin::Joined(record)) => record.opened_at(),
+                    Ok(GroupJoin::RecordsAnother(record)) => {
+                        return Err(self.refuse_group_join(
+                            key,
+                            attachment,
+                            records_another_recording(
+                                key,
+                                &identity.account_id,
+                                &record.recording_id,
+                                &record.format,
+                            ),
+                        ))
+                    }
+                    Ok(GroupJoin::ParticipantHeld { participant, owner }) => {
+                        return Err(self.refuse_group_join(
+                            key,
+                            attachment,
+                            participant_already_held(key, &participant, Some(&owner)),
+                        ))
+                    }
+                    Err(error) => {
+                        return Err(self.refuse_group_join(
+                            key,
+                            attachment,
+                            format!(
+                                "recording group {key} could not be read from the session \
+                                 registry ({error}); a member that cannot see the group would \
+                                 open a second half-recording under the same prefix"
+                            ),
+                        ))
+                    }
+                }
+            }
+            None => self.group_anchor_for(session),
+        };
+        match self.seat_group_member(key, attachment, identity, &participants, anchor) {
+            Ok(opened_at) => Ok(opened_at),
+            Err(reason) => {
+                if let Some(store) = &store {
+                    if let Err(error) = store.leave_group(&shared, &participants).await {
+                        warn!(
+                            group = %key,
+                            %error,
+                            "this member's seat is left behind in the session registry until \
+                             the group record expires"
+                        );
+                    }
+                }
+                Err(self.refuse_group_join(key, attachment, reason))
+            }
+        }
+    }
+
+    fn release_group_seat(&self, key: &GroupKey, attachment: AttachmentId) -> Option<Vec<String>> {
         let Ok(mut held) = self.groups.lock() else {
             warn!(group = %key, "the recording group table is poisoned; the group is left behind");
-            return;
+            return None;
         };
-        let Some(group) = held.get_mut(key) else {
-            return;
-        };
-        if group.members.remove(&attachment).is_some() {
+        let group = held.get_mut(key)?;
+        let departed = group.members.remove(&attachment);
+        if departed.is_some() {
             self.config
                 .recording
                 .counters
@@ -1019,6 +1159,24 @@ impl TapPlane {
                 .groups_live
                 .fetch_sub(1, Ordering::Relaxed);
             info!(group = %key, "the last member left this recording group");
+        }
+        departed
+    }
+
+    async fn leave_group(&self, key: &GroupKey, attachment: AttachmentId) {
+        let departed = self.release_group_seat(key, attachment);
+        let Some(participants) = departed else {
+            return;
+        };
+        if let Some(store) = self.group_store.get() {
+            if let Err(error) = store.leave_group(&key.to_string(), &participants).await {
+                warn!(
+                    group = %key,
+                    %error,
+                    "this member's seat is left behind in the session registry until the \
+                     group record expires"
+                );
+            }
         }
     }
 
@@ -1068,7 +1226,7 @@ impl TapPlane {
             "recording stopped; its upload runs in the background"
         );
         if let Some(key) = member_of.as_ref() {
-            self.leave_group(key, attachment);
+            self.leave_group(key, attachment).await;
         }
         self.uploads.adopt(finished, self.observer());
         Some(())
@@ -2091,7 +2249,7 @@ impl MediaPlane for TapPlane {
         let opened = match view.transport {
             Transport::WsTwilio => self.open_ws_attachment(view),
             Transport::GrpcStream => self.open_grpc_attachment(view),
-            Transport::FileS3 => self.open_recording_attachment(view),
+            Transport::FileS3 => self.open_recording_attachment(view).await,
             other => Err(MediaPlaneError(format!(
                 "{other} attachments are not served yet; ws-twilio, grpc-stream \
                  and file-s3 are"
@@ -2772,6 +2930,32 @@ fn recording_selection_of(selector: TrackSelector) -> TrackSelection {
     }
 }
 
+fn records_another_recording(
+    key: &GroupKey,
+    account_id: &str,
+    held_recording_id: &str,
+    held_format: &str,
+) -> String {
+    format!(
+        "recording group {key} is already recording {held_recording_id} and one group writes \
+         one recording; attach with {account_id}/{held_recording_id}.{held_format} or a \
+         different group"
+    )
+}
+
+fn participant_already_held(key: &GroupKey, participant: &str, owner: Option<&str>) -> String {
+    match owner {
+        Some(owner) => format!(
+            "recording group {key} already has a participant writing {participant}, on pod \
+             {owner}; each member needs a label of its own"
+        ),
+        None => format!(
+            "recording group {key} already has a participant writing {participant}; each \
+             member needs a label of its own"
+        ),
+    }
+}
+
 fn participant_of(view: &AttachmentView, external_id: &str) -> Result<String, MediaPlaneError> {
     let named = if view.label.is_empty() {
         external_id
@@ -2999,6 +3183,7 @@ fn speaker_track(index: usize) -> Track {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::session_store::MemorySessionStore;
     use media_core::AudioFormat;
     use session_core::mix::{
         MEMBER_DEAF_METADATA_KEY, MEMBER_FLAG_OFF, MEMBER_FLAG_ON, MEMBER_HOLD_METADATA_KEY,
@@ -3149,6 +3334,19 @@ mod tests {
     }
 
     fn plane_with_recording(recording: RecordingSupport) -> TapPlane {
+        plane_sharing_groups(recording, Arc::new(MemorySessionStore::default()))
+    }
+
+    fn plane_sharing_groups(
+        recording: RecordingSupport,
+        store: Arc<MemorySessionStore>,
+    ) -> TapPlane {
+        let plane = plane_without_a_store(recording);
+        plane.share_groups_through(store as Arc<dyn SessionStore>);
+        plane
+    }
+
+    fn plane_without_a_store(recording: RecordingSupport) -> TapPlane {
         TapPlane::new(TapPlaneConfig {
             default_node: None,
             local_media_address: IpAddr::from([127, 0, 0, 1]),
@@ -3370,13 +3568,17 @@ mod tests {
     }
 
     fn recording_support() -> RecordingSupport {
+        recording_support_owned("pod-a")
+    }
+
+    fn recording_support_owned(owner: &str) -> RecordingSupport {
         RecordingSupport {
             sink: Some(Arc::new(NowhereSink)),
             spill_dir: None,
             journal: None,
             spill_every: recorder::SPILL_EVERY,
             counters: Arc::new(RecorderCounters::default()),
-            owner: "pod-a".to_string(),
+            owner: owner.to_string(),
             upload_permits: std::sync::Arc::new(tokio::sync::Semaphore::new(
                 recorder::DEFAULT_UPLOAD_CONCURRENCY,
             )),
@@ -3899,18 +4101,30 @@ m=audio {peer_port} RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\na=ptime:{ptime_ms}\r\n"
         }
     }
 
-    fn bucket_plane(bucket: &Arc<BucketSink>) -> TapPlane {
-        plane_with_recording(RecordingSupport {
+    fn recording_into(bucket: &Arc<BucketSink>, owner: &str) -> RecordingSupport {
+        RecordingSupport {
             sink: Some(Arc::clone(bucket) as Arc<dyn recorder::RecordingSink>),
             journal: None,
             spill_dir: None,
             spill_every: recorder::SPILL_EVERY,
             counters: Arc::new(RecorderCounters::default()),
-            owner: "pod-a".to_string(),
+            owner: owner.to_string(),
             upload_permits: std::sync::Arc::new(tokio::sync::Semaphore::new(
                 recorder::DEFAULT_UPLOAD_CONCURRENCY,
             )),
-        })
+        }
+    }
+
+    fn bucket_plane(bucket: &Arc<BucketSink>) -> TapPlane {
+        plane_with_recording(recording_into(bucket, "pod-a"))
+    }
+
+    fn bucket_plane_of(
+        bucket: &Arc<BucketSink>,
+        store: &Arc<MemorySessionStore>,
+        owner: &str,
+    ) -> TapPlane {
+        plane_sharing_groups(recording_into(bucket, owner), Arc::clone(store))
     }
 
     #[tokio::test]
@@ -5281,8 +5495,8 @@ m=audio 41000 RTP/AVP 111\r\na=rtpmap:111 opus/48000/2\r\n",
         assert!(error.to_string().contains("attachment label"), "{error}");
     }
 
-    #[test]
-    fn a_group_refuses_a_second_member_that_would_overwrite_the_first() {
+    #[tokio::test]
+    async fn a_group_refuses_a_second_member_that_would_overwrite_the_first() {
         let plane = plane_with_recording(recording_support());
         let identity = identity("acct-42/rec-99.wav");
         let key = GroupKey {
@@ -5298,17 +5512,41 @@ m=audio 41000 RTP/AVP 111\r\na=rtpmap:111 opus/48000/2\r\n",
         let bob = participant_targets(&identity, "bob", TrackSelector::All, Attribution::Explicit);
 
         let opened = plane
-            .join_group(&key, AttachmentId::from_raw(2), &identity, &alice)
+            .join_group(
+                &key,
+                AttachmentId::from_raw(2),
+                SessionId::from_raw(1),
+                &identity,
+                &alice,
+                false,
+            )
+            .await
             .expect("the first member opens the group");
         let joined_late = plane
-            .join_group(&key, AttachmentId::from_raw(3), &identity, &bob)
+            .join_group(
+                &key,
+                AttachmentId::from_raw(3),
+                SessionId::from_raw(2),
+                &identity,
+                &bob,
+                false,
+            )
+            .await
             .expect("a second participant is the whole point");
         assert_eq!(
             opened, joined_late,
             "every member of a group anchors on the instant the group opened"
         );
         let error = plane
-            .join_group(&key, AttachmentId::from_raw(4), &identity, &alice)
+            .join_group(
+                &key,
+                AttachmentId::from_raw(4),
+                SessionId::from_raw(3),
+                &identity,
+                &alice,
+                false,
+            )
+            .await
             .unwrap_err();
 
         assert!(error.to_string().contains("label of its own"), "{error}");
@@ -5324,8 +5562,8 @@ m=audio 41000 RTP/AVP 111\r\na=rtpmap:111 opus/48000/2\r\n",
         assert_eq!(counters.group_joins_refused.load(Ordering::Relaxed), 1);
     }
 
-    #[test]
-    fn one_group_records_one_recording_and_says_so_when_asked_for_two() {
+    #[tokio::test]
+    async fn one_group_records_one_recording_and_says_so_when_asked_for_two() {
         let plane = plane_with_recording(recording_support());
         let first = identity("acct-42/rec-99.wav");
         let second = identity("acct-42/rec-100.wav");
@@ -5338,17 +5576,23 @@ m=audio 41000 RTP/AVP 111\r\na=rtpmap:111 opus/48000/2\r\n",
             .join_group(
                 &key,
                 AttachmentId::from_raw(2),
+                SessionId::from_raw(1),
                 &first,
                 &participant_targets(&first, "alice", TrackSelector::All, Attribution::Explicit),
+                false,
             )
+            .await
             .unwrap();
         let error = plane
             .join_group(
                 &key,
                 AttachmentId::from_raw(3),
+                SessionId::from_raw(2),
                 &second,
                 &participant_targets(&second, "bob", TrackSelector::All, Attribution::Explicit),
+                false,
             )
+            .await
             .unwrap_err();
 
         assert!(error.to_string().contains("rec-99"), "{error}");
@@ -5358,8 +5602,8 @@ m=audio 41000 RTP/AVP 111\r\na=rtpmap:111 opus/48000/2\r\n",
         );
     }
 
-    #[test]
-    fn a_group_dies_with_its_last_member() {
+    #[tokio::test]
+    async fn a_group_dies_with_its_last_member() {
         let plane = plane_with_recording(recording_support());
         let identity = identity("acct-42/rec-99.wav");
         let key = GroupKey {
@@ -5372,6 +5616,7 @@ m=audio 41000 RTP/AVP 111\r\na=rtpmap:111 opus/48000/2\r\n",
                 .join_group(
                     &key,
                     *member,
+                    SessionId::from_raw(index as u64 + 1),
                     &identity,
                     &participant_targets(
                         &identity,
@@ -5379,15 +5624,17 @@ m=audio 41000 RTP/AVP 111\r\na=rtpmap:111 opus/48000/2\r\n",
                         TrackSelector::Only(Track::Customer),
                         Attribution::Explicit,
                     ),
+                    false,
                 )
+                .await
                 .unwrap();
         }
         let counters = &plane.config.recording.counters;
         assert_eq!(counters.group_members_live.load(Ordering::Relaxed), 2);
 
-        plane.leave_group(&key, members[0]);
+        plane.leave_group(&key, members[0]).await;
         assert_eq!(counters.groups_live.load(Ordering::Relaxed), 1);
-        plane.leave_group(&key, members[1]);
+        plane.leave_group(&key, members[1]).await;
 
         assert_eq!(counters.groups_live.load(Ordering::Relaxed), 0);
         assert_eq!(counters.group_members_live.load(Ordering::Relaxed), 0);
@@ -5397,6 +5644,7 @@ m=audio 41000 RTP/AVP 111\r\na=rtpmap:111 opus/48000/2\r\n",
             .join_group(
                 &key,
                 members[0],
+                SessionId::from_raw(1),
                 &identity,
                 &participant_targets(
                     &identity,
@@ -5404,9 +5652,302 @@ m=audio 41000 RTP/AVP 111\r\na=rtpmap:111 opus/48000/2\r\n",
                     TrackSelector::Only(Track::Customer),
                     Attribution::Explicit,
                 ),
+                false,
             )
+            .await
             .expect("the same group name is free once the last member has gone");
         assert_eq!(counters.groups_live.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn a_group_name_reused_on_a_second_pod_joins_it_instead_of_opening_another() {
+        let store = Arc::new(MemorySessionStore::default());
+        let first = plane_sharing_groups(recording_support_owned("pod-a"), Arc::clone(&store));
+        let second = plane_sharing_groups(recording_support_owned("pod-b"), Arc::clone(&store));
+        let identity = identity("acct-42/rec-99.wav");
+        let key = GroupKey {
+            account_id: identity.account_id.clone(),
+            group: "conf-9".to_string(),
+        };
+        let alice = participant_targets(
+            &identity,
+            "alice",
+            TrackSelector::Only(Track::Customer),
+            Attribution::Explicit,
+        );
+        let bob = participant_targets(
+            &identity,
+            "bob",
+            TrackSelector::Only(Track::Customer),
+            Attribution::Explicit,
+        );
+
+        let opened = first
+            .join_group(
+                &key,
+                AttachmentId::from_raw(2),
+                SessionId::from_raw(1),
+                &identity,
+                &alice,
+                false,
+            )
+            .await
+            .expect("the first member opens the group");
+        first.groups.lock().unwrap().clear();
+        let joined = second
+            .join_group(
+                &key,
+                AttachmentId::from_raw(3),
+                SessionId::from_raw(2),
+                &identity,
+                &bob,
+                false,
+            )
+            .await
+            .expect("a member on another pod joins the group that already exists");
+
+        assert_eq!(
+            opened, joined,
+            "a group name reused on a second pod must not open a second half-recording \
+             under the same prefix"
+        );
+        let record = store
+            .group_record(&key.to_string())
+            .expect("the group is a shared record, not one pod's memory");
+        assert_eq!(record.recording_id, "rec-99");
+        assert_eq!(record.format, "wav");
+        assert_eq!(
+            record.created_by, "pod-a",
+            "the pod that opened the group owns its anchor"
+        );
+        assert_eq!(
+            store.group_members(&key.to_string()),
+            BTreeMap::from([
+                ("acct-42/rec-99/alice.wav".to_string(), "pod-a".to_string()),
+                ("acct-42/rec-99/bob.wav".to_string(), "pod-b".to_string()),
+            ]),
+            "the participant set says which pod writes which object"
+        );
+
+        let error = second
+            .join_group(
+                &key,
+                AttachmentId::from_raw(4),
+                SessionId::from_raw(3),
+                &identity,
+                &alice,
+                false,
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("label of its own"), "{error}");
+        assert!(
+            error.to_string().contains("pod-a"),
+            "a cross-pod refusal must name the pod already writing that object: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_adopted_member_takes_its_seat_back_from_the_pod_that_died() {
+        let store = Arc::new(MemorySessionStore::default());
+        let dead = plane_sharing_groups(recording_support_owned("pod-a"), Arc::clone(&store));
+        let adopter = plane_sharing_groups(recording_support_owned("pod-b"), Arc::clone(&store));
+        let identity = identity("acct-42/rec-99.wav");
+        let key = GroupKey {
+            account_id: identity.account_id.clone(),
+            group: "conf-9".to_string(),
+        };
+        let alice = participant_targets(
+            &identity,
+            "alice",
+            TrackSelector::Only(Track::Customer),
+            Attribution::Explicit,
+        );
+        let opened = dead
+            .join_group(
+                &key,
+                AttachmentId::from_raw(2),
+                SessionId::from_raw(1),
+                &identity,
+                &alice,
+                false,
+            )
+            .await
+            .expect("the member records on the pod that dies");
+
+        let refused = adopter
+            .join_group(
+                &key,
+                AttachmentId::from_raw(3),
+                SessionId::from_raw(1),
+                &identity,
+                &alice,
+                false,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            refused.to_string().contains("label of its own"),
+            "a fresh attach must not silently overwrite a live member's object: {refused}"
+        );
+
+        let adopted = adopter
+            .join_group(
+                &key,
+                AttachmentId::from_raw(4),
+                SessionId::from_raw(1),
+                &identity,
+                &alice,
+                true,
+            )
+            .await
+            .expect("an adopter whose lease claim already arbitrated takes the seat back");
+
+        assert_eq!(
+            opened, adopted,
+            "an adopted member keeps the anchor the group opened on"
+        );
+        assert_eq!(
+            store.group_members(&key.to_string()),
+            BTreeMap::from([("acct-42/rec-99/alice.wav".to_string(), "pod-b".to_string())]),
+            "the seat now names the pod that finishes the object"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_group_the_store_cannot_answer_for_is_refused_rather_than_kept_locally() {
+        let store = Arc::new(MemorySessionStore::default());
+        let plane = plane_sharing_groups(recording_support(), Arc::clone(&store));
+        let identity = identity("acct-42/rec-99.wav");
+        let key = GroupKey {
+            account_id: identity.account_id.clone(),
+            group: "conf-9".to_string(),
+        };
+        store.set_unreachable(true);
+
+        let error = plane
+            .join_group(
+                &key,
+                AttachmentId::from_raw(2),
+                SessionId::from_raw(1),
+                &identity,
+                &participant_targets(
+                    &identity,
+                    "alice",
+                    TrackSelector::Only(Track::Customer),
+                    Attribution::Explicit,
+                ),
+                false,
+            )
+            .await
+            .unwrap_err();
+
+        assert!(
+            error.to_string().contains("session registry"),
+            "a store this pod cannot read must be named in the refusal: {error}"
+        );
+        let counters = &plane.config.recording.counters;
+        assert_eq!(counters.group_joins_refused.load(Ordering::Relaxed), 1);
+        assert_eq!(counters.groups_live.load(Ordering::Relaxed), 0);
+        assert_eq!(counters.group_members_live.load(Ordering::Relaxed), 0);
+        assert!(
+            plane.groups.lock().unwrap().is_empty(),
+            "a half-group in one pod's memory is worse than no group"
+        );
+    }
+
+    #[tokio::test]
+    async fn two_pods_sharing_one_store_pad_their_members_back_to_one_anchor() {
+        let bucket = Arc::new(BucketSink::default());
+        let store = Arc::new(MemorySessionStore::default());
+        let first = bucket_plane_of(&bucket, &store, "pod-a");
+        let second = bucket_plane_of(&bucket, &store, "pod-b");
+        let mut alice = seat_peer(&first, 1, "cross-pod").await;
+
+        first
+            .open_attachment(recording_attachment(
+                11,
+                alice.session,
+                "acct-7/parties.wav",
+                TrackSelector::Only(Track::Customer),
+                "parties",
+                "alice",
+            ))
+            .await
+            .expect("the first pod opens the group");
+        for _ in 0..8 {
+            alice.speak(1_000, 4);
+            tokio::time::sleep(Duration::from_millis(80)).await;
+        }
+
+        let mut bob = seat_peer(&second, 2, "cross-pod").await;
+        second
+            .open_attachment(recording_attachment(
+                12,
+                bob.session,
+                "acct-7/parties.wav",
+                TrackSelector::Only(Track::Customer),
+                "parties",
+                "bob",
+            ))
+            .await
+            .expect("a member on a second pod joins the group the first pod opened");
+        for _ in 0..8 {
+            alice.speak(1_000, 4);
+            bob.speak(2_000, 4);
+            tokio::time::sleep(Duration::from_millis(80)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        first
+            .close_attachment(alice.session, AttachmentId::from_raw(11))
+            .await
+            .expect("the first pod's member closes");
+        second
+            .close_attachment(bob.session, AttachmentId::from_raw(12))
+            .await
+            .expect("the second pod's member closes");
+        first.await_uploads().await;
+        second.await_uploads().await;
+
+        let mut keys = bucket.keys();
+        keys.sort();
+        assert_eq!(
+            keys,
+            vec![
+                "acct-7/parties/alice.wav".to_string(),
+                "acct-7/parties/bob.wav".to_string(),
+            ],
+            "one prefix, one object per participant, across two pods"
+        );
+        let (_, alice_samples) = recorded_wav(&bucket.body("acct-7/parties/alice.wav"));
+        let (_, bob_samples) = recorded_wav(&bucket.body("acct-7/parties/bob.wav"));
+        let lead = bob_samples
+            .iter()
+            .position(|sample| *sample != 0)
+            .unwrap_or(bob_samples.len());
+        assert!(
+            lead >= 8_000 / 4,
+            "the second pod's member must be padded back to the anchor the first pod \
+             stamped: {lead} samples"
+        );
+        let slack = 8_000usize / 2;
+        assert!(
+            bob_samples.len() + slack >= alice_samples.len()
+                && bob_samples.len() <= alice_samples.len() + slack,
+            "two members of one group on two pods must be the same length: {} against {}",
+            bob_samples.len(),
+            alice_samples.len()
+        );
+
+        first
+            .close_session(alice.session)
+            .await
+            .expect("a conference leg closes");
+        second
+            .close_session(bob.session)
+            .await
+            .expect("a conference leg closes");
     }
 
     #[test]
