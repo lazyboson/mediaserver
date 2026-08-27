@@ -10,7 +10,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 #[path = "../src/hub.rs"]
 mod hub;
 
-#[allow(dead_code)]
+#[allow(dead_code, unused_imports)]
 #[path = "../src/recorder.rs"]
 mod recorder;
 
@@ -139,6 +139,7 @@ async fn a_recording_group_lands_one_object_per_participant_in_a_real_bucket() {
     eprintln!("drill: recording a group into {}", sink.describe());
     let support = RecordingSupport {
         sink: Some(Arc::new(sink) as Arc<dyn RecordingSink>),
+        journal: None,
         spill_dir: None,
         spill_every: recorder::SPILL_EVERY,
         counters: Arc::new(RecorderCounters::default()),
@@ -348,6 +349,7 @@ async fn a_paused_recording_lands_in_a_real_bucket_under_the_frozen_identity() {
     let key = identity.object_key();
     let support = RecordingSupport {
         sink: Some(Arc::new(sink) as Arc<dyn RecordingSink>),
+        journal: None,
         spill_dir: None,
         spill_every: recorder::SPILL_EVERY,
         counters: Arc::new(RecorderCounters::default()),
@@ -489,5 +491,132 @@ async fn a_paused_recording_lands_in_a_real_bucket_under_the_frozen_identity() {
     eprintln!(
         "drill: verified {} stereo frames at {key} in bucket {bucket}",
         left.len()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_journal_spilled_to_a_real_bucket_is_read_back_by_another_pod() {
+    let Some(lab) = lab() else {
+        return;
+    };
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis();
+    let identity = RecordingIdentity::parse(&format!("acct-spill/rec-{stamp}.wav")).unwrap();
+    let key = identity.object_key();
+    let sink: Arc<dyn RecordingSink> = Arc::new(
+        S3RecordingSink::new(
+            lab.bucket.clone(),
+            REGION.to_string(),
+            Some(lab.endpoint.clone()),
+            Some((lab.access_key.clone(), lab.secret_key.clone())),
+        )
+        .expect("the drill needs a usable bucket configuration"),
+    );
+    let prefix = recording_spill::DEFAULT_SPILL_PREFIX;
+    let journal: Arc<dyn recording_spill::SpillStore> =
+        Arc::new(recording_spill::ObjectSpill::new(Arc::clone(&sink), prefix));
+    let support_of = |owner: &str| RecordingSupport {
+        sink: Some(Arc::clone(&sink)),
+        journal: Some(Arc::clone(&journal)),
+        spill_dir: None,
+        spill_every: recorder::SPILL_EVERY,
+        counters: Arc::new(RecorderCounters::default()),
+        owner: owner.to_string(),
+        upload_permits: std::sync::Arc::new(tokio::sync::Semaphore::new(
+            recorder::DEFAULT_UPLOAD_CONCURRENCY,
+        )),
+    };
+
+    let dying = support_of("pod-a");
+    let mut held = recording_spill::SegmentJournal::open(
+        &dying,
+        &identity.recording_id,
+        "pod-a",
+        RATE,
+        &[(key.clone(), 1)],
+    )
+    .await
+    .expect("the spill journal needs a store");
+    for tone in [CUSTOMER_TONE, AGENT_TONE] {
+        held.append(
+            vec![recorder::RecordedAudio {
+                channels: 1,
+                samples: vec![tone; FRAME],
+            }],
+            FRAME as u64,
+        )
+        .await
+        .expect("a segment did not reach the bucket");
+    }
+    assert_eq!(held.frames_on_disk(), 2 * FRAME as u64);
+    eprintln!("drill: two segments spilled to {}", held.describe());
+    drop(held);
+
+    let adopting = support_of("pod-b");
+    let counters = Arc::clone(&adopting.counters);
+    let (mut live, client) = Hub::new();
+    let subscription = client.attach(512, TrackSelection::All).unwrap();
+    live.poll_commands();
+    let resume_ms = 2 * FRAME as u64 * 1000 / RATE as u64;
+    let handle = recorder::spawn(
+        RecorderSpec {
+            session: SessionId::from_raw(1),
+            recording_id: identity.recording_id.clone(),
+            format: identity.format,
+            targets: vec![RecordingTarget {
+                key: key.clone(),
+                layout: Layout::Mono(Track::Customer),
+            }],
+            sample_rate_hz: RATE,
+            max_duration: recorder::MAX_RECORDING,
+            group_anchor: None,
+            resume_ms,
+        },
+        subscription,
+        adopting,
+        None,
+    );
+    live.publish(TapEvent::media(Track::Customer, 0, &[THIRD_TONE; FRAME]));
+    let outcome = handle
+        .finish()
+        .await
+        .settle()
+        .await
+        .expect("the adopting pod had no outcome");
+    drop(live);
+
+    assert_eq!(
+        counters
+            .frames_lost_on_adopt
+            .load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "every spilled frame was in the bucket, so nothing may be counted lost"
+    );
+    assert_eq!(outcome.frames, 3 * FRAME);
+
+    let reader = reader_of(&lab);
+    let heard = mono_samples(&reader, &key).await;
+    assert_eq!(heard.len(), 3 * FRAME);
+    assert!(heard[..FRAME].iter().all(|sample| *sample == CUSTOMER_TONE));
+    assert!(heard[FRAME..2 * FRAME]
+        .iter()
+        .all(|sample| *sample == AGENT_TONE));
+    assert!(heard[2 * FRAME..]
+        .iter()
+        .all(|sample| *sample == THIRD_TONE));
+
+    let leftovers = sink
+        .list(&format!("{prefix}{key}/"))
+        .await
+        .expect("the reserved spill namespace could not be listed");
+    assert!(
+        leftovers.is_empty(),
+        "an uploaded recording left {leftovers:?} in the reserved spill namespace"
+    );
+    eprintln!(
+        "drill: pod-b finished pod-a's recording at {key} in bucket {} and cleared {prefix}",
+        lab.bucket
     );
 }

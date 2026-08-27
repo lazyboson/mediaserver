@@ -1,8 +1,9 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub const LEASE_TTL: Duration = Duration::from_secs(15);
+pub const GROUP_RECORD_TTL: Duration = Duration::from_secs(3 * 60 * 60);
 pub const RENEW_EVERY: Duration = Duration::from_secs(5);
 pub const ADOPT_EVERY: Duration = Duration::from_secs(10);
 pub const MAX_ADOPTIONS_PER_SWEEP: usize = 8;
@@ -52,6 +53,7 @@ pub struct PersistedFormat {
 }
 
 pub const INLINE_SESSION_KIND: i32 = 2;
+pub const MIX_SESSION_KIND: i32 = 3;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PersistedSession {
@@ -71,9 +73,55 @@ impl PersistedSession {
         self.kind == INLINE_SESSION_KIND
     }
 
-    pub fn is_rebuildable(&self) -> bool {
-        !self.is_inline() && !self.call_id.is_empty() && !self.from_tags.is_empty()
+    pub fn is_room(&self) -> bool {
+        self.kind == MIX_SESSION_KIND
     }
+
+    pub fn is_pod_bound(&self) -> bool {
+        self.is_inline() || self.is_room()
+    }
+
+    pub fn is_rebuildable(&self) -> bool {
+        !self.is_pod_bound() && !self.call_id.is_empty() && !self.from_tags.is_empty()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GroupRecord {
+    pub recording_id: String,
+    pub format: String,
+    pub opened_at_unix_ms: u64,
+    pub created_by: String,
+}
+
+impl GroupRecord {
+    pub fn opening_at(
+        opened_at: SystemTime,
+        recording_id: &str,
+        format: &str,
+        created_by: &str,
+    ) -> GroupRecord {
+        GroupRecord {
+            recording_id: recording_id.to_string(),
+            format: format.to_string(),
+            opened_at_unix_ms: opened_at
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64,
+            created_by: created_by.to_string(),
+        }
+    }
+
+    pub fn opened_at(&self) -> SystemTime {
+        UNIX_EPOCH + Duration::from_millis(self.opened_at_unix_ms)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GroupJoin {
+    Joined(GroupRecord),
+    RecordsAnother(GroupRecord),
+    ParticipantHeld { participant: String, owner: String },
 }
 
 #[control_api::async_trait]
@@ -93,6 +141,16 @@ pub trait SessionStore: Send + Sync + 'static {
         owner: &str,
         limit: usize,
     ) -> Result<Vec<PersistedSession>, StoreError>;
+
+    async fn open_or_join_group(
+        &self,
+        key: &str,
+        proposed: &GroupRecord,
+        participants: &[String],
+        take_over: bool,
+    ) -> Result<GroupJoin, StoreError>;
+
+    async fn leave_group(&self, key: &str, participants: &[String]) -> Result<(), StoreError>;
 }
 
 pub struct RedisSessionStore {
@@ -132,6 +190,14 @@ impl RedisSessionStore {
 
     fn index_key(&self) -> String {
         format!("{}:sessions", self.namespace)
+    }
+
+    fn group_key(&self, group: &str) -> String {
+        format!("{}:group:{group}", self.namespace)
+    }
+
+    fn group_members_key(&self, group: &str) -> String {
+        format!("{}:group:{group}:members", self.namespace)
     }
 
     pub async fn read_key(&self, key: &str) -> Result<Option<String>, StoreError> {
@@ -291,6 +357,144 @@ impl SessionStore for RedisSessionStore {
         }
         Ok(claimed)
     }
+
+    async fn open_or_join_group(
+        &self,
+        key: &str,
+        proposed: &GroupRecord,
+        participants: &[String],
+        take_over: bool,
+    ) -> Result<GroupJoin, StoreError> {
+        let body = serde_json::to_string(proposed)
+            .map_err(|error| StoreError::Encoding(error.to_string()))?;
+        let record_key = self.group_key(key);
+        let members_key = self.group_members_key(key);
+        let ttl = GROUP_RECORD_TTL.as_secs();
+        let mut connection = self.connection().await?;
+        let won: Option<String> = redis::cmd("SET")
+            .arg(&record_key)
+            .arg(&body)
+            .arg("NX")
+            .arg("EX")
+            .arg(ttl)
+            .query_async(&mut connection)
+            .await
+            .map_err(|error| StoreError::Backend(error.to_string()))?;
+        let record = match won {
+            Some(_) => proposed.clone(),
+            None => {
+                let held: Option<String> = redis::cmd("GET")
+                    .arg(&record_key)
+                    .query_async(&mut connection)
+                    .await
+                    .map_err(|error| StoreError::Backend(error.to_string()))?;
+                match held {
+                    Some(held) => serde_json::from_str::<GroupRecord>(&held)
+                        .map_err(|error| StoreError::Encoding(error.to_string()))?,
+                    None => {
+                        redis::cmd("SET")
+                            .arg(&record_key)
+                            .arg(&body)
+                            .arg("EX")
+                            .arg(ttl)
+                            .query_async::<()>(&mut connection)
+                            .await
+                            .map_err(|error| StoreError::Backend(error.to_string()))?;
+                        proposed.clone()
+                    }
+                }
+            }
+        };
+        if record.recording_id != proposed.recording_id || record.format != proposed.format {
+            return Ok(GroupJoin::RecordsAnother(record));
+        }
+        let mut seated: Vec<&String> = Vec::new();
+        for participant in participants {
+            let seat_taken = if take_over {
+                redis::cmd("HSET")
+                    .arg(&members_key)
+                    .arg(participant)
+                    .arg(&proposed.created_by)
+                    .query_async::<i64>(&mut connection)
+                    .await
+                    .map_err(|error| StoreError::Backend(error.to_string()))?;
+                true
+            } else {
+                let added: i64 = redis::cmd("HSETNX")
+                    .arg(&members_key)
+                    .arg(participant)
+                    .arg(&proposed.created_by)
+                    .query_async(&mut connection)
+                    .await
+                    .map_err(|error| StoreError::Backend(error.to_string()))?;
+                added == 1
+            };
+            if seat_taken {
+                seated.push(participant);
+                continue;
+            }
+            for taken_back in seated {
+                let _: Result<i64, _> = redis::cmd("HDEL")
+                    .arg(&members_key)
+                    .arg(taken_back)
+                    .query_async(&mut connection)
+                    .await;
+            }
+            let owner: Option<String> = redis::cmd("HGET")
+                .arg(&members_key)
+                .arg(participant)
+                .query_async(&mut connection)
+                .await
+                .map_err(|error| StoreError::Backend(error.to_string()))?;
+            return Ok(GroupJoin::ParticipantHeld {
+                participant: participant.clone(),
+                owner: owner.unwrap_or_default(),
+            });
+        }
+        let _: Result<(), _> = redis::pipe()
+            .expire(&record_key, ttl as i64)
+            .ignore()
+            .expire(&members_key, ttl as i64)
+            .ignore()
+            .query_async::<()>(&mut connection)
+            .await;
+        Ok(GroupJoin::Joined(record))
+    }
+
+    async fn leave_group(&self, key: &str, participants: &[String]) -> Result<(), StoreError> {
+        let record_key = self.group_key(key);
+        let members_key = self.group_members_key(key);
+        let mut connection = self.connection().await?;
+        for participant in participants {
+            redis::cmd("HDEL")
+                .arg(&members_key)
+                .arg(participant)
+                .query_async::<i64>(&mut connection)
+                .await
+                .map_err(|error| StoreError::Backend(error.to_string()))?;
+        }
+        let remaining: i64 = redis::cmd("HLEN")
+            .arg(&members_key)
+            .query_async(&mut connection)
+            .await
+            .map_err(|error| StoreError::Backend(error.to_string()))?;
+        if remaining == 0 {
+            let _: Result<(), _> = redis::pipe()
+                .del(&members_key)
+                .ignore()
+                .del(&record_key)
+                .ignore()
+                .query_async::<()>(&mut connection)
+                .await;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+struct HeldGroup {
+    record: GroupRecord,
+    members: BTreeMap<String, String>,
 }
 
 #[cfg(test)]
@@ -298,6 +502,7 @@ impl SessionStore for RedisSessionStore {
 pub struct MemorySessionStore {
     sessions: std::sync::Mutex<BTreeMap<String, PersistedSession>>,
     leases: std::sync::Mutex<BTreeMap<String, String>>,
+    groups: std::sync::Mutex<BTreeMap<String, HeldGroup>>,
     unreachable: std::sync::atomic::AtomicBool,
 }
 
@@ -318,6 +523,23 @@ impl MemorySessionStore {
 
     pub fn lease_holder(&self, external_id: &str) -> Option<String> {
         self.leases.lock().unwrap().get(external_id).cloned()
+    }
+
+    pub fn group_record(&self, key: &str) -> Option<GroupRecord> {
+        self.groups
+            .lock()
+            .unwrap()
+            .get(key)
+            .map(|held| held.record.clone())
+    }
+
+    pub fn group_members(&self, key: &str) -> BTreeMap<String, String> {
+        self.groups
+            .lock()
+            .unwrap()
+            .get(key)
+            .map(|held| held.members.clone())
+            .unwrap_or_default()
     }
 }
 
@@ -389,6 +611,61 @@ impl SessionStore for MemorySessionStore {
             claimed.push(adopted);
         }
         Ok(claimed)
+    }
+
+    async fn open_or_join_group(
+        &self,
+        key: &str,
+        proposed: &GroupRecord,
+        participants: &[String],
+        take_over: bool,
+    ) -> Result<GroupJoin, StoreError> {
+        if self.unreachable.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(StoreError::Backend("connection refused".to_string()));
+        }
+        let mut groups = self.groups.lock().unwrap();
+        let held = groups.entry(key.to_string()).or_insert_with(|| HeldGroup {
+            record: proposed.clone(),
+            members: BTreeMap::new(),
+        });
+        if held.record.recording_id != proposed.recording_id
+            || held.record.format != proposed.format
+        {
+            return Ok(GroupJoin::RecordsAnother(held.record.clone()));
+        }
+        for participant in participants {
+            if take_over {
+                continue;
+            }
+            if let Some(owner) = held.members.get(participant) {
+                return Ok(GroupJoin::ParticipantHeld {
+                    participant: participant.clone(),
+                    owner: owner.clone(),
+                });
+            }
+        }
+        for participant in participants {
+            held.members
+                .insert(participant.clone(), proposed.created_by.clone());
+        }
+        Ok(GroupJoin::Joined(held.record.clone()))
+    }
+
+    async fn leave_group(&self, key: &str, participants: &[String]) -> Result<(), StoreError> {
+        if self.unreachable.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(StoreError::Backend("connection refused".to_string()));
+        }
+        let mut groups = self.groups.lock().unwrap();
+        let Some(held) = groups.get_mut(key) else {
+            return Ok(());
+        };
+        for participant in participants {
+            held.members.remove(participant);
+        }
+        if held.members.is_empty() {
+            groups.remove(key);
+        }
+        Ok(())
     }
 }
 
@@ -622,5 +899,25 @@ mod tests {
         telcompat_shaped.call_id = String::new();
         telcompat_shaped.from_tags.clear();
         assert!(!telcompat_shaped.is_rebuildable());
+    }
+
+    #[test]
+    fn a_room_session_is_bound_to_the_pod_that_mixes_it_and_is_never_adopted() {
+        let mut room = session("the-room", "pod-a");
+        room.kind = MIX_SESSION_KIND;
+        room.call_id = String::new();
+        room.from_tags.clear();
+        assert!(room.is_room());
+        assert!(!room.is_inline());
+        assert!(room.is_pod_bound());
+        assert!(!room.is_rebuildable());
+
+        let mut room_with_a_call_identity = room.clone();
+        room_with_a_call_identity.call_id = "call-abc".to_string();
+        room_with_a_call_identity.from_tags = vec!["from-a".to_string()];
+        assert!(
+            !room_with_a_call_identity.is_rebuildable(),
+            "a room is the mix on one pod, whatever else its record carries"
+        );
     }
 }
