@@ -14,7 +14,7 @@
 #   export MSS_MEDIA_ADVERTISE_IP=172.31.99.31
 #   docker compose -f lab/docker-compose.microsip.yml \
 #     -f lab/docker-compose.webrtc.yml up -d rtpengine opensips freeswitch \
-#     call-watcher redpanda redis minio minio-init llm-bridge mss-control
+#     call-watcher redpanda redis minio minio-init mock-bridge mss-control
 #   ./lab/media_port_drill.sh
 #
 # The advertised address is the same as the bind address in the lab on purpose:
@@ -53,8 +53,20 @@ metric() {
 }
 # iproute2 is not in the rust image, so read the kernel table directly.
 udp_ports() {
+  # strtonum() is a gawk extension. Under mawk (Debian's default awk) it is an
+  # undefined function: every port came back empty, the drill reported that no
+  # media socket was inside the range, and the product looked broken. Convert
+  # the hex by hand so any POSIX awk reads the kernel table.
   docker exec "$POD" sh -c 'cat /proc/net/udp /proc/net/udp6 2>/dev/null' |
-    awk 'NR>1 {split($2, a, ":"); if (a[2] != "") print strtonum("0x" a[2])}' |
+    awk 'function hex(s) {
+           n = 0
+           s = toupper(s)
+           for (i = 1; i <= length(s); i++) {
+             n = n * 16 + index("0123456789ABCDEF", substr(s, i, 1)) - 1
+           }
+           return n
+         }
+         NR > 1 {split($2, a, ":"); if (a[2] != "") print hex(a[2])}' |
     sort -n | uniq
 }
 
@@ -118,9 +130,8 @@ cargo run --quiet -p control-api --example mss_ctl -- \
 sleep "$TAP_SECONDS"
 DURING=$(udp_ports | awk -v lo="$PORT_MIN" -v hi="$PORT_MAX" \
   '$1 >= lo && $1 <= hi' | tr '\n' ' ')
-OUTSIDE=$(docker exec "$POD" sh -c 'cat /proc/net/udp' |
-  awk 'NR>1 {split($2, a, ":"); print strtonum("0x" a[2])}' |
-  awk -v lo="$PORT_MIN" -v hi="$PORT_MAX" '$1 < lo || $1 > hi' | tr '\n' ' ')
+OUTSIDE=$(udp_ports | awk -v lo="$PORT_MIN" -v hi="$PORT_MAX" \
+  '$1 < lo || $1 > hi' | tr '\n' ' ')
 DATAGRAMS=$(metric mss_ingest_datagrams_total)
 say "udp sockets inside the range while tapping: [${DURING:-none}]"
 say "udp sockets outside the range (ng control sockets, by design): \

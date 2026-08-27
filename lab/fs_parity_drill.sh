@@ -7,7 +7,7 @@
 #
 #   DOCKER_API_VERSION=1.43 docker compose -f lab/docker-compose.microsip.yml \
 #     up -d rtpengine opensips freeswitch call-watcher redpanda redis \
-#           minio minio-init llm-bridge mss-control
+#           minio minio-init mock-bridge mss-control
 #   ./lab/fs_parity_drill.sh
 #
 # The lab's FS image has mod_dptools (record_session, uuid_record) and
@@ -47,10 +47,25 @@ FS_PATH=$FS_DIR/parity-$STAMP.wav
 mkdir -p "$OUT"
 echo "drill: session $EXTERNAL_ID, log $LOG" | tee "$LOG"
 
+# A Debian-packaged FreeSWITCH puts fs_cli on PATH; a source build leaves it in
+# /usr/local/freeswitch/bin and nothing links it. Without this the channel
+# lookup below found nothing and the drill claimed FS was not in the path.
+if [ -z "${FS_CLI:-}" ]; then
+  if docker exec "$FS" sh -c 'command -v fs_cli' >/dev/null 2>&1; then
+    FS_CLI=fs_cli
+  elif docker exec "$FS" test -x /usr/local/freeswitch/bin/fs_cli; then
+    FS_CLI=/usr/local/freeswitch/bin/fs_cli
+  else
+    echo "drill: no fs_cli in $FS; set FS_CLI to its path" | tee -a "$LOG"
+    exit 1
+  fi
+fi
+echo "drill: fs_cli is $FS_CLI in $FS" | tee -a "$LOG"
+
 echo "drill: what the FS image can record" | tee -a "$LOG"
-docker exec "$FS" fs_cli -x "show application" 2>&1 |
+docker exec "$FS" "$FS_CLI" -x "show application" 2>&1 |
   grep -E '^(record|record_session|stop_record_session)' | tee -a "$LOG"
-docker exec "$FS" fs_cli -x "show api" 2>&1 |
+docker exec "$FS" "$FS_CLI" -x "show api" 2>&1 |
   grep -E '^uuid_record' | tee -a "$LOG"
 
 echo "drill: building mss_ctl before the call so it starts immediately" | tee -a "$LOG"
@@ -87,9 +102,9 @@ echo "drill: call $CALL_ID tags $FROM_TAGS" | tee -a "$LOG"
 UUID=""
 waited=0
 while [ "$waited" -lt 10 ]; do
-  for candidate in $(docker exec "$FS" fs_cli -x "show channels as delim |" 2>/dev/null |
+  for candidate in $(docker exec "$FS" "$FS_CLI" -x "show channels as delim |" 2>/dev/null |
                        sed -n 's/^\([0-9a-f-]\{36\}\)|.*/\1/p'); do
-    got=$(docker exec "$FS" fs_cli -x "uuid_getvar $candidate sip_call_id" 2>/dev/null |
+    got=$(docker exec "$FS" "$FS_CLI" -x "uuid_getvar $candidate sip_call_id" 2>/dev/null |
             tr -d '\r\n')
     if [ "$got" = "$CALL_ID" ]; then
       UUID=$candidate
@@ -115,12 +130,12 @@ cargo run --quiet -p control-api --example mss_ctl -- \
     "$CONTROL" record "$EXTERNAL_ID" "$RECORDING" parity 2>&1 | tee -a "$LOG"
 
 echo "drill: FS record_session (RECORD_STEREO) to $FS_PATH" | tee -a "$LOG"
-docker exec "$FS" fs_cli -x "uuid_setvar $UUID RECORD_STEREO true" 2>&1 | tee -a "$LOG"
-docker exec "$FS" fs_cli -x "uuid_record $UUID start $FS_PATH" 2>&1 | tee -a "$LOG"
+docker exec "$FS" "$FS_CLI" -x "uuid_setvar $UUID RECORD_STEREO true" 2>&1 | tee -a "$LOG"
+docker exec "$FS" "$FS_CLI" -x "uuid_record $UUID start $FS_PATH" 2>&1 | tee -a "$LOG"
 
 sleep "$RECORD_SECONDS"
 
-docker exec "$FS" fs_cli -x "uuid_record $UUID stop $FS_PATH" 2>&1 | tee -a "$LOG"
+docker exec "$FS" "$FS_CLI" -x "uuid_record $UUID stop $FS_PATH" 2>&1 | tee -a "$LOG"
 cargo run --quiet -p control-api --example mss_ctl -- \
     "$CONTROL" destroy "$EXTERNAL_ID" 2>&1 | tee -a "$LOG"
 wait "$CALLER" 2>/dev/null || true
@@ -140,6 +155,18 @@ if [ ! -s "$FS_WAV" ] || [ ! -s "$MSS_WAV" ]; then
 fi
 
 echo "drill: parity" | tee -a "$LOG"
-python3 "$HERE/recording_parity.py" --mss "$MSS_WAV" --fs "$FS_WAV" 2>&1 | tee -a "$LOG" || true
+# recording_parity.py returns 1 when a tolerance is missed. Piping it straight
+# into tee threw that away (and `|| true` finished the job), so a drill whose
+# comparison FAILED still exited 0 and read as a pass in any CI that checks
+# exit codes.
+PARITY_OUT=$OUT/parity-$STAMP-report.txt
+PARITY_STATUS=0
+python3 "$HERE/recording_parity.py" --mss "$MSS_WAV" --fs "$FS_WAV" \
+  >"$PARITY_OUT" 2>&1 || PARITY_STATUS=$?
+tee -a "$LOG" < "$PARITY_OUT"
 
 echo "drill: done; wavs $MSS_WAV and $FS_WAV, transcript in $LOG"
+if [ "$PARITY_STATUS" -ne 0 ]; then
+  echo "drill: FAILED -- the parity report above missed a tolerance"
+fi
+exit "$PARITY_STATUS"

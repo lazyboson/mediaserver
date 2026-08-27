@@ -14,7 +14,7 @@
 #
 #   DOCKER_API_VERSION=1.43 docker compose -f lab/docker-compose.microsip.yml \
 #     up -d rtpengine opensips freeswitch call-watcher redpanda redis \
-#           minio minio-init llm-bridge mss-control mss-control-b mss-control-c
+#           minio minio-init mock-bridge mss-control mss-control-b mss-control-c
 #   ./lab/pod_kill_drill.sh
 #
 # The compose "mediaserverd" service (the Phase-0 spike) must stay DOWN: it
