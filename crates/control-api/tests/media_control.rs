@@ -247,6 +247,76 @@ async fn a_conference_group_rides_on_an_inline_leg_and_nowhere_else() {
 }
 
 #[tokio::test]
+async fn a_room_session_is_a_group_with_no_leg_and_reports_the_conferences_open() {
+    let plane = Arc::new(RecordingMediaPlane::default());
+    let controller = controller().with_media_plane(plane.clone());
+    let room = controller
+        .create_session(Request::new(proto::CreateSessionRequest {
+            kind: proto::SessionKind::Mix as i32,
+            call_id: String::new(),
+            from_tags: Vec::new(),
+            group: "sales-standup".to_string(),
+            ..create("the-room")
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(room.kind, proto::SessionKind::Mix as i32);
+    assert_eq!(room.group, "sales-standup");
+    assert!(
+        room.opened_at_unix_ms > 0,
+        "every session says when it opened"
+    );
+    assert!(
+        room.member.is_none() && room.conference.is_none(),
+        "this fake media plane holds no conference, so there is nothing to read back"
+    );
+
+    let no_group = controller
+        .create_session(Request::new(proto::CreateSessionRequest {
+            kind: proto::SessionKind::Mix as i32,
+            call_id: String::new(),
+            from_tags: Vec::new(),
+            ..create("roomless")
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(no_group.code(), Code::InvalidArgument);
+    assert!(no_group.message().contains("needs a group"), "{no_group}");
+
+    let with_an_offer = controller
+        .create_session(Request::new(proto::CreateSessionRequest {
+            kind: proto::SessionKind::Mix as i32,
+            call_id: String::new(),
+            from_tags: Vec::new(),
+            group: "sales-standup".to_string(),
+            sdp_offer: "v=0\r\n".to_string(),
+            ..create("room-with-an-offer")
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(with_an_offer.code(), Code::InvalidArgument);
+    assert!(
+        with_an_offer.message().contains("kind=inline"),
+        "{with_an_offer}"
+    );
+
+    let with_a_call = controller
+        .create_session(Request::new(proto::CreateSessionRequest {
+            kind: proto::SessionKind::Mix as i32,
+            group: "sales-standup".to_string(),
+            ..create("room-with-a-call")
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(with_a_call.code(), Code::InvalidArgument);
+    assert!(
+        with_a_call.message().contains("no call_id"),
+        "{with_a_call}"
+    );
+}
+
+#[tokio::test]
 async fn an_inline_session_without_an_offer_and_a_tap_with_one_are_both_refused() {
     let controller = controller();
     let no_offer = controller

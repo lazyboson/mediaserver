@@ -840,9 +840,20 @@ below testable without a lab (Constitution, Article III).
 The four nouns are `SessionKind` (Tap/Inline/Mix), `AttachSpec`,
 `PlaybackSpec` and `MediaEvent`. Phase 3/4 add no operations — an inline leg
 is `SessionKind::Inline` and **a conference is inline legs sharing a `group`**
-(item 37), so both ride the same calls. `SessionKind::Mix` was the original guess
-and is **unused** — it is refused by name in the controller; see the tap_plane
-section on why a conference needed no new session kind.
+(item 37), so both ride the same calls. Since item 55 `SessionKind::Mix` is the
+**room session**: a session with no leg whose `group` names the conference it
+*is*. `create_session` validates that shape in one place
+(`room_session_shape`): a non-empty `group` and no `call_id`, `from_tags` or
+`sdp_offer`, refused otherwise as `ControlError::RoomSessionShape { reason }`
+(→ `INVALID_ARGUMENT`), which is the only kind-specific rule that lives in
+session-core rather than in the controller — a room's shape is a property of the
+record, not of the wire.
+
+`SessionRecord` also stamps `opened_at: SystemTime` at create and `SessionView`
+exposes it, which the controller renders as `Session.opened_at_unix_ms`
+(field 15). It is **not** persisted: an adopted session is re-created on the
+adopting pod and takes that pod's stamp, and the only session whose open must
+be exact — the room — is never adopted.
 
 ### The invariants it enforces, and where they come from
 
@@ -988,8 +999,8 @@ full of doc comments lifted from the `.proto` files).
   `AuthoritativeAlreadyBound` / `TransportCannotCarry` →
   `FAILED_PRECONDITION`, `ExternalIdInUse` → `ALREADY_EXISTS`,
   `IdempotencyConflict` → `ABORTED`, `TooManyAttachments` →
-  `RESOURCE_EXHAUSTED`, `Unknown*` → `NOT_FOUND`, malformed ids and
-  unspecified enums → `INVALID_ARGUMENT`.
+  `RESOURCE_EXHAUSTED`, `Unknown*` → `NOT_FOUND`, malformed ids,
+  `RoomSessionShape` and unspecified enums → `INVALID_ARGUMENT`.
 - **Unspecified enum values are refused, never defaulted.** proto3 cannot
   distinguish "absent" from "zero", so accepting `SESSION_KIND_UNSPECIFIED`
   would silently create a TAP session for a caller who meant INLINE.
@@ -1003,6 +1014,13 @@ full of doc comments lifted from the `.proto` files).
   `open_stream` (a bounded channel of `StreamFrame`s for a grpc-stream
   attachment; defaulted to a refusal so registry-only planes need not care).
   It is async because opening a tap means an NG round trip to rtpengine.
+  Two synchronous readers hang off it — `inline_egress_sink` and
+  `member_state`, both defaulted — and one **reverse** call goes the other way:
+  `ObservationSink::session_finished(session, reason)`, added by item 55 so the
+  auto-ending room session can end its own control-plane record (the controller
+  implements it as `destroy_session`, so `SessionEnded` reaches the bus in that
+  session's own sequence). It is defaulted to a no-op; nothing else uses it, and
+  the media plane still never reaches into the registry itself.
   **Every open is rolled back if the media world refuses it** — a session
   rtpengine will not tap is destroyed again before the RPC returns, and an
   attachment whose consumer cannot be reached is detached, so a failed call
@@ -2128,11 +2146,141 @@ reconnect, and that is all it makes. A lease needs an owner: item 40 rejected th
 attachment, and the API does not model the caller, so the decision is deferred
 rather than guessed.
 
+### conference.rs + tap_plane.rs — the room is a session (item 55, D20, 2026-08-27)
+
+Before this item a room recording hung off **one member's** session, so the
+object ended when that member left even though the conference kept mixing, and
+its t=0 was its attach moment. `CreateSession{kind=MIX, group=<conference>}` now
+creates — or **adopts**, if a member opened the conference first — the room
+itself as a session with no leg. Everything else is unchanged: the room session
+is an ordinary `LiveSession` whose hub happens to be the conference's, so every
+attachment kind works on it with the verbs that already existed.
+
+**The room hub.** `Conference::start` creates a second `Hub` (`Hub::new()`, the
+same pair as a leg's), moves the `Hub` into `Mixed` and keeps the `HubClient`
+on the control-plane handle. Each tick the mix thread calls
+`room_hub.poll_commands()` beside every member's, and after `matrix.mix()`
+publishes the monitor listener's full sum into it with
+`timestamp_ms = frames * ptime_ms` — **the conference clock**, frames counted
+from the conference's own open, distinct from the per-member publishes which are
+stamped `(frames - seated_at_frame) * ptime_ms` (item 39's fix). It is one more
+bounded-queue `force_push` per frame on a queue nobody may block on: no
+allocation, no lock, no I/O, and a room consumer that falls behind loses its
+oldest frames and is counted exactly like any other. When the mix thread ends,
+the `Hub` drops and closes its subscriptions, which is how a room recorder sees
+end-of-stream without a special case.
+
+**A conference with no member still mixes.** The room session opens the
+conference when it arrives first, and `Mixed::run` with zero seated members
+still ticks and still publishes the monitor frame — silence — so a room
+recording opened before anybody joins **records the wait**, rather than needing
+a pad. That is measured, not assumed
+(`a_room_session_opened_before_anybody_joins_records_the_wait_and_then_the_room`).
+A room-opened conference takes its format from the **pod's** tap format
+(`TapPlaneConfig::format`), since there is no leg to negotiate one; a member
+whose rate or ptime differs is refused by name by item 37's `accepts`.
+
+**t=0 is the conference's open, for both recording shapes.** `Conference` stamps
+`opened_at: Instant` (handed to the mix thread, which uses it as its release
+epoch) and `opened_at_wall: SystemTime` at `start`. Two consumers of that
+instant:
+
+- an **ungrouped** recording on the room session gets
+  `RecorderSpec.group_anchor = opened_at_wall` (`room_anchor_of`), so a recorder
+  attached late pads back to the open through item 29's `lead_with_silence`
+  seam. `resume_ms > 0` still clears it, exactly as for a group: an adopted
+  recording's spilled frames already carry the lead;
+- `group_anchor_for(session)` — item 54's seam, which returned
+  `SystemTime::now()` — now returns the **conference's** open for any session
+  seated in one, so the per-participant group of the same conference anchors on
+  the same instant. The two shapes are therefore sample-aligned by construction
+  rather than by being attached together.
+
+`RecordingShape` is untouched: a room object is still `conference-mixed`,
+because `conference_of` answers for the room session too. A **group** on the
+room session is refused by name (a room has no participant seat), and item 39's
+grouped-mixed refusal on a member is unchanged — recording the room off a member
+is still possible, and the D20 row now says the room session is the way not to.
+
+**Lifetime.** `Conference` gained `room: Option<RoomSeat>` (the owning session
+and its external id) and `seated_ever`, and `unseat` returns `RoomFate`:
+`Mixing` (members remain), `Stopped(JoinHandle)` (today's behaviour — no room
+session, so the last leg out closes the conference) or `Emptied` (a room session
+holds it open). On `Emptied`, `close_session` either ends the room session
+**synchronously** — the default, `MSS_CONFERENCE_LINGER_SECS=0` — or arms a
+linger. `EndSession` on the room session ends its attachments (so the recording
+uploads), unseats the room and stops the mix only if no member remains; members
+that remain keep mixing with `ConferenceView.room_session` empty.
+
+**The linger is a spawned sleep, not a housekeeping tick.** There is no
+control-world sweep in this daemon (only `RegistryKeeper::run` and
+`health::watch` recur), so a linger is one `tokio::spawn(sleep(linger))` per
+emptied conference, its `JoinHandle` parked in `Conference::linger` and
+**aborted by `seat`** — a member that rejoins cancels it — and by `stop_now`.
+On expiry the task re-checks under the conference lock that the room is still
+empty before ending it. The task needs the plane, and a `&TapPlane` cannot be
+moved into a task, so `main.rs` hands the plane a `Weak<TapPlane>` of itself
+(`linger_through`, the `observe_through`/`discover_through` idiom). **With no
+weak self set** — which is every test that does not ask for a linger — a
+non-zero linger warns and the room stays open until the API ends it; that is the
+safe direction (nothing is lost, a mix idles). Item 56 may replace this with a
+general sweep; nothing here builds one.
+
+**Ending a session from the media plane needed one new seam.**
+`ObservationSink` gained `fn session_finished(&self, session, reason)`, a
+defaulted no-op implemented by `SessionController` as
+`registry.destroy_session(...)` through `commit`, so an auto-ended room
+publishes `AttachmentDown`/`SessionEnded` on `mss.events` in its own sequence
+and frees its external id. That is the **only** way the media plane ends a
+control-plane session, and it exists because a room session has no hangup of its
+own to be told about. The plane closes its own half first (attachments, then the
+mix), so the uploads are already in flight — item 50's `finishing` state keeps
+the record alive for the late `UploadCompleted`.
+
+**Playback on a room session.** `playback_reach` takes the session kind: on a
+room, an empty target **or** `all` is the room prompt, and `own` is refused by
+name (a room has no ear). So `StartPlayback` on the room session is a room
+prompt, `StopPlayback` flushes the room queue, and — because the generic
+non-inline INJECT path turns an utterance plus a `Mark` into a `StartPlayback`
+blob on its own session — an INJECT attachment on the room session is a room
+prompt too, capped by `MAX_UTTERANCE_SAMPLES` and the room's prompt queue.
+`StartPlayback{target_tag=all}` from a **member** still works; no verb was
+removed. Route and member verbs (`mix_target`, `member_mute`…) on the room
+session are refused by `Conference::{route,control}`'s `NotSeated`, since the
+room is not a member of itself.
+
+**Read-back.** `MemberStateView` grew `room_session`, `opened_at` and `seated`;
+`Conference::room_state()` builds the room's view (members, room session,
+conference open, no flags, `seated: false`) and `member_state` fills its own
+fields over it. `TapPlane::member_state` answers with the room's view when the
+session **is** the room, so `session_message` reports `Session.conference` for a
+room and omits `Session.member` (a room is not a member of itself), and
+`Session.opened_at_unix_ms` is the **conference's** open for a MIX session and
+the registry's own stamp for everything else. Proto: `Session.opened_at_unix_ms
+= 15` and `ConferenceView.room_session = 4`, both additive; **the next free
+`Session` field is 16 and the next free `MediaEvent` payload tag is still 28**.
+
+**Adoption.** `PersistedSession::is_room()` (kind 3) joins `is_inline()` under a
+new `is_pod_bound()`, and `is_rebuildable()` now excludes it **explicitly** —
+it was already false by the empty `call_id`, which is an accident this makes a
+rule — so `registry_keeper::adopt_orphans` releases a room record with a message
+that says why instead of half-restoring it. A conference is one pod's threads;
+nothing about that changed.
+
+**New metrics.** `mss_conference_rooms_live` (gauge: conferences owned by a room
+session) and `mss_conference_rooms_auto_ended_total`.
+
 ### tap_plane.rs — the control plane's hands in the media world
 
 `TapPlane` implements `control_api::MediaPlane` over the machinery the
 Phase-0 spike proved, which is what turns `MediaControl` from a registry
 into something that actually taps calls.
+
+It serves three session kinds: `Tap` (`open_tap_session`, an rtpengine
+subscription), `Inline` (`open_inline_session`, MSS's own socket, optionally
+seated in a conference) and — since item 55 — `Mix` (`open_room_session`, the
+conference room itself, with no leg and no ports; see the room-is-a-session
+section above for its lifetime, its anchor and its refusals).
 
 - **Transcoding at the tap is now a choice, not a constant (2026-08-22).**
   `TapPlaneConfig.transcode_at_tap` (daemon env `MSS_TAP_TRANSCODE`, default
@@ -2604,7 +2752,10 @@ whitespace `MSS_RTPENGINE_NODE` as unset (item 43's rule) and a malformed one as
 permanent failure rather than as "no node configured".
 
 ### hub.rs — the fan-out core (M3), first increment
-The per-session pub/sub the roadmap calls the fan-out hub. Two-worlds
+The per-session pub/sub the roadmap calls the fan-out hub. Since item 55 a
+`Hub` is not always a session's leg: a conference owns one more of them, the
+**room hub**, whose only publisher is the mix thread and whose owner is the room
+session — same struct, same bounded rings, same drop-oldest accounting. Two-worlds
 shape: the capture thread owns the consumer list and is the only thing
 that touches it; attach/detach arrive over a bounded lock-free command
 queue (`crossbeam` `ArrayQueue`) polled once per tick, so the media world

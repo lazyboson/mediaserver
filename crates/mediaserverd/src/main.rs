@@ -54,6 +54,8 @@ const TAP_FORMAT_ENV: &str = "MSS_TAP_FORMAT";
 const OPUS_DECODE_RATE_DEFAULT_HZ: u32 = 16000;
 const AUTH_TOKEN_ENV: &str = "MSS_AUTH_TOKEN";
 const RECORDING_BUCKET_ENV: &str = "MSS_RECORDING_BUCKET";
+const CONFERENCE_LINGER_ENV: &str = "MSS_CONFERENCE_LINGER_SECS";
+const DEFAULT_CONFERENCE_LINGER: std::time::Duration = std::time::Duration::from_secs(0);
 const DEFAULT_POD_NAME: &str = "mediaserverd";
 
 fn main() {
@@ -274,6 +276,33 @@ fn tap_format(opus_decode_rate_hz: u32) -> AudioFormat {
     }
 }
 
+fn conference_linger() -> std::time::Duration {
+    let Ok(configured) = std::env::var(CONFERENCE_LINGER_ENV) else {
+        return DEFAULT_CONFERENCE_LINGER;
+    };
+    match configured.trim().parse::<u64>() {
+        Ok(seconds) => {
+            let linger = std::time::Duration::from_secs(seconds);
+            info!(
+                env = CONFERENCE_LINGER_ENV,
+                seconds,
+                "an emptied conference with a room session is held open this long before the \
+                 room session ends itself"
+            );
+            linger
+        }
+        Err(_) => {
+            warn!(
+                env = CONFERENCE_LINGER_ENV,
+                configured = %configured,
+                fallback_secs = DEFAULT_CONFERENCE_LINGER.as_secs(),
+                "a conference linger is a whole number of seconds"
+            );
+            DEFAULT_CONFERENCE_LINGER
+        }
+    }
+}
+
 fn opus_decode_rate_hz() -> u32 {
     let Ok(configured) = std::env::var(OPUS_DECODE_RATE_ENV) else {
         return OPUS_DECODE_RATE_DEFAULT_HZ;
@@ -402,9 +431,11 @@ async fn serve_control_plane(
         sdp_session_id: cookie_prefix(),
         recording,
         capabilities: Arc::clone(&capabilities),
+        conference_linger: conference_linger(),
     }));
     let draining = Arc::clone(&plane);
     let observing = Arc::clone(&plane);
+    observing.linger_through(Arc::downgrade(&observing));
     let tap_metrics = plane.metrics();
     let mut controller = SessionController::new(owner.clone()).with_media_plane(plane);
 

@@ -1,7 +1,7 @@
 use crate::convert::{
     attachment_id, capabilities, capabilities_wire, conference_wire, event_wire, format,
     format_wire, member_state_wire, playback_id, selector, selector_wire, session_id, session_kind,
-    session_kind_wire, status_of, transport, transport_wire,
+    session_kind_wire, status_of, transport, transport_wire, unix_ms,
 };
 use crate::proto;
 use crate::proto::media_control_server::{MediaControl, MediaControlServer};
@@ -24,6 +24,10 @@ pub trait EventSink: Send + Sync + 'static {
 
 pub trait ObservationSink: Send + Sync + 'static {
     fn observe(&self, session: SessionId, observation: Observation);
+
+    fn session_finished(&self, session: SessionId, reason: &str) {
+        let _ = (session, reason);
+    }
 
     fn retain_for_upload(&self, session: SessionId) -> bool {
         let _ = session;
@@ -368,8 +372,15 @@ impl SessionController {
             sdp_answer: view.sdp_answer.unwrap_or_default(),
             group: view.group,
             attribution: view.attribution.as_str().to_string(),
-            member: member.as_ref().map(member_state_wire),
+            member: member
+                .as_ref()
+                .filter(|held| held.seated)
+                .map(member_state_wire),
             conference: member.as_ref().map(conference_wire),
+            opened_at_unix_ms: unix_ms(match (view.kind, member.as_ref()) {
+                (SessionKind::Mix, Some(room)) => room.opened_at,
+                _ => view.opened_at,
+            }),
         })
     }
 }
@@ -381,6 +392,16 @@ impl ObservationSink for SessionController {
                 %session,
                 %status,
                 "an observation had nowhere to land; the session is already gone"
+            );
+        }
+    }
+
+    fn session_finished(&self, session: SessionId, reason: &str) {
+        if let Err(status) = self.commit(|registry| registry.destroy_session(session, reason)) {
+            tracing::warn!(
+                %session,
+                %status,
+                "the media plane ended a session the registry no longer holds"
             );
         }
     }
@@ -538,6 +559,12 @@ impl MediaControl for SessionController {
                      rtp endpoint",
                 ))
             }
+            (SessionKind::Mix, Some(_)) => {
+                return Err(Status::invalid_argument(
+                    "a mix session is the conference room itself and answers no offer; \
+                     an rtp endpoint in the path is kind=inline",
+                ))
+            }
             (SessionKind::Tap, Some(_)) => {
                 return Err(Status::invalid_argument(
                     "a tap has no sdp: it asks rtpengine for a copy of media that is \
@@ -546,10 +573,11 @@ impl MediaControl for SessionController {
             }
             _ => {}
         }
-        if !message.group.is_empty() && kind != SessionKind::Inline {
+        if !message.group.is_empty() && !matches!(kind, SessionKind::Inline | SessionKind::Mix) {
             return Err(Status::invalid_argument(
-                "a session group is the phase-4 conference and mixes inline legs; \
-                 a recording group is named on Attach instead",
+                "a session group is the phase-4 conference: it mixes inline legs and names \
+                 the room a kind=mix session owns; a recording group is named on Attach \
+                 instead",
             ));
         }
         let view = self.commit(|registry| {

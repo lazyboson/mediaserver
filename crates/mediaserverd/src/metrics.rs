@@ -284,6 +284,11 @@ pub fn render(sources: &MetricsSources) -> String {
         snapshot.conference.member_controls,
     );
     counter(
+        "mss_conference_rooms_auto_ended_total",
+        "Room sessions that ended themselves because their conference emptied",
+        snapshot.conference.rooms_auto_ended,
+    );
+    counter(
         "mss_conference_prompt_frames_total",
         "Frames a prompt played into the whole room contributed to the mix",
         snapshot.conference.prompt_frames,
@@ -464,6 +469,12 @@ pub fn render(sources: &MetricsSources) -> String {
         "mss_conferences_live",
         "Conference mixes this pod is running",
         snapshot.conferences_live,
+    );
+    gauge(
+        "mss_conference_rooms_live",
+        "Conferences whose room is itself a session (CreateSession kind=mix), the shape a \
+         room recording belongs on",
+        snapshot.conference_rooms_live,
     );
     gauge(
         "mss_conference_members_live",
@@ -915,6 +926,7 @@ mod tests {
             sdp_session_id: 1,
             recording: crate::recorder::RecordingSupport::default(),
             capabilities: Arc::clone(&capabilities),
+            conference_linger: std::time::Duration::ZERO,
         });
         MetricsSources {
             tap: plane.metrics(),
