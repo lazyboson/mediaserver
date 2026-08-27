@@ -6,7 +6,13 @@
 #   ../overlays/hostnetwork  -- the node's own network stack, a wide range
 #
 # See docs/deploy.md for the trade-off. Everything else -- the API, health
-# probes, events, recording -- works from the base as it stands.
+# probes, events, recording -- works from the base as it stands, which for
+# recording means an S3 bucket. Compose
+#
+#   ../overlays/filesystem-recording
+#
+# on top of a media overlay to record into a shared RWX filesystem tree instead
+# (item 58); it changes MSS_RECORDING_STORE and nothing else.
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 

@@ -120,6 +120,45 @@ def check(overlay, results):
         )
     )
 
+    store = (config.get("MSS_RECORDING_STORE") or "s3").strip()
+    root = (config.get("MSS_RECORDING_ROOT") or "").strip()
+    results.append(
+        (
+            store in ("s3", "filesystem"),
+            name,
+            f"MSS_RECORDING_STORE {store!r} is a store mediaserverd knows (anything else refuses to start)",
+        )
+    )
+    if store == "filesystem":
+        results.append(
+            (
+                root.startswith("/") and root in mounts,
+                name,
+                f"MSS_RECORDING_ROOT {root!r} is an absolute path and a mounted volume",
+            )
+        )
+        volumes = {volume["name"]: volume for volume in deployment["spec"]["template"]["spec"].get("volumes", [])}
+        mount = next((entry for entry in spec.get("volumeMounts", []) if entry["mountPath"] == root), None)
+        claim = volumes.get(mount["name"], {}).get("persistentVolumeClaim", {}).get("claimName") if mount else None
+        results.append(
+            (
+                bool(claim),
+                name,
+                "the recording root is a PersistentVolumeClaim, not per-pod scratch",
+            )
+        )
+        claims = {doc["metadata"]["name"]: doc for doc in by_kind.get("PersistentVolumeClaim", [])}
+        if claim and claim in claims:
+            results.append(
+                (
+                    "ReadWriteMany" in claims[claim]["spec"].get("accessModes", []),
+                    name,
+                    f"PersistentVolumeClaim/{claim} is ReadWriteMany, so any pod can adopt a recording",
+                )
+            )
+    elif store == "s3":
+        results.append((not root, name, "MSS_RECORDING_ROOT is unset while the store is s3, so nothing is ignored"))
+
     host_ports = sorted(port["hostPort"] for port in spec.get("ports", []) if "hostPort" in port)
     low = config.get("MSS_MEDIA_PORT_MIN") or None
     high = config.get("MSS_MEDIA_PORT_MAX") or None
