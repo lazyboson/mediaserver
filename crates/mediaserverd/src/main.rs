@@ -436,6 +436,7 @@ async fn serve_control_plane(
     if recording.sink.is_none() {
         info!(
             env = RECORDING_BUCKET_ENV,
+            store = recorder::STORE_ENV,
             "no recording storage configured; file-s3 attachments will be refused"
         );
     }

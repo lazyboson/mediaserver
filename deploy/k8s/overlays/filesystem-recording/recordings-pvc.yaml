@@ -1,0 +1,23 @@
+# The shared recording tree. storageClassName is a PLACEHOLDER: name the class
+# that actually gives you ReadWriteMany here (EFS, Azure Files, Filestore, an
+# NFS or CephFS provisioner). There is no portable default, and a class that
+# only offers ReadWriteOnce will bind and then strand every pod but one.
+#
+# Size it at (concurrent recordings) x (call minutes) x ~1 MB/min for 16 kHz
+# mono 16-bit, plus whatever your pickup job leaves behind: MSS implements NO
+# retention here, exactly as it implements none in a bucket. Expiring finished
+# recordings and stale `_spill/` journals (7 days) is the operator's job.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: mediaserverd-recordings
+  labels:
+    app.kubernetes.io/name: mediaserver
+    app.kubernetes.io/component: media-plane
+spec:
+  accessModes:
+    - ReadWriteMany
+  storageClassName: REPLACE_ME_RWX_STORAGE_CLASS
+  resources:
+    requests:
+      storage: 100Gi

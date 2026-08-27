@@ -42,6 +42,8 @@ BUCKET=${MSS_RECORDING_BUCKET:-}
 REGION=${MSS_RECORDING_S3_REGION:-us-east-1}
 ACCESS_KEY=${MSS_RECORDING_S3_ACCESS_KEY_ID:-}
 SECRET_KEY=${MSS_RECORDING_S3_SECRET_ACCESS_KEY:-}
+RECORDING_STORE=${MSS_RECORDING_STORE:-}
+RECORDING_ROOT=${MSS_RECORDING_ROOT:-}
 PORT_MIN=${MSS_MEDIA_PORT_MIN:-}
 PORT_MAX=${MSS_MEDIA_PORT_MAX:-}
 ADVERTISE_IP=${MSS_MEDIA_ADVERTISE_IP:-}
@@ -63,6 +65,10 @@ Usage: preflight.sh [options]
   --region NAME              S3 region            (MSS_RECORDING_S3_REGION)
   --access-key ID            S3 access key  (MSS_RECORDING_S3_ACCESS_KEY_ID)
   --secret-key KEY           S3 secret  (MSS_RECORDING_S3_SECRET_ACCESS_KEY)
+  --recording-store NAME     s3 | filesystem            (MSS_RECORDING_STORE)
+  --recording-root DIR       the shared recording tree, checked with the same
+                             write/rename/delete probe mediaserverd runs at
+                             startup                     (MSS_RECORDING_ROOT)
   --media-ports MIN-MAX      media range     (MSS_MEDIA_PORT_MIN/MAX)
   --advertise-ip ADDR        address peers reach  (MSS_MEDIA_ADVERTISE_IP)
   --local-ip ADDR            address to bind          (MSS_TAP_LOCAL_IP)
@@ -88,6 +94,8 @@ while [ $# -gt 0 ]; do
     --region) REGION=$2; shift 2 ;;
     --access-key) ACCESS_KEY=$2; shift 2 ;;
     --secret-key) SECRET_KEY=$2; shift 2 ;;
+    --recording-store) RECORDING_STORE=$2; shift 2 ;;
+    --recording-root) RECORDING_ROOT=$2; RECORDING_STORE=${RECORDING_STORE:-filesystem}; shift 2 ;;
     --media-ports)
       PORT_MIN=$(echo "$2" | cut -d- -f1)
       PORT_MAX=$(echo "$2" | cut -d- -f2)
@@ -110,12 +118,14 @@ fi
 PF_NG=$NG; PF_REDIS=$REDIS; PF_KAFKA=$KAFKA; PF_TOPIC=$TOPIC
 PF_S3_ENDPOINT=$S3_ENDPOINT; PF_BUCKET=$BUCKET; PF_REGION=$REGION
 PF_ACCESS_KEY=$ACCESS_KEY; PF_SECRET_KEY=$SECRET_KEY
+PF_RECORDING_STORE=$RECORDING_STORE; PF_RECORDING_ROOT=$RECORDING_ROOT
 PF_PORT_MIN=$PORT_MIN; PF_PORT_MAX=$PORT_MAX
 PF_ADVERTISE_IP=$ADVERTISE_IP; PF_LOCAL_IP=$LOCAL_IP
 PF_SSH=$SSH_TARGET; PF_RTPENGINE_VERSION=$RTPENGINE_VERSION
 PF_KERNEL_PROBE=$HERE/kernel_probe.sh; PF_JSON=$JSON
 export PF_NG PF_REDIS PF_KAFKA PF_TOPIC PF_S3_ENDPOINT PF_BUCKET PF_REGION
 export PF_ACCESS_KEY PF_SECRET_KEY PF_PORT_MIN PF_PORT_MAX PF_ADVERTISE_IP
+export PF_RECORDING_STORE PF_RECORDING_ROOT
 export PF_LOCAL_IP PF_SSH PF_RTPENGINE_VERSION PF_KERNEL_PROBE PF_JSON
 
 exec python3 - <<'PY'
@@ -146,6 +156,8 @@ BUCKET = os.environ.get("PF_BUCKET", "").strip()
 REGION = os.environ.get("PF_REGION", "").strip() or "us-east-1"
 ACCESS_KEY = os.environ.get("PF_ACCESS_KEY", "").strip()
 SECRET_KEY = os.environ.get("PF_SECRET_KEY", "").strip()
+RECORDING_STORE = os.environ.get("PF_RECORDING_STORE", "").strip().lower()
+RECORDING_ROOT = os.environ.get("PF_RECORDING_ROOT", "").strip()
 PORT_MIN = os.environ.get("PF_PORT_MIN", "").strip()
 PORT_MAX = os.environ.get("PF_PORT_MAX", "").strip()
 ADVERTISE_IP = os.environ.get("PF_ADVERTISE_IP", "").strip()
@@ -788,6 +800,11 @@ def check_s3():
     same three verbs and is then confirmed gone. SigV4 by hand in the standard
     library beats requiring boto3 on a jump host; the CLIs are the fallback when
     no keys were passed, because they can read a role or a profile."""
+    if RECORDING_STORE == "filesystem":
+        record("SKIP", "s3",
+               "MSS_RECORDING_STORE=filesystem, so the bucket variables are ignored by "
+               "mediaserverd and nothing here was checked -- see the recording-root line")
+        return
     if not BUCKET:
         record("SKIP", "s3",
                "no --bucket/MSS_RECORDING_BUCKET given, so recording to S3 is off and "
@@ -861,6 +878,65 @@ def check_s3():
     record("SKIP", "s3",
            f"no --access-key/--secret-key and neither `aws` nor `mc` on PATH, so "
            f"{BUCKET} on {endpoint} was not touched")
+
+
+def check_recording_root():
+    """The filesystem store lands a recording by writing a sibling .part file,
+    fsyncing it and renaming it over the final name, so the probe is exactly
+    those three verbs -- the same ones mediaserverd runs at startup and refuses
+    to start without. A root that is writable but cannot rename (some FUSE and
+    SMB mounts) fails here rather than mid-call."""
+    if RECORDING_STORE and RECORDING_STORE not in ("s3", "filesystem"):
+        record("FAIL", "recording-root",
+               f"MSS_RECORDING_STORE={RECORDING_STORE} names no recording store, and "
+               f"mediaserverd REFUSES TO START on it; it is s3 or filesystem")
+        return
+    if RECORDING_STORE != "filesystem" and not RECORDING_ROOT:
+        record("SKIP", "recording-root",
+               "the recording store is s3 (the default), so no shared recording tree "
+               "was checked -- pass --recording-root DIR to check one")
+        return
+    if not RECORDING_ROOT:
+        record("FAIL", "recording-root",
+               "MSS_RECORDING_STORE=filesystem needs MSS_RECORDING_ROOT, an absolute "
+               "directory every recording pod mounts; mediaserverd refuses to start "
+               "without it")
+        return
+    if not RECORDING_ROOT.startswith("/"):
+        record("FAIL", "recording-root",
+               f"{RECORDING_ROOT} is not absolute, and mediaserverd refuses to start "
+               f"on a relative recording root")
+        return
+    probe = os.path.join(RECORDING_ROOT, f".mss-preflight-{RUN}")
+    written = f"{probe}.part"
+    try:
+        os.makedirs(RECORDING_ROOT, exist_ok=True)
+        with open(written, "wb") as handle:
+            handle.write(f"mss preflight {RUN}\n".encode())
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.rename(written, probe)
+        if not os.path.isfile(probe):
+            record("FAIL", "recording-root",
+                   f"{probe} is not there after the rename that created it")
+            return
+        os.unlink(probe)
+        free = shutil.disk_usage(RECORDING_ROOT)
+        record("PASS", "recording-root",
+               f"write, fsync, rename and delete under {RECORDING_ROOT} "
+               f"({free.free // (1024 * 1024 * 1024)} GiB free of "
+               f"{free.total // (1024 * 1024 * 1024)} GiB) -- this is the same probe "
+               f"mediaserverd runs at startup. It must be the SAME volume on every "
+               f"recording pod (RWX), or a cross-pod adopter finds nothing")
+    except OSError as failure:
+        for leftover in (written, probe):
+            try:
+                os.unlink(leftover)
+            except OSError:
+                pass
+        record("FAIL", "recording-root",
+               f"{RECORDING_ROOT}: {failure} -- mediaserverd runs as uid 65532 and "
+               f"refuses to start when this probe fails")
 
 
 def check_media_ports():
@@ -1037,7 +1113,8 @@ def main():
     line(f"preflight: mediaserverd target-environment check, run {RUN}")
     line(f"preflight: ng={NG or 'unset'} redis={REDIS or 'unset'} "
          f"kafka={KAFKA or 'unset'} topic={TOPIC} bucket={BUCKET or 'unset'} "
-         f"s3={S3_ENDPOINT or 'unset'} ports={PORT_MIN or 'unset'}-{PORT_MAX or 'unset'} "
+         f"s3={S3_ENDPOINT or 'unset'} store={RECORDING_STORE or 's3'} "
+         f"root={RECORDING_ROOT or 'unset'} ports={PORT_MIN or 'unset'}-{PORT_MAX or 'unset'} "
          f"advertise={ADVERTISE_IP or 'unset'} local={LOCAL_IP or 'unset'} "
          f"ssh={SSH_TARGET or 'unset'}")
     line("")
@@ -1047,6 +1124,7 @@ def main():
     check_redis()
     check_kafka()
     check_s3()
+    check_recording_root()
     check_media_ports()
     check_media_reachability()
     check_clock()
@@ -1070,6 +1148,8 @@ def main():
             "target": {
                 "ng": NG, "redis": REDIS, "kafka": KAFKA, "topic": TOPIC,
                 "s3_endpoint": S3_ENDPOINT, "bucket": BUCKET, "region": REGION,
+                "recording_store": RECORDING_STORE or "s3",
+                "recording_root": RECORDING_ROOT,
                 "media_port_min": PORT_MIN, "media_port_max": PORT_MAX,
                 "advertise_ip": ADVERTISE_IP, "local_ip": LOCAL_IP,
                 "ssh": SSH_TARGET,

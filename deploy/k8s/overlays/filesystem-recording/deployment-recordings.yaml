@@ -1,0 +1,21 @@
+# The shared tree, mounted at MSS_RECORDING_ROOT. fsGroup 65532 in the base
+# securityContext is what makes it writable by the non-root process; a storage
+# class that ignores fsGroup (some NFS provisioners) needs the export to grant
+# uid 65532 write access instead, and the startup probe -- write, rename, delete
+# -- is what tells you it does not, by refusing to start.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mediaserverd
+spec:
+  template:
+    spec:
+      containers:
+        - name: mediaserverd
+          volumeMounts:
+            - name: recordings
+              mountPath: /var/lib/mediaserverd/recordings
+      volumes:
+        - name: recordings
+          persistentVolumeClaim:
+            claimName: mediaserverd-recordings

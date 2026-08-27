@@ -62,8 +62,20 @@ data:
   MSS_EVENTS_PARTITIONS: "4"
 
   # --- Recording -------------------------------------------------------------
+  # Which store holds the recordings: "s3" (the default, and what the
+  # architecture chose) or "filesystem", a shared tree every recording pod
+  # mounts. ANY OTHER VALUE REFUSES TO START. See
+  # ../overlays/filesystem-recording, which is this variable plus an RWX PVC.
+  MSS_RECORDING_STORE: "s3"
+  # Only read when the store is "filesystem": the absolute root of the tree
+  # holding ${accountID}/${recordingID}.${format} verbatim -- the layout
+  # FreeSWITCH's record_session produced. Probed (write, rename, delete) at
+  # startup; a root that fails the probe refuses to start. Ignored, with one
+  # warning, under the s3 store.
+  MSS_RECORDING_ROOT: ""
   # The bucket holding ${accountID}/${recordingID}.${format}. Unset = file-s3
-  # attachments are refused; unusable = refuse to start.
+  # attachments are refused; unusable = refuse to start. Ignored, with one
+  # warning, under the filesystem store.
   MSS_RECORDING_BUCKET: "call-recordings"
   # Leave empty for AWS proper; set it for MinIO or any other S3 API.
   MSS_RECORDING_S3_ENDPOINT: ""
@@ -77,9 +89,10 @@ data:
   # SPILL_TO=disk, and on any pod with SPILL_TO=s3.
   MSS_RECORDING_SPILL_SECONDS: "30"
   # Where the segment journal lives: "disk" (the SPILL_DIR above, per pod, so a
-  # cross-pod adopter reads nothing) or "s3" (inside the recording bucket under
-  # the reserved prefix below, so any pod can finish a recording a dead pod
-  # started -- item 53, defect D9). More than one pod means s3.
+  # cross-pod adopter reads nothing) or "store" ("s3" is the older name for the
+  # same thing) -- inside the recording store itself under the reserved prefix
+  # below, so any pod can finish a recording a dead pod started (item 53,
+  # defect D9). More than one pod means "store".
   MSS_RECORDING_SPILL_TO: "s3"
   # The reserved key prefix the s3 journal is written under. Nothing else may
   # write there, and it needs a bucket lifecycle rule -- expire after 7 days --
