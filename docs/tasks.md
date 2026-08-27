@@ -3995,6 +3995,71 @@ it goes stale (the price of the one-series-per-node shape the item chose). And a
 node that keeps answering `ping` but stops answering `statistics` keeps its last
 sample, visible only as a growing `mss_rtpengine_sample_age_seconds`.
 
+## Recording store selection — the one storage decision that is the deployment's
+
+### 58. A flag picks the recording store: S3 or a FreeSWITCH-style filesystem — ⬜ NEXT
+**Where:** `crates/mediaserverd/src/recorder.rs` (a second `RecordingSink`),
+`recording_spill.rs` (no change intended — `ObjectSpill` already takes any
+sink), `lab/preflight.sh`, `deploy/k8s`, `docs/deploy.md`.
+**Why:** the architecture chose direct-to-S3 over the legacy shared-filesystem
+recording (architecture.md §3, "no shared filesystem, no SQS hop") and that stays
+the default. But a deployment with no object store — or one whose downstream
+recording pickup already watches a mounted tree the way it watched FreeSWITCH's
+`record_session` output — should be able to keep that tree and still retire
+FreeSWITCH. `RecordingSink` is a trait with one production implementation; the
+choice between two is configuration, not architecture.
+**What:**
+- `MSS_RECORDING_STORE` ∈ {`s3` (default, unchanged behaviour), `filesystem`}.
+  Any other value is a storage misconfiguration and **refuses to start**, the
+  same way an unusable bucket does.
+- `filesystem` requires `MSS_RECORDING_ROOT`, an absolute directory on a volume
+  every recording pod mounts (RWX PVC, EFS, NFS — MSS does not care which). At
+  start the process writes, renames and deletes a probe file under it and
+  refuses to start if it cannot. With `filesystem` selected the `MSS_RECORDING_S3_*`
+  and bucket variables are ignored with one warning naming them; with `s3`
+  selected a set `MSS_RECORDING_ROOT` is ignored the same way.
+- The tree under the root **is the frozen identity, verbatim**:
+  `<root>/${accountID}/${recordingID}.${format}` and
+  `<root>/${accountID}/${recordingID}/${participant}.${format}` — the layout
+  `record_session` produced, so an existing pickup job keeps working. Nothing
+  else is written outside `_spill/`.
+- A file lands **atomically**: written to a sibling `.${basename}.${owner}.part`
+  in the same directory, fsynced, then renamed over the final name, so a watcher
+  never reads a half file; `list` never reports `.part` files. `exists` keeps the
+  rule that MSS never writes over an object that already exists.
+- `UploadCompleted.uri` is `file://<root>/<key>`. The attachment transport stays
+  `TRANSPORT_FILE_S3` / `file-s3`: the wire is frozen (Constitution VII); the
+  store behind it is deployment configuration and the event's URI scheme says
+  which one it was.
+- `MSS_RECORDING_SPILL_TO=s3` keeps working and means "the recording store,
+  whichever it is" — the journal lands at `<root>/_spill/…` through the same
+  `ObjectSpill`, so cross-pod adoption works on a shared filesystem too. Accept
+  `store` as the clearer synonym; `disk` is unchanged.
+**Verification, in order:** unit tests on a real temporary directory — the five
+sink methods, the `.part` file invisible to `list` and gone after `put`, a refused
+overwrite, `ObjectSpill` over the filesystem sink round-tripping a journal and
+`salvage` finishing it, and the `from_env` matrix (default is `s3`; `filesystem`
+without a root refuses; an unknown store refuses; the cross-set variable warns).
+Then, **if the lab stack is reachable**, run `lab/grpc_stream_drill.sh RECORD=1`
+with the pod switched to `MSS_RECORDING_STORE=filesystem` and a bind-mounted root,
+and check the WAV at the identity path with `track_dump.py`; if the lab is not
+up, the commit message must say so and name the unit tests as the evidence.
+**Also:** `lab/preflight.sh --recording-root DIR` (the same probe write); a
+`deploy/k8s/overlays/filesystem-recording` overlay (an RWX `PersistentVolumeClaim`
+with a placeholder storage class, mounted at `/var/lib/mediaserverd/recordings`,
+`MSS_RECORDING_STORE=filesystem` and the root in the ConfigMap) that
+`deploy/k8s/validate.sh` passes, with `validate_fields.py` asserting the root is a
+mounted volume whenever the store is `filesystem`; the `docs/deploy.md` Recording
+table and a short "which store" paragraph; one clause on architecture.md's
+recording-sink line saying S3 is the default and a shared filesystem the
+alternative; an implementation-notes.md section; this item and the tables above
+updated.
+**Done when:** the five-command gate passes, both stores are selectable by one
+variable with everything else unchanged, and a recording made with
+`MSS_RECORDING_STORE=filesystem` is a WAV at
+`<root>/${accountID}/${recordingID}.wav` that `track_dump.py` reads, announced by
+an `UploadCompleted` whose URI starts `file://`.
+
 ## Open defects and soft spots
 
 | # | Item | Where | Severity |
