@@ -69,14 +69,41 @@ services:
       lab:
         ipv4_address: 172.31.99.80
 
+  # The offline default: same wire dialect, no keys, no spend, and it is in
+  # this repo. Every drill that wants a consumer can point at it.
+  mock-bridge:
+    image: python:3-slim
+    volumes:
+      - ./mock_bridge.py:/mock_bridge.py:ro
+    command: ["python3", "/mock_bridge.py"]
+    environment:
+      BRIDGE_PORT: "8080"
+      SPEAK_AFTER_SECONDS: "4"
+      SPEAK_EVERY_SECONDS: "5"
+    networks:
+      lab:
+        ipv4_address: 172.31.99.41
+
+  # The real bridge, built from ../../stream-llm-bridge, behind a profile: it
+  # needs an image built outside this repo and two paid API keys. Bring it up
+  # with `--profile real` and point the consumer at it:
+  #
+  #   MSS_CONSUMER_URL=ws://172.31.99.50:8080/ws docker compose \
+  #     -f docker-compose.microsip.yml --profile real up -d llm-bridge
+  #
+  # The keys default to empty rather than `:?` because compose interpolates
+  # every service before it filters by profile, so a `:?` here refused to parse
+  # the whole file -- `docker compose up rtpengine` failed for want of a
+  # text-to-speech key. The bridge reports its own missing key.
   llm-bridge:
     image: stream-llm-bridge:local
+    profiles: [real]
     environment:
       SERVER_PORT: "8080"
       LOG_LEVEL: debug
       USE_LLM: "false"
-      ELEVENLABS_API_KEY: ${ELEVENLABS_API_KEY:?set it in lab/.env}
-      DEEPGRAM_API_KEY: ${DEEPGRAM_API_KEY:?deepgram is what turns your speech into the echo}
+      ELEVENLABS_API_KEY: ${ELEVENLABS_API_KEY:-}
+      DEEPGRAM_API_KEY: ${DEEPGRAM_API_KEY:-}
       DEEPGRAM_MODEL: ${DEEPGRAM_MODEL:-nova-3}
       WELCOME_MESSAGE: ${WELCOME_MESSAGE:-Hello, I am listening. Say something and I will repeat it.}
       AZURE_API_KEY: ${AZURE_API_KEY:-}
@@ -141,7 +168,7 @@ services:
       dockerfile: Dockerfile.rust
     working_dir: /build
     command: ["/lab/tap_live_call.sh"]
-    depends_on: [opensips, freeswitch, llm-bridge, call-watcher, rtt-service, recorder-service]
+    depends_on: [opensips, freeswitch, mock-bridge, call-watcher, rtt-service, recorder-service]
     volumes:
       - ..:/build:ro
       - ./tap_live_call.sh:/lab/tap_live_call.sh:ro
@@ -159,7 +186,7 @@ services:
       MSS_TAP_SECONDS: "900"
       MSS_TAP_OUTPUT: /out/microsip_tap.wav
       MSS_TAP_DATAGRAM_LOG_DIR: /out
-      MSS_CONSUMER_URL: ws://172.31.99.50:8080/ws
+      MSS_CONSUMER_URL: ${MSS_CONSUMER_URL:-ws://172.31.99.41:8080/ws}
       MSS_CONSUMER_ACCOUNT_ID: lab-account
       MSS_CONSUMER_STREAM_SID: MZ-microsip
       MSS_LISTENERS: rtt=ws://172.31.99.100:8091/ws,recorder=ws://172.31.99.110:8090/ws
