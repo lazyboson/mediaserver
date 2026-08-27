@@ -458,6 +458,8 @@ async fn serve_control_plane(
                 probe_interval,
             );
             registry_store = Some(Arc::clone(&store));
+            observing
+                .share_groups_through(Arc::clone(&store) as Arc<dyn session_store::SessionStore>);
             let keeper = Arc::new(
                 registry_keeper::RegistryKeeper::new(
                     Arc::clone(&controller),

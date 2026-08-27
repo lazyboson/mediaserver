@@ -49,7 +49,8 @@ async fn expire_now(url: &str, external_id: &str) {
 mod session_store;
 
 use session_store::{
-    PersistedAttachment, PersistedFormat, PersistedSession, RedisSessionStore, SessionStore,
+    GroupJoin, GroupRecord, PersistedAttachment, PersistedFormat, PersistedSession,
+    RedisSessionStore, SessionStore,
 };
 use std::collections::BTreeMap;
 
@@ -316,4 +317,141 @@ async fn a_record_written_before_the_tap_tag_existed_is_still_adoptable() {
     );
 
     wipe(&url, external_id).await;
+}
+
+async fn wipe_group(url: &str, group: &str) {
+    let client = redis::Client::open(url).unwrap();
+    let mut connection = client.get_multiplexed_async_connection().await.unwrap();
+    let _: Result<(), _> = redis::pipe()
+        .del(format!("mss-itest-{group}:group:{group}"))
+        .ignore()
+        .del(format!("mss-itest-{group}:group:{group}:members"))
+        .ignore()
+        .query_async::<()>(&mut connection)
+        .await;
+}
+
+async fn group_ttl(url: &str, group: &str) -> i64 {
+    let client = redis::Client::open(url).unwrap();
+    let mut connection = client.get_multiplexed_async_connection().await.unwrap();
+    redis::cmd("TTL")
+        .arg(format!("mss-itest-{group}:group:{group}"))
+        .query_async(&mut connection)
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn two_pods_opening_one_recording_group_agree_on_one_anchor() {
+    let Some(url) = url() else {
+        eprintln!("{URL_ENV} not set; skipping");
+        return;
+    };
+    let group = "acct-race/conf-race";
+    wipe_group(&url, group).await;
+
+    let contenders: u64 = 6;
+    let mut tasks = Vec::new();
+    for index in 0..contenders {
+        let url = url.clone();
+        tasks.push(tokio::spawn(async move {
+            let store = RedisSessionStore::connect_in(&url, &namespace(group))
+                .await
+                .unwrap();
+            let owner = format!("pod-{index}");
+            let proposed = GroupRecord::opening_at(
+                std::time::UNIX_EPOCH + Duration::from_millis(1_700_000_000_000 + index * 1_000),
+                "rec-race",
+                "wav",
+                &owner,
+            );
+            let participants = vec![format!("acct-race/rec-race/party-{index}.wav")];
+            store
+                .open_or_join_group(group, &proposed, &participants, false)
+                .await
+                .unwrap()
+        }));
+    }
+    let mut anchors = Vec::new();
+    let mut creators = Vec::new();
+    for task in tasks {
+        match task.await.unwrap() {
+            GroupJoin::Joined(record) => {
+                anchors.push(record.opened_at_unix_ms);
+                creators.push(record.created_by);
+            }
+            other => panic!("a distinct participant label must always be seated: {other:?}"),
+        }
+    }
+
+    assert_eq!(anchors.len(), contenders as usize);
+    creators.sort();
+    creators.dedup();
+    assert_eq!(
+        creators.len(),
+        1,
+        "SET NX must leave exactly one creator, not {creators:?}"
+    );
+    let first = anchors[0];
+    assert!(
+        anchors.iter().all(|held| *held == first),
+        "every member of one group must anchor on one instant: {anchors:?}"
+    );
+
+    let ttl = group_ttl(&url, group).await;
+    assert!(
+        ttl > 0 && ttl <= session_store::GROUP_RECORD_TTL.as_secs() as i64,
+        "group ttl was {ttl}; a group record without expiry would outlive every recording"
+    );
+
+    let store = RedisSessionStore::connect_in(&url, &namespace(group))
+        .await
+        .unwrap();
+    let held = store
+        .open_or_join_group(
+            group,
+            &GroupRecord::opening_at(std::time::SystemTime::now(), "rec-race", "wav", "pod-late"),
+            &["acct-race/rec-race/party-0.wav".to_string()],
+            false,
+        )
+        .await
+        .unwrap();
+    match held {
+        GroupJoin::ParticipantHeld { participant, owner } => {
+            assert_eq!(participant, "acct-race/rec-race/party-0.wav");
+            assert!(
+                !owner.is_empty(),
+                "the refusal must name the pod holding it"
+            );
+        }
+        other => panic!("a reused participant label must be refused: {other:?}"),
+    }
+
+    let other_recording = store
+        .open_or_join_group(
+            group,
+            &GroupRecord::opening_at(std::time::SystemTime::now(), "rec-other", "wav", "pod-late"),
+            &["acct-race/rec-other/party-9.wav".to_string()],
+            false,
+        )
+        .await
+        .unwrap();
+    match other_recording {
+        GroupJoin::RecordsAnother(record) => assert_eq!(record.recording_id, "rec-race"),
+        other => panic!("one group writes one recording: {other:?}"),
+    }
+
+    for index in 0..contenders {
+        store
+            .leave_group(group, &[format!("acct-race/rec-race/party-{index}.wav")])
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        group_ttl(&url, group).await,
+        -2,
+        "the group record must be gone once its last member left"
+    );
+
+    wipe_group(&url, group).await;
 }

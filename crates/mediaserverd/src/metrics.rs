@@ -643,11 +643,6 @@ pub fn render(sources: &MetricsSources) -> String {
             keeper.inline_not_adopted.load(Ordering::Relaxed),
         );
         counter(
-            "mss_registry_grouped_not_adopted_total",
-            "Recording-group members not restored on the adopting pod",
-            keeper.grouped_not_adopted.load(Ordering::Relaxed),
-        );
-        counter(
             "mss_registry_surrendered_total",
             "Sessions this pod gave up because another pod holds their lease",
             keeper.surrendered.load(Ordering::Relaxed),

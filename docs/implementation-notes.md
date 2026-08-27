@@ -1171,6 +1171,14 @@ How the numbers get out of the media world without locks or allocation:
   directly from their existing `Arc`s; absent sources (no Kafka, no Redis)
   leave their series out entirely rather than reporting zeros that look
   like health.
+- `mss_registry_grouped_not_adopted_total` was **removed** by item 54: a
+  grouped recording is now rebuilt on the adopting pod, so there is nothing
+  left to count. The recording-group series that remain
+  (`mss_recording_groups_live`, `mss_recording_group_members_live`,
+  `mss_recording_group_joins_refused_total`) are **per pod** by design — a
+  group whose members sit on two pods is counted once on each — and the
+  refusal counter gained a fourth reason, a session registry this pod could
+  not read.
 
 `deploy/prometheus-alerts.yaml` carries the alert rules: every drop counter
 (consumer frames, event queue, publish failures, outbox), watchdog stalls,
@@ -1355,7 +1363,7 @@ group's membership, and a recording's buffered audio.
   for it was the one that caught it.
 
 Counters (`persisted`, `renewed`, `lost`, `adopted`, `unrebuildable`,
-`released`, `failed`, `grouped_not_adopted`, `orphans_unsubscribed`,
+`released`, `failed`, `inline_not_adopted`, `orphans_unsubscribed`,
 `orphans_still_subscribed`, `surrendered`) are exported as
 `mss_registry_*_total`. A rising `lost`/`surrendered` means two pods believed
 they owned one session and one gave up; a rising `orphans_still_subscribed`
@@ -2285,6 +2293,12 @@ code. What differs:
   already bounds it at one ptime.
 - The answer is not persisted. See `session_store.rs` on why an inline session
   is not adoptable.
+- **The plane reaches the session store for one thing only: recording groups.**
+  `share_groups_through(Arc<dyn SessionStore>)` is a `OnceLock` set from
+  `main.rs` right where the keeper is built, the same shape as
+  `discover_through`. It is consulted once per grouped `FILE_S3` attachment and
+  once when one leaves — control world, never a frame path. See *Recording
+  groups as a shared record* under `recorder.rs`.
 - **A `group` on an inline session makes it a conference leg (item 37).**
   `open_inline_session` builds the same socket, pipeline, hub and egress and
   then, instead of spawning a per-session capture thread, hands the bundle to
@@ -3446,16 +3460,13 @@ object** under the recording's own prefix.
   dialect is two-track by construction and multi-party gRPC is its own item.
   Pause is per member: `UpdateAttachment{paused}` reaches that member's
   recorder only.
-- **The group is in one pod's memory, so v1 is single-pod.** `TapPlane` holds
-  `groups: Mutex<HashMap<GroupKey, RecordingGroup>>`; the group opens with its
-  first member and dies with its last (`mss_recording_groups_live`,
-  `mss_recording_group_members_live`). `PersistedAttachment` carries the group
-  (serde `default`, so records written before this still decode) and
-  `RegistryKeeper::rebuild` **refuses to restore a grouped recording on the
-  adopting pod** — counted `grouped_not_adopted` — because rebuilding it there
-  would split one recording across two pods' memory and two prefixes. That is
-  soft spot D16; the fix is placement (schedule a group's sessions onto one
-  pod, or make groups a shared-storage concept).
+- **The group was in one pod's memory in v1, and is a shared record since item
+  54.** `TapPlane` still holds
+  `groups: Mutex<HashMap<GroupKey, RecordingGroup>>` — it is the in-process
+  cache and the source of the `mss_recording_groups_live` /
+  `mss_recording_group_members_live` gauges, which stay **per pod** — but what
+  a group *is* now lives in the session store. See *Recording groups as a
+  shared record* below.
 
 ### The recording-group time anchor (P2-1, closes D18, 2026-08-23)
 
@@ -3503,9 +3514,87 @@ if they stop together, the same length to within one frame.
   against 66.16 s live, before the fix). Only a *padded* recording could see it:
   `segment_start` is 0 for every ungrouped one. `a_padded_member_keeps_its_whole
   _tail_across_a_spill` fails by exactly the lead if this is reverted.
-- **Unchanged:** the frozen identity, per-member pause, the refusal shapes, and
-  D16 (a group is still one pod's memory, so the anchor is one pod's clock —
-  which is also why a monotonic `Instant` is the right type here).
+- **Unchanged:** the frozen identity, per-member pause and the refusal shapes.
+  The anchor's *type* changed with item 54: it is a `SystemTime`, because two
+  pods cannot compare each other's `Instant`s. Everything above holds
+  unchanged — `lead_with_silence` still takes a `Duration`, and `absorb` still
+  reads the clock exactly once.
+
+### Recording groups as a shared record, not one pod's memory (item 54, closes D16, 2026-08-27)
+
+D16: `TapPlane::groups` was the whole truth about a recording group, so every
+member of one conference recording had to attach to the same pod. There is no
+placement that guarantees that (D8), a member whose session was adopted
+elsewhere was **refused** rather than restored (its participant object simply
+ended at the pod that died), and a group name reused on a second pod silently
+produced a second half-recording under the same object prefix.
+
+**The group is now a record in the session store**, with `TapPlane::groups`
+demoted to a per-pod cache. Two keys beside the session keys, same namespace:
+
+- `mss:group:<account>/<group>` → JSON
+  `GroupRecord { recording_id, format, opened_at_unix_ms, created_by }`,
+  created with `SET NX`. The loser of a race **reads the winner back**, so two
+  first-members on two pods agree on one `recording_id` and one anchor.
+- `mss:group:<account>/<group>:members` → hash `object key → owner pod`.
+  `HSETNX` is the duplicate-participant refusal, and because the value is the
+  pod, a cross-pod refusal can name the pod already writing that object. `HDEL`
+  on leave; both keys are `DEL`ed (best effort) when the hash empties, and both
+  are `EXPIRE`d at `GROUP_RECORD_TTL` (3 h = `MAX_RECORDING` + 1 h) on every
+  join as the backstop against a pod that dies without leaving.
+
+`SessionStore` gained `open_or_join_group` / `leave_group`; `RedisSessionStore`
+implements them with the commands above, and `MemorySessionStore` mirrors the
+semantics exactly so every `TapPlane` test runs the store path without Redis.
+`TapPlane` reaches the store through `share_groups_through(Arc<dyn
+SessionStore>)`, a `OnceLock` set from `main.rs` beside the keeper — the same
+idiom as `discover_through`. **No store configured means the old, pod-local
+behaviour**, which is right for a single pod.
+
+Decisions, and why:
+
+- **A store error refuses the grouped attachment.** `join_group`'s failure path
+  never falls back to a local-only group: a half-group is worse than no group,
+  because the member would open a second recording under a prefix another pod
+  is already writing. The refusal is counted like every other
+  (`mss_recording_group_joins_refused_total`) and names the registry.
+- **The anchor became wall-clock.** `RecordingGroup.opened_at`,
+  `RecorderSpec.group_anchor` and `recorder::absorb`'s lead computation are all
+  `SystemTime` now (unix ms in the record). Cross-pod alignment is therefore as
+  good as the nodes' clock sync — a skew of *s* misaligns two participants by
+  *s*, which deploy.md says out loud. The `resume_ms > 0` rule that clears
+  `group_anchor` stays: an adopted recording's spilled frames already carry the
+  lead silence, so padding again would double it.
+- **Adoption takes the seat back rather than being refused by it.** A
+  participant's seat in the members hash is held by the pod that died, so a
+  plain `HSETNX` would refuse the adopter its own object. `open_or_join_group`
+  takes a `take_over` flag, and `open_recording_attachment` sets it when the
+  attach carries `mss.recording.spillOwner` — the metadata key
+  `RegistryKeeper::rebuild` adds and nothing else does. The justification is
+  that the lease claim already arbitrated ownership of that session: `HSET`
+  here is not a race, it is recording the outcome of one already decided.
+- **Order inside `join_group`:** a sync local precheck (cheap, and it keeps the
+  single-pod error messages byte-identical), then the store round trip, then a
+  sync commit into the cache. The lock is never held across the await. If the
+  commit fails after the store accepted, the seat is released again. That store
+  round trip is **once per grouped attachment, in the control world** — never
+  on a frame path.
+- **`registry_keeper::rebuild` stopped skipping grouped attachments** and
+  passes `group` through like every other field; `join_group` finds the record
+  and the adopter rejoins. `KeeperCounters.grouped_not_adopted` and
+  `mss_registry_grouped_not_adopted_total` are **deleted** — the behaviour they
+  counted no longer exists.
+- **`group_anchor_for(session)` is the seam item 55 fills.** Today it returns
+  `SystemTime::now()`. When a conference owns its own recording, the first
+  member of a new group whose session is a conference member must anchor on the
+  *conference's* open instant instead, and that is the one function that has to
+  change.
+
+What this does **not** do: it does not place a group's sessions onto one pod
+(D8 is still open), and it does not make a conference survive a pod loss — a
+conference member is an inline session and inline sessions are never adopted
+(`PersistedSession::is_rebuildable`). What survives is a **tapped** session's
+recording and its membership in a group.
 
 ### The rustls/ring dependency this added, and why
 
