@@ -150,8 +150,11 @@ for endpoint in "$METRICS_A" "$METRICS_B" $METRICS_C; do
 done
 MINIO=${MINIO:-$(docker ps --filter name=minio --format '{{.Names}}' | head -1)}
 if [ "$RECORD" = 1 ]; then
-  if ! docker logs "$POD_A" 2>&1 |
-       grep -q 'spill into the recording bucket itself'; then
+  # The daemon says "store", not "bucket", and has since item 58 made the
+  # recording store a flag -- so this gate refused every RECORD=1 run, which is
+  # why D9's row still says this has never run. Match the structured field
+  # instead of the sentence, so prose can change without blocking the drill.
+  if ! docker logs "$POD_A" 2>&1 | grep -q '"spill_in_store":true'; then
     say "RECORD=1 needs the pods started with MSS_RECORDING_SPILL_TO=s3, or a \
 cross-pod adopter reads nothing (and this lab's shared ./out mount would hide \
 that). See the header of this script."

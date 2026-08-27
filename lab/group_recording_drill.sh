@@ -43,8 +43,12 @@ REGISTRY_VOLUME=${REGISTRY_VOLUME:-${NET}-registry}
 CONTROL_PORT=${CONTROL_PORT:-19090}
 METRICS_PORT=${METRICS_PORT:-19091}
 PODS=${PODS:-1}
-CONTROL_PORT_B=${CONTROL_PORT_B:-19092}
-METRICS_PORT_B=${METRICS_PORT_B:-19093}
+# Not 19092/19093: docker-compose.microsip.yml publishes redpanda's EXTERNAL
+# kafka listener on 19092, so PODS=2 could never bind its second pod --
+# "listen tcp4 127.0.0.1:19092: bind: address already in use" -- whenever the
+# lab this drill needs was up, which is always.
+CONTROL_PORT_B=${CONTROL_PORT_B:-19094}
+METRICS_PORT_B=${METRICS_PORT_B:-19095}
 REDIS=${REDIS:-172.31.99.61:6379}
 RECORD_SECONDS=${RECORD_SECONDS:-20}
 JOIN_STAGGER_SECONDS=${JOIN_STAGGER_SECONDS:-5}
