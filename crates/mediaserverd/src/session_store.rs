@@ -53,6 +53,7 @@ pub struct PersistedFormat {
 }
 
 pub const INLINE_SESSION_KIND: i32 = 2;
+pub const MIX_SESSION_KIND: i32 = 3;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PersistedSession {
@@ -72,8 +73,16 @@ impl PersistedSession {
         self.kind == INLINE_SESSION_KIND
     }
 
+    pub fn is_room(&self) -> bool {
+        self.kind == MIX_SESSION_KIND
+    }
+
+    pub fn is_pod_bound(&self) -> bool {
+        self.is_inline() || self.is_room()
+    }
+
     pub fn is_rebuildable(&self) -> bool {
-        !self.is_inline() && !self.call_id.is_empty() && !self.from_tags.is_empty()
+        !self.is_pod_bound() && !self.call_id.is_empty() && !self.from_tags.is_empty()
     }
 }
 
@@ -890,5 +899,25 @@ mod tests {
         telcompat_shaped.call_id = String::new();
         telcompat_shaped.from_tags.clear();
         assert!(!telcompat_shaped.is_rebuildable());
+    }
+
+    #[test]
+    fn a_room_session_is_bound_to_the_pod_that_mixes_it_and_is_never_adopted() {
+        let mut room = session("the-room", "pod-a");
+        room.kind = MIX_SESSION_KIND;
+        room.call_id = String::new();
+        room.from_tags.clear();
+        assert!(room.is_room());
+        assert!(!room.is_inline());
+        assert!(room.is_pod_bound());
+        assert!(!room.is_rebuildable());
+
+        let mut room_with_a_call_identity = room.clone();
+        room_with_a_call_identity.call_id = "call-abc".to_string();
+        room_with_a_call_identity.from_tags = vec!["from-a".to_string()];
+        assert!(
+            !room_with_a_call_identity.is_rebuildable(),
+            "a room is the mix on one pod, whatever else its record carries"
+        );
     }
 }

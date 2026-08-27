@@ -41,7 +41,10 @@ enum SessionKind {
   SESSION_KIND_UNSPECIFIED = 0;
   SESSION_KIND_TAP = 1;     // phase 1-2: rtpengine subscription, listen-only
   SESSION_KIND_INLINE = 2;  // phase 3: MSS is an RTP endpoint in the path
-  SESSION_KIND_MIX = 3;     // phase 4: conference
+  SESSION_KIND_MIX = 3;     // phase 4: the conference room itself, as a
+                            // session with no leg (CreateSession{kind=MIX,
+                            // group}). It owns the room's clock, its mixed
+                            // track and therefore its recording.
 }
 
 enum SessionState {
@@ -68,8 +71,14 @@ message CreateSessionRequest {
   // returns the answer in Session.sdp_answer. A tap needs no SDP: it asks
   // rtpengine for a copy instead.
   string sdp_offer = 8;
-  // INLINE only: the conference this leg joins, mirroring the recording
-  // group on AttachRequest. Legs naming the same group share one mix matrix
+  // INLINE and MIX: the conference this session belongs to, mirroring the
+  // recording group on AttachRequest. On a MIX session the group is
+  // required and names the room this session *is*: it has no leg, no
+  // call_id and no sdp_offer, its opened_at_unix_ms is the conference's own
+  // open instant, and a FILE_S3 attachment with selector only=mixed on it
+  // records the room from open to close however its members come and go.
+  // On an INLINE session it names the conference the leg joins.
+  // Legs naming the same group share one mix matrix
   // driven by one capture-world clock, hear every other member but not
   // themselves, and publish the conference mix as the "mixed" track on every
   // member session. Empty is a plain two-party inline leg, which is exactly
@@ -111,6 +120,12 @@ message Session {
   // Conference members only: the room this member is seated in, so an
   // integrator can enumerate it from any member without a second RPC.
   ConferenceView conference = 14;
+  // When this session opened, on the owner pod's wall clock, so a controller
+  // can align its own timeline with MSS's. On a MIX session this is the
+  // *conference's* open instant — earlier than the CreateSession that adopted
+  // the room if a member opened the conference first — because that is the
+  // t=0 every recording of that room is anchored on.
+  uint64 opened_at_unix_ms = 15;
 }
 
 // One live route of a member's audio inside its conference. A member with no
@@ -146,6 +161,10 @@ message ConferenceView {
   string group = 1;
   uint32 member_count = 2;
   repeated string members = 3;
+  // The external id of the room session that owns this conference, empty when
+  // no CreateSession{kind=MIX} has claimed it. A room recording belongs on
+  // that session rather than on a member's (D20).
+  string room_session = 4;
 }
 
 message SessionRef {

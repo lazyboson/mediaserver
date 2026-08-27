@@ -7,6 +7,7 @@ use media_core::{AudioFormat, Track};
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeMap, VecDeque};
 use std::hash::{Hash, Hasher};
+use std::time::SystemTime;
 
 pub const DEFAULT_MAX_ATTACHMENTS: usize = 16;
 pub const OUTBOX_CAPACITY: usize = 1024;
@@ -73,6 +74,8 @@ pub enum ControlError {
     TooManyAttachments { session: SessionId, limit: usize },
     #[error("{0}")]
     MixRoute(#[from] crate::mix::MixRouteError),
+    #[error("a room session (kind=mix) is a conference and has no leg of its own, so {reason}")]
+    RoomSessionShape { reason: &'static str },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -169,6 +172,7 @@ pub struct SessionView {
     pub id: SessionId,
     pub external_id: String,
     pub kind: SessionKind,
+    pub opened_at: SystemTime,
     pub call_id: String,
     pub from_tags: Vec<String>,
     pub attribution: Attribution,
@@ -200,6 +204,7 @@ struct SessionRecord {
     id: SessionId,
     external_id: String,
     kind: SessionKind,
+    opened_at: SystemTime,
     call_id: String,
     from_tags: Vec<String>,
     attribution: Attribution,
@@ -289,6 +294,9 @@ impl SessionRegistry {
     }
 
     pub fn create_session(&mut self, request: CreateSession) -> Result<SessionView, ControlError> {
+        if request.kind == SessionKind::Mix {
+            room_session_shape(&request)?;
+        }
         if let Some(Outcome::Session(existing)) =
             self.replay(&request.idempotency_key, request.fingerprint())?
         {
@@ -309,6 +317,7 @@ impl SessionRegistry {
                 id,
                 external_id: request.external_id.clone(),
                 kind: request.kind,
+                opened_at: SystemTime::now(),
                 call_id: request.call_id.clone(),
                 attribution: if request.kind == SessionKind::Tap && request.from_tags.is_empty() {
                     Attribution::Unknown
@@ -427,6 +436,7 @@ impl SessionRegistry {
             id: record.id,
             external_id: record.external_id.clone(),
             kind: record.kind,
+            opened_at: record.opened_at,
             call_id: record.call_id.clone(),
             from_tags: record.from_tags.clone(),
             attribution: record.attribution,
@@ -1012,6 +1022,24 @@ impl SessionRegistry {
     }
 }
 
+fn room_session_shape(request: &CreateSession) -> Result<(), ControlError> {
+    let reason = if request.group.trim().is_empty() {
+        Some("it needs a group naming the conference it is the room of")
+    } else if !request.call_id.is_empty() {
+        Some("it carries no call_id: a room is not a call")
+    } else if !request.from_tags.is_empty() {
+        Some("it carries no from_tags: a room has no sip participant of its own")
+    } else if request.sdp_offer.is_some() {
+        Some("it carries no sdp_offer: an rtp endpoint in the path is kind=inline")
+    } else {
+        None
+    };
+    match reason {
+        Some(reason) => Err(ControlError::RoomSessionShape { reason }),
+        None => Ok(()),
+    }
+}
+
 fn member_controlled(control: &MemberControl) -> EventKind {
     EventKind::MemberControlled {
         mute: control.muted(),
@@ -1036,6 +1064,70 @@ mod tests {
             sdp_offer: None,
             group: String::new(),
             idempotency_key: None,
+        }
+    }
+
+    fn room(external_id: &str, group: &str) -> CreateSession {
+        CreateSession {
+            call_id: String::new(),
+            from_tags: Vec::new(),
+            kind: SessionKind::Mix,
+            group: group.to_string(),
+            ..tap(external_id)
+        }
+    }
+
+    #[test]
+    fn a_room_session_is_a_conference_with_a_group_and_no_call_identity_of_its_own() {
+        let mut registry = SessionRegistry::default();
+        let opened = registry
+            .create_session(room("the-room", "sales-standup"))
+            .expect("a room session is a group and nothing else");
+        assert_eq!(opened.kind, SessionKind::Mix);
+        assert_eq!(opened.group, "sales-standup");
+        assert!(opened.call_id.is_empty());
+        assert!(
+            opened.opened_at <= std::time::SystemTime::now(),
+            "every session is stamped when it opens"
+        );
+
+        let named_nothing = registry
+            .create_session(CreateSession {
+                group: String::new(),
+                ..room("no-group", "")
+            })
+            .unwrap_err();
+        assert!(
+            matches!(named_nothing, ControlError::RoomSessionShape { .. })
+                && named_nothing.to_string().contains("needs a group"),
+            "{named_nothing}"
+        );
+
+        for (broken, expected) in [
+            (
+                CreateSession {
+                    call_id: "call-abc".to_string(),
+                    ..room("with-a-call", "sales-standup")
+                },
+                "no call_id",
+            ),
+            (
+                CreateSession {
+                    from_tags: vec!["from-a".to_string()],
+                    ..room("with-a-tag", "sales-standup")
+                },
+                "no from_tags",
+            ),
+            (
+                CreateSession {
+                    sdp_offer: Some("v=0".to_string()),
+                    ..room("with-an-offer", "sales-standup")
+                },
+                "no sdp_offer",
+            ),
+        ] {
+            let refused = registry.create_session(broken).unwrap_err();
+            assert!(refused.to_string().contains(expected), "{refused}");
         }
     }
 

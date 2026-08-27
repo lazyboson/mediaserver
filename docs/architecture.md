@@ -708,6 +708,16 @@ leg out closes it, and the verbs below ride on `Attach` / `UpdateAttachment`
 metadata (merge semantics: named keys overwritten, the rest untouched) and on
 `StartPlayback` / `StopPlayback`.
 
+The room may also be **a session in its own right**:
+`CreateSession{kind=MIX, group=<room>}` (item 55) creates or adopts the room as
+a session with no leg, whose clock is the conference's. It is not a new noun —
+`SESSION_KIND_MIX` was always in the proto — and it adds no RPC: it exists
+because a recording of the room belongs to the room, not to whichever member
+happened to be attached to (D20). Whoever arrives first, the room session or the
+first member, opens the conference; the room session ends on `DestroySession`,
+or by itself once the conference has held a member and then emptied
+(`MSS_CONFERENCE_LINGER_SECS`, default 0).
+
 Two rules explain most of the table. **A member verb is member state:** it rides
 on any attachment of that member's own session and it outlives that attachment,
 because muting somebody is not a property of the consumer that asked for it. **A
@@ -731,8 +741,10 @@ private when the whisperer detaches.
 | Hold a member | `member_hold=on\|off` | mute and deaf in one verb, with the ear left open for hold audio |
 | Hold audio / MOH | `StartPlayback` on the held member's session (`target_tag` empty or `own`) | the ordinary private playback path |
 | Prompt into the room | `StartPlayback` with `target_tag="all"`; `StopPlayback` with `"all"` flushes it | one prompt source per room, mixed into every ear and the mixed track |
-| Record the room as one object | `Attach{FILE_S3, selector.only="mixed"}` | one mono object under the frozen identity |
-| Record every participant | a recording **group** over the member sessions | one object per member, time-aligned on the group anchor |
+| Open the room itself as a session | `CreateSession{kind=MIX, group=<room>}` | no leg, no ports, no SDP; it owns the room's clock and is where a room recording belongs. Not adoptable: a room is one pod's mix |
+| Record the room as one object | `Attach{FILE_S3, selector.only="mixed"}` on the **room session** (or, still, on any member) | one mono object under the frozen identity; on the room session it runs from the conference's open to its close however the members come and go |
+| Record every participant | a recording **group** over the member sessions | one object per member, time-aligned on the **conference's** open, which is the same t=0 the room object uses |
+| Monitor or prompt the room without a member | `Attach{SINK, only="mixed"}` / `StartPlayback` on the room session | the room session's hub is the room feed; an empty playback target on it means the room |
 | Member state, observable | `MemberControlled` on `mss.events`; `mss_conference_{muted,deaf,held}_members`, `mss_conference_whispers_live` | |
 
 ### B.2 What is deliberately absent
@@ -769,7 +781,7 @@ column is the whole conference surface MSS has.
 
 | # | Integrator RPC (by function) | MSS verb | Status | Recommendation |
 | --- | --- | --- | --- | --- |
-| 1 | Create conference / open room | none — `CreateSession{INLINE, group}` opens it lazily | **implemented** | map create to a no-op that remembers the room name; do not add a room noun |
+| 1 | Create conference / open room | `CreateSession{kind=MIX, group}`, or nothing at all — `CreateSession{INLINE, group}` opens it lazily | **implemented** | map create to the room session when the room will be recorded or monitored as a whole; otherwise to a no-op that remembers the room name. Either way, do not add a room noun |
 | 2 | Add participant (dial into the room) | `CreateSession{INLINE, group, sdp_offer}` | **implemented** (MSS half) | the dial is the integrator's: its proxy/controller routes a leg to MSS with the room as `group` |
 | 3 | Remove participant / kick | `DestroySession` | **implemented** | the SIP leg is the integrator's to tear down; MSS unseats and stops mixing |
 | 4 | List participants / room state | `DescribeSession` per session, `SessionCreated`/`SessionEnded` on the bus, `mss_conference_members_live` | **mappable** | keep the roster in the controller; add a `ListSessions{group}` filter only if a UI needs MSS as the source of truth |
@@ -781,14 +793,16 @@ column is the whole conference surface MSS has.
 | 10 | Whisper / coach (`relate … nospeak`) | `mix_target=<member>`, with `mix_source=leg` when the coach's own voice is the audio | **implemented** | one attachment does both shapes; the coach needs no separate room |
 | 11 | Barge (full-duplex join) | `mix_target=all` | **implemented** | it is a metadata flip on the same attachment, so barge-in is not a re-INVITE |
 | 12 | Play prompt / announcement into the room | `StartPlayback{target_tag="all"}` | **implemented** | enter/exit sounds are the integrator's trigger on the event stream (§B.2) |
-| 13 | Record the conference | `Attach{FILE_S3, only="mixed"}` (room) or a recording group (per participant) | **implemented** | both shapes may run at once, under the frozen identity |
+| 13 | Record the conference | `Attach{FILE_S3, only="mixed"}` on the room session (room) or a recording group (per participant) | **implemented** | both shapes may run at once, under the frozen identity, and both anchor on the conference's open. Attach the room object to the **room session**, not to a member, or it ends when that member does |
 | 14 | In-conference DTMF control menu | none by design | **not planned** | map digits to these API calls in the integrator; MSS hands over the digits on the consumer stream and interprets none of them. The digits do **not** reach `mss.events` today (tasks.md D21) |
 
 Two soft spots an adapter author must know: member state has **no owner and no
 lease** — a controller that dies between `member_mute=on` and `off` leaves the
-member muted, and there is no API to read the room's member state back
-(tasks.md D22); and a room lives on one pod, so every member of a room, and any
-per-participant recording of it, must be placed on the same pod.
+member muted (tasks.md D22; since item 49 `DescribeSession` at least reads it
+back) — and a room lives on one pod, so every member of a room must be placed on
+the same pod, and neither a member nor the room session is ever adopted after a
+pod loss. A **per-participant recording** no longer needs one pod (item 54), but
+the legs it records still do.
 
 ---
 

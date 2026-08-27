@@ -1,4 +1,6 @@
-use crate::conference::{Conference, ConferenceMember, ConferenceShared, ConferenceTotals};
+use crate::conference::{
+    Conference, ConferenceMember, ConferenceShared, ConferenceTotals, RoomFate, RoomSeat,
+};
 use crate::consumer_ws::{self, ConsumerConfig};
 use crate::digits::DigitQueue;
 use crate::discovery::NodeDiscovery;
@@ -78,6 +80,7 @@ pub struct TapPlaneConfig {
     pub sdp_session_id: u64,
     pub recording: RecordingSupport,
     pub capabilities: Arc<NodeCapabilityLog>,
+    pub conference_linger: Duration,
 }
 
 struct ResolvedNode {
@@ -87,6 +90,7 @@ struct ResolvedNode {
 }
 
 struct SessionHandles {
+    kind: SessionKind,
     transport: Option<Arc<NgTransport>>,
     call_id: String,
     hub: HubClient,
@@ -270,6 +274,7 @@ pub struct IngestSnapshot {
     pub inline_legs_live: u64,
     pub inline: InlineEgressTotals,
     pub conferences_live: u64,
+    pub conference_rooms_live: u64,
     pub conference_members_live: u64,
     pub conference_whispers_live: u64,
     pub conference_members_muted: u64,
@@ -418,6 +423,7 @@ impl TapPlaneMetrics {
         for conference in inner.conferences.values() {
             snapshot.conference.add_shared(conference);
             snapshot.conference_members_live += conference.members_live.load(Ordering::Relaxed);
+            snapshot.conference_rooms_live += conference.rooms_live.load(Ordering::Relaxed);
             snapshot.conference_whispers_live += conference.whispers_live.load(Ordering::Relaxed);
             snapshot.conference_members_muted += conference.members_muted.load(Ordering::Relaxed);
             snapshot.conference_members_deaf += conference.members_deaf.load(Ordering::Relaxed);
@@ -454,6 +460,7 @@ pub struct TapPlane {
     discovery: OnceLock<Arc<NodeDiscovery>>,
     group_store: OnceLock<Arc<dyn SessionStore>>,
     uploads: Arc<UploadTracker>,
+    me: OnceLock<Weak<TapPlane>>,
 }
 
 impl TapPlane {
@@ -471,7 +478,20 @@ impl TapPlane {
             discovery: OnceLock::new(),
             group_store: OnceLock::new(),
             uploads,
+            me: OnceLock::new(),
         }
+    }
+
+    pub fn linger_through(&self, me: Weak<TapPlane>) {
+        if self.me.set(me).is_err() {
+            warn!("this tap plane already knows how to reach itself from a timer");
+            return;
+        }
+        info!(
+            linger_secs = self.config.conference_linger.as_secs(),
+            "an emptied conference whose room session is still open is held for this long \
+             before the room session ends itself"
+        );
     }
 
     pub fn uploads_in_flight(&self) -> u64 {
@@ -809,6 +829,17 @@ impl TapPlane {
         } = self.session_handles(view.session)?;
         let selection = recording_selection_of(view.selector);
         let conferenced = self.conference_of(view.session).is_ok();
+        let room_anchor = self.room_anchor_of(view.session);
+        if room_anchor.is_some() && !view.group.is_empty() {
+            return Err(MediaPlaneError(format!(
+                "a room session is the whole conference and has no participant seat, so it \
+                 cannot join recording group {}; record the room once with an ungrouped \
+                 file-s3 attachment whose selector is only={}, and group the members' own \
+                 objects on their own sessions",
+                view.group,
+                consumer_ws::track_name(Track::Mixed)
+            )));
+        }
         if conferenced
             && !view.group.is_empty()
             && matches!(view.selector, TrackSelector::Only(Track::Mixed))
@@ -865,6 +896,7 @@ impl TapPlane {
                 None,
                 RecorderSpec {
                     resume_ms,
+                    group_anchor: room_anchor.filter(|_| resume_ms == 0),
                     ..RecorderSpec::one_object(
                         view.session,
                         &identity,
@@ -955,8 +987,24 @@ impl TapPlane {
         Ok(())
     }
 
-    fn group_anchor_for(&self, _session: SessionId) -> SystemTime {
-        SystemTime::now()
+    fn group_anchor_for(&self, session: SessionId) -> SystemTime {
+        self.conference_open_of(session)
+            .unwrap_or_else(SystemTime::now)
+    }
+
+    fn conference_open_of(&self, session: SessionId) -> Option<SystemTime> {
+        let name = self.conference_of(session).ok()?;
+        let held = self.conferences.lock().ok()?;
+        held.get(&name)
+            .map(|conference| conference.opened_at_wall())
+    }
+
+    fn room_anchor_of(&self, session: SessionId) -> Option<SystemTime> {
+        let is_room = self.sessions.lock().ok()?.get(&session)?.kind == SessionKind::Mix;
+        match is_room {
+            true => self.conference_open_of(session),
+            false => None,
+        }
     }
 
     fn refuse_group_join(
@@ -1744,6 +1792,222 @@ impl TapPlane {
         Ok(OpenedSession::answered(answer_sdp))
     }
 
+    fn open_room_session(&self, view: SessionView) -> Result<OpenedSession, MediaPlaneError> {
+        if view.group.trim().is_empty() {
+            return Err(MediaPlaneError(
+                "a room session is a conference: name the conference in group".to_string(),
+            ));
+        }
+        let name = view.group.clone();
+        let (hub, format, opened_at_wall, open_for) = {
+            let mut held = self
+                .conferences
+                .lock()
+                .map_err(|_| MediaPlaneError("the conference table is poisoned".to_string()))?;
+            if !held.contains_key(&name) {
+                let opened = Conference::start(&name, self.config.format)
+                    .map_err(|error| MediaPlaneError(format!("conference {name}: {error}")))?;
+                self.metrics.register_conference(&name, opened.shared());
+                held.insert(name.clone(), opened);
+                info!(
+                    conference = %name,
+                    session = %view.id,
+                    "opened a conference for its room session; the mix runs with no member \
+                     yet, so the room records silence until the first leg joins"
+                );
+            }
+            let conference = held.get_mut(&name).ok_or_else(|| {
+                MediaPlaneError(format!("conference {name} is not running on this pod"))
+            })?;
+            conference
+                .seat_room(RoomSeat {
+                    session: view.id,
+                    external_id: view.external_id.clone(),
+                })
+                .map_err(|error| MediaPlaneError(format!("conference {name}: {error}")))?;
+            (
+                conference.room_hub(),
+                conference.format(),
+                conference.opened_at_wall(),
+                conference.open_for(),
+            )
+        };
+        let digits = DigitQueue::new();
+        digits.close();
+        let mut held = self
+            .sessions
+            .lock()
+            .map_err(|_| MediaPlaneError("the session table is poisoned".to_string()))?;
+        held.insert(
+            view.id,
+            LiveSession {
+                kind: SessionKind::Mix,
+                attribution: view.attribution,
+                media_ports: Vec::new(),
+                transport: None,
+                external_id: view.external_id.clone(),
+                call_id: String::new(),
+                to_tag: String::new(),
+                format,
+                hub,
+                egress: None,
+                stop: Arc::new(AtomicBool::new(false)),
+                capture: None,
+                conference: Some(name.clone()),
+                mix_route: None,
+                speakers: None,
+                digits,
+            },
+        );
+        drop(held);
+        self.metrics.register_session(view.id, Vec::new());
+        info!(
+            session = %view.id,
+            external_id = %view.external_id,
+            conference = %name,
+            opened_at_unix_ms = control_api::convert::unix_ms(opened_at_wall),
+            conference_open_for_ms = open_for.as_millis() as u64,
+            encoding = ?format.encoding,
+            sample_rate_hz = format.sample_rate_hz,
+            ptime_ms = format.ptime_ms,
+            "this session is the room itself: it has no leg, and every recording of it is \
+             anchored on the conference's open"
+        );
+        Ok(OpenedSession::default())
+    }
+
+    async fn end_room_session(&self, name: &str, reason: &str) {
+        let room = {
+            let Ok(held) = self.sessions.lock() else {
+                warn!(conference = %name, "the session table is poisoned; the room is left behind");
+                return;
+            };
+            held.iter()
+                .find(|(_, live)| {
+                    live.kind == SessionKind::Mix && live.conference.as_deref() == Some(name)
+                })
+                .map(|(session, live)| (*session, live.external_id.clone()))
+        };
+        let Some((session, external_id)) = room else {
+            return;
+        };
+        if let Ok(mut held) = self.conferences.lock() {
+            if let Some(conference) = held.get_mut(name) {
+                conference.count_auto_end();
+            }
+        }
+        if let Err(error) = self.close_room(session, name).await {
+            warn!(conference = %name, %session, %error, "this room session did not close cleanly");
+        }
+        info!(
+            %session,
+            %external_id,
+            conference = %name,
+            %reason,
+            "the room session ended itself, so its recording is closed and uploaded"
+        );
+        match self.observer().as_ref().and_then(Weak::upgrade) {
+            Some(sink) => sink.session_finished(session, reason),
+            None => warn!(
+                %session,
+                "no observation sink is wired, so the registry still holds this room session"
+            ),
+        }
+    }
+
+    async fn close_room(&self, session: SessionId, name: &str) -> Result<(), MediaPlaneError> {
+        let live = {
+            let mut held = self
+                .sessions
+                .lock()
+                .map_err(|_| MediaPlaneError("the session table is poisoned".to_string()))?;
+            held.remove(&session)
+        };
+        if live.is_none() {
+            return Ok(());
+        }
+        for (attachment, held) in self.take_attachments_of(session)? {
+            self.end_attachment(attachment, held, "the room closed")
+                .await;
+        }
+        let stopped = {
+            let mut held = self
+                .conferences
+                .lock()
+                .map_err(|_| MediaPlaneError("the conference table is poisoned".to_string()))?;
+            match held.get_mut(name) {
+                Some(conference) => {
+                    let stopped = conference.unseat_room();
+                    if stopped.is_some() {
+                        held.remove(name);
+                        self.metrics.retire_conference(name);
+                    }
+                    stopped
+                }
+                None => None,
+            }
+        };
+        if let Some(thread) = stopped {
+            let joined = tokio::task::spawn_blocking(move || thread.join()).await;
+            if joined.is_err() {
+                warn!(conference = %name, "the conference thread did not join cleanly");
+            }
+            info!(
+                conference = %name,
+                "the room session was the last thing holding this conference; the mix stopped"
+            );
+        }
+        self.metrics.retire_session(session);
+        Ok(())
+    }
+
+    async fn end_room_if_still_empty(&self, name: &str) {
+        let still_empty = match self.conferences.lock() {
+            Ok(held) => held
+                .get(name)
+                .map(|conference| conference.emptied() && conference.room().is_some())
+                .unwrap_or(false),
+            Err(_) => false,
+        };
+        if !still_empty {
+            return;
+        }
+        self.end_room_session(name, "the conference emptied and its linger expired")
+            .await;
+    }
+
+    fn linger_over(&self, name: &str) {
+        let linger = self.config.conference_linger;
+        let Some(me) = self.me.get().cloned() else {
+            warn!(
+                conference = %name,
+                "this conference emptied and its linger cannot be timed, so its room session \
+                 stays open until it is ended by the api"
+            );
+            return;
+        };
+        let held_name = name.to_string();
+        let task = tokio::spawn(async move {
+            tokio::time::sleep(linger).await;
+            if let Some(plane) = me.upgrade() {
+                plane.end_room_if_still_empty(&held_name).await;
+            }
+        });
+        if let Ok(mut held) = self.conferences.lock() {
+            if let Some(conference) = held.get_mut(name) {
+                conference.linger_until(task);
+                info!(
+                    conference = %name,
+                    linger_secs = linger.as_secs(),
+                    "the last member left an owned conference; the room session is held open \
+                     for the linger, and a member that rejoins cancels it"
+                );
+                return;
+            }
+        }
+        warn!(conference = %name, "the conference vanished while its linger was being armed");
+    }
+
     fn seat_in_conference(
         &self,
         name: &str,
@@ -1773,9 +2037,7 @@ impl TapPlane {
         let mut opened = Conference::start(name, format)
             .map_err(|error| MediaPlaneError(format!("conference {name}: {error}")))?;
         if let Err(error) = opened.seat(member) {
-            if let Some(thread) = opened.unseat(session) {
-                drop(thread);
-            }
+            drop(opened.stop_now());
             return Err(MediaPlaneError(format!("conference {name}: {error}")));
         }
         self.metrics.register_conference(name, opened.shared());
@@ -1784,26 +2046,24 @@ impl TapPlane {
         Ok(())
     }
 
-    fn leave_conference(
-        &self,
-        name: &str,
-        session: SessionId,
-    ) -> Option<std::thread::JoinHandle<()>> {
+    fn leave_conference(&self, name: &str, session: SessionId) -> RoomFate {
         let mut held = match self.conferences.lock() {
             Ok(held) => held,
             Err(_) => {
                 warn!(conference = %name, "the conference table is poisoned; the mix is left behind");
-                return None;
+                return RoomFate::Mixing;
             }
         };
-        let conference = held.get_mut(name)?;
-        let thread = conference.unseat(session);
-        if thread.is_some() {
+        let Some(conference) = held.get_mut(name) else {
+            return RoomFate::Mixing;
+        };
+        let fate = conference.unseat(session);
+        if matches!(fate, RoomFate::Stopped(_)) {
             held.remove(name);
             self.metrics.retire_conference(name);
             info!(conference = %name, "the last leg left this conference; it is closed");
         }
-        thread
+        fate
     }
 
     fn conference_of(&self, session: SessionId) -> Result<String, MediaPlaneError> {
@@ -2052,6 +2312,7 @@ impl TapPlane {
             .get(&session)
             .ok_or_else(|| MediaPlaneError(format!("{session} is not tapped here")))?;
         Ok(SessionHandles {
+            kind: live.kind,
             transport: live.transport.clone(),
             call_id: live.call_id.clone(),
             hub: live.hub.clone(),
@@ -2143,26 +2404,38 @@ impl MediaPlane for TapPlane {
 
     fn member_state(&self, session: SessionId) -> Option<MemberStateView> {
         let name = self.conference_of(session).ok()?;
-        self.conferences
-            .lock()
-            .ok()?
-            .get(&name)?
-            .member_state(session)
+        let held = self.conferences.lock().ok()?;
+        let conference = held.get(&name)?;
+        match conference.room().map(|seat| seat.session) == Some(session) {
+            true => Some(conference.room_state()),
+            false => conference.member_state(session),
+        }
     }
 
     async fn open_session(&self, view: SessionView) -> Result<OpenedSession, MediaPlaneError> {
         match view.kind {
             SessionKind::Tap => self.open_tap_session(view).await,
             SessionKind::Inline => self.open_inline_session(view),
-            SessionKind::Mix => Err(MediaPlaneError(
-                "a mixed session is the phase-4 conference; join inline legs into a group \
-                 instead"
-                    .to_string(),
-            )),
+            SessionKind::Mix => self.open_room_session(view),
         }
     }
 
     async fn close_session(&self, session: SessionId) -> Result<(), MediaPlaneError> {
+        let room = {
+            let held = self
+                .sessions
+                .lock()
+                .map_err(|_| MediaPlaneError("the session table is poisoned".to_string()))?;
+            held.get(&session).and_then(|live| match live.kind {
+                SessionKind::Mix => live.conference.clone(),
+                _ => None,
+            })
+        };
+        if let Some(name) = room {
+            self.close_room(session, &name).await?;
+            info!(%session, conference = %name, "the room session closed");
+            return Ok(());
+        }
         let live = {
             let mut held = self
                 .sessions
@@ -2195,10 +2468,18 @@ impl MediaPlane for TapPlane {
                 );
             }
         }
-        let mixing = live
-            .conference
-            .as_deref()
-            .and_then(|name| self.leave_conference(name, session));
+        let mut emptied = None;
+        let mixing = match live.conference.as_deref() {
+            Some(name) => match self.leave_conference(name, session) {
+                RoomFate::Stopped(thread) => Some(thread),
+                RoomFate::Emptied => {
+                    emptied = Some(name.to_string());
+                    None
+                }
+                RoomFate::Mixing => None,
+            },
+            None => None,
+        };
         if let Some(thread) = live.capture.take().or(mixing) {
             let joined = tokio::task::spawn_blocking(move || thread.join()).await;
             if joined.is_err() {
@@ -2216,6 +2497,14 @@ impl MediaPlane for TapPlane {
             ?released_ports,
             "session closed"
         );
+        if let Some(name) = emptied {
+            if self.config.conference_linger.is_zero() {
+                self.end_room_session(&name, "the last member left the conference")
+                    .await;
+            } else {
+                self.linger_over(&name);
+            }
+        }
         Ok(())
     }
 
@@ -2509,10 +2798,13 @@ impl MediaPlane for TapPlane {
             ));
         }
         let SessionHandles {
-            transport, call_id, ..
+            kind,
+            transport,
+            call_id,
+            ..
         } = self.session_handles(session)?;
         if transport.is_none() {
-            return match playback_reach(target_tag.as_deref())? {
+            return match playback_reach(target_tag.as_deref(), kind)? {
                 PlaybackReach::Room => self.play_into_room(session, source),
                 PlaybackReach::Ear => self.play_into_inline_leg(session, source),
             };
@@ -2539,10 +2831,16 @@ impl MediaPlane for TapPlane {
         target_tag: Option<String>,
     ) -> Result<(), MediaPlaneError> {
         let SessionHandles {
-            transport, call_id, ..
+            kind,
+            transport,
+            call_id,
+            ..
         } = self.session_handles(session)?;
         let Some(transport) = transport else {
-            if matches!(playback_reach(target_tag.as_deref())?, PlaybackReach::Room) {
+            if matches!(
+                playback_reach(target_tag.as_deref(), kind)?,
+                PlaybackReach::Room
+            ) {
                 return self.flush_room_prompts(session);
             }
             let egress = self.inline_egress(session).ok_or_else(|| {
@@ -2670,9 +2968,21 @@ enum PlaybackReach {
     Room,
 }
 
-fn playback_reach(target_tag: Option<&str>) -> Result<PlaybackReach, MediaPlaneError> {
+fn playback_reach(
+    target_tag: Option<&str>,
+    kind: SessionKind,
+) -> Result<PlaybackReach, MediaPlaneError> {
+    let room = kind == SessionKind::Mix;
     match target_tag.map(str::trim) {
-        None | Some("") => Ok(PlaybackReach::Ear),
+        None | Some("") => Ok(match room {
+            true => PlaybackReach::Room,
+            false => PlaybackReach::Ear,
+        }),
+        Some(MIX_TARGET_OWN) if room => Err(MediaPlaneError(
+            "a room session has no ear of its own; a playback on the room is the room's, \
+             so leave the target empty or say \"all\""
+                .to_string(),
+        )),
         Some(MIX_TARGET_OWN) => Ok(PlaybackReach::Ear),
         Some(MIX_TARGET_EVERYONE) => Ok(PlaybackReach::Room),
         Some(other) => Err(MediaPlaneError(format!(
@@ -3347,6 +3657,10 @@ mod tests {
     }
 
     fn plane_without_a_store(recording: RecordingSupport) -> TapPlane {
+        plane_lingering_for(recording, Duration::ZERO)
+    }
+
+    fn plane_lingering_for(recording: RecordingSupport, conference_linger: Duration) -> TapPlane {
         TapPlane::new(TapPlaneConfig {
             default_node: None,
             local_media_address: IpAddr::from([127, 0, 0, 1]),
@@ -3359,6 +3673,7 @@ mod tests {
             sdp_session_id: 1,
             recording,
             capabilities: Arc::new(NodeCapabilityLog::new(true)),
+            conference_linger,
         })
     }
 
@@ -3377,6 +3692,7 @@ mod tests {
             sdp_session_id: 1,
             recording: RecordingSupport::default(),
             capabilities: Arc::new(NodeCapabilityLog::new(true)),
+            conference_linger: Duration::ZERO,
         })
     }
 
@@ -3385,6 +3701,7 @@ mod tests {
             id: SessionId::from_raw(1),
             external_id: "req-1".to_string(),
             kind,
+            opened_at: SystemTime::now(),
             call_id: "call-abc".to_string(),
             from_tags: vec!["from-a".to_string()],
             attribution: Attribution::Explicit,
@@ -3410,6 +3727,7 @@ mod tests {
             sdp_session_id: 1,
             recording: RecordingSupport::default(),
             capabilities: Arc::new(NodeCapabilityLog::new(true)),
+            conference_linger: Duration::ZERO,
         })
     }
 
@@ -3800,11 +4118,14 @@ a=rtpmap:101 telephone-event/8000\r\na=ptime:20\r\n"
     }
 
     #[derive(Default)]
-    struct WitnessedObservations(Mutex<Vec<(SessionId, Observation)>>);
+    struct WitnessedObservations {
+        seen: Mutex<Vec<(SessionId, Observation)>>,
+        finished: Mutex<Vec<(SessionId, String)>>,
+    }
 
     impl WitnessedObservations {
         fn digits(&self) -> Vec<Observation> {
-            self.0
+            self.seen
                 .lock()
                 .unwrap()
                 .iter()
@@ -3812,11 +4133,22 @@ a=rtpmap:101 telephone-event/8000\r\na=ptime:20\r\n"
                 .map(|(_, seen)| seen.clone())
                 .collect()
         }
+
+        fn finished(&self) -> Vec<(SessionId, String)> {
+            self.finished.lock().unwrap().clone()
+        }
     }
 
     impl ObservationSink for WitnessedObservations {
         fn observe(&self, session: SessionId, observation: Observation) {
-            self.0.lock().unwrap().push((session, observation));
+            self.seen.lock().unwrap().push((session, observation));
+        }
+
+        fn session_finished(&self, session: SessionId, reason: &str) {
+            self.finished
+                .lock()
+                .unwrap()
+                .push((session, reason.to_string()));
         }
     }
 
@@ -5333,13 +5665,15 @@ m=audio 41000 RTP/AVP 111\r\na=rtpmap:111 opus/48000/2\r\n",
     }
 
     #[tokio::test]
-    async fn a_mixed_session_names_the_conference_phase_rather_than_half_opening() {
+    async fn a_room_session_that_names_no_conference_is_refused_rather_than_half_opened() {
         let plane = plane();
         let error = plane
             .open_session(session(SessionKind::Mix, ""))
             .await
             .unwrap_err();
-        assert!(error.to_string().contains("phase-4"), "{error}");
+        assert!(error.to_string().contains("name the conference"), "{error}");
+        assert_eq!(plane.metrics().snapshot().conferences_live, 0);
+        assert_eq!(plane.live_sessions(), 0);
     }
 
     #[tokio::test]
@@ -5948,6 +6282,346 @@ m=audio 41000 RTP/AVP 111\r\na=rtpmap:111 opus/48000/2\r\n",
             .close_session(bob.session)
             .await
             .expect("a conference leg closes");
+    }
+
+    fn room_session(id: u64, group: &str) -> SessionView {
+        SessionView {
+            id: SessionId::from_raw(id),
+            external_id: format!("room-{id}"),
+            call_id: String::new(),
+            from_tags: Vec::new(),
+            attribution: Attribution::Explicit,
+            group: group.to_string(),
+            ..session(SessionKind::Mix, "")
+        }
+    }
+
+    async fn open_room(plane: &TapPlane, id: u64, group: &str) -> SessionId {
+        plane
+            .open_session(room_session(id, group))
+            .await
+            .expect("a room session opens or adopts its conference");
+        SessionId::from_raw(id)
+    }
+
+    fn lead_samples(samples: &[i16]) -> usize {
+        samples
+            .iter()
+            .position(|sample| *sample != 0)
+            .unwrap_or(samples.len())
+    }
+
+    #[tokio::test]
+    async fn a_room_session_opened_before_anybody_joins_records_the_wait_and_then_the_room() {
+        let bucket = Arc::new(BucketSink::default());
+        let plane = bucket_plane(&bucket);
+        let room = open_room(&plane, 9, "board-room").await;
+        plane
+            .open_attachment(recording_attachment(
+                11,
+                room,
+                "acct-7/room.wav",
+                TrackSelector::Only(Track::Mixed),
+                "",
+                "room",
+            ))
+            .await
+            .expect("the room session records the room, member or no member");
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        let mut alice = seat_peer(&plane, 1, "board-room").await;
+        let mut bob = seat_peer(&plane, 2, "board-room").await;
+        for _ in 0..6 {
+            alice.speak(1_000, 4);
+            bob.speak(2_000, 4);
+            tokio::time::sleep(Duration::from_millis(80)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        plane
+            .close_session(room)
+            .await
+            .expect("the room session closes on its own end-session");
+        plane.await_uploads().await;
+
+        let (channels, samples) = recorded_wav(&bucket.body("acct-7/room.wav"));
+        assert_eq!(channels, 1, "a room object is one mono mix");
+        let lead = lead_samples(&samples);
+        assert!(
+            lead >= 8_000 / 4,
+            "the room object opens with the silence nobody spoke into: {lead} samples"
+        );
+        let loudest = samples.iter().copied().max().unwrap_or(0);
+        assert!(
+            (2_700..=3_300).contains(&loudest),
+            "and then carries both members summed: {loudest}"
+        );
+
+        assert_eq!(
+            plane.metrics().snapshot().conferences_live,
+            1,
+            "ending the room session leaves the members mixing"
+        );
+        assert!(
+            (1_600..=2_400).contains(&alice.loudest_ear()),
+            "alice still hears bob after the room session ended"
+        );
+        for peer in [&alice, &bob] {
+            plane
+                .close_session(peer.session)
+                .await
+                .expect("a conference leg closes");
+        }
+        assert_eq!(plane.metrics().snapshot().conferences_live, 0);
+    }
+
+    #[tokio::test]
+    async fn a_room_recording_attached_late_starts_at_the_rooms_open_and_matches_its_participants()
+    {
+        let bucket = Arc::new(BucketSink::default());
+        let plane = bucket_plane(&bucket);
+        let mut alice = seat_peer(&plane, 1, "late-room").await;
+        let mut bob = seat_peer(&plane, 2, "late-room").await;
+        for _ in 0..6 {
+            alice.speak(1_000, 4);
+            bob.speak(2_000, 4);
+            tokio::time::sleep(Duration::from_millis(80)).await;
+        }
+
+        let room = open_room(&plane, 9, "late-room").await;
+        plane
+            .open_attachment(recording_attachment(
+                11,
+                room,
+                "acct-7/room.wav",
+                TrackSelector::Only(Track::Mixed),
+                "",
+                "room",
+            ))
+            .await
+            .expect("a room session adopts a conference that is already mixing");
+        for (id, session, label) in [(12u64, alice.session, "alice"), (13, bob.session, "bob")] {
+            plane
+                .open_attachment(recording_attachment(
+                    id,
+                    session,
+                    "acct-7/parties.wav",
+                    TrackSelector::Only(Track::Customer),
+                    "parties",
+                    label,
+                ))
+                .await
+                .expect("the participants record one object each");
+        }
+        for _ in 0..6 {
+            alice.speak(1_000, 4);
+            bob.speak(2_000, 4);
+            tokio::time::sleep(Duration::from_millis(80)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        for (session, id) in [(room, 11u64), (alice.session, 12), (bob.session, 13)] {
+            plane
+                .close_attachment(session, AttachmentId::from_raw(id))
+                .await
+                .expect("a recording attachment closes and uploads");
+        }
+        plane.await_uploads().await;
+
+        let (_, room_samples) = recorded_wav(&bucket.body("acct-7/room.wav"));
+        let room_lead = lead_samples(&room_samples);
+        assert!(
+            room_lead >= 8_000 / 4,
+            "a room object attached late is padded back to the conference's open: \
+             {room_lead} samples"
+        );
+        let (_, alice_samples) = recorded_wav(&bucket.body("acct-7/parties/alice.wav"));
+        assert!(
+            lead_samples(&alice_samples) >= 8_000 / 4,
+            "and so is a participant group opened at the same late moment, because both \
+             anchor on the conference"
+        );
+        let slack = 8_000usize / 2;
+        assert!(
+            room_samples.len() + slack >= alice_samples.len()
+                && room_samples.len() <= alice_samples.len() + slack,
+            "the two shapes are sample-aligned by construction: {} against {}",
+            room_samples.len(),
+            alice_samples.len()
+        );
+
+        for peer in [&alice, &bob] {
+            plane
+                .close_session(peer.session)
+                .await
+                .expect("a conference leg closes");
+        }
+    }
+
+    #[tokio::test]
+    async fn the_room_object_outlives_a_member_and_closes_when_the_last_one_leaves() {
+        let bucket = Arc::new(BucketSink::default());
+        let plane = bucket_plane(&bucket);
+        let witness = Arc::new(WitnessedObservations::default());
+        plane.observe_through(Arc::downgrade(&witness) as Weak<dyn ObservationSink>);
+        let room = open_room(&plane, 9, "outlives").await;
+        plane
+            .open_attachment(recording_attachment(
+                11,
+                room,
+                "acct-7/room.wav",
+                TrackSelector::Only(Track::Mixed),
+                "",
+                "room",
+            ))
+            .await
+            .expect("the room records itself");
+        let mut alice = seat_peer(&plane, 1, "outlives").await;
+        let mut bob = seat_peer(&plane, 2, "outlives").await;
+        for _ in 0..5 {
+            alice.speak(1_000, 4);
+            bob.speak(2_000, 4);
+            tokio::time::sleep(Duration::from_millis(80)).await;
+        }
+
+        plane
+            .close_session(alice.session)
+            .await
+            .expect("a conference leg closes");
+        assert_eq!(
+            plane.metrics().snapshot().recordings_live,
+            1,
+            "the member who left did not own the room object"
+        );
+        assert!(
+            bucket.keys().is_empty(),
+            "and nothing was uploaded when she left: {:?}",
+            bucket.keys()
+        );
+        for _ in 0..5 {
+            bob.speak(2_000, 4);
+            tokio::time::sleep(Duration::from_millis(80)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        plane
+            .close_session(bob.session)
+            .await
+            .expect("the last conference leg closes");
+        plane.await_uploads().await;
+
+        assert_eq!(
+            bucket.keys(),
+            vec!["acct-7/room.wav".to_string()],
+            "the last member out ends the room session, which uploads the room object"
+        );
+        assert_eq!(plane.live_sessions(), 0, "the room session ended itself");
+        assert_eq!(plane.metrics().snapshot().conferences_live, 0);
+        assert_eq!(plane.metrics().snapshot().conference.rooms_auto_ended, 1);
+        let finished = witness.finished();
+        assert_eq!(finished.len(), 1, "{finished:?}");
+        assert_eq!(finished[0].0, room);
+        assert!(finished[0].1.contains("last member"), "{finished:?}");
+
+        let (_, samples) = recorded_wav(&bucket.body("acct-7/room.wav"));
+        let opens = samples.len() * 3 / 10;
+        let closes = samples.len() * 9 / 10;
+        let with_alice = samples[..opens].iter().copied().max().unwrap_or(0);
+        let after_she_left = samples[samples.len() / 2..closes]
+            .iter()
+            .copied()
+            .max()
+            .unwrap_or(0);
+        assert!(
+            (2_700..=3_300).contains(&with_alice),
+            "the object carried both members while both were in the room: {with_alice}"
+        );
+        assert!(
+            (1_600..=2_400).contains(&after_she_left),
+            "and kept recording bob alone after alice left: {after_she_left}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_emptied_room_lingers_and_a_member_that_rejoins_cancels_the_linger() {
+        const LINGER: Duration = Duration::from_millis(300);
+        let plane = Arc::new(plane_lingering_for(RecordingSupport::default(), LINGER));
+        plane.linger_through(Arc::downgrade(&plane));
+        let room = open_room(&plane, 9, "linger-room").await;
+        let alice = seat_peer(&plane, 1, "linger-room").await;
+
+        plane
+            .close_session(alice.session)
+            .await
+            .expect("the only conference leg closes");
+        assert_eq!(
+            plane.metrics().snapshot().conferences_live,
+            1,
+            "an emptied conference with a room session is held, not closed"
+        );
+
+        let bob = seat_peer(&plane, 2, "linger-room").await;
+        tokio::time::sleep(LINGER * 2).await;
+        assert_eq!(
+            plane.metrics().snapshot().conference_members_live,
+            1,
+            "a member that rejoined inside the linger cancelled it"
+        );
+        assert_eq!(plane.live_sessions(), 2);
+
+        plane
+            .close_session(bob.session)
+            .await
+            .expect("the last conference leg closes");
+        assert_eq!(plane.live_sessions(), 1, "the linger is running again");
+        tokio::time::sleep(LINGER * 3).await;
+        assert_eq!(
+            plane.live_sessions(),
+            0,
+            "the linger expired, so the room session ended itself"
+        );
+        assert_eq!(plane.metrics().snapshot().conferences_live, 0);
+        assert!(plane.metrics().snapshot().conference.rooms_auto_ended >= 1);
+        let _ = room;
+    }
+
+    #[tokio::test]
+    async fn a_room_session_is_refused_a_recording_group_and_a_second_owner() {
+        let bucket = Arc::new(BucketSink::default());
+        let plane = bucket_plane(&bucket);
+        let room = open_room(&plane, 9, "one-owner").await;
+        let error = plane
+            .open_attachment(recording_attachment(
+                11,
+                room,
+                "acct-7/parties.wav",
+                TrackSelector::Only(Track::Mixed),
+                "parties",
+                "room",
+            ))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("no participant seat"), "{error}");
+
+        let error = plane
+            .open_session(SessionView {
+                id: SessionId::from_raw(10),
+                external_id: "room-10".to_string(),
+                ..room_session(10, "one-owner")
+            })
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("already owned by"), "{error}");
+
+        plane
+            .close_session(room)
+            .await
+            .expect("the room session closes");
+        assert_eq!(
+            plane.metrics().snapshot().conferences_live,
+            0,
+            "the room session was the only thing holding the conference open"
+        );
     }
 
     #[test]
@@ -6759,6 +7433,128 @@ m=audio 41000 RTP/AVP 111\r\na=rtpmap:111 opus/48000/2\r\n",
         assert!(
             bob_after.member.expect("bob is still seated").mute,
             "member state has no lease, so it survives every other membership change"
+        );
+
+        room.close().await;
+    }
+
+    #[tokio::test]
+    async fn describing_a_room_session_reads_the_conferences_open_and_its_members() {
+        use control_api::proto;
+        use control_api::proto::media_control_client::MediaControlClient;
+
+        let plane = Arc::new(plane());
+        let (room, _controller) = WiredRoom::with_plane(Arc::clone(&plane)).await;
+        let mut client = MediaControlClient::connect(room.endpoint.clone())
+            .await
+            .expect("a client reaches the control port");
+
+        let mut peers = Vec::new();
+        for member in ["alice", "bob"] {
+            let (peer, offer) = silent_peer();
+            peers.push(peer);
+            client
+                .create_session(proto::CreateSessionRequest {
+                    external_id: member.to_string(),
+                    kind: proto::SessionKind::Inline as i32,
+                    call_id: format!("call-{member}"),
+                    from_tags: Vec::new(),
+                    rtpengine_node: String::new(),
+                    mix: false,
+                    idempotency_key: String::new(),
+                    sdp_offer: offer,
+                    group: "sales-standup".to_string(),
+                })
+                .await
+                .expect("an inline leg is answered and seated");
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        let before_the_room = control_api::convert::unix_ms(SystemTime::now());
+
+        let created = client
+            .create_session(proto::CreateSessionRequest {
+                external_id: "the-room".to_string(),
+                kind: proto::SessionKind::Mix as i32,
+                call_id: String::new(),
+                from_tags: Vec::new(),
+                rtpengine_node: String::new(),
+                mix: false,
+                idempotency_key: String::new(),
+                sdp_offer: String::new(),
+                group: "sales-standup".to_string(),
+            })
+            .await
+            .expect("a room session adopts the conference its members opened")
+            .into_inner();
+        assert_eq!(created.kind, proto::SessionKind::Mix as i32);
+        assert!(created.sdp_answer.is_empty(), "a room answers no offer");
+
+        let described = client
+            .describe_session(wire_reference("the-room"))
+            .await
+            .expect("the room describes")
+            .into_inner();
+        assert!(
+            described.member.is_none(),
+            "the room is not a member of itself"
+        );
+        let view = described.conference.expect("the room enumerates itself");
+        assert_eq!(view.group, "sales-standup");
+        assert_eq!(view.member_count, 2);
+        assert_eq!(
+            view.members,
+            vec!["alice".to_string(), "bob".to_string()],
+            "the room reads its members back in seating order"
+        );
+        assert_eq!(view.room_session, "the-room");
+        assert!(
+            described.opened_at_unix_ms > 0 && described.opened_at_unix_ms + 100 <= before_the_room,
+            "a room session reports the conference's open, not its own creation: {} against \
+             {before_the_room}",
+            described.opened_at_unix_ms
+        );
+
+        let alice = client
+            .describe_session(wire_reference("alice"))
+            .await
+            .expect("a member describes")
+            .into_inner();
+        assert_eq!(
+            alice
+                .conference
+                .expect("a member enumerates its room")
+                .room_session,
+            "the-room",
+            "every member can find the session that owns the room recording"
+        );
+        assert!(
+            alice.member.is_some(),
+            "a member still reads its own state back"
+        );
+        assert!(
+            described.opened_at_unix_ms >= alice.opened_at_unix_ms,
+            "the conference opened when its first leg was seated, which is at or after \
+             that leg's own create: {} against {}",
+            described.opened_at_unix_ms,
+            alice.opened_at_unix_ms
+        );
+
+        client
+            .destroy_session(wire_reference("the-room"))
+            .await
+            .expect("the room session ends");
+        let alice_after = client
+            .describe_session(wire_reference("alice"))
+            .await
+            .expect("a member describes")
+            .into_inner();
+        assert_eq!(
+            alice_after
+                .conference
+                .expect("the room is still mixing")
+                .room_session,
+            "",
+            "the members keep mixing with no room session of their own"
         );
 
         room.close().await;

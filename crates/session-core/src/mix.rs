@@ -1,5 +1,6 @@
 use crate::{AttachmentId, Capabilities};
 use std::collections::BTreeMap;
+use std::time::SystemTime;
 
 pub const MIX_TARGET_METADATA_KEY: &str = "mix_target";
 pub const MIX_MONITOR_METADATA_KEY: &str = "mix_monitor";
@@ -54,6 +55,9 @@ pub struct MemberRouteView {
 pub struct MemberStateView {
     pub conference: String,
     pub members: Vec<String>,
+    pub room_session: String,
+    pub opened_at: SystemTime,
+    pub seated: bool,
     pub mute: bool,
     pub deaf: bool,
     pub hold: bool,

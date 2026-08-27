@@ -23,9 +23,9 @@ pub fn status_of(error: ControlError) -> Status {
         ControlError::ExternalIdInUse { .. } => Status::already_exists(error.to_string()),
         ControlError::IdempotencyConflict(_) => Status::aborted(error.to_string()),
         ControlError::TooManyAttachments { .. } => Status::resource_exhausted(error.to_string()),
-        ControlError::NoCapabilityDeclared | ControlError::MixRoute(_) => {
-            Status::invalid_argument(error.to_string())
-        }
+        ControlError::NoCapabilityDeclared
+        | ControlError::MixRoute(_)
+        | ControlError::RoomSessionShape { .. } => Status::invalid_argument(error.to_string()),
     }
 }
 
@@ -86,7 +86,14 @@ pub fn conference_wire(state: &MemberStateView) -> proto::ConferenceView {
         group: state.conference.clone(),
         member_count: state.members.len() as u32,
         members: state.members.clone(),
+        room_session: state.room_session.clone(),
     }
+}
+
+pub fn unix_ms(at: SystemTime) -> u64 {
+    at.duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
 }
 
 pub fn session_kind_wire(kind: SessionKind) -> i32 {
