@@ -284,6 +284,11 @@ pub fn render(sources: &MetricsSources) -> String {
         snapshot.conference.member_controls,
     );
     counter(
+        "mss_conference_member_state_expired_total",
+        "Member flags this pod lifted itself because their lease ran out unrefreshed",
+        snapshot.conference.member_state_expired,
+    );
+    counter(
         "mss_conference_rooms_auto_ended_total",
         "Room sessions that ended themselves because their conference emptied",
         snapshot.conference.rooms_auto_ended,
@@ -927,6 +932,7 @@ mod tests {
             recording: crate::recorder::RecordingSupport::default(),
             capabilities: Arc::clone(&capabilities),
             conference_linger: std::time::Duration::ZERO,
+            member_state_ttl: std::time::Duration::ZERO,
         });
         MetricsSources {
             tap: plane.metrics(),
@@ -1011,6 +1017,16 @@ mod tests {
         ] {
             assert!(text.contains(name), "missing {name} in:\n{text}");
         }
+    }
+
+    #[test]
+    fn the_exposition_counts_the_member_state_leases_this_pod_lifted_itself() {
+        let text = render(&sources());
+        assert!(
+            text.contains("mss_conference_member_state_expired_total 0"),
+            "a pod with no conference still declares the series:\n{text}"
+        );
+        assert!(text.contains("mss_conference_member_controls_total"));
     }
 
     #[test]

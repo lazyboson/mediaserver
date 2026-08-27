@@ -4,7 +4,7 @@ Living work list. [roadmap.md](roadmap.md) holds the *why* and the phase exit
 criteria; this file holds the *what next*, ordered, with a definition of done
 for each item. Update it in the same PR that changes the state of an item.
 
-Status as of **2026-08-26**.
+Status as of **2026-08-27**.
 
 ## Milestones
 
@@ -2262,9 +2262,10 @@ hearing everybody; and the refusals (a flag that is not `on`/`off`, a member ver
 off a conference, a from-tag-shaped playback target on an inline leg). Plus the
 mix-metadata parser tests and a registry audit test for `MemberControlled`.
 
-**Residuals.** (a) Member state has no owner and no lease — D22; since item 49
-`DescribeSession` reads it back on the member's own session, but nothing reclaims
-it. (b) One prompt source per room: overlapping prompts queue.
+**Residuals.** (a) Member state has no owner — D22; since item 49
+`DescribeSession` reads it back on the member's own session, and since item 56
+`member_state_ttl_ms` bounds how long it holds without a refresh, but nothing
+decides whose it is. (b) One prompt source per room: overlapping prompts queue.
 (c) Enter/exit sounds and DTMF menus are integrator work by design; since item 48
 the digits themselves are on the bus (D21), but nothing in MSS interprets them. (d) Per-member volume/energy, member
 enumeration, room lock and moderator roles are not built (architecture.md
@@ -3035,13 +3036,14 @@ reports neither. C is then destroyed: the room reads back as `[alice, bob]` with
 `member_count 2`, A's route still names `carol`, and B is **still muted** — the
 lease residual, demonstrated rather than described.
 
-**Residual — no lease (the other half of D22).** Member state still has no owner
-and no expiry: nothing reclaims a mute when the controller that set it dies. The
-read-back makes that recoverable (an integrator can now reconcile a room on
-reconnect) but not automatic. A lease would have to decide whose it is — the
-attachment that set it, which item 40 explicitly rejected, or the API caller,
-which this API does not model — so it is left open deliberately and stays on the
-defect list.
+**Residual when this landed — no lease (the other half of D22).** Member state
+had no owner and no expiry: nothing reclaimed a mute when the controller that set
+it died. The read-back made that recoverable (an integrator can reconcile a room
+on reconnect) but not automatic. **Item 56 closed it** without answering the
+ownership question this item deferred: `member_state_ttl_ms` bounds how long a
+flag holds without a refresh, and the control world lifts what runs out through
+the same path an `off` takes. There is still no owner — that part of D22's
+wording stays true and is now the whole of its residual.
 
 ### 50. Non-blocking StopRecording/Detach (G10, D11) — ✅ DONE (2026-08-26)
 
@@ -3759,10 +3761,143 @@ licenses, sources ok.
 - With a non-zero linger and no `linger_through` (any embedder that builds a
   `TapPlane` without handing it a `Weak` of itself), an emptied room stays open
   until the API ends it. `main.rs` always sets it.
-- Member state still has no lease (D22, item 56), and the room session is not an
-  owner for one: it holds no member state of its own.
+- Member state had no lease when this landed; **item 56 gave it one** (D22
+  closed). The room session is still not an owner for it: it holds no member
+  state of its own.
 
-### 56. Member state with a lease (D22)
+### 56. Member state with a lease (D22) — ✅ DONE (2026-08-27)
+
+**What shipped.** A member flag can now name how long it holds. A fourth
+metadata key on the same `Attach`/`UpdateAttachment` that carries the verbs —
+`member_state_ttl_ms` — leases every flag set `on` in that request; when the
+lease runs out unrefreshed, the pod lifts the flag itself, through the exact same
+path an explicit `off` takes, and says so on the bus. Absent or `0` is
+**today's behaviour, unchanged**: the flag holds until a controller says
+otherwise.
+
+- Parsed in `MemberControl::from_metadata` into `ttl_ms: Option<u64>` — `None`
+  is "the request named none, take the pod's default", `Some(0)` is "explicitly
+  no lease" — with a bad value refused by name through a new
+  `MixRouteError::MemberStateTtl { key, value }`. A TTL with no flag `on` beside
+  it leases nothing rather than being an error, because `member_mute=off` next to
+  a leftover TTL has to stay legal.
+- `MSS_MEMBER_STATE_TTL_SECS` (default `0`) is the deployment default, resolved
+  in exactly one place — `TapPlane::control_member` rewrites `ttl_ms` before the
+  value reaches the conference — and an explicit `0` in the request outranks it.
+- The deadline lives in the **control-world mirror**: `MirroredMember` gained
+  `mute_until` / `deaf_until` / `hold_until: Option<Instant>`, written by the
+  same call that writes the flag. `Conference::control` is a wrapper over
+  `control_at(session, control, now)`.
+- Expiry: `Conference::expire_member_state(now)` finds the passed deadlines and
+  applies them by calling **`control_at` with `MemberControl::releasing(..)`** —
+  the same mirror write and the same `ConferenceCommand::Control` an `off`
+  enqueues. `TapPlane::sweep_member_state(now)` runs it over every conference
+  under one lock, drops the lock, and publishes the observations.
+  `main.rs` spawns the daemon's **first housekeeping tick** — a
+  `tokio::time::interval` of 500 ms, `MissedTickBehavior::Delay` — that calls it.
+  **`Mixed::run` is untouched:** no timer, no new work, and it cannot tell an
+  expiry from an `off`.
+- Event: `EventKind::MemberControlled` gained `cause: MemberControlCause
+  { Requested, Expired }`, proto `MemberControlled.cause = 4` with
+  `MEMBER_CONTROL_CAUSE_REQUESTED = 0`. Read-back: `MemberState`
+  `.{mute,deaf,hold}_expires_in_ms = 6,7,8` (0 = no lease), filled from the
+  mirror. **All additive — next free `Session` field is still 16, next free
+  `MediaEvent` payload tag is still 28.**
+- Metric `mss_conference_member_state_expired_total` (one per **flag** lifted),
+  `mss_ctl member <attachment> mute on ttl <ms>`, and `MUTE_TTL_MS` in
+  `lab/conference_drill.sh`.
+
+**Decisions, as specified and as built.**
+
+- **The lease answers "how long", never "whose".** Item 40 rejected the
+  attachment as owner and this API still does not model the caller, so nothing
+  here invents an owner: the deadline is a field beside the flag it bounds. Two
+  controllers muting the same member still race, and the last lease wins.
+- **Expiry is a control-world event applied through the write path.** The
+  alternative — a deadline the mix thread checks — would have put a timer and a
+  clock comparison per member per tick into the packet path for something the
+  control world already knows. The mirror is where item 49 put member state; the
+  deadline belongs beside it.
+- **The registry's own mirror is corrected by the expiry.**
+  `SessionRegistry::observe` maps `Observation::MemberStateExpired` through
+  `release_member_state`, which rewrites `on` to `off` in the metadata of every
+  attachment of that session **and then** folds them back together to report the
+  state that is left. Both halves matter: without the rewrite a later
+  `UpdateAttachment` would diff `member_mute=on` against a stale `on` and
+  publish nothing when a controller re-mutes; without the fold, an expiry event
+  could not say that a hold which was never leased is still held. The event takes
+  the session's next `seq` with `attachment: None`, because nobody asked for it.
+  The TTL key is deliberately left in the metadata, so a later bare
+  `member_mute=on` re-leases at the length that client last asked for.
+- **A refresh is the same request again, and publishes no event.** Resending
+  `member_mute=on` + a TTL moves the deadline out; the declared state did not
+  change, so `update_attachment`'s diff emits nothing. That is on purpose: a
+  10-second refresh loop must not put an event on Kafka every ten seconds.
+- **One ordering fix fell out of it.** `control_at` now verifies the seat,
+  **enqueues the command, and writes the mirror last**. It used to write the
+  mirror first, so a full command queue left the mirror claiming a state the mix
+  thread had never been told about — and, for an expiry, with the deadline
+  already cleared, so nothing would ever retry. Every caller of `control` gets
+  that fix.
+- **A deviation from this item's letter, and why.** The item had
+  `sweep_member_state` return the expired pairs "so the caller can emit events".
+  It does return them, but the **plane** publishes the observations, because the
+  plane is what holds the `ObservationSink` (`observe_through`) and every other
+  media-initiated event — DTMF, the recording callbacks, item 55's
+  `session_finished` — goes out that way; `main.rs` only logs a count. The
+  returned pairs are what the unit tests assert against.
+
+**Verified — unit tests, in-process, on real UDP and real gRPC sockets. The lab
+Docker stack was down for this session (Docker Desktop not running), so the
+conference drill did not run.**
+
+| Test | What it proves |
+| --- | --- |
+| `tap_plane::a_muted_members_lease_lifts_the_mute_with_no_off_and_a_refresh_holds_it` | the whole loop on three real conference peers: a mute with a 500 ms lease is heard by nobody (alice hears carol alone at ≈4000, the mixed track ≈5000) **and stays muted past its own deadline for as long as nobody sweeps** — the mix thread keeps no timer, which is the invariant in one assertion; a refresh with a 60 s TTL then makes the sweep a no-op; a sweep at the new deadline releases exactly `mute: Some(false)` (and `deaf: None`), is observed once as `Observation::MemberStateExpired` on bob's own session, counts one `member_state_expired`, and alice hears bob again (≈6000, mixed ≈7000) **with no `off` ever sent** |
+| `tap_plane::a_deployment_default_leases_a_member_flag_that_names_no_ttl_of_its_own` | `MSS_MEMBER_STATE_TTL_SECS`' half: a `member_deaf=on` that names no TTL counts down from the pod's 400 ms default and is swept away; an explicit `member_state_ttl_ms=0` outranks that default and is **never** swept, even an hour later — the pre-lease behaviour, on demand |
+| `tap_plane::a_leased_member_flag_counts_down_over_the_wire_and_expires_as_its_own_cause` (`WiredRoom`, a real `MediaControlClient` over TCP) | the wire: `DescribeSession` reports `mute_expires_in_ms` inside `1..=60000` with the two unleased flags at `0`; a `WatchEvents` stream on that member then receives `MemberControlled{mute: false, cause: MEMBER_CONTROL_CAUSE_EXPIRED}`, and a second Describe reads the flag off with no lease left |
+| `session-core::registry::a_member_state_lease_that_runs_out_is_audited_as_expired_and_leaves_the_metadata_off` | the registry half: the expiry event carries the state that is **left** (`mute: false`, the never-leased `hold: true`), takes the session's next `seq` with no attachment, flips the attachment's `member_mute` metadata to `off` and leaves `member_hold` alone — and re-muting afterwards is a real change that publishes `cause: Requested` rather than being swallowed by a stale mirror |
+| `session-core::mix::a_member_flag_may_carry_a_lease_and_absent_still_means_it_holds_forever` | the parser: absent → `None` → the deployment default; one TTL applying to every flag `on` in the request; a trimmed value; an explicit `0` outranking the default; a TTL alone leasing nothing; and two refusals by the key's own name |
+| `session-core::mix::a_release_names_only_the_flags_whose_lease_ran_out` | `MemberControl::releasing` is `Some(false)` for the expired flags and `None` for the rest — an expiry is byte-for-byte the value an `off` produces |
+| `metrics::the_exposition_counts_the_member_state_leases_this_pod_lifted_itself` | the counter is declared and rendered on a pod with no conference at all |
+| the pre-existing member-verb, whisper, room and read-back tests | unchanged and green: with no TTL anywhere, nothing about member state moved |
+
+Gate, run as separate commands: `cargo test --workspace` green (315
+mediaserverd unit tests, 70 session-core), `cargo fmt --all --check` clean,
+`cargo clippy --all-targets -- -D warnings` clean, the comment scan empty,
+`cargo deny check all` clean.
+
+**Owed.**
+
+1. **`lab/conference_drill.sh` has not run.** Its mute phase is updated per this
+   item and `sh -n` clean: with `MUTE_TTL_MS` set (it must exceed the mute
+   window, or the drill refuses it by name) the mute is sent as
+   `member <A> mute on ttl $MUTE_TTL_MS`, the unmute phase sends **no `off`** —
+   it waits out the rest of the lease plus one sweep and fails unless
+   `mss_conference_member_state_expired_total` moved — and the existing ear
+   expectations judge the two windows unchanged. Run it the next time the lab is
+   up (`MUTE_TTL_MS=12000 ./lab/conference_drill.sh`) and put the numbers in
+   [lab.md](lab.md).
+2. Nothing here has been judged by a human ear, and no lease has ever bounded a
+   **SIP** peer's mute.
+
+**Residual.**
+
+- **The lease is pod-local.** It is an `Instant` in one pod's memory, so it
+  neither survives a pod loss nor moves with a member. Conferences are pod-bound
+  anyway (D16's residual), so this adds no new exposure — but a controller cannot
+  treat a TTL as a durable promise.
+- **Still no owner.** The lease bounds member state without deciding whose it is,
+  which is the honest scope: concurrent controllers still race and the last lease
+  wins, and a member muted by a policy engine with no TTL is exactly as
+  unreclaimable as it was before.
+- **Half a second of slack.** The sweep runs every 500 ms, so a flag lifts up to
+  that late. Anything tighter would either poll harder in the control world or
+  put a clock in the mix thread.
+- **A refresh is silent on the bus** (no state change, no event), so an auditor
+  cannot see refreshes — only the set, and the lift.
+
+### 56b. (original description, for reference) Member state with a lease
 **Where:** `crates/session-core/src/{mix.rs,event.rs,registry.rs}`,
 `crates/mediaserverd/src/{conference.rs,tap_plane.rs,main.rs,metrics.rs}`,
 `crates/control-api/src/convert.rs`, `proto/mediacontrol.proto` (fields only),
@@ -3881,7 +4016,7 @@ sample, visible only as a growing `mss_rtpengine_sample_age_seconds`.
 | ~~D23~~ | ~~**A padded recording-group member lost its pad's worth of audio off the tail.** `Segmenter::close_segment` subtracted the closed frames from `segment_start` (the lead-silence offset) *and* advanced `anchor_ms` by the same frames, so every spill moved a late joiner's timeline forward by the pad twice~~ — **found and fixed 2026-08-24 (item 41)**: the anchor now advances only by `frames - segment_start`. Invisible to every earlier test because an ungrouped recording has `segment_start == 0` and item 29's group drill (5 s stagger, 20 s run) never reached the 30 s spill. Live in the conference drill: `party-c.wav` **55.88 s against 66.16/66.24** before, **72.10 against 71.96/72.02** after, with the 10.66 s pad still at the front. Guarded by `a_padded_member_keeps_its_whole_tail_across_a_spill`, which fails by exactly the lead if the fix is reverted | `recorder.rs` | closed |
 | ~~D20~~ | ~~**A room recording belongs to a member, not to the conference.**~~ — **fixed 2026-08-27 (item 55)**: `CreateSession{kind=MIX, group=<conference>}` opens the room itself as a session with no leg. The conference stamps its own open (`opened_at_wall`) and publishes its full sum into a **room hub** on the conference clock; a `FILE_S3 only=mixed` attachment on the room session records from that open to the room's close, so a member leaving no longer ends the object — and `group_anchor_for` now gives the per-participant group the **same** anchor, which makes the two shapes sample-aligned whenever they are attached. The room session ends on `EndSession` or by itself once the conference has held a member and emptied (`MSS_CONFERENCE_LINGER_SECS`, default 0), uploading its object; `DescribeSession` on it reports the conference's `opened_at_unix_ms` and its members, and every member names the room back (`ConferenceView.room_session`). **Verified over in-process UDP sockets and the recording fakes only** — including the room object outliving the member who left, and a room recording opened before anybody joined; `lab/conference_drill.sh` is rewritten to record through the room session, with a **leave** phase and a length comparison that is exactly this defect, and has **never run** (the lab stack was down). **What remains:** that run, and the residuals in item 55 — an INJECT on the room is a prompt path rather than a full-duplex one, a room-opened conference fixes its format from the pod's tap format, and a room is still pod-local and never adopted | `tap_plane.rs`, `conference.rs` | closed (the drill owed) |
 | ~~D21~~ | ~~**DTMF digits never reach the event bus.** A tapped or inline leg's digits are delivered to consumers (WS `dtmf` frames, gRPC `DtmfFrame`) and counted in `mss_ingest_dtmf_digits_total`, but nothing publishes `Observation::Dtmf`, so `mss.events` carries no digit~~ — **fixed 2026-08-26 (item 48)**: every press on a tap leg or an inline leg is published as a session-level `MediaEvent` carrying `digit`, `track` (attribution-aware, so `leg_a`/`leg_b` when unproven), `duration_ms` (through the negotiated RTP clock) and the event's `rtp_timestamp`. **No capability and no consumer**: unlike `SpeechReport`, which a consumer *claims* and which is gated on `CAPABILITY_EVENTS`, a digit is a property of the call MSS decoded itself, so it goes out whenever the session exists. RFC 4733's three end retransmissions stay one event. The capture thread hands presses to the control plane over a bounded lock-free queue that counts refusals (`mss_dtmf_events_dropped_total`) rather than blocking the media path. Live-proved with no consumer attached (`lab/dtmf_event_drill.sh`). **Residual, by design:** MSS interprets no digit — no menu, no collection, no inter-digit timer (item 40: conference control is API-first) — and nothing rate-limits presses beyond the queue's drop counter | `digits.rs`, `tap_spike.rs`, `tap_plane.rs`, `registry.rs` | closed |
-| D22 | 🔶 **Member state has no owner and no lease** — read-back landed (item 49, 2026-08-26): `DescribeSession` on a member session reports its `mute`/`deaf`/`hold`, its mix routes and the room's members, read from the control-world mirror. What remains: `member_mute`/`member_deaf`/`member_hold` still outlive the attachment that set them (item 40) with no expiry, so a controller that dies between `on` and `off` leaves a member muted for the life of the conference — recoverable now by reconciling the room on reconnect, but nothing reclaims it. A lease needs an owner this API does not model (item 40 rejected the attachment as owner) | `conference.rs`, `tap_plane.rs`, `registry.rs` | medium once a tenant drives mute from a UI |
+| ~~D22~~ | ~~**Member state has no owner and no lease**~~ — **read-back 2026-08-26 (item 49), lease 2026-08-27 (item 56)**: `DescribeSession` on a member session reports its `mute`/`deaf`/`hold` (now with `*_expires_in_ms` beside each), its mix routes and the room's members, and `member_state_ttl_ms` on the same request that sets a flag `on` says how long it holds without a refresh — `MSS_MEMBER_STATE_TTL_SECS` is the deployment default, a 500 ms control-world sweep lifts what runs out **through the same `Conference::control` path an explicit `off` takes**, and the lift is published as `MemberControlled{cause=EXPIRED}` and counted by `mss_conference_member_state_expired_total`. So a controller that dies between `on` and `off` now costs one lease rather than the life of the conference. **Residual:** the lease is pod-local (an `Instant` in one pod's memory: it neither survives a pod loss nor moves with a member), there is still **no owner** — item 40 rejected the attachment and this API does not model the caller, so two controllers muting one member race and the last lease wins — a flag lifts up to one sweep (500 ms) late, and with no TTL, still the default, member state holds until an `off` exactly as before. Verified by unit tests on real sockets; the `MUTE_TTL_MS` variant of `conference_drill.sh` is owed | `conference.rs`, `tap_plane.rs`, `registry.rs` | closed (residual documented) |
 | ~~D16~~ | ~~**A recording group is one pod's memory.**~~ — **fixed 2026-08-27 (item 54)**: the group moved into the session store. `mss:group:<account>/<group>` (`SET NX`, so two first-members on two pods agree on one recording and one anchor) plus a `mss:group:…:members` hash keyed by object key and valued by owner pod (`HSETNX` is the duplicate-participant refusal, and it can now name the pod holding the seat), both expiring at `MAX_RECORDING + 1 h`. A member may attach on **any** pod, `registry_keeper::rebuild` **rebuilds** a grouped attachment with its group instead of skipping it (`grouped_not_adopted` is deleted), and a reused group name joins the existing group instead of opening a second half-recording under the same prefix. The group's open instant became **wall-clock** (`SystemTime`) so two pods can share it, which makes cross-pod alignment as good as the nodes' NTP — deploy.md says so beside the new key table. A store MSS cannot read is a **refusal** of the grouped attachment, counted, never a silent local group. **Verified against `MemorySessionStore` and the in-crate recording fakes only** — including two planes sharing one store whose second pod's object opens with the lead silence back to the first pod's anchor; the env-gated Redis `SET NX` race test and `PODS=2 lab/group_recording_drill.sh` are written but have **never run**. **What remains:** those two runs, and placement (D8) — which is now an optimisation rather than a correctness requirement | `session_store.rs`, `tap_plane.rs`, `registry_keeper.rs`, `recorder.rs` | closed (two runs owed) |
 | ~~D13~~ | ~~`StreamStart` (and the Twilio `start` frame's `tracks`) advertises `["customer","agent"]` for `TrackSelector::All`, but a silent `mixed` track is delivered too~~ — **fixed 2026-08-23 (item 27)**: the hub selection split into `All` (every track, including `mixed`) and `Speakers` (customer + agent). Consumers get `Speakers`, so delivery matches the advertisement exactly; the **recorder keeps `All`** because injected bot speech belongs in the recording. The frozen Twilio start frame and `StreamStart.tracks` were not touched — the delivery was brought in line with them. A consumer that wants the injected track can still ask for it by name (`TrackSelector::Only(Mixed)`). Replay-verified | `hub.rs`, `tap_plane.rs` | closed |
 | ~~D17~~ | ~~**Leg labels invert when the caller's from-tag is not given.** With `from_tags` unspecified (`-`), `TapPlane` labels the two legs in the order rtpengine's `query` returns them, and in the two-node drill that put **FreeSWITCH's** tag first — so `customer` and `agent` were swapped in the recording and in the `tracks` a consumer sees~~ — **fixed 2026-08-26 (item 47)**: the order was in fact `BTreeMap` order, i.e. lexicographic by tag. MSS now refuses to name a direction it cannot back up: `attribution=explicit` when a from-tag was supplied (and for every inline leg), `inferred` when rtpengine's per-participant `created` seconds strictly order the legs, `unknown` otherwise — and under `unknown` the gRPC tracks, the event payload tracks and the recording object keys are `leg_a`/`leg_b`, with a WARN log, a `LegsAttributed` event and `attribution` on `DescribeSession` and on every event envelope. The frozen WS Twilio names never move. Live-proved on a call built to invert (callee tag sorting first): `unknown` + `leg_a`/`leg_b` with no from-tag, `explicit` + `customer`/`agent` with one. **Residual, and it is the vendor's:** `created` is stamped per *dialogue*, so the two legs of one call always tie — `inferred` cannot fire for a two-party call on rtpengine 14.1.1.8, and an integrator who needs speaker attribution **must** pass the caller's from-tag (`docs/deploy.md`, "Leg attribution") | `tap_plane.rs`, `attribution.rs` | closed (residual is the vendor's) |
@@ -3994,5 +4129,6 @@ Appendix B. Item 41 judged all of it on **real sockets**: three container peers
 at 440/880/1320 Hz in one conference, **twenty tone-per-phase assertions green**
 at a ≥30:1 margin, and both recording shapes in MinIO at once. What the phase
 owes is deployment-gated (a SIP proxy's B2B leg into a conference, a pilot) plus
-the defects it left open: D16 and D20, with D21 closed by item 48 and D22 half
-closed by item 49 (read-back landed, no lease).
+the defects it left open: D16 (closed by item 54) and D20 (closed by item 55),
+with D21 closed by item 48 and D22 closed by items 49 and 56 (read-back, then a
+lease; no owner, by design).

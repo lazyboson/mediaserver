@@ -227,6 +227,7 @@ key. Two operational consequences:
 | --- | --- | --- | --- | --- |
 | `MSS_DRAIN_TIMEOUT_SECS` | `30` | Ceiling on the whole shutdown drain: stop accepting, hand registry leases to an adopter, close every session politely (consumer stop frames, recordings finished, taps unsubscribed), flush the event backlog. The process exits **0** whether or not the window is used up; a second SIGTERM/SIGINT exits at once. `0` means "stop accepting and exit". Set `terminationGracePeriodSeconds` **at or above** it — with `docker stop`, whose default grace is 10 s, pass `-t` above it | raise it if long calls need longer to close politely; the grace period must follow | [item 42](tasks.md) |
 | `MSS_CONFERENCE_LINGER_SECS` | `0` | How long a conference whose **room session** is open is held after its last member leaves. `0` (the default) ends the room session on the last leave — its room recording is closed and uploaded there and then. A non-zero value keeps the mix running and the room session open for that long, so a member who rejoins inside the window lands back in the same room, on the same clock, still recording into the same object; a rejoin cancels the wait. A conference with **no** room session is unaffected: its last member out always closes it | raise it a few seconds if your call flow drops the last leg and dials back in (a transfer, a re-INVITE the proxy handles by re-dialling) and you want one recording rather than two | [item 55](tasks.md) |
+| `MSS_MEMBER_STATE_TTL_SECS` | `0` | The **default lease** on a conference member flag: how long a `member_mute` / `member_deaf` / `member_hold` set `on` holds without being refreshed when the request itself names no `member_state_ttl_ms`. `0` (the default) means no lease — the flag holds until an explicit `off`, exactly as it did before item 56. A request may always override this per call, and an explicit `member_state_ttl_ms=0` outranks it | set it to a little longer than your UI's refresh interval (say `30`) when a tenant drives mute from a screen, so a controller that dies costs one lease rather than the life of the conference. Leave it `0` when member state is owned by a policy engine that will reconcile it | [item 56](tasks.md) |
 | `MSS_HEALTH_PROBE_INTERVAL_SECS` | `10` | How often the background watchers re-probe each **configured** dependency for `/readyz`: Redis `PING`, a Kafka partition-offset read, NG `ping`. A failing dependency is re-probed sooner — 1 s, 2, 4, 8, then this interval — so a restarted dependency is picked up quickly; a probe that hangs is a failure after 15 s. The request path never probes, so this bounds only how stale a `/readyz` answer can be | lower for a faster readiness reaction, raise to cut chatter | [item 44](tasks.md) |
 
 ### Lab instruments — never set these in a deployment
@@ -569,9 +570,51 @@ the way not to have it.
 `mute`/`deaf`/`hold`, its mix routes (target, source, whether the recording feed
 carries it, and the attachment that owns each) and the room it sits in — group
 name, member count and every member's external id — so a UI can reconcile a whole
-room from any one member, with no extra RPC. Member state has **no lease**: if
-your controller dies between `mute on` and `mute off` the member stays muted for
-the life of the conference, so reconcile on reconnect rather than assuming.
+room from any one member, with no extra RPC.
+
+### The lease, and the refresh loop a UI should run
+
+By default a member flag holds until an explicit `off`: if your controller dies
+between `mute on` and `mute off`, the member stays muted for the life of the
+conference. Since item 56 a request may bound that with a **lease**.
+
+- **`member_state_ttl_ms`** is a fourth metadata key on the same `Attach` /
+  `UpdateAttachment` that carries the verbs. It applies to **every flag set `on`
+  in that request**, and is a whole number of milliseconds; anything else is
+  refused by name. Absent, or `0`, means no lease.
+- **`MSS_MEMBER_STATE_TTL_SECS`** is the deployment default for a request that
+  names no `member_state_ttl_ms`. An explicit `0` in the request outranks it.
+- **A refresh is any request that sets the flag `on` again with a TTL** — the
+  same `UpdateAttachment`, resent. There is no separate renew verb, and
+  resending the identical metadata is enough: MSS moves the deadline out even
+  though the declared state did not change (so no `MemberControlled` event is
+  published for a refresh that changed nothing).
+- **`off` clears the flag and its deadline** and is still how you lift a mute
+  early.
+- **Reading it back:** `DescribeSession` fills
+  `MemberState.{mute,deaf,hold}_expires_in_ms` with the milliseconds left. `0`
+  means no lease, which is also what an unset flag reports.
+- **When a lease runs out** the pod lifts the flag itself, through exactly the
+  path an explicit `off` takes, and publishes `MemberControlled` with
+  `cause = MEMBER_CONTROL_CAUSE_EXPIRED` and the member's whole remaining state
+  (a hold that was never leased stays `true`). `REQUESTED` is the zero value, so
+  a consumer written before item 56 reads every controller-driven event
+  unchanged. `mss_conference_member_state_expired_total` counts the flags lifted.
+
+**The loop a UI should run:** pick a TTL comfortably longer than your refresh
+interval — 30 s TTL refreshed every 10 s is a reasonable shape — resend the
+`UpdateAttachment` on that interval while the screen holds the member muted, and
+send `off` when the operator unmutes. Then a browser tab that closes, a pod that
+restarts or a controller that crashes costs at most one TTL of unwanted mute
+instead of the rest of the call. Watch
+`mss_conference_member_state_expired_total`: in a healthy deployment it stays
+near zero, because refreshes arrive before the deadlines do.
+
+**Two limits worth knowing.** The lease is **pod-local** — it lives in the
+control-world mirror beside the flag, so it does not survive a pod loss and does
+not move with a member (conferences are pod-bound anyway). And the deadline is
+checked by a control-world sweep every 500 ms, so a flag lifts up to half a
+second after its lease runs out; nothing in the media path holds a timer.
 
 ## Attachment metadata — the `mss.` prefix is reserved
 
@@ -579,8 +622,8 @@ the life of the conference, so reconcile on reconnect rather than assuming.
 a handful of keys out of it: `accountId`, `streamSid`, `callSid`, `recordId`,
 `fileFormat`, `recordingChannels`, `sipCallId`, `callerTag`, and the conference
 verbs `mix_target` / `mix_monitor` / `mix_source` / `member_mute` /
-`member_deaf` / `member_hold`. Everything else is yours and is passed through
-untouched — **except any key beginning `mss.`**, which is refused with
+`member_deaf` / `member_hold` / `member_state_ttl_ms`. Everything else is yours
+and is passed through untouched — **except any key beginning `mss.`**, which is refused with
 `INVALID_ARGUMENT` naming the key.
 
 That prefix is how mediaserverd's own session registry talks to itself: when a
@@ -737,6 +780,14 @@ configured, because the gauges are per pod.
 | `mss_recording_groups_live` | recording groups with at least one member **on this pod**. Sum across pods to see a cross-pod group counted once per pod that holds a member of it |
 | `mss_recording_group_members_live` | members of those groups on this pod. One per `FILE_S3` attachment that named a group |
 | `mss_recording_group_joins_refused_total` | grouped attachments refused, by one of four reasons the log names: a participant label already writing that object (now including one held **by another pod**), a member naming a different `recordingID` or format inside an existing group, a non-empty group on any transport but `FILE_S3`, and — since item 54 — a **session registry MSS could not read**. That last one is deliberate: a member that cannot see the group would open a second half-recording under the same prefix, so it is refused instead |
+
+### Conference member state series (item 56)
+
+| Series | Meaning |
+| --- | --- |
+| `mss_conference_member_controls_total` | times a member was muted, deafened, put on hold or released — every write, whether a controller asked or a lease expired |
+| `mss_conference_member_state_expired_total` | **member flags this pod lifted by itself** because their lease ran out unrefreshed. One per flag, not per member: a mute and a deaf expiring together count two. A rising rate means controllers are setting leases and not refreshing them — either their refresh loop is broken or `MSS_MEMBER_STATE_TTL_SECS` is shorter than the interaction it is bounding. Flat at zero on a pod whose clients send no TTL is expected |
+| `mss_conference_muted_members` / `mss_conference_deaf_members` / `mss_conference_held_members` | how many members are in that state right now, on this pod. These say *how many*, never *who* — `DescribeSession` per member says who |
 
 ### rtpengine node series (item 57)
 

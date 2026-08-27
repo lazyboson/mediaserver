@@ -29,10 +29,13 @@ mss_ctl <endpoint> mix <attachment-id> <own|all|member-external-id> [include|exc
    conference's mixed track carries it (default: include for a whisper or a
    barge, exclude for private playback); leg routes the member's OWN rtp
    instead of the injected audio, which is the coach-listen shape
-mss_ctl <endpoint> member <attachment-id> <mute|deaf|hold> <on|off> [more pairs]
+mss_ctl <endpoint> member <attachment-id> <mute|deaf|hold|ttl> <on|off|ms> [more pairs]
    member verbs ride on any attachment of the member's session: mute silences
    that member everywhere, deaf silences the room into their ear, hold is both
-   and leaves the playback path open for hold audio
+   and leaves the playback path open for hold audio; ttl <ms> leases every flag
+   set on in the same call, so MSS lifts it by itself if nothing refreshes it
+   (0 or absent = it holds until an off, which is the pod default unless
+   MSS_MEMBER_STATE_TTL_SECS says otherwise)
 mss_ctl <endpoint> detach <attachment-id>
 mss_ctl <endpoint> play <external-id> <wav-path> [target-tag]
    on an inline leg the target is own (its own ear, the default) or all
@@ -315,8 +318,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     "mute" => "member_mute",
                     "deaf" => "member_deaf",
                     "hold" => "member_hold",
+                    "ttl" => "member_state_ttl_ms",
                     other => {
-                        eprintln!("member takes mute|deaf|hold, not {other:?}");
+                        eprintln!("member takes mute|deaf|hold|ttl, not {other:?}");
                         std::process::exit(2);
                     }
                 };

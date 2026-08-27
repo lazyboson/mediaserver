@@ -14,6 +14,7 @@ pub const MIX_SOURCE_LEG: &str = "leg";
 pub const MEMBER_MUTE_METADATA_KEY: &str = "member_mute";
 pub const MEMBER_DEAF_METADATA_KEY: &str = "member_deaf";
 pub const MEMBER_HOLD_METADATA_KEY: &str = "member_hold";
+pub const MEMBER_STATE_TTL_METADATA_KEY: &str = "member_state_ttl_ms";
 pub const MEMBER_FLAG_ON: &str = "on";
 pub const MEMBER_FLAG_OFF: &str = "off";
 
@@ -43,6 +44,7 @@ pub struct MemberControl {
     pub mute: Option<bool>,
     pub deaf: Option<bool>,
     pub hold: Option<bool>,
+    pub ttl_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -63,6 +65,9 @@ pub struct MemberStateView {
     pub hold: bool,
     pub source: MixSource,
     pub routes: Vec<MemberRouteView>,
+    pub mute_expires_in_ms: u64,
+    pub deaf_expires_in_ms: u64,
+    pub hold_expires_in_ms: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -79,6 +84,11 @@ pub enum MixRouteError {
     SourceWithoutTarget,
     #[error("{key} is \"on\" or \"off\", not {value:?}")]
     MemberFlag { key: String, value: String },
+    #[error(
+        "{key} is how many milliseconds a member flag holds without being refreshed, \
+         so it is a whole number and 0 means no lease, not {value:?}"
+    )]
+    MemberStateTtl { key: String, value: String },
 }
 
 impl MixRoute {
@@ -175,16 +185,46 @@ impl MemberControl {
                 value: other.to_string(),
             }),
         };
+        let ttl_ms = match metadata
+            .get(MEMBER_STATE_TTL_METADATA_KEY)
+            .map(|value| value.trim())
+        {
+            None => None,
+            Some(carried) => {
+                Some(
+                    carried
+                        .parse::<u64>()
+                        .map_err(|_| MixRouteError::MemberStateTtl {
+                            key: MEMBER_STATE_TTL_METADATA_KEY.to_string(),
+                            value: carried.to_string(),
+                        })?,
+                )
+            }
+        };
         let control = MemberControl {
             mute: flag(MEMBER_MUTE_METADATA_KEY)?,
             deaf: flag(MEMBER_DEAF_METADATA_KEY)?,
             hold: flag(MEMBER_HOLD_METADATA_KEY)?,
+            ttl_ms,
         };
         Ok((!control.is_empty()).then_some(control))
     }
 
     pub fn is_empty(&self) -> bool {
         self.mute.is_none() && self.deaf.is_none() && self.hold.is_none()
+    }
+
+    pub fn lease_ms(&self, default_ms: u64) -> u64 {
+        self.ttl_ms.unwrap_or(default_ms)
+    }
+
+    pub fn releasing(mute: bool, deaf: bool, hold: bool) -> MemberControl {
+        MemberControl {
+            mute: mute.then_some(false),
+            deaf: deaf.then_some(false),
+            hold: hold.then_some(false),
+            ttl_ms: None,
+        }
     }
 
     pub fn muted(&self) -> bool {
@@ -335,7 +375,8 @@ mod tests {
             MemberControl {
                 mute: Some(true),
                 deaf: None,
-                hold: None
+                hold: None,
+                ttl_ms: None
             }
         );
         assert!(muted.muted() && !muted.deafened() && !muted.held());
@@ -355,6 +396,85 @@ mod tests {
                 value: "yes".to_string()
             })
         );
+    }
+
+    #[test]
+    fn a_member_flag_may_carry_a_lease_and_absent_still_means_it_holds_forever() {
+        let held = MemberControl::from_metadata(&metadata(&[("member_mute", "on")]))
+            .unwrap()
+            .unwrap();
+        assert_eq!(held.ttl_ms, None, "no key is no lease");
+        assert_eq!(
+            held.lease_ms(0),
+            0,
+            "and no deployment default leaves it held until a controller says otherwise"
+        );
+        assert_eq!(
+            held.lease_ms(30_000),
+            30_000,
+            "a deployment default applies to a request that carries none"
+        );
+        let leased = MemberControl::from_metadata(&metadata(&[
+            ("member_mute", "on"),
+            ("member_deaf", "on"),
+            ("member_state_ttl_ms", " 300 "),
+        ]))
+        .unwrap()
+        .unwrap();
+        assert_eq!(leased.ttl_ms, Some(300));
+        assert_eq!(
+            leased.lease_ms(30_000),
+            300,
+            "one ttl applies to every flag set on in the same request"
+        );
+        let unleased = MemberControl::from_metadata(&metadata(&[
+            ("member_mute", "on"),
+            ("member_state_ttl_ms", "0"),
+        ]))
+        .unwrap()
+        .unwrap();
+        assert_eq!(unleased.ttl_ms, Some(0));
+        assert_eq!(
+            unleased.lease_ms(30_000),
+            0,
+            "an explicit 0 means no lease, and outranks the deployment default"
+        );
+        assert_eq!(
+            MemberControl::from_metadata(&metadata(&[("member_state_ttl_ms", "300")])),
+            Ok(None),
+            "a ttl on its own leases nothing, because it qualifies a flag set on"
+        );
+        assert_eq!(
+            MemberControl::from_metadata(&metadata(&[
+                ("member_mute", "on"),
+                ("member_state_ttl_ms", "a while")
+            ])),
+            Err(MixRouteError::MemberStateTtl {
+                key: "member_state_ttl_ms".to_string(),
+                value: "a while".to_string()
+            })
+        );
+        assert!(
+            MemberControl::from_metadata(&metadata(&[
+                ("member_mute", "on"),
+                ("member_state_ttl_ms", "-1")
+            ]))
+            .unwrap_err()
+            .to_string()
+            .contains("member_state_ttl_ms"),
+            "a negative lease is refused by the key's name"
+        );
+    }
+
+    #[test]
+    fn a_release_names_only_the_flags_whose_lease_ran_out() {
+        let expired = MemberControl::releasing(true, false, true);
+        assert_eq!(expired.mute, Some(false));
+        assert_eq!(expired.deaf, None);
+        assert_eq!(expired.hold, Some(false));
+        assert_eq!(expired.ttl_ms, None, "a release leases nothing");
+        assert!(!expired.is_empty());
+        assert!(MemberControl::releasing(false, false, false).is_empty());
     }
 
     #[test]
