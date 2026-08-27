@@ -17,7 +17,7 @@
 #
 #   DOCKER_API_VERSION=1.43 docker compose -f lab/docker-compose.microsip.yml \
 #     -f lab/docker-compose.webrtc.yml up -d rtpengine opensips freeswitch \
-#     call-watcher redpanda redis minio minio-init llm-bridge mss-control \
+#     call-watcher redpanda redis minio minio-init mock-bridge mss-control \
 #     mss-control-b
 #   ./lab/drain_drill.sh
 #
