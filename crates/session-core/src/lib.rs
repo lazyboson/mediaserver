@@ -10,7 +10,7 @@ pub mod registry;
 
 pub use attribution::Attribution;
 pub use capability::{Capabilities, Transport};
-pub use event::{ConsumerEvent, EventKind, MediaEvent, Observation};
+pub use event::{ConsumerEvent, EventKind, MediaEvent, MemberControlCause, Observation};
 pub use ids::{AttachmentId, IdParseError, PlaybackId, SessionId};
 pub use metadata::{
     reserved_metadata_key, reserved_metadata_refusal, RESERVED_METADATA_PREFIX,

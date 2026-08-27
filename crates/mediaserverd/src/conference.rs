@@ -40,6 +40,7 @@ pub struct ConferenceTotals {
     pub prompt_frames: u64,
     pub rooms_live: u64,
     pub rooms_auto_ended: u64,
+    pub member_state_expired: u64,
 }
 
 #[derive(Default)]
@@ -62,6 +63,7 @@ pub struct ConferenceShared {
     pub prompt_frames: AtomicU64,
     pub rooms_live: AtomicU64,
     pub rooms_auto_ended: AtomicU64,
+    pub member_state_expired: AtomicU64,
 }
 
 impl ConferenceTotals {
@@ -85,6 +87,7 @@ impl ConferenceTotals {
         self.prompt_frames += read(&shared.prompt_frames);
         self.rooms_live += read(&shared.rooms_live);
         self.rooms_auto_ended += read(&shared.rooms_auto_ended);
+        self.member_state_expired += read(&shared.member_state_expired);
     }
 }
 
@@ -115,8 +118,31 @@ struct MirroredMember {
     mute: bool,
     deaf: bool,
     hold: bool,
+    mute_until: Option<Instant>,
+    deaf_until: Option<Instant>,
+    hold_until: Option<Instant>,
     route: MixRoute,
     route_owner: Option<AttachmentId>,
+}
+
+impl MirroredMember {
+    fn lease_expired(held: bool, until: Option<Instant>, now: Instant) -> bool {
+        held && until.is_some_and(|deadline| deadline <= now)
+    }
+
+    fn expired_flags(&self, now: Instant) -> MemberControl {
+        MemberControl::releasing(
+            MirroredMember::lease_expired(self.mute, self.mute_until, now),
+            MirroredMember::lease_expired(self.deaf, self.deaf_until, now),
+            MirroredMember::lease_expired(self.hold, self.hold_until, now),
+        )
+    }
+
+    fn remaining_ms(until: Option<Instant>, now: Instant) -> u64 {
+        until
+            .map(|deadline| deadline.saturating_duration_since(now).as_millis() as u64)
+            .unwrap_or(0)
+    }
 }
 
 pub struct RoomSeat {
@@ -297,6 +323,9 @@ impl Conference {
             mute: false,
             deaf: false,
             hold: false,
+            mute_until: None,
+            deaf_until: None,
+            hold_until: None,
             route: MixRoute::private(),
             route_owner: None,
         });
@@ -325,21 +354,81 @@ impl Conference {
         session: SessionId,
         control: MemberControl,
     ) -> Result<(), ConferenceError> {
-        let mirrored = self
-            .mirrored(session)
+        self.control_at(session, control, Instant::now())
+    }
+
+    pub fn control_at(
+        &mut self,
+        session: SessionId,
+        control: MemberControl,
+        now: Instant,
+    ) -> Result<(), ConferenceError> {
+        let lease = control
+            .ttl_ms
+            .filter(|ms| *ms > 0)
+            .map(|ms| now + Duration::from_millis(ms));
+        let seat = self
+            .members
+            .iter()
+            .position(|held| held.session == session)
             .ok_or(ConferenceError::NotSeated(session))?;
+        self.commands
+            .push(ConferenceCommand::Control { session, control })
+            .map_err(|_| ConferenceError::Busy)?;
+        let mirrored = &mut self.members[seat];
         if let Some(mute) = control.mute {
             mirrored.mute = mute;
+            mirrored.mute_until = mute.then_some(lease).flatten();
         }
         if let Some(deaf) = control.deaf {
             mirrored.deaf = deaf;
+            mirrored.deaf_until = deaf.then_some(lease).flatten();
         }
         if let Some(hold) = control.hold {
             mirrored.hold = hold;
+            mirrored.hold_until = hold.then_some(lease).flatten();
         }
-        self.commands
-            .push(ConferenceCommand::Control { session, control })
-            .map_err(|_| ConferenceError::Busy)
+        Ok(())
+    }
+
+    pub fn expire_member_state(&mut self, now: Instant) -> Vec<(SessionId, MemberControl)> {
+        let due: Vec<(SessionId, MemberControl)> = self
+            .members
+            .iter()
+            .map(|held| (held.session, held.expired_flags(now)))
+            .filter(|(_, expired)| !expired.is_empty())
+            .collect();
+        let mut released = Vec::new();
+        for (session, expired) in due {
+            match self.control_at(session, expired, now) {
+                Ok(()) => {
+                    let flags = [expired.mute, expired.deaf, expired.hold]
+                        .into_iter()
+                        .filter(Option::is_some)
+                        .count() as u64;
+                    self.shared
+                        .member_state_expired
+                        .fetch_add(flags, Ordering::Relaxed);
+                    info!(
+                        %session,
+                        conference = %self.name,
+                        mute = ?expired.mute,
+                        deaf = ?expired.deaf,
+                        hold = ?expired.hold,
+                        "a member state lease ran out, so this pod lifted the flag itself"
+                    );
+                    released.push((session, expired));
+                }
+                Err(error) => warn!(
+                    %session,
+                    conference = %self.name,
+                    %error,
+                    "a member state lease ran out and the conference would not take the release; \
+                     the next sweep retries it"
+                ),
+            }
+        }
+        released
     }
 
     pub fn member_state(&self, session: SessionId) -> Option<MemberStateView> {
@@ -352,11 +441,15 @@ impl Conference {
                 attachment: member.route_owner,
             }]
         };
+        let now = Instant::now();
         Some(MemberStateView {
             seated: true,
             mute: member.mute,
             deaf: member.deaf,
             hold: member.hold,
+            mute_expires_in_ms: MirroredMember::remaining_ms(member.mute_until, now),
+            deaf_expires_in_ms: MirroredMember::remaining_ms(member.deaf_until, now),
+            hold_expires_in_ms: MirroredMember::remaining_ms(member.hold_until, now),
             source: member.route.source,
             routes,
             ..self.room_state()
@@ -381,6 +474,9 @@ impl Conference {
             mute: false,
             deaf: false,
             hold: false,
+            mute_expires_in_ms: 0,
+            deaf_expires_in_ms: 0,
+            hold_expires_in_ms: 0,
             source: MixSource::default(),
             routes: Vec::new(),
         }
