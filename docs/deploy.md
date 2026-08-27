@@ -38,6 +38,10 @@ deploy/k8s/base/                Deployment, ConfigMap, Secret template, two
                                 PrometheusRule
 deploy/k8s/overlays/hostport/     pod network + an enumerated hostPort range
 deploy/k8s/overlays/hostnetwork/  the node's network stack + a wide range
+deploy/k8s/overlays/filesystem-recording/
+                                  record to a shared RWX volume instead of a
+                                  bucket (item 58) -- compose it with one of
+                                  the two media overlays, not instead of one
 deploy/k8s/validate.sh            checks the tree without a cluster
 deploy/k8s/sync-alerts.sh         regenerates the PrometheusRule from
                                   deploy/prometheus-alerts.yaml
@@ -55,7 +59,11 @@ kubectl apply -k deploy/k8s/overlays/hostnetwork
 
 The base is **not** deployable on its own for media: it leaves the media range
 empty, so every tap socket takes an ephemeral port and no firewall can describe
-it. Pick an overlay.
+it. Pick an overlay. The two media overlays are alternatives to each other;
+`overlays/filesystem-recording` is orthogonal — it changes only where
+recordings land, and a deployment wanting both composes them in one
+kustomization of its own (`resources: [../hostnetwork, recordings-pvc.yaml]`
+plus this overlay's two patches).
 
 `base/secret.yaml` is a **template** whose every value is the literal string
 `REPLACE_ME`, carrying a banner that says so. It exists to document the key
@@ -189,6 +197,8 @@ correct for a single pod and wrong for two.
 
 | Variable | Default | Meaning | When to change | Added by |
 | --- | --- | --- | --- | --- |
+| `MSS_RECORDING_STORE` | `s3` | Which store holds the recordings: `s3` (the default, and what architecture §3 chose) or `filesystem`, a shared tree every recording pod mounts. **Any other value is a storage misconfiguration and refuses to start**, exactly as an unusable bucket does. The attachment transport stays `file-s3` either way — the wire is frozen (Constitution, Article VII); the `UploadCompleted.uri` scheme (`s3://` or `file://`) is what says which store it was | `filesystem` when there is no object store to point at, or when the pickup job downstream already watches a mounted tree | [item 58](tasks.md) |
+| `MSS_RECORDING_ROOT` | unset | Read **only** under `MSS_RECORDING_STORE=filesystem`, and then required: the absolute root of the tree holding `${accountID}/${recordingID}.${format}` (and `${accountID}/${recordingID}/${participant}.${format}` for a group) **verbatim** — the layout `record_session` produced, so an existing pickup job keeps working. At startup MSS writes, renames and deletes a probe file under it and **refuses to start** if it cannot. It must be the **same** volume on every recording pod (RWX PVC, EFS, NFS — MSS does not care which), or a cross-pod adopter finds nothing. Ignored with one warning under the `s3` store | always, with `filesystem` | [item 58](tasks.md) |
 | `MSS_RECORDING_BUCKET` | unset | The bucket holding `${accountID}/${recordingID}.${format}` — a **frozen** identity scheme (Constitution, Article VII). Unset = `file-s3` attachments are refused by name; unusable = **refuse to start** | always set it for recording | M5 |
 | `MSS_RECORDING_S3_ENDPOINT` | unset (AWS) | Endpoint URL for a non-AWS S3 API | MinIO, Ceph, any S3-compatible store | M5 |
 | `MSS_RECORDING_S3_REGION` | `us-east-1` | Region for request signing | match the bucket | M5 |
@@ -196,10 +206,26 @@ correct for a single pod and wrong for two.
 | `MSS_RECORDING_SPILL_DIR` | unset (memory only) | Closed segments spill here so a container restart does not lose them (defect D9), and this pod's leftovers are salvaged on its next start — never over an object that already exists | always set it, to a writable volume. The root filesystem is read-only and the process runs as uid 65532, so it must be a mount | [item 30](tasks.md) |
 | `MSS_RECORDING_UPLOAD_CONCURRENCY` | `4` | How many finished recordings upload at once. `Detach`/`StopRecording` never waits for an upload ([item 50](tasks.md), D11): it returns as soon as the segment is closed and `RecordingStopped` is published, and the upload runs on in the background. This bounds how many run at a time — and therefore the memory, since each holds one rendered WAV. Empty = unset = the default | raise it only if `mss_recording_uploads_in_flight` sits at the cap while calls end faster than uploads finish; lower it to protect a slow object store | [item 50](tasks.md) |
 | `MSS_RECORDING_SPILL_SECONDS` | `30` | How often a live recording spills. This **is** the worst-case audio loss when a pod dies mid-call — on the same pod always, and on **any** pod with `MSS_RECORDING_SPILL_TO=s3` | lower for shorter worst-case loss, at more IO | [item 30](tasks.md), [item 53](tasks.md) |
-| `MSS_RECORDING_SPILL_TO` | `disk` | Where the segment journal lives. `disk` is per-pod local disk (`MSS_RECORDING_SPILL_DIR`; unset there still means "no spill"), so a **cross-pod** adopter reads nothing. `s3` puts the journal in the recording bucket itself under `MSS_RECORDING_SPILL_PREFIX`, so any pod can finish a recording a dead pod started. Anything else logs a warning and means `disk` | set `s3` whenever you run more than one pod and care about recordings surviving a node loss | [item 53](tasks.md) |
+| `MSS_RECORDING_SPILL_TO` | `disk` | Where the segment journal lives. `disk` is per-pod local disk (`MSS_RECORDING_SPILL_DIR`; unset there still means "no spill"), so a **cross-pod** adopter reads nothing. `s3` puts the journal in the recording bucket itself under `MSS_RECORDING_SPILL_PREFIX`, so any pod can finish a recording a dead pod started — and it means **the recording store, whichever one it is**, so under the filesystem store the journal lands at `<root>/_spill/…` on the shared volume. `store` is the clearer synonym for `s3` and does exactly the same thing. Anything else logs a warning and means `disk` | set `s3` whenever you run more than one pod and care about recordings surviving a node loss | [item 53](tasks.md) |
 | `MSS_RECORDING_SPILL_PREFIX` | `_spill/` | The **reserved** key prefix inside the recording bucket that `MSS_RECORDING_SPILL_TO=s3` writes journals under (a missing trailing `/` is added). Nothing but MSS may write there, and nothing outside it is ever written by the spill | change it only if `_spill/` collides with keys you already have | [item 53](tasks.md) |
 
-**The bucket holds two namespaces, and only one of them is a contract.**
+**Which store.** S3 is the default and the recommendation: architecture §3 chose
+direct-to-object-store over the legacy shared-filesystem recording ("no shared
+filesystem, no SQS hop") and nothing here retracts that — a filesystem is one
+more thing that can be full, stale or slow for every pod at once, and it needs
+RWX, which not every cluster offers. Pick `filesystem` for one of two reasons:
+there is no object store to point at, or the recording pickup downstream already
+watches a mounted tree the way it watched FreeSWITCH's `record_session` output
+and you would rather keep that tree than change the consumer. Everything else is
+identical — the frozen identity, pause segmenting, recording groups, spill and
+cross-pod adoption, the `file-s3` transport name, the events — so the choice is
+one variable and is reversible for **new** recordings at any time (recordings
+already written stay where they were written; nothing migrates them).
+`lab/preflight.sh --recording-root DIR` runs the same startup probe from the
+outside, and `deploy/k8s/overlays/filesystem-recording` is the variable plus an
+RWX PVC mounted at `/var/lib/mediaserverd/recordings`.
+
+**The store holds two namespaces, and only one of them is a contract.**
 `${accountID}/${recordingID}.${format}` (and
 `${accountID}/${recordingID}/${participant}.${format}` for a recording group) is
 the frozen recording identity — Constitution, Article VII. Everything under
@@ -208,7 +234,8 @@ raw little-endian PCM chunks and a `manifest.json` per unfinished recording, of
 no use to a consumer, deleted by MSS as soon as the recording reaches its real
 key. Two operational consequences:
 
-- **Do not point a downstream consumer at the whole bucket.** Filter to the
+- **Do not point a downstream consumer at the whole bucket** (or at the whole
+  recording root). Filter to the
   identity scheme, or give `_spill/` its own exclusion, or your pipeline will
   try to play headerless `.pcm` files.
 - **Give `_spill/` a lifecycle rule: expire objects after 7 days.** MSS deletes a
@@ -853,7 +880,8 @@ Every option defaults to the `MSS_*` variable mediaserverd itself reads
 (`MSS_RTPENGINE_NODE`, `MSS_REDIS_URL`, `MSS_KAFKA_BROKERS`, `MSS_EVENTS_TOPIC`,
 `MSS_RECORDING_S3_ENDPOINT`, `MSS_RECORDING_BUCKET`, `MSS_RECORDING_S3_REGION`,
 `MSS_RECORDING_S3_ACCESS_KEY_ID`, `MSS_RECORDING_S3_SECRET_ACCESS_KEY`,
-`MSS_MEDIA_PORT_MIN`/`MAX`, `MSS_MEDIA_ADVERTISE_IP`, `MSS_TAP_LOCAL_IP`), so on
+`MSS_RECORDING_STORE`, `MSS_RECORDING_ROOT`, `MSS_MEDIA_PORT_MIN`/`MAX`,
+`MSS_MEDIA_ADVERTISE_IP`, `MSS_TAP_LOCAL_IP`), so on
 a host with the deployment's environment file sourced, bare `./preflight.sh`
 checks exactly what that deployment would use. `--json` puts a machine-readable
 report on stdout and the lines on stderr. **Exit 0 when nothing FAILed, 1 when
@@ -875,6 +903,7 @@ a pass.
 | `kafka` | TCP connect to every bootstrap broker. | No broker accepted a connection. |
 | `kafka_topic` | Produces one probe record to the topic and reads it back — **only if a `kafka` python client is importable** (`kafka-python-ng`). | The topic will not take a record. Without the library this is a `SKIP` naming the `rpk`/`kafka-topics.sh` command to run on a broker host: hand-rolling the Kafka wire protocol here would be a second implementation of what MSS already has in rskafka. |
 | `s3` | `PUT`/`HEAD`/`DELETE` of `mss-preflight/<run>.probe`, then a `HEAD` to prove it is gone — SigV4 signed in the standard library (path style). With no `--access-key`/`--secret-key` it falls back to the `aws` CLI if on PATH; the line always says which path was used. | Wrong bucket, endpoint, region or credentials — the S3 error code is in the line (`NoSuchBucket`, `SignatureDoesNotMatch`, …). |
+| `recording-root` | With `--recording-root DIR` (or `MSS_RECORDING_STORE=filesystem`): write, `fsync`, rename and delete a probe file under the root — **the same probe mediaserverd runs at startup** — and report the free space. An unknown `--recording-store` FAILs here too, because mediaserverd refuses to start on one. | The root does not exist, is not writable by uid 65532, or cannot rename (some FUSE and SMB mounts) — mediaserverd would refuse to start. A `SKIP` means the store is `s3`. It cannot tell you the volume is the **same** one on every pod: with `ReadWriteOnce` this line passes and cross-pod adoption still recovers nothing. |
 | `media_ports` | Validates the range, reports its real capacity (**even ports only**), and binds both ends locally. | Half a range set, no even port in it, or something on this host already holds it. Only meaningful when run **on** the host MSS will run on. |
 | `media_udp` | With `--ssh <rtpengine-host>`: opens a listener on the range's first even port and has the rtpengine host send it 5 datagrams (`python3`, else `nc -u`). | A firewall between rtpengine and MSS, or the wrong advertise address. Without `--ssh` it is a `SKIP`. |
 | `clock` | `chronyc tracking` (100 ms tolerance) or `timedatectl`. | The clock is not NTP-synchronised, so recording timestamps, event order and recording-group alignment cannot be trusted across pods. |

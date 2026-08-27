@@ -1,0 +1,29 @@
+# mediaserverd recording to a SHARED FILESYSTEM instead of an object store
+# (item 58). Everything else -- taps, consumers, events, the registry -- is the
+# base unchanged; this overlay changes one variable and gives the pods somewhere
+# to write.
+#
+# Use it when there is no object store to point at, or when the pickup job
+# downstream already watches a mounted tree the way it watched FreeSWITCH's
+# record_session output. S3 stays the default and the recommendation
+# (architecture 3): a shared filesystem is one more thing that can be full,
+# stale or slow for every pod at once.
+#
+# THE VOLUME MUST BE ReadWriteMany. Every recording pod mounts the same tree, so
+# a pod that adopts a dead pod's recording can read the journal it left behind.
+# With ReadWriteOnce, adoption silently recovers nothing -- and the second pod
+# will not schedule on another node at all.
+#
+# Compose it with a media overlay rather than instead of one: this overlay
+# leaves MSS_MEDIA_PORT_MIN/MAX alone, so on its own every media socket takes an
+# ephemeral port (see ../hostport, ../hostnetwork and docs/deploy.md).
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - ../../base
+  - recordings-pvc.yaml
+
+patches:
+  - path: recording-store.yaml
+  - path: deployment-recordings.yaml

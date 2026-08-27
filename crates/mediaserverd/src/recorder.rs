@@ -31,6 +31,12 @@ const ENDPOINT_ENV: &str = "MSS_RECORDING_S3_ENDPOINT";
 const REGION_ENV: &str = "MSS_RECORDING_S3_REGION";
 const ACCESS_KEY_ENV: &str = "MSS_RECORDING_S3_ACCESS_KEY_ID";
 const SECRET_KEY_ENV: &str = "MSS_RECORDING_S3_SECRET_ACCESS_KEY";
+pub const STORE_ENV: &str = "MSS_RECORDING_STORE";
+pub const ROOT_ENV: &str = "MSS_RECORDING_ROOT";
+const STORE_S3: &str = "s3";
+const STORE_FILESYSTEM: &str = "filesystem";
+const PART_SUFFIX: &str = ".part";
+const PROBE_BASENAME: &str = ".mss-recording-store-probe";
 const SPILL_DIR_ENV: &str = "MSS_RECORDING_SPILL_DIR";
 const SPILL_SECONDS_ENV: &str = "MSS_RECORDING_SPILL_SECONDS";
 pub const SPILL_TO_ENV: &str = "MSS_RECORDING_SPILL_TO";
@@ -711,6 +717,276 @@ impl RecordingSink for S3RecordingSink {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RecordingStore {
+    ObjectStore,
+    Filesystem(PathBuf),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoreDecision {
+    pub store: RecordingStore,
+    pub ignored: Vec<&'static str>,
+}
+
+pub fn decide_store(
+    configured_store: Option<&str>,
+    configured_root: Option<&str>,
+    object_store_variables_set: &[&'static str],
+) -> Result<StoreDecision, UploadError> {
+    let selected = configured_store.map(str::trim).unwrap_or_default();
+    let root = configured_root.map(str::trim).unwrap_or_default();
+    match selected.to_ascii_lowercase().as_str() {
+        "" | STORE_S3 => Ok(StoreDecision {
+            store: RecordingStore::ObjectStore,
+            ignored: if root.is_empty() {
+                Vec::new()
+            } else {
+                vec![ROOT_ENV]
+            },
+        }),
+        STORE_FILESYSTEM => {
+            if root.is_empty() {
+                return Err(UploadError::Configuration(format!(
+                    "{STORE_ENV}={STORE_FILESYSTEM} needs {ROOT_ENV}, an absolute directory \
+                     every recording pod mounts"
+                )));
+            }
+            let path = PathBuf::from(root);
+            if !path.is_absolute() {
+                return Err(UploadError::Configuration(format!(
+                    "{ROOT_ENV}={root} is not an absolute directory"
+                )));
+            }
+            Ok(StoreDecision {
+                store: RecordingStore::Filesystem(path),
+                ignored: object_store_variables_set.to_vec(),
+            })
+        }
+        _ => Err(UploadError::Configuration(format!(
+            "{STORE_ENV}={selected} names no recording store; it is \
+             {STORE_S3} or {STORE_FILESYSTEM}"
+        ))),
+    }
+}
+
+pub fn probe_recording_root(root: &Path) -> Result<(), UploadError> {
+    let unusable = |stage: &str, error: std::io::Error| {
+        UploadError::Configuration(format!(
+            "{ROOT_ENV}={} cannot hold recordings: {stage} failed: {error}",
+            root.display()
+        ))
+    };
+    std::fs::create_dir_all(root).map_err(|error| unusable("creating the root", error))?;
+    let written = root.join(format!("{PROBE_BASENAME}{PART_SUFFIX}"));
+    let landed = root.join(PROBE_BASENAME);
+    std::fs::write(&written, b"mss recording store probe\n")
+        .map_err(|error| unusable("writing a probe file", error))?;
+    if let Err(error) = std::fs::rename(&written, &landed) {
+        let _ = std::fs::remove_file(&written);
+        return Err(unusable("renaming the probe file into place", error));
+    }
+    std::fs::remove_file(&landed).map_err(|error| unusable("deleting the probe file", error))?;
+    Ok(())
+}
+
+pub struct FilesystemRecordingSink {
+    root: PathBuf,
+    owner: String,
+}
+
+impl FilesystemRecordingSink {
+    pub fn new(root: PathBuf, owner: &str) -> FilesystemRecordingSink {
+        let trimmed = root.to_string_lossy().trim_end_matches('/').to_string();
+        let root = if trimmed.is_empty() {
+            root
+        } else {
+            PathBuf::from(trimmed)
+        };
+        let owner: String = owner
+            .chars()
+            .map(|letter| {
+                if letter.is_ascii_alphanumeric() || letter == '-' || letter == '_' {
+                    letter
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+        let owner = if owner.is_empty() {
+            "mediaserverd".to_string()
+        } else {
+            owner
+        };
+        FilesystemRecordingSink { root, owner }
+    }
+
+    fn resolve(&self, key: &str) -> Result<PathBuf, UploadError> {
+        let refused = |reason: &str| UploadError::Key(key.to_string(), reason.to_string());
+        if key.is_empty() {
+            return Err(refused("a recording key cannot be empty"));
+        }
+        if key.starts_with('/') {
+            return Err(refused("a recording key is relative to the recording root"));
+        }
+        if key.contains('\\') {
+            return Err(refused("a recording key separates its segments with /"));
+        }
+        let mut path = self.root.clone();
+        for segment in key.split('/') {
+            if segment.is_empty() || segment == "." || segment == ".." {
+                return Err(refused("a recording key has no empty or relative segment"));
+            }
+            if segment.chars().any(char::is_control) {
+                return Err(refused("a recording key carries no control characters"));
+            }
+            path.push(segment);
+        }
+        Ok(path)
+    }
+
+    fn part_of(&self, landing: &Path) -> Result<PathBuf, UploadError> {
+        let basename = landing
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| {
+                UploadError::Key(landing.display().to_string(), "names no file".to_string())
+            })?;
+        let parent = landing.parent().unwrap_or(&self.root);
+        Ok(parent.join(format!(".{basename}.{}{PART_SUFFIX}", self.owner)))
+    }
+
+    fn key_of(&self, path: &Path) -> Option<String> {
+        let relative = path.strip_prefix(&self.root).ok()?;
+        let key = relative.to_string_lossy().replace('\\', "/");
+        if key.is_empty() {
+            None
+        } else {
+            Some(key)
+        }
+    }
+}
+
+fn is_part_name(name: &str) -> bool {
+    name.starts_with('.') && name.ends_with(PART_SUFFIX)
+}
+
+#[control_api::async_trait]
+impl RecordingSink for FilesystemRecordingSink {
+    async fn put(
+        &self,
+        key: &str,
+        _content_type: &'static str,
+        body: Vec<u8>,
+    ) -> Result<String, UploadError> {
+        let landing = self.resolve(key)?;
+        let part = self.part_of(&landing)?;
+        let refused = |error: std::io::Error| UploadError::Refused(format!("{key}: {error}"));
+        if let Some(parent) = landing.parent() {
+            tokio::fs::create_dir_all(parent).await.map_err(refused)?;
+        }
+        let written = async {
+            let mut file = tokio::fs::File::create(&part).await?;
+            tokio::io::AsyncWriteExt::write_all(&mut file, &body).await?;
+            file.sync_all().await?;
+            drop(file);
+            tokio::fs::rename(&part, &landing).await
+        }
+        .await;
+        if let Err(error) = written {
+            let _ = tokio::fs::remove_file(&part).await;
+            return Err(refused(error));
+        }
+        Ok(format!(
+            "file:{URI_SCHEME_SEPARATOR}{}/{key}",
+            self.root.display()
+        ))
+    }
+
+    async fn exists(&self, key: &str) -> Result<bool, UploadError> {
+        let path = self.resolve(key)?;
+        match tokio::fs::metadata(&path).await {
+            Ok(found) => Ok(found.is_file()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(UploadError::Refused(format!("{key}: {error}"))),
+        }
+    }
+
+    async fn get(&self, key: &str) -> Result<Vec<u8>, UploadError> {
+        let path = self.resolve(key)?;
+        match tokio::fs::read(&path).await {
+            Ok(body) => Ok(body),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                Err(UploadError::Missing(key.to_string()))
+            }
+            Err(error) => Err(UploadError::Refused(format!("{key}: {error}"))),
+        }
+    }
+
+    async fn list(&self, prefix: &str) -> Result<Vec<String>, UploadError> {
+        let trimmed = prefix.trim_end_matches('/');
+        let under = if trimmed.is_empty() {
+            self.root.clone()
+        } else {
+            self.resolve(trimmed)?
+        };
+        let named = |error: std::io::Error| UploadError::Refused(format!("{prefix}: {error}"));
+        match tokio::fs::metadata(&under).await {
+            Ok(found) if found.is_file() => return Ok(self.key_of(&under).into_iter().collect()),
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(named(error)),
+        }
+        let mut keys = Vec::new();
+        let mut pending = vec![under];
+        while let Some(directory) = pending.pop() {
+            let mut entries = match tokio::fs::read_dir(&directory).await {
+                Ok(entries) => entries,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(named(error)),
+            };
+            while let Some(entry) = entries.next_entry().await.map_err(named)? {
+                let path = entry.path();
+                let kind = entry.file_type().await.map_err(named)?;
+                if kind.is_dir() {
+                    pending.push(path);
+                    continue;
+                }
+                let name = entry.file_name().to_string_lossy().to_string();
+                if is_part_name(&name) {
+                    continue;
+                }
+                if let Some(key) = self.key_of(&path) {
+                    keys.push(key);
+                }
+            }
+        }
+        keys.sort();
+        Ok(keys)
+    }
+
+    async fn delete(&self, key: &str) -> Result<(), UploadError> {
+        let path = self.resolve(key)?;
+        match tokio::fs::remove_file(&path).await {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(UploadError::Refused(format!("{key}: {error}"))),
+        }
+        let mut parent = path.parent().map(Path::to_path_buf);
+        while let Some(directory) = parent {
+            if directory == self.root || tokio::fs::remove_dir(&directory).await.is_err() {
+                break;
+            }
+            parent = directory.parent().map(Path::to_path_buf);
+        }
+        Ok(())
+    }
+
+    fn describe(&self) -> String {
+        format!("filesystem {}", self.root.display())
+    }
+}
+
 #[derive(Default)]
 pub struct RecorderCounters {
     pub started: AtomicU64,
@@ -806,12 +1082,12 @@ fn spill_to_object_store_from_env() -> bool {
     let configured = std::env::var(SPILL_TO_ENV).unwrap_or_default();
     match configured.trim().to_ascii_lowercase().as_str() {
         "" | "disk" => false,
-        "s3" => true,
+        "s3" | "store" => true,
         other => {
             warn!(
                 env = SPILL_TO_ENV,
                 configured = %other,
-                "a recording spill goes to disk or to s3; falling back to disk"
+                "a recording spill goes to disk or to the recording store; falling back to disk"
             );
             false
         }
@@ -828,6 +1104,49 @@ fn spill_prefix_from_env() -> String {
     }
 }
 
+fn object_store_variables_set() -> Vec<&'static str> {
+    [
+        BUCKET_ENV,
+        ENDPOINT_ENV,
+        REGION_ENV,
+        ACCESS_KEY_ENV,
+        SECRET_KEY_ENV,
+    ]
+    .into_iter()
+    .filter(|name| {
+        std::env::var(name)
+            .map(|value| !value.trim().is_empty())
+            .unwrap_or(false)
+    })
+    .collect()
+}
+
+fn s3_sink_from_env() -> Result<Option<Arc<dyn RecordingSink>>, UploadError> {
+    let Ok(bucket) = std::env::var(BUCKET_ENV) else {
+        return Ok(None);
+    };
+    if bucket.is_empty() {
+        return Err(UploadError::Configuration(format!(
+            "{BUCKET_ENV} is set but names no bucket"
+        )));
+    }
+    let region = std::env::var(REGION_ENV).unwrap_or_else(|_| DEFAULT_REGION.to_string());
+    let endpoint = std::env::var(ENDPOINT_ENV).ok().filter(|it| !it.is_empty());
+    let credentials = match (
+        std::env::var(ACCESS_KEY_ENV).ok(),
+        std::env::var(SECRET_KEY_ENV).ok(),
+    ) {
+        (Some(access_key_id), Some(secret_access_key)) => Some((access_key_id, secret_access_key)),
+        _ => None,
+    };
+    Ok(Some(Arc::new(S3RecordingSink::new(
+        bucket,
+        region,
+        endpoint,
+        credentials,
+    )?)))
+}
+
 impl RecordingSupport {
     pub fn from_env(owner: &str) -> Result<RecordingSupport, UploadError> {
         let upload_permits = Arc::new(Semaphore::new(upload_concurrency_from_env()));
@@ -839,13 +1158,34 @@ impl RecordingSupport {
             .map(Duration::from_secs)
             .unwrap_or(SPILL_EVERY);
         let to_object_store = spill_to_object_store_from_env();
-        let Ok(bucket) = std::env::var(BUCKET_ENV) else {
+        let decided = decide_store(
+            std::env::var(STORE_ENV).ok().as_deref(),
+            std::env::var(ROOT_ENV).ok().as_deref(),
+            &object_store_variables_set(),
+        )?;
+        if !decided.ignored.is_empty() {
+            warn!(
+                env = STORE_ENV,
+                store = ?decided.store,
+                ignored = %decided.ignored.join(", "),
+                "these variables belong to the recording store this deployment did not pick; \
+                 they are ignored"
+            );
+        }
+        let sink: Option<Arc<dyn RecordingSink>> = match &decided.store {
+            RecordingStore::Filesystem(root) => {
+                probe_recording_root(root)?;
+                Some(Arc::new(FilesystemRecordingSink::new(root.clone(), owner)))
+            }
+            RecordingStore::ObjectStore => s3_sink_from_env()?,
+        };
+        let Some(sink) = sink else {
             if to_object_store {
                 warn!(
                     env = SPILL_TO_ENV,
                     bucket = BUCKET_ENV,
-                    "the recording bucket is where the spill journal was asked to live, and no \
-                     bucket is configured; nothing spills"
+                    "the recording store is where the spill journal was asked to live, and no \
+                     store is configured; nothing spills"
                 );
             }
             return Ok(RecordingSupport {
@@ -858,30 +1198,12 @@ impl RecordingSupport {
                 upload_permits,
             });
         };
-        if bucket.is_empty() {
-            return Err(UploadError::Configuration(format!(
-                "{BUCKET_ENV} is set but names no bucket"
-            )));
-        }
-        let region = std::env::var(REGION_ENV).unwrap_or_else(|_| DEFAULT_REGION.to_string());
-        let endpoint = std::env::var(ENDPOINT_ENV).ok().filter(|it| !it.is_empty());
-        let credentials = match (
-            std::env::var(ACCESS_KEY_ENV).ok(),
-            std::env::var(SECRET_KEY_ENV).ok(),
-        ) {
-            (Some(access_key_id), Some(secret_access_key)) => {
-                Some((access_key_id, secret_access_key))
-            }
-            _ => None,
-        };
-        let sink: Arc<dyn RecordingSink> =
-            Arc::new(S3RecordingSink::new(bucket, region, endpoint, credentials)?);
         let journal: Option<Arc<dyn SpillStore>> = if to_object_store {
             let prefix = spill_prefix_from_env();
             info!(
                 env = SPILL_TO_ENV,
                 prefix = %prefix,
-                "closed recording segments spill into the recording bucket itself, so any pod \
+                "closed recording segments spill into the recording store itself, so any pod \
                  can read back what a dead pod held"
             );
             Some(Arc::new(ObjectSpill::new(Arc::clone(&sink), &prefix)))
@@ -889,9 +1211,10 @@ impl RecordingSupport {
             spill_dir.clone().map(disk_journal)
         };
         info!(
+            env = STORE_ENV,
             storage = %sink.describe(),
             spill_dir = ?spill_dir,
-            spill_in_bucket = to_object_store,
+            spill_in_store = to_object_store,
             "recording uploads are configured"
         );
         Ok(RecordingSupport {
@@ -3744,5 +4067,306 @@ mod tests {
         )
         .expect("the lab sink did not build");
         assert!(sink.describe().contains("lab-recordings"));
+    }
+
+    fn filesystem_sink(root: &Path) -> Arc<FilesystemRecordingSink> {
+        Arc::new(FilesystemRecordingSink::new(
+            root.to_path_buf(),
+            "mediaserverd-7f9c",
+        ))
+    }
+
+    #[tokio::test]
+    async fn the_filesystem_sink_writes_reads_lists_and_deletes_the_frozen_identity() {
+        let root = scratch("fs-sink");
+        let sink = filesystem_sink(&root);
+        let key = identity().object_key();
+
+        let uri = sink
+            .put(&key, "audio/wav", vec![1, 2, 3, 4])
+            .await
+            .expect("the recording did not land");
+
+        assert_eq!(
+            uri,
+            format!(
+                "file:{URI_SCHEME_SEPARATOR}{}/{key}",
+                root.display().to_string().trim_end_matches('/')
+            )
+        );
+        assert!(root.join("acct-42").join("rec-99.wav").is_file());
+        assert!(sink.exists(&key).await.unwrap());
+        assert!(!sink.exists("acct-42/absent.wav").await.unwrap());
+        assert_eq!(sink.get(&key).await.unwrap(), vec![1, 2, 3, 4]);
+        assert_eq!(sink.list("acct-42").await.unwrap(), vec![key.clone()]);
+        assert_eq!(sink.list("acct-42/").await.unwrap(), vec![key.clone()]);
+        assert_eq!(sink.list("").await.unwrap(), vec![key.clone()]);
+        assert!(sink.list("acct-43").await.unwrap().is_empty());
+        assert!(sink.describe().contains(&root.display().to_string()));
+
+        sink.delete(&key).await.expect("the file was not deleted");
+
+        assert!(!sink.exists(&key).await.unwrap());
+        assert!(sink.list("").await.unwrap().is_empty());
+        assert!(matches!(
+            sink.get(&key).await,
+            Err(UploadError::Missing(missing)) if missing == key
+        ));
+        sink.delete(&key).await.expect("a second delete is a no-op");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn a_part_file_is_invisible_to_list_and_gone_once_the_recording_lands() {
+        let root = scratch("fs-part");
+        let sink = filesystem_sink(&root);
+        let key = identity().object_key();
+        let directory = root.join("acct-42");
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(
+            directory.join(".rec-98.wav.another-pod.part"),
+            b"half a file",
+        )
+        .unwrap();
+
+        assert!(
+            sink.list("").await.unwrap().is_empty(),
+            "a half-written file must never be listed"
+        );
+
+        sink.put(&key, "audio/wav", vec![7; 64]).await.unwrap();
+
+        assert_eq!(sink.list("").await.unwrap(), vec![key.clone()]);
+        let leftovers: Vec<String> = std::fs::read_dir(&directory)
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().to_string())
+            .filter(|name| is_part_name(name) && name.contains("rec-99"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "the landing file left a part file behind: {leftovers:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn the_filesystem_sink_refuses_a_key_that_would_leave_the_root() {
+        let root = scratch("fs-escape");
+        let sink = filesystem_sink(&root);
+
+        for key in ["", "/acct/rec.wav", "../rec.wav", "acct/../../rec.wav"] {
+            assert!(
+                matches!(
+                    sink.put(key, "audio/wav", vec![1]).await,
+                    Err(UploadError::Key(_, _))
+                ),
+                "{key} was accepted"
+            );
+        }
+        assert!(std::fs::read_dir(&root).unwrap().next().is_none());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn a_second_put_replaces_the_file_because_the_no_overwrite_rule_lives_in_salvage() {
+        let root = scratch("fs-replace");
+        let sink = filesystem_sink(&root);
+        let key = identity().object_key();
+
+        sink.put(&key, "audio/wav", vec![1]).await.unwrap();
+        sink.put(&key, "audio/wav", vec![2, 2]).await.unwrap();
+
+        assert_eq!(
+            sink.get(&key).await.unwrap(),
+            vec![2, 2],
+            "the sink is last-write-wins, exactly as the s3 sink is"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn filesystem_support(root: &Path, owner: &str) -> RecordingSupport {
+        let sink = Arc::new(FilesystemRecordingSink::new(root.to_path_buf(), owner))
+            as Arc<dyn RecordingSink>;
+        let journal: Arc<dyn SpillStore> = Arc::new(ObjectSpill::new(
+            Arc::clone(&sink),
+            crate::recording_spill::DEFAULT_SPILL_PREFIX,
+        ));
+        RecordingSupport {
+            sink: Some(sink),
+            journal: Some(journal),
+            spill_dir: None,
+            spill_every: SPILL_EVERY,
+            counters: Arc::new(RecorderCounters::default()),
+            owner: owner.to_string(),
+            upload_permits: Arc::new(Semaphore::new(DEFAULT_UPLOAD_CONCURRENCY)),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_journal_spilled_onto_the_filesystem_store_is_salvaged_into_the_identity_path() {
+        let root = scratch("fs-spill");
+        let support = filesystem_support(&root, "pod-a");
+        let key = identity().object_key();
+        let mut journal =
+            SegmentJournal::open(&support, "rec-99", "pod-a", RATE, &[(key.clone(), 2)])
+                .await
+                .expect("a journal needs a store");
+        journal
+            .append(
+                vec![RecordedAudio {
+                    channels: 2,
+                    samples: vec![9; 2 * FRAME],
+                }],
+                FRAME as u64,
+            )
+            .await
+            .unwrap();
+        drop(journal);
+        let spilled = support
+            .sink
+            .as_ref()
+            .unwrap()
+            .list(crate::recording_spill::DEFAULT_SPILL_PREFIX)
+            .await
+            .unwrap();
+        assert!(
+            spilled
+                .iter()
+                .any(|held| held.ends_with("manifest.json") && held.starts_with("_spill/")),
+            "the journal did not reach the filesystem store: {spilled:?}"
+        );
+
+        let summary = crate::recording_spill::salvage(&support).await;
+
+        assert_eq!(summary.uploaded, 1, "{summary:?}");
+        let body = std::fs::read(root.join("acct-42").join("rec-99.wav"))
+            .expect("the salvaged recording is not at its identity path");
+        assert_eq!(frames_of(&body), FRAME);
+        assert_eq!(samples_of(&body)[0], 9);
+        assert!(
+            support
+                .sink
+                .as_ref()
+                .unwrap()
+                .list(crate::recording_spill::DEFAULT_SPILL_PREFIX)
+                .await
+                .unwrap()
+                .is_empty(),
+            "a salvaged journal must be cleaned out of the store"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_recording_store_is_s3_unless_a_deployment_says_otherwise() {
+        assert_eq!(
+            decide_store(None, None, &[]).unwrap(),
+            StoreDecision {
+                store: RecordingStore::ObjectStore,
+                ignored: Vec::new(),
+            }
+        );
+        assert_eq!(
+            decide_store(Some(" S3 "), None, &[]).unwrap().store,
+            RecordingStore::ObjectStore
+        );
+        assert_eq!(
+            decide_store(Some(""), None, &[]).unwrap().store,
+            RecordingStore::ObjectStore
+        );
+    }
+
+    #[test]
+    fn the_filesystem_store_needs_an_absolute_root_and_refuses_to_start_without_one() {
+        for root in [None, Some(""), Some("  ")] {
+            assert!(
+                matches!(
+                    decide_store(Some("filesystem"), root, &[]),
+                    Err(UploadError::Configuration(_))
+                ),
+                "{root:?} was accepted as a recording root"
+            );
+        }
+        assert!(matches!(
+            decide_store(Some("filesystem"), Some("recordings"), &[]),
+            Err(UploadError::Configuration(_))
+        ));
+        assert_eq!(
+            decide_store(Some("filesystem"), Some("/srv/recordings"), &[])
+                .unwrap()
+                .store,
+            RecordingStore::Filesystem(PathBuf::from("/srv/recordings"))
+        );
+    }
+
+    #[test]
+    fn a_store_this_build_does_not_know_refuses_to_start() {
+        assert!(matches!(
+            decide_store(Some("gcs"), None, &[]),
+            Err(UploadError::Configuration(_))
+        ));
+        assert!(matches!(
+            decide_store(Some("nfs"), Some("/srv/recordings"), &[]),
+            Err(UploadError::Configuration(_))
+        ));
+    }
+
+    #[test]
+    fn the_variables_belonging_to_the_store_nobody_picked_are_named_and_ignored() {
+        assert_eq!(
+            decide_store(
+                Some("filesystem"),
+                Some("/srv/recordings"),
+                &[BUCKET_ENV, REGION_ENV]
+            )
+            .unwrap()
+            .ignored,
+            vec![BUCKET_ENV, REGION_ENV]
+        );
+        assert_eq!(
+            decide_store(Some("s3"), Some("/srv/recordings"), &[BUCKET_ENV])
+                .unwrap()
+                .ignored,
+            vec![ROOT_ENV]
+        );
+    }
+
+    #[test]
+    fn the_recording_root_is_probed_by_writing_renaming_and_deleting_a_file() {
+        let root = scratch("fs-probe");
+        let under = root.join("recordings");
+
+        probe_recording_root(&under).expect("a fresh directory must be usable");
+
+        assert!(under.is_dir());
+        assert!(
+            std::fs::read_dir(&under).unwrap().next().is_none(),
+            "the probe left a file behind"
+        );
+
+        let blocked = root.join("a-file");
+        std::fs::write(&blocked, b"not a directory").unwrap();
+        assert!(matches!(
+            probe_recording_root(&blocked.join("recordings")),
+            Err(UploadError::Configuration(_))
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_spill_journal_goes_to_the_recording_store_under_either_name() {
+        for value in ["s3", "store", "STORE"] {
+            std::env::set_var(SPILL_TO_ENV, value);
+            assert!(spill_to_object_store_from_env(), "{value} spilled to disk");
+        }
+        for value in ["", "disk", "somewhere-else"] {
+            std::env::set_var(SPILL_TO_ENV, value);
+            assert!(
+                !spill_to_object_store_from_env(),
+                "{value} spilled to the store"
+            );
+        }
+        std::env::remove_var(SPILL_TO_ENV);
     }
 }
