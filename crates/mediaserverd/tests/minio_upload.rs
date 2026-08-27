@@ -10,7 +10,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 #[path = "../src/hub.rs"]
 mod hub;
 
-#[allow(dead_code)]
+#[allow(dead_code, unused_imports)]
 #[path = "../src/recorder.rs"]
 mod recorder;
 

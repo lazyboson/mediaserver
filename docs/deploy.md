@@ -529,6 +529,29 @@ room from any one member, with no extra RPC. Member state has **no lease**: if
 your controller dies between `mute on` and `mute off` the member stays muted for
 the life of the conference, so reconcile on reconnect rather than assuming.
 
+## Attachment metadata — the `mss.` prefix is reserved
+
+`Attach` and `UpdateAttachment` carry a free-form `metadata` map, and MSS reads
+a handful of keys out of it: `accountId`, `streamSid`, `callSid`, `recordId`,
+`fileFormat`, `recordingChannels`, `sipCallId`, `callerTag`, and the conference
+verbs `mix_target` / `mix_monitor` / `mix_source` / `member_mute` /
+`member_deaf` / `member_hold`. Everything else is yours and is passed through
+untouched — **except any key beginning `mss.`**, which is refused with
+`INVALID_ARGUMENT` naming the key.
+
+That prefix is how mediaserverd's own session registry talks to itself: when a
+pod adopts a session, `RegistryKeeper::rebuild` re-issues the attachment with
+`mss.recording.resumeMs` (how much audio the dead pod had recorded, which
+becomes leading silence) and `mss.recording.spillOwner` (the pod whose spill
+journal to read, and the fact that this attach may take back its
+recording-group seat). A client that could set those could silence-pad any
+recording or claim another pod's seat in a recording group, so the guard sits
+on the wire: the keeper reaches the controller in-process and is unaffected,
+and the same refusal covers the legacy `telsvc` façade, whose `StartStream`
+copies caller metadata straight through. If you are carrying your own
+namespaced keys, use anything but `mss.` — `tenant.`, your product's name,
+whatever — and nothing changes for you.
+
 ## High availability: what is adoptable and what is not
 
 Ownership is a TTL'd lease in Redis, renewed by heartbeat. On pod loss another
