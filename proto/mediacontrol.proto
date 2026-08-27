@@ -41,7 +41,10 @@ enum SessionKind {
   SESSION_KIND_UNSPECIFIED = 0;
   SESSION_KIND_TAP = 1;     // phase 1-2: rtpengine subscription, listen-only
   SESSION_KIND_INLINE = 2;  // phase 3: MSS is an RTP endpoint in the path
-  SESSION_KIND_MIX = 3;     // phase 4: conference
+  SESSION_KIND_MIX = 3;     // phase 4: the conference room itself, as a
+                            // session with no leg (CreateSession{kind=MIX,
+                            // group}). It owns the room's clock, its mixed
+                            // track and therefore its recording.
 }
 
 enum SessionState {
@@ -68,8 +71,14 @@ message CreateSessionRequest {
   // returns the answer in Session.sdp_answer. A tap needs no SDP: it asks
   // rtpengine for a copy instead.
   string sdp_offer = 8;
-  // INLINE only: the conference this leg joins, mirroring the recording
-  // group on AttachRequest. Legs naming the same group share one mix matrix
+  // INLINE and MIX: the conference this session belongs to, mirroring the
+  // recording group on AttachRequest. On a MIX session the group is
+  // required and names the room this session *is*: it has no leg, no
+  // call_id and no sdp_offer, its opened_at_unix_ms is the conference's own
+  // open instant, and a FILE_S3 attachment with selector only=mixed on it
+  // records the room from open to close however its members come and go.
+  // On an INLINE session it names the conference the leg joins.
+  // Legs naming the same group share one mix matrix
   // driven by one capture-world clock, hear every other member but not
   // themselves, and publish the conference mix as the "mixed" track on every
   // member session. Empty is a plain two-party inline leg, which is exactly
@@ -111,6 +120,12 @@ message Session {
   // Conference members only: the room this member is seated in, so an
   // integrator can enumerate it from any member without a second RPC.
   ConferenceView conference = 14;
+  // When this session opened, on the owner pod's wall clock, so a controller
+  // can align its own timeline with MSS's. On a MIX session this is the
+  // *conference's* open instant — earlier than the CreateSession that adopted
+  // the room if a member opened the conference first — because that is the
+  // t=0 every recording of that room is anchored on.
+  uint64 opened_at_unix_ms = 15;
 }
 
 // One live route of a member's audio inside its conference. A member with no
@@ -129,8 +144,9 @@ message MemberRoute {
 }
 
 // A conference member's state, read from the control plane's own mirror.
-// D22 residual: this state has no lease, so it outlives the controller that
-// set it for the life of the conference.
+// Since item 56 each flag may carry a lease: *_expires_in_ms counts down to
+// the moment MSS lifts it by itself, and 0 means the flag holds until a
+// controller says otherwise (the pre-item-56 behaviour).
 message MemberState {
   bool mute = 1;
   bool deaf = 2;
@@ -138,6 +154,12 @@ message MemberState {
   // Where this member's routed audio comes from: "inject" or "leg".
   string mix_source = 4;
   repeated MemberRoute routes = 5;
+  // Milliseconds until this pod lifts the flag by itself. 0 = no lease, which
+  // is also what an unset flag reports. Refresh by setting the flag "on" again
+  // with member_state_ttl_ms before this reaches 0.
+  uint64 mute_expires_in_ms = 6;
+  uint64 deaf_expires_in_ms = 7;
+  uint64 hold_expires_in_ms = 8;
 }
 
 // The room a member is seated in, as this pod holds it. A conference is
@@ -146,6 +168,10 @@ message ConferenceView {
   string group = 1;
   uint32 member_count = 2;
   repeated string members = 3;
+  // The external id of the room session that owns this conference, empty when
+  // no CreateSession{kind=MIX} has claimed it. A room recording belongs on
+  // that session rather than on a member's (D20).
+  string room_session = 4;
 }
 
 message SessionRef {
@@ -418,7 +444,24 @@ message MixRouted { string mix_target = 1; bool monitor_audible = 2; }
 // A conference member's own routing verbs: mute silences their contributor row,
 // deaf silences the room into their ear, hold is both. Member state outlives
 // the attachment that carried the verb.
-message MemberControlled { bool mute = 1; bool deaf = 2; bool hold = 3; }
+// Why a member's flags are what this event says they are: a controller asked,
+// or a lease ran out and MSS lifted the flag itself. REQUESTED is the zero
+// value, so a consumer written before item 56 reads every requested event
+// unchanged.
+enum MemberControlCause {
+  MEMBER_CONTROL_CAUSE_REQUESTED = 0;
+  MEMBER_CONTROL_CAUSE_EXPIRED = 1;
+}
+
+// The member's whole declared state after the change, not just the verb that
+// changed: on an EXPIRED event the flags that are still leased or still held
+// stay true.
+message MemberControlled {
+  bool mute = 1;
+  bool deaf = 2;
+  bool hold = 3;
+  MemberControlCause cause = 4;
+}
 message AttachmentDown { string label = 1; string reason = 2; }
 message SessionEnded { string reason = 1; }
 message EndOfInteraction { string reason = 1; }

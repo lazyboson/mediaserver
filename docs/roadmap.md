@@ -170,9 +170,10 @@ against a real MinIO from a synthetic hub **and on a live tapped call**
 (item 10). Since then: **recording groups** record N sessions as one recording
 with one mono object per participant (item 21), time-aligned on the group's open
 instant (item 29, closing D18), and closed segments **spill to disk as the call
-runs** so a pod death costs the spill interval rather than the call (item 30,
-partly closing D9 — the spill dir is per-pod local disk, so the cross-pod half
-stays open with D16).
+runs** so a pod death costs the spill interval rather than the call (item 30),
+and with `MSS_RECORDING_SPILL_TO=s3` that journal lives in the recording bucket
+itself, so an adopter on **any** pod finishes what a dead pod started (item 53,
+closing D9 but for retention and a live drill nobody has run).
 Hold/pause arrives as `UpdateAttachment{paused}` (which now reaches the media
 world at all) rather than from Redis; the legacy controller drives it through
 `TelCompat`. Dual recording remains a the legacy controller per-tenant flag and nothing here

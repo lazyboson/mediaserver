@@ -1,10 +1,12 @@
-use crate::conference::{Conference, ConferenceMember, ConferenceShared, ConferenceTotals};
+use crate::conference::{
+    Conference, ConferenceMember, ConferenceShared, ConferenceTotals, RoomFate, RoomSeat,
+};
 use crate::consumer_ws::{self, ConsumerConfig};
 use crate::digits::DigitQueue;
 use crate::discovery::NodeDiscovery;
 use crate::hub::{
     Hub, HubClient, Subscription, SubscriptionControl, SubscriptionMetrics, TapEvent,
-    TrackSelection,
+    TrackSelection, CONSUMER_QUEUE_FRAMES,
 };
 use crate::inline_leg::{
     egress_ssrc, InlineEgress, InlineEgressHandle, InlineEgressShared, InlineEgressTotals,
@@ -19,7 +21,7 @@ use crate::recorder::{
 use crate::recording_uploads::UploadTracker;
 use crate::registry_keeper::TapSubscriptions;
 use crate::rtpengine_capability::NodeCapabilityLog;
-use crate::session_store::PersistedRecording;
+use crate::session_store::{GroupJoin, GroupRecord, PersistedRecording, SessionStore};
 use crate::tap_spike::{
     capture, capture_with_egress, SharedLegStats, SsrcTrackPublisher, SsrcTracks, TapLeg,
     MAX_SSRC_TRACKS,
@@ -45,7 +47,7 @@ use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
@@ -56,7 +58,6 @@ pub const STALL_AFTER: Duration = Duration::from_secs(10);
 const TARGET_DEPTH_PACKETS: u16 = 3;
 const MAX_TAPPED_STREAMS: usize = 2;
 const MAX_TAPPED_LEGS: usize = 2;
-const CONSUMER_QUEUE_FRAMES: usize = 200;
 const TEXT_QUEUE_DEPTH: usize = 32;
 const GRPC_FRAME_QUEUE: usize = 64;
 const RETAIN_NO_LOCAL_AUDIO: Duration = Duration::ZERO;
@@ -79,6 +80,8 @@ pub struct TapPlaneConfig {
     pub sdp_session_id: u64,
     pub recording: RecordingSupport,
     pub capabilities: Arc<NodeCapabilityLog>,
+    pub conference_linger: Duration,
+    pub member_state_ttl: Duration,
 }
 
 struct ResolvedNode {
@@ -88,6 +91,7 @@ struct ResolvedNode {
 }
 
 struct SessionHandles {
+    kind: SessionKind,
     transport: Option<Arc<NgTransport>>,
     call_id: String,
     hub: HubClient,
@@ -153,7 +157,7 @@ impl std::fmt::Display for GroupKey {
 struct RecordingGroup {
     recording_id: String,
     format: RecordingFormat,
-    opened_at: Instant,
+    opened_at: SystemTime,
     members: HashMap<AttachmentId, Vec<String>>,
 }
 
@@ -256,6 +260,8 @@ pub struct IngestSnapshot {
     pub recording_spills: u64,
     pub recording_segments_spilled: u64,
     pub recording_segment_spill_failures: u64,
+    pub recording_spill_lost_ownership: u64,
+    pub recording_spill_foreign_manifests: u64,
     pub recording_salvaged: u64,
     pub recording_salvage_skipped: u64,
     pub recording_salvage_failures: u64,
@@ -269,6 +275,7 @@ pub struct IngestSnapshot {
     pub inline_legs_live: u64,
     pub inline: InlineEgressTotals,
     pub conferences_live: u64,
+    pub conference_rooms_live: u64,
     pub conference_members_live: u64,
     pub conference_whispers_live: u64,
     pub conference_members_muted: u64,
@@ -393,6 +400,8 @@ impl TapPlaneMetrics {
             recording_spills: read(&recorder.spilled),
             recording_segments_spilled: read(&recorder.segments_spilled),
             recording_segment_spill_failures: read(&recorder.segment_spill_failures),
+            recording_spill_lost_ownership: read(&recorder.spill_lost_ownership),
+            recording_spill_foreign_manifests: read(&recorder.spill_foreign_manifests),
             recording_salvaged: read(&recorder.salvaged),
             recording_salvage_skipped: read(&recorder.salvage_skipped),
             recording_salvage_failures: read(&recorder.salvage_failures),
@@ -415,6 +424,7 @@ impl TapPlaneMetrics {
         for conference in inner.conferences.values() {
             snapshot.conference.add_shared(conference);
             snapshot.conference_members_live += conference.members_live.load(Ordering::Relaxed);
+            snapshot.conference_rooms_live += conference.rooms_live.load(Ordering::Relaxed);
             snapshot.conference_whispers_live += conference.whispers_live.load(Ordering::Relaxed);
             snapshot.conference_members_muted += conference.members_muted.load(Ordering::Relaxed);
             snapshot.conference_members_deaf += conference.members_deaf.load(Ordering::Relaxed);
@@ -449,7 +459,9 @@ pub struct TapPlane {
     metrics: TapPlaneMetrics,
     observations: OnceLock<Weak<dyn ObservationSink>>,
     discovery: OnceLock<Arc<NodeDiscovery>>,
+    group_store: OnceLock<Arc<dyn SessionStore>>,
     uploads: Arc<UploadTracker>,
+    me: OnceLock<Weak<TapPlane>>,
 }
 
 impl TapPlane {
@@ -465,8 +477,22 @@ impl TapPlane {
             metrics,
             observations: OnceLock::new(),
             discovery: OnceLock::new(),
+            group_store: OnceLock::new(),
             uploads,
+            me: OnceLock::new(),
         }
+    }
+
+    pub fn linger_through(&self, me: Weak<TapPlane>) {
+        if self.me.set(me).is_err() {
+            warn!("this tap plane already knows how to reach itself from a timer");
+            return;
+        }
+        info!(
+            linger_secs = self.config.conference_linger.as_secs(),
+            "an emptied conference whose room session is still open is held for this long \
+             before the room session ends itself"
+        );
     }
 
     pub fn uploads_in_flight(&self) -> u64 {
@@ -481,6 +507,17 @@ impl TapPlane {
         if self.observations.set(sink).is_err() {
             warn!("this tap plane already reports its observations somewhere");
         }
+    }
+
+    pub fn share_groups_through(&self, store: Arc<dyn SessionStore>) {
+        if self.group_store.set(store).is_err() {
+            warn!("this tap plane already shares its recording groups through a session store");
+            return;
+        }
+        info!(
+            "recording groups are shared through the session registry, so a member can join \
+             from any pod and an adopted member rejoins the group it was already in"
+        );
     }
 
     pub fn discover_through(&self, discovery: Arc<NodeDiscovery>) {
@@ -771,7 +808,7 @@ impl TapPlane {
         Ok(())
     }
 
-    fn open_recording_attachment(&self, view: AttachmentView) -> Result<(), MediaPlaneError> {
+    async fn open_recording_attachment(&self, view: AttachmentView) -> Result<(), MediaPlaneError> {
         let identity = RecordingIdentity::parse(&view.endpoint).map_err(|error| {
             MediaPlaneError(format!(
                 "{error}; a file-s3 endpoint is the frozen recording identity {}",
@@ -793,6 +830,17 @@ impl TapPlane {
         } = self.session_handles(view.session)?;
         let selection = recording_selection_of(view.selector);
         let conferenced = self.conference_of(view.session).is_ok();
+        let room_anchor = self.room_anchor_of(view.session);
+        if room_anchor.is_some() && !view.group.is_empty() {
+            return Err(MediaPlaneError(format!(
+                "a room session is the whole conference and has no participant seat, so it \
+                 cannot join recording group {}; record the room once with an ungrouped \
+                 file-s3 attachment whose selector is only={}, and group the members' own \
+                 objects on their own sessions",
+                view.group,
+                consumer_ws::track_name(Track::Mixed)
+            )));
+        }
         if conferenced
             && !view.group.is_empty()
             && matches!(view.selector, TrackSelector::Only(Track::Mixed))
@@ -812,7 +860,12 @@ impl TapPlane {
                 account_id: identity.account_id.clone(),
                 group: view.group.clone(),
             };
-            let anchor = self.join_group(&key, view.id, &identity, &targets)?;
+            let take_over = view
+                .metadata
+                .contains_key(recorder::SPILL_OWNER_METADATA_KEY);
+            let anchor = self
+                .join_group(&key, view.id, view.session, &identity, &targets, take_over)
+                .await?;
             Some((key, targets, anchor))
         };
         let rate = self.config.format.sample_rate_hz;
@@ -844,6 +897,7 @@ impl TapPlane {
                 None,
                 RecorderSpec {
                     resume_ms,
+                    group_anchor: room_anchor.filter(|_| resume_ms == 0),
                     ..RecorderSpec::one_object(
                         view.session,
                         &identity,
@@ -857,7 +911,7 @@ impl TapPlane {
             Some(subscription) => subscription,
             None => {
                 if let Some(key) = &member_of {
-                    self.leave_group(key, view.id);
+                    self.leave_group(key, view.id).await;
                 }
                 return Err(MediaPlaneError(
                     "the hub would not take another consumer".to_string(),
@@ -934,74 +988,212 @@ impl TapPlane {
         Ok(())
     }
 
-    fn join_group(
+    fn group_anchor_for(&self, session: SessionId) -> SystemTime {
+        self.conference_open_of(session)
+            .unwrap_or_else(SystemTime::now)
+    }
+
+    fn conference_open_of(&self, session: SessionId) -> Option<SystemTime> {
+        let name = self.conference_of(session).ok()?;
+        let held = self.conferences.lock().ok()?;
+        held.get(&name)
+            .map(|conference| conference.opened_at_wall())
+    }
+
+    fn room_anchor_of(&self, session: SessionId) -> Option<SystemTime> {
+        let is_room = self.sessions.lock().ok()?.get(&session)?.kind == SessionKind::Mix;
+        match is_room {
+            true => self.conference_open_of(session),
+            false => None,
+        }
+    }
+
+    fn refuse_group_join(
+        &self,
+        key: &GroupKey,
+        attachment: AttachmentId,
+        reason: String,
+    ) -> MediaPlaneError {
+        self.config
+            .recording
+            .counters
+            .group_joins_refused
+            .fetch_add(1, Ordering::Relaxed);
+        warn!(group = %key, %attachment, %reason, "this recording group refused a member");
+        MediaPlaneError(reason)
+    }
+
+    fn group_precheck(
+        &self,
+        key: &GroupKey,
+        identity: &RecordingIdentity,
+        participants: &[String],
+    ) -> Result<(), String> {
+        let held = self
+            .groups
+            .lock()
+            .map_err(|_| "the recording group table is poisoned".to_string())?;
+        let Some(group) = held.get(key) else {
+            return Ok(());
+        };
+        if group.recording_id != identity.recording_id {
+            return Err(records_another_recording(
+                key,
+                &identity.account_id,
+                &group.recording_id,
+                group.format.extension(),
+            ));
+        }
+        for participant in participants {
+            if group.holds(participant) {
+                return Err(participant_already_held(key, participant, None));
+            }
+        }
+        Ok(())
+    }
+
+    fn seat_group_member(
         &self,
         key: &GroupKey,
         attachment: AttachmentId,
         identity: &RecordingIdentity,
-        targets: &[RecordingTarget],
-    ) -> Result<Instant, MediaPlaneError> {
+        participants: &[String],
+        opened_at: SystemTime,
+    ) -> Result<SystemTime, String> {
         let counters = &self.config.recording.counters;
         let mut held = self
             .groups
             .lock()
-            .map_err(|_| MediaPlaneError("the recording group table is poisoned".to_string()))?;
-        let refuse = |reason: String| {
-            counters.group_joins_refused.fetch_add(1, Ordering::Relaxed);
-            warn!(group = %key, %attachment, %reason, "this recording group refused a member");
-            MediaPlaneError(reason)
-        };
+            .map_err(|_| "the recording group table is poisoned".to_string())?;
         let group = match held.get_mut(key) {
             Some(group) => {
                 if group.recording_id != identity.recording_id {
-                    return Err(refuse(format!(
-                        "recording group {key} is already recording {} and one group writes \
-                         one recording; attach with {}/{}.{} or a different group",
-                        group.recording_id,
-                        identity.account_id,
-                        group.recording_id,
-                        group.format.extension()
-                    )));
+                    return Err(records_another_recording(
+                        key,
+                        &identity.account_id,
+                        &group.recording_id,
+                        group.format.extension(),
+                    ));
                 }
                 group
             }
             None => {
                 counters.groups_live.fetch_add(1, Ordering::Relaxed);
-                info!(group = %key, recording_id = %identity.recording_id, "opened a recording group");
+                info!(
+                    group = %key,
+                    recording_id = %identity.recording_id,
+                    opened_at_unix_ms = opened_at
+                        .duration_since(SystemTime::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis() as u64,
+                    "opened a recording group"
+                );
                 held.entry(key.clone()).or_insert(RecordingGroup {
                     recording_id: identity.recording_id.clone(),
                     format: identity.format,
-                    opened_at: Instant::now(),
+                    opened_at,
                     members: HashMap::new(),
                 })
             }
         };
-        for target in targets {
-            if group.holds(&target.key) {
-                return Err(refuse(format!(
-                    "recording group {key} already has a participant writing {}; \
-                     each member needs a label of its own",
-                    target.key
-                )));
+        for participant in participants {
+            if group.holds(participant) {
+                return Err(participant_already_held(key, participant, None));
             }
         }
-        group.members.insert(
-            attachment,
-            targets.iter().map(|target| target.key.clone()).collect(),
-        );
+        group.members.insert(attachment, participants.to_vec());
         counters.group_members_live.fetch_add(1, Ordering::Relaxed);
         Ok(group.opened_at)
     }
 
-    fn leave_group(&self, key: &GroupKey, attachment: AttachmentId) {
+    async fn join_group(
+        &self,
+        key: &GroupKey,
+        attachment: AttachmentId,
+        session: SessionId,
+        identity: &RecordingIdentity,
+        targets: &[RecordingTarget],
+        take_over: bool,
+    ) -> Result<SystemTime, MediaPlaneError> {
+        let participants: Vec<String> = targets.iter().map(|target| target.key.clone()).collect();
+        if let Err(reason) = self.group_precheck(key, identity, &participants) {
+            return Err(self.refuse_group_join(key, attachment, reason));
+        }
+        let store = self.group_store.get().cloned();
+        let shared = key.to_string();
+        let anchor = match &store {
+            Some(store) => {
+                let proposed = GroupRecord::opening_at(
+                    self.group_anchor_for(session),
+                    &identity.recording_id,
+                    identity.format.extension(),
+                    &self.config.recording.owner,
+                );
+                match store
+                    .open_or_join_group(&shared, &proposed, &participants, take_over)
+                    .await
+                {
+                    Ok(GroupJoin::Joined(record)) => record.opened_at(),
+                    Ok(GroupJoin::RecordsAnother(record)) => {
+                        return Err(self.refuse_group_join(
+                            key,
+                            attachment,
+                            records_another_recording(
+                                key,
+                                &identity.account_id,
+                                &record.recording_id,
+                                &record.format,
+                            ),
+                        ))
+                    }
+                    Ok(GroupJoin::ParticipantHeld { participant, owner }) => {
+                        return Err(self.refuse_group_join(
+                            key,
+                            attachment,
+                            participant_already_held(key, &participant, Some(&owner)),
+                        ))
+                    }
+                    Err(error) => {
+                        return Err(self.refuse_group_join(
+                            key,
+                            attachment,
+                            format!(
+                                "recording group {key} could not be read from the session \
+                                 registry ({error}); a member that cannot see the group would \
+                                 open a second half-recording under the same prefix"
+                            ),
+                        ))
+                    }
+                }
+            }
+            None => self.group_anchor_for(session),
+        };
+        match self.seat_group_member(key, attachment, identity, &participants, anchor) {
+            Ok(opened_at) => Ok(opened_at),
+            Err(reason) => {
+                if let Some(store) = &store {
+                    if let Err(error) = store.leave_group(&shared, &participants).await {
+                        warn!(
+                            group = %key,
+                            %error,
+                            "this member's seat is left behind in the session registry until \
+                             the group record expires"
+                        );
+                    }
+                }
+                Err(self.refuse_group_join(key, attachment, reason))
+            }
+        }
+    }
+
+    fn release_group_seat(&self, key: &GroupKey, attachment: AttachmentId) -> Option<Vec<String>> {
         let Ok(mut held) = self.groups.lock() else {
             warn!(group = %key, "the recording group table is poisoned; the group is left behind");
-            return;
+            return None;
         };
-        let Some(group) = held.get_mut(key) else {
-            return;
-        };
-        if group.members.remove(&attachment).is_some() {
+        let group = held.get_mut(key)?;
+        let departed = group.members.remove(&attachment);
+        if departed.is_some() {
             self.config
                 .recording
                 .counters
@@ -1016,6 +1208,24 @@ impl TapPlane {
                 .groups_live
                 .fetch_sub(1, Ordering::Relaxed);
             info!(group = %key, "the last member left this recording group");
+        }
+        departed
+    }
+
+    async fn leave_group(&self, key: &GroupKey, attachment: AttachmentId) {
+        let departed = self.release_group_seat(key, attachment);
+        let Some(participants) = departed else {
+            return;
+        };
+        if let Some(store) = self.group_store.get() {
+            if let Err(error) = store.leave_group(&key.to_string(), &participants).await {
+                warn!(
+                    group = %key,
+                    %error,
+                    "this member's seat is left behind in the session registry until the \
+                     group record expires"
+                );
+            }
         }
     }
 
@@ -1065,7 +1275,7 @@ impl TapPlane {
             "recording stopped; its upload runs in the background"
         );
         if let Some(key) = member_of.as_ref() {
-            self.leave_group(key, attachment);
+            self.leave_group(key, attachment).await;
         }
         self.uploads.adopt(finished, self.observer());
         Some(())
@@ -1583,6 +1793,222 @@ impl TapPlane {
         Ok(OpenedSession::answered(answer_sdp))
     }
 
+    fn open_room_session(&self, view: SessionView) -> Result<OpenedSession, MediaPlaneError> {
+        if view.group.trim().is_empty() {
+            return Err(MediaPlaneError(
+                "a room session is a conference: name the conference in group".to_string(),
+            ));
+        }
+        let name = view.group.clone();
+        let (hub, format, opened_at_wall, open_for) = {
+            let mut held = self
+                .conferences
+                .lock()
+                .map_err(|_| MediaPlaneError("the conference table is poisoned".to_string()))?;
+            if !held.contains_key(&name) {
+                let opened = Conference::start(&name, self.config.format)
+                    .map_err(|error| MediaPlaneError(format!("conference {name}: {error}")))?;
+                self.metrics.register_conference(&name, opened.shared());
+                held.insert(name.clone(), opened);
+                info!(
+                    conference = %name,
+                    session = %view.id,
+                    "opened a conference for its room session; the mix runs with no member \
+                     yet, so the room records silence until the first leg joins"
+                );
+            }
+            let conference = held.get_mut(&name).ok_or_else(|| {
+                MediaPlaneError(format!("conference {name} is not running on this pod"))
+            })?;
+            conference
+                .seat_room(RoomSeat {
+                    session: view.id,
+                    external_id: view.external_id.clone(),
+                })
+                .map_err(|error| MediaPlaneError(format!("conference {name}: {error}")))?;
+            (
+                conference.room_hub(),
+                conference.format(),
+                conference.opened_at_wall(),
+                conference.open_for(),
+            )
+        };
+        let digits = DigitQueue::new();
+        digits.close();
+        let mut held = self
+            .sessions
+            .lock()
+            .map_err(|_| MediaPlaneError("the session table is poisoned".to_string()))?;
+        held.insert(
+            view.id,
+            LiveSession {
+                kind: SessionKind::Mix,
+                attribution: view.attribution,
+                media_ports: Vec::new(),
+                transport: None,
+                external_id: view.external_id.clone(),
+                call_id: String::new(),
+                to_tag: String::new(),
+                format,
+                hub,
+                egress: None,
+                stop: Arc::new(AtomicBool::new(false)),
+                capture: None,
+                conference: Some(name.clone()),
+                mix_route: None,
+                speakers: None,
+                digits,
+            },
+        );
+        drop(held);
+        self.metrics.register_session(view.id, Vec::new());
+        info!(
+            session = %view.id,
+            external_id = %view.external_id,
+            conference = %name,
+            opened_at_unix_ms = control_api::convert::unix_ms(opened_at_wall),
+            conference_open_for_ms = open_for.as_millis() as u64,
+            encoding = ?format.encoding,
+            sample_rate_hz = format.sample_rate_hz,
+            ptime_ms = format.ptime_ms,
+            "this session is the room itself: it has no leg, and every recording of it is \
+             anchored on the conference's open"
+        );
+        Ok(OpenedSession::default())
+    }
+
+    async fn end_room_session(&self, name: &str, reason: &str) {
+        let room = {
+            let Ok(held) = self.sessions.lock() else {
+                warn!(conference = %name, "the session table is poisoned; the room is left behind");
+                return;
+            };
+            held.iter()
+                .find(|(_, live)| {
+                    live.kind == SessionKind::Mix && live.conference.as_deref() == Some(name)
+                })
+                .map(|(session, live)| (*session, live.external_id.clone()))
+        };
+        let Some((session, external_id)) = room else {
+            return;
+        };
+        if let Ok(mut held) = self.conferences.lock() {
+            if let Some(conference) = held.get_mut(name) {
+                conference.count_auto_end();
+            }
+        }
+        if let Err(error) = self.close_room(session, name).await {
+            warn!(conference = %name, %session, %error, "this room session did not close cleanly");
+        }
+        info!(
+            %session,
+            %external_id,
+            conference = %name,
+            %reason,
+            "the room session ended itself, so its recording is closed and uploaded"
+        );
+        match self.observer().as_ref().and_then(Weak::upgrade) {
+            Some(sink) => sink.session_finished(session, reason),
+            None => warn!(
+                %session,
+                "no observation sink is wired, so the registry still holds this room session"
+            ),
+        }
+    }
+
+    async fn close_room(&self, session: SessionId, name: &str) -> Result<(), MediaPlaneError> {
+        let live = {
+            let mut held = self
+                .sessions
+                .lock()
+                .map_err(|_| MediaPlaneError("the session table is poisoned".to_string()))?;
+            held.remove(&session)
+        };
+        if live.is_none() {
+            return Ok(());
+        }
+        for (attachment, held) in self.take_attachments_of(session)? {
+            self.end_attachment(attachment, held, "the room closed")
+                .await;
+        }
+        let stopped = {
+            let mut held = self
+                .conferences
+                .lock()
+                .map_err(|_| MediaPlaneError("the conference table is poisoned".to_string()))?;
+            match held.get_mut(name) {
+                Some(conference) => {
+                    let stopped = conference.unseat_room();
+                    if stopped.is_some() {
+                        held.remove(name);
+                        self.metrics.retire_conference(name);
+                    }
+                    stopped
+                }
+                None => None,
+            }
+        };
+        if let Some(thread) = stopped {
+            let joined = tokio::task::spawn_blocking(move || thread.join()).await;
+            if joined.is_err() {
+                warn!(conference = %name, "the conference thread did not join cleanly");
+            }
+            info!(
+                conference = %name,
+                "the room session was the last thing holding this conference; the mix stopped"
+            );
+        }
+        self.metrics.retire_session(session);
+        Ok(())
+    }
+
+    async fn end_room_if_still_empty(&self, name: &str) {
+        let still_empty = match self.conferences.lock() {
+            Ok(held) => held
+                .get(name)
+                .map(|conference| conference.emptied() && conference.room().is_some())
+                .unwrap_or(false),
+            Err(_) => false,
+        };
+        if !still_empty {
+            return;
+        }
+        self.end_room_session(name, "the conference emptied and its linger expired")
+            .await;
+    }
+
+    fn linger_over(&self, name: &str) {
+        let linger = self.config.conference_linger;
+        let Some(me) = self.me.get().cloned() else {
+            warn!(
+                conference = %name,
+                "this conference emptied and its linger cannot be timed, so its room session \
+                 stays open until it is ended by the api"
+            );
+            return;
+        };
+        let held_name = name.to_string();
+        let task = tokio::spawn(async move {
+            tokio::time::sleep(linger).await;
+            if let Some(plane) = me.upgrade() {
+                plane.end_room_if_still_empty(&held_name).await;
+            }
+        });
+        if let Ok(mut held) = self.conferences.lock() {
+            if let Some(conference) = held.get_mut(name) {
+                conference.linger_until(task);
+                info!(
+                    conference = %name,
+                    linger_secs = linger.as_secs(),
+                    "the last member left an owned conference; the room session is held open \
+                     for the linger, and a member that rejoins cancels it"
+                );
+                return;
+            }
+        }
+        warn!(conference = %name, "the conference vanished while its linger was being armed");
+    }
+
     fn seat_in_conference(
         &self,
         name: &str,
@@ -1612,9 +2038,7 @@ impl TapPlane {
         let mut opened = Conference::start(name, format)
             .map_err(|error| MediaPlaneError(format!("conference {name}: {error}")))?;
         if let Err(error) = opened.seat(member) {
-            if let Some(thread) = opened.unseat(session) {
-                drop(thread);
-            }
+            drop(opened.stop_now());
             return Err(MediaPlaneError(format!("conference {name}: {error}")));
         }
         self.metrics.register_conference(name, opened.shared());
@@ -1623,26 +2047,24 @@ impl TapPlane {
         Ok(())
     }
 
-    fn leave_conference(
-        &self,
-        name: &str,
-        session: SessionId,
-    ) -> Option<std::thread::JoinHandle<()>> {
+    fn leave_conference(&self, name: &str, session: SessionId) -> RoomFate {
         let mut held = match self.conferences.lock() {
             Ok(held) => held,
             Err(_) => {
                 warn!(conference = %name, "the conference table is poisoned; the mix is left behind");
-                return None;
+                return RoomFate::Mixing;
             }
         };
-        let conference = held.get_mut(name)?;
-        let thread = conference.unseat(session);
-        if thread.is_some() {
+        let Some(conference) = held.get_mut(name) else {
+            return RoomFate::Mixing;
+        };
+        let fate = conference.unseat(session);
+        if matches!(fate, RoomFate::Stopped(_)) {
             held.remove(name);
             self.metrics.retire_conference(name);
             info!(conference = %name, "the last leg left this conference; it is closed");
         }
-        thread
+        fate
     }
 
     fn conference_of(&self, session: SessionId) -> Result<String, MediaPlaneError> {
@@ -1704,6 +2126,11 @@ impl TapPlane {
         session: SessionId,
         control: MemberControl,
     ) -> Result<(), MediaPlaneError> {
+        let lease_ms = control.lease_ms(self.config.member_state_ttl.as_millis() as u64);
+        let control = MemberControl {
+            ttl_ms: Some(lease_ms),
+            ..control
+        };
         let name = self.conference_of(session)?;
         {
             let mut held = self
@@ -1723,9 +2150,34 @@ impl TapPlane {
             mute = ?control.mute,
             deaf = ?control.deaf,
             hold = ?control.hold,
+            lease_ms,
             "a member control verb arrived for this conference leg"
         );
         Ok(())
+    }
+
+    pub fn sweep_member_state(&self, now: Instant) -> Vec<(SessionId, MemberControl)> {
+        let released = match self.conferences.lock() {
+            Ok(mut held) => held
+                .values_mut()
+                .flat_map(|conference| conference.expire_member_state(now))
+                .collect::<Vec<_>>(),
+            Err(_) => {
+                warn!("the conference table is poisoned; no member state lease can be swept");
+                Vec::new()
+            }
+        };
+        for (session, expired) in &released {
+            self.observe(
+                *session,
+                Observation::MemberStateExpired {
+                    mute: expired.mute == Some(false),
+                    deaf: expired.deaf == Some(false),
+                    hold: expired.hold == Some(false),
+                },
+            );
+        }
+        released
     }
 
     fn play_into_room(
@@ -1891,6 +2343,7 @@ impl TapPlane {
             .get(&session)
             .ok_or_else(|| MediaPlaneError(format!("{session} is not tapped here")))?;
         Ok(SessionHandles {
+            kind: live.kind,
             transport: live.transport.clone(),
             call_id: live.call_id.clone(),
             hub: live.hub.clone(),
@@ -1982,26 +2435,38 @@ impl MediaPlane for TapPlane {
 
     fn member_state(&self, session: SessionId) -> Option<MemberStateView> {
         let name = self.conference_of(session).ok()?;
-        self.conferences
-            .lock()
-            .ok()?
-            .get(&name)?
-            .member_state(session)
+        let held = self.conferences.lock().ok()?;
+        let conference = held.get(&name)?;
+        match conference.room().map(|seat| seat.session) == Some(session) {
+            true => Some(conference.room_state()),
+            false => conference.member_state(session),
+        }
     }
 
     async fn open_session(&self, view: SessionView) -> Result<OpenedSession, MediaPlaneError> {
         match view.kind {
             SessionKind::Tap => self.open_tap_session(view).await,
             SessionKind::Inline => self.open_inline_session(view),
-            SessionKind::Mix => Err(MediaPlaneError(
-                "a mixed session is the phase-4 conference; join inline legs into a group \
-                 instead"
-                    .to_string(),
-            )),
+            SessionKind::Mix => self.open_room_session(view),
         }
     }
 
     async fn close_session(&self, session: SessionId) -> Result<(), MediaPlaneError> {
+        let room = {
+            let held = self
+                .sessions
+                .lock()
+                .map_err(|_| MediaPlaneError("the session table is poisoned".to_string()))?;
+            held.get(&session).and_then(|live| match live.kind {
+                SessionKind::Mix => live.conference.clone(),
+                _ => None,
+            })
+        };
+        if let Some(name) = room {
+            self.close_room(session, &name).await?;
+            info!(%session, conference = %name, "the room session closed");
+            return Ok(());
+        }
         let live = {
             let mut held = self
                 .sessions
@@ -2034,10 +2499,18 @@ impl MediaPlane for TapPlane {
                 );
             }
         }
-        let mixing = live
-            .conference
-            .as_deref()
-            .and_then(|name| self.leave_conference(name, session));
+        let mut emptied = None;
+        let mixing = match live.conference.as_deref() {
+            Some(name) => match self.leave_conference(name, session) {
+                RoomFate::Stopped(thread) => Some(thread),
+                RoomFate::Emptied => {
+                    emptied = Some(name.to_string());
+                    None
+                }
+                RoomFate::Mixing => None,
+            },
+            None => None,
+        };
         if let Some(thread) = live.capture.take().or(mixing) {
             let joined = tokio::task::spawn_blocking(move || thread.join()).await;
             if joined.is_err() {
@@ -2055,6 +2528,14 @@ impl MediaPlane for TapPlane {
             ?released_ports,
             "session closed"
         );
+        if let Some(name) = emptied {
+            if self.config.conference_linger.is_zero() {
+                self.end_room_session(&name, "the last member left the conference")
+                    .await;
+            } else {
+                self.linger_over(&name);
+            }
+        }
         Ok(())
     }
 
@@ -2088,7 +2569,7 @@ impl MediaPlane for TapPlane {
         let opened = match view.transport {
             Transport::WsTwilio => self.open_ws_attachment(view),
             Transport::GrpcStream => self.open_grpc_attachment(view),
-            Transport::FileS3 => self.open_recording_attachment(view),
+            Transport::FileS3 => self.open_recording_attachment(view).await,
             other => Err(MediaPlaneError(format!(
                 "{other} attachments are not served yet; ws-twilio, grpc-stream \
                  and file-s3 are"
@@ -2348,10 +2829,13 @@ impl MediaPlane for TapPlane {
             ));
         }
         let SessionHandles {
-            transport, call_id, ..
+            kind,
+            transport,
+            call_id,
+            ..
         } = self.session_handles(session)?;
         if transport.is_none() {
-            return match playback_reach(target_tag.as_deref())? {
+            return match playback_reach(target_tag.as_deref(), kind)? {
                 PlaybackReach::Room => self.play_into_room(session, source),
                 PlaybackReach::Ear => self.play_into_inline_leg(session, source),
             };
@@ -2378,10 +2862,16 @@ impl MediaPlane for TapPlane {
         target_tag: Option<String>,
     ) -> Result<(), MediaPlaneError> {
         let SessionHandles {
-            transport, call_id, ..
+            kind,
+            transport,
+            call_id,
+            ..
         } = self.session_handles(session)?;
         let Some(transport) = transport else {
-            if matches!(playback_reach(target_tag.as_deref())?, PlaybackReach::Room) {
+            if matches!(
+                playback_reach(target_tag.as_deref(), kind)?,
+                PlaybackReach::Room
+            ) {
                 return self.flush_room_prompts(session);
             }
             let egress = self.inline_egress(session).ok_or_else(|| {
@@ -2509,9 +2999,21 @@ enum PlaybackReach {
     Room,
 }
 
-fn playback_reach(target_tag: Option<&str>) -> Result<PlaybackReach, MediaPlaneError> {
+fn playback_reach(
+    target_tag: Option<&str>,
+    kind: SessionKind,
+) -> Result<PlaybackReach, MediaPlaneError> {
+    let room = kind == SessionKind::Mix;
     match target_tag.map(str::trim) {
-        None | Some("") => Ok(PlaybackReach::Ear),
+        None | Some("") => Ok(match room {
+            true => PlaybackReach::Room,
+            false => PlaybackReach::Ear,
+        }),
+        Some(MIX_TARGET_OWN) if room => Err(MediaPlaneError(
+            "a room session has no ear of its own; a playback on the room is the room's, \
+             so leave the target empty or say \"all\""
+                .to_string(),
+        )),
         Some(MIX_TARGET_OWN) => Ok(PlaybackReach::Ear),
         Some(MIX_TARGET_EVERYONE) => Ok(PlaybackReach::Room),
         Some(other) => Err(MediaPlaneError(format!(
@@ -2769,6 +3271,32 @@ fn recording_selection_of(selector: TrackSelector) -> TrackSelection {
     }
 }
 
+fn records_another_recording(
+    key: &GroupKey,
+    account_id: &str,
+    held_recording_id: &str,
+    held_format: &str,
+) -> String {
+    format!(
+        "recording group {key} is already recording {held_recording_id} and one group writes \
+         one recording; attach with {account_id}/{held_recording_id}.{held_format} or a \
+         different group"
+    )
+}
+
+fn participant_already_held(key: &GroupKey, participant: &str, owner: Option<&str>) -> String {
+    match owner {
+        Some(owner) => format!(
+            "recording group {key} already has a participant writing {participant}, on pod \
+             {owner}; each member needs a label of its own"
+        ),
+        None => format!(
+            "recording group {key} already has a participant writing {participant}; each \
+             member needs a label of its own"
+        ),
+    }
+}
+
 fn participant_of(view: &AttachmentView, external_id: &str) -> Result<String, MediaPlaneError> {
     let named = if view.label.is_empty() {
         external_id
@@ -2996,11 +3524,13 @@ fn speaker_track(index: usize) -> Track {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::session_store::MemorySessionStore;
     use media_core::AudioFormat;
     use session_core::mix::{
         MEMBER_DEAF_METADATA_KEY, MEMBER_FLAG_OFF, MEMBER_FLAG_ON, MEMBER_HOLD_METADATA_KEY,
-        MEMBER_MUTE_METADATA_KEY, MIX_MONITOR_EXCLUDE, MIX_MONITOR_METADATA_KEY, MIX_SOURCE_LEG,
-        MIX_SOURCE_METADATA_KEY, MIX_TARGET_EVERYONE, MIX_TARGET_METADATA_KEY,
+        MEMBER_MUTE_METADATA_KEY, MEMBER_STATE_TTL_METADATA_KEY, MIX_MONITOR_EXCLUDE,
+        MIX_MONITOR_METADATA_KEY, MIX_SOURCE_LEG, MIX_SOURCE_METADATA_KEY, MIX_TARGET_EVERYONE,
+        MIX_TARGET_METADATA_KEY,
     };
     use session_core::{Capabilities, PlaybackId};
     use std::collections::BTreeMap;
@@ -3022,6 +3552,18 @@ mod tests {
 
         async fn exists(&self, _key: &str) -> Result<bool, recorder::UploadError> {
             Ok(false)
+        }
+
+        async fn get(&self, key: &str) -> Result<Vec<u8>, recorder::UploadError> {
+            Err(recorder::UploadError::Missing(key.to_string()))
+        }
+
+        async fn list(&self, _prefix: &str) -> Result<Vec<String>, recorder::UploadError> {
+            Ok(Vec::new())
+        }
+
+        async fn delete(&self, _key: &str) -> Result<(), recorder::UploadError> {
+            Ok(())
         }
 
         fn describe(&self) -> String {
@@ -3088,6 +3630,32 @@ mod tests {
                 .any(|(held, _)| held == key))
         }
 
+        async fn get(&self, key: &str) -> Result<Vec<u8>, recorder::UploadError> {
+            self.puts
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|(held, _)| held == key)
+                .map(|(_, body)| body.clone())
+                .ok_or_else(|| recorder::UploadError::Missing(key.to_string()))
+        }
+
+        async fn list(&self, prefix: &str) -> Result<Vec<String>, recorder::UploadError> {
+            Ok(self
+                .puts
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(held, _)| held.starts_with(prefix))
+                .map(|(held, _)| held.clone())
+                .collect())
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), recorder::UploadError> {
+            self.puts.lock().unwrap().retain(|(held, _)| held != key);
+            Ok(())
+        }
+
         fn describe(&self) -> String {
             "an in-memory bucket".to_string()
         }
@@ -3108,6 +3676,42 @@ mod tests {
     }
 
     fn plane_with_recording(recording: RecordingSupport) -> TapPlane {
+        plane_sharing_groups(recording, Arc::new(MemorySessionStore::default()))
+    }
+
+    fn plane_sharing_groups(
+        recording: RecordingSupport,
+        store: Arc<MemorySessionStore>,
+    ) -> TapPlane {
+        let plane = plane_without_a_store(recording);
+        plane.share_groups_through(store as Arc<dyn SessionStore>);
+        plane
+    }
+
+    fn plane_without_a_store(recording: RecordingSupport) -> TapPlane {
+        plane_lingering_for(recording, Duration::ZERO)
+    }
+
+    fn plane_leasing_member_state_for(member_state_ttl: Duration) -> TapPlane {
+        let plane = plane_configured(
+            RecordingSupport::default(),
+            Duration::ZERO,
+            member_state_ttl,
+        );
+        plane
+            .share_groups_through(Arc::new(MemorySessionStore::default()) as Arc<dyn SessionStore>);
+        plane
+    }
+
+    fn plane_lingering_for(recording: RecordingSupport, conference_linger: Duration) -> TapPlane {
+        plane_configured(recording, conference_linger, Duration::ZERO)
+    }
+
+    fn plane_configured(
+        recording: RecordingSupport,
+        conference_linger: Duration,
+        member_state_ttl: Duration,
+    ) -> TapPlane {
         TapPlane::new(TapPlaneConfig {
             default_node: None,
             local_media_address: IpAddr::from([127, 0, 0, 1]),
@@ -3120,6 +3724,8 @@ mod tests {
             sdp_session_id: 1,
             recording,
             capabilities: Arc::new(NodeCapabilityLog::new(true)),
+            conference_linger,
+            member_state_ttl,
         })
     }
 
@@ -3138,6 +3744,8 @@ mod tests {
             sdp_session_id: 1,
             recording: RecordingSupport::default(),
             capabilities: Arc::new(NodeCapabilityLog::new(true)),
+            conference_linger: Duration::ZERO,
+            member_state_ttl: Duration::ZERO,
         })
     }
 
@@ -3146,6 +3754,7 @@ mod tests {
             id: SessionId::from_raw(1),
             external_id: "req-1".to_string(),
             kind,
+            opened_at: SystemTime::now(),
             call_id: "call-abc".to_string(),
             from_tags: vec!["from-a".to_string()],
             attribution: Attribution::Explicit,
@@ -3171,6 +3780,8 @@ mod tests {
             sdp_session_id: 1,
             recording: RecordingSupport::default(),
             capabilities: Arc::new(NodeCapabilityLog::new(true)),
+            conference_linger: Duration::ZERO,
+            member_state_ttl: Duration::ZERO,
         })
     }
 
@@ -3329,12 +3940,17 @@ mod tests {
     }
 
     fn recording_support() -> RecordingSupport {
+        recording_support_owned("pod-a")
+    }
+
+    fn recording_support_owned(owner: &str) -> RecordingSupport {
         RecordingSupport {
             sink: Some(Arc::new(NowhereSink)),
             spill_dir: None,
+            journal: None,
             spill_every: recorder::SPILL_EVERY,
             counters: Arc::new(RecorderCounters::default()),
-            owner: "pod-a".to_string(),
+            owner: owner.to_string(),
             upload_permits: std::sync::Arc::new(tokio::sync::Semaphore::new(
                 recorder::DEFAULT_UPLOAD_CONCURRENCY,
             )),
@@ -3556,11 +4172,14 @@ a=rtpmap:101 telephone-event/8000\r\na=ptime:20\r\n"
     }
 
     #[derive(Default)]
-    struct WitnessedObservations(Mutex<Vec<(SessionId, Observation)>>);
+    struct WitnessedObservations {
+        seen: Mutex<Vec<(SessionId, Observation)>>,
+        finished: Mutex<Vec<(SessionId, String)>>,
+    }
 
     impl WitnessedObservations {
         fn digits(&self) -> Vec<Observation> {
-            self.0
+            self.seen
                 .lock()
                 .unwrap()
                 .iter()
@@ -3568,11 +4187,32 @@ a=rtpmap:101 telephone-event/8000\r\na=ptime:20\r\n"
                 .map(|(_, seen)| seen.clone())
                 .collect()
         }
+
+        fn finished(&self) -> Vec<(SessionId, String)> {
+            self.finished.lock().unwrap().clone()
+        }
+
+        fn member_state_expiries(&self) -> Vec<(SessionId, Observation)> {
+            self.seen
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(_, seen)| matches!(seen, Observation::MemberStateExpired { .. }))
+                .cloned()
+                .collect()
+        }
     }
 
     impl ObservationSink for WitnessedObservations {
         fn observe(&self, session: SessionId, observation: Observation) {
-            self.0.lock().unwrap().push((session, observation));
+            self.seen.lock().unwrap().push((session, observation));
+        }
+
+        fn session_finished(&self, session: SessionId, reason: &str) {
+            self.finished
+                .lock()
+                .unwrap()
+                .push((session, reason.to_string()));
         }
     }
 
@@ -3857,17 +4497,30 @@ m=audio {peer_port} RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\na=ptime:{ptime_ms}\r\n"
         }
     }
 
-    fn bucket_plane(bucket: &Arc<BucketSink>) -> TapPlane {
-        plane_with_recording(RecordingSupport {
+    fn recording_into(bucket: &Arc<BucketSink>, owner: &str) -> RecordingSupport {
+        RecordingSupport {
             sink: Some(Arc::clone(bucket) as Arc<dyn recorder::RecordingSink>),
+            journal: None,
             spill_dir: None,
             spill_every: recorder::SPILL_EVERY,
             counters: Arc::new(RecorderCounters::default()),
-            owner: "pod-a".to_string(),
+            owner: owner.to_string(),
             upload_permits: std::sync::Arc::new(tokio::sync::Semaphore::new(
                 recorder::DEFAULT_UPLOAD_CONCURRENCY,
             )),
-        })
+        }
+    }
+
+    fn bucket_plane(bucket: &Arc<BucketSink>) -> TapPlane {
+        plane_with_recording(recording_into(bucket, "pod-a"))
+    }
+
+    fn bucket_plane_of(
+        bucket: &Arc<BucketSink>,
+        store: &Arc<MemorySessionStore>,
+        owner: &str,
+    ) -> TapPlane {
+        plane_sharing_groups(recording_into(bucket, owner), Arc::clone(store))
     }
 
     #[tokio::test]
@@ -4583,6 +5236,213 @@ m=audio {peer_port} RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\na=ptime:{ptime_ms}\r\n"
     }
 
     #[tokio::test]
+    async fn a_muted_members_lease_lifts_the_mute_with_no_off_and_a_refresh_holds_it() {
+        let plane = plane();
+        let witness = Arc::new(WitnessedObservations::default());
+        plane.observe_through(Arc::downgrade(&witness) as Weak<dyn ObservationSink>);
+        let mut alice = seat_peer(&plane, 1, "leasing").await;
+        let mut bob = seat_peer(&plane, 2, "leasing").await;
+        let mut carol = seat_peer(&plane, 3, "leasing").await;
+        let SessionHandles { hub, .. } = plane
+            .session_handles(alice.session)
+            .expect("the conference leg is live here");
+        let mut monitor = hub
+            .attach(512, TrackSelection::Only(Track::Mixed))
+            .expect("the hub takes a monitor that wants the mix only");
+
+        plane
+            .open_attachment(member_attachment(
+                bob.session,
+                7,
+                &[
+                    (MEMBER_MUTE_METADATA_KEY, MEMBER_FLAG_ON),
+                    (MEMBER_STATE_TTL_METADATA_KEY, "500"),
+                ],
+            ))
+            .await
+            .expect("a member verb may name how long it holds");
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        assert_eq!(plane.metrics().snapshot().conference_members_muted, 1);
+        let leased = plane
+            .member_state(bob.session)
+            .expect("a seated member reads its own state back");
+        assert!(
+            (1..=500).contains(&leased.mute_expires_in_ms),
+            "the mute counts down to the moment it lifts: {}",
+            leased.mute_expires_in_ms
+        );
+        assert_eq!(
+            leased.deaf_expires_in_ms, 0,
+            "deaf was never set, so it has no lease"
+        );
+
+        let _ = loudest_mixed(&mut monitor);
+        everybody_speaks(&mut alice, &mut bob, &mut carol).await;
+        let alice_ear = alice.loudest_ear();
+        let mixed = loudest_mixed(&mut monitor);
+        assert!(
+            about(4_000, alice_ear),
+            "bob is muted for as long as nobody sweeps, even past his deadline: {alice_ear}"
+        );
+        assert!(
+            about(5_000, mixed),
+            "and the recording feed agrees: {mixed}"
+        );
+        assert_eq!(
+            plane.metrics().snapshot().conference_members_muted,
+            1,
+            "the mix thread keeps no timer of its own; a deadline that passed is not applied \
+             until the control world sweeps"
+        );
+
+        plane
+            .update_attachment(member_attachment(
+                bob.session,
+                7,
+                &[
+                    (MEMBER_MUTE_METADATA_KEY, MEMBER_FLAG_ON),
+                    (MEMBER_STATE_TTL_METADATA_KEY, "60000"),
+                ],
+            ))
+            .await
+            .expect("setting the flag on again with a ttl is the refresh");
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        assert!(
+            plane.sweep_member_state(Instant::now()).is_empty(),
+            "a refresh before the sweep moves the deadline out, so nothing expires"
+        );
+        assert_eq!(plane.metrics().snapshot().conference_members_muted, 1);
+
+        let released = plane.sweep_member_state(Instant::now() + Duration::from_secs(61));
+        assert_eq!(released.len(), 1, "one member's lease ran out");
+        assert_eq!(released[0].0, bob.session);
+        assert_eq!(
+            released[0].1.mute,
+            Some(false),
+            "the sweep releases, like an off"
+        );
+        assert_eq!(
+            released[0].1.deaf, None,
+            "and only the flag that was leased"
+        );
+        assert_eq!(
+            witness.member_state_expiries(),
+            vec![(
+                bob.session,
+                Observation::MemberStateExpired {
+                    mute: true,
+                    deaf: false,
+                    hold: false
+                }
+            )],
+            "the expiry is observed once, on the member's own session"
+        );
+        assert_eq!(
+            plane.metrics().snapshot().conference.member_state_expired,
+            1
+        );
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        assert_eq!(
+            plane.metrics().snapshot().conference_members_muted,
+            0,
+            "no off was ever sent"
+        );
+        assert_eq!(
+            plane
+                .member_state(bob.session)
+                .expect("bob is still seated")
+                .mute_expires_in_ms,
+            0,
+            "a lifted flag reports no lease"
+        );
+
+        let _ = loudest_mixed(&mut monitor);
+        everybody_speaks(&mut alice, &mut bob, &mut carol).await;
+        let alice_ear = alice.loudest_ear();
+        let mixed = loudest_mixed(&mut monitor);
+        assert!(
+            about(6_000, alice_ear),
+            "alice hears bob again without anybody asking for it: {alice_ear}"
+        );
+        assert!(
+            about(7_000, mixed),
+            "and the whole room is back on the record: {mixed}"
+        );
+
+        for peer in [&alice, &bob, &carol] {
+            plane
+                .close_session(peer.session)
+                .await
+                .expect("a conference leg closes");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_deployment_default_leases_a_member_flag_that_names_no_ttl_of_its_own() {
+        let plane = plane_leasing_member_state_for(Duration::from_millis(400));
+        let alice = seat_peer(&plane, 1, "default-lease").await;
+        let bob = seat_peer(&plane, 2, "default-lease").await;
+
+        plane
+            .open_attachment(member_attachment(
+                bob.session,
+                7,
+                &[(MEMBER_DEAF_METADATA_KEY, MEMBER_FLAG_ON)],
+            ))
+            .await
+            .expect("a member verb that names no lease takes the pod's default");
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        let leased = plane.member_state(bob.session).expect("bob is seated");
+        assert!(
+            (1..=400).contains(&leased.deaf_expires_in_ms),
+            "the deployment default is the lease: {}",
+            leased.deaf_expires_in_ms
+        );
+        assert_eq!(plane.metrics().snapshot().conference_members_deaf, 1);
+
+        assert!(plane.sweep_member_state(Instant::now()).is_empty());
+        let released = plane.sweep_member_state(Instant::now() + Duration::from_millis(500));
+        assert_eq!(released.len(), 1);
+        assert_eq!(released[0].1.deaf, Some(false));
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        assert_eq!(plane.metrics().snapshot().conference_members_deaf, 0);
+
+        plane
+            .open_attachment(member_attachment(
+                alice.session,
+                8,
+                &[
+                    (MEMBER_HOLD_METADATA_KEY, MEMBER_FLAG_ON),
+                    (MEMBER_STATE_TTL_METADATA_KEY, "0"),
+                ],
+            ))
+            .await
+            .expect("an explicit zero outranks the deployment default");
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        assert_eq!(
+            plane
+                .member_state(alice.session)
+                .expect("alice is seated")
+                .hold_expires_in_ms,
+            0
+        );
+        assert!(
+            plane
+                .sweep_member_state(Instant::now() + Duration::from_secs(3600))
+                .is_empty(),
+            "an unleased flag is never swept, which is the pre-lease behaviour"
+        );
+        assert_eq!(plane.metrics().snapshot().conference_members_held, 1);
+
+        for peer in [&alice, &bob] {
+            plane
+                .close_session(peer.session)
+                .await
+                .expect("a conference leg closes");
+        }
+    }
+
+    #[tokio::test]
     async fn a_deaf_member_still_speaks_into_a_room_it_cannot_hear() {
         let plane = plane();
         let mut alice = seat_peer(&plane, 1, "deafness").await;
@@ -5076,13 +5936,15 @@ m=audio 41000 RTP/AVP 111\r\na=rtpmap:111 opus/48000/2\r\n",
     }
 
     #[tokio::test]
-    async fn a_mixed_session_names_the_conference_phase_rather_than_half_opening() {
+    async fn a_room_session_that_names_no_conference_is_refused_rather_than_half_opened() {
         let plane = plane();
         let error = plane
             .open_session(session(SessionKind::Mix, ""))
             .await
             .unwrap_err();
-        assert!(error.to_string().contains("phase-4"), "{error}");
+        assert!(error.to_string().contains("name the conference"), "{error}");
+        assert_eq!(plane.metrics().snapshot().conferences_live, 0);
+        assert_eq!(plane.live_sessions(), 0);
     }
 
     #[tokio::test]
@@ -5132,6 +5994,7 @@ m=audio 41000 RTP/AVP 111\r\na=rtpmap:111 opus/48000/2\r\n",
         let plane = plane_with_recording(RecordingSupport {
             sink: Some(Arc::new(NowhereSink)),
             spill_dir: None,
+            journal: None,
             spill_every: recorder::SPILL_EVERY,
             counters: Arc::new(RecorderCounters::default()),
             owner: "pod-a".to_string(),
@@ -5237,8 +6100,8 @@ m=audio 41000 RTP/AVP 111\r\na=rtpmap:111 opus/48000/2\r\n",
         assert!(error.to_string().contains("attachment label"), "{error}");
     }
 
-    #[test]
-    fn a_group_refuses_a_second_member_that_would_overwrite_the_first() {
+    #[tokio::test]
+    async fn a_group_refuses_a_second_member_that_would_overwrite_the_first() {
         let plane = plane_with_recording(recording_support());
         let identity = identity("acct-42/rec-99.wav");
         let key = GroupKey {
@@ -5254,17 +6117,41 @@ m=audio 41000 RTP/AVP 111\r\na=rtpmap:111 opus/48000/2\r\n",
         let bob = participant_targets(&identity, "bob", TrackSelector::All, Attribution::Explicit);
 
         let opened = plane
-            .join_group(&key, AttachmentId::from_raw(2), &identity, &alice)
+            .join_group(
+                &key,
+                AttachmentId::from_raw(2),
+                SessionId::from_raw(1),
+                &identity,
+                &alice,
+                false,
+            )
+            .await
             .expect("the first member opens the group");
         let joined_late = plane
-            .join_group(&key, AttachmentId::from_raw(3), &identity, &bob)
+            .join_group(
+                &key,
+                AttachmentId::from_raw(3),
+                SessionId::from_raw(2),
+                &identity,
+                &bob,
+                false,
+            )
+            .await
             .expect("a second participant is the whole point");
         assert_eq!(
             opened, joined_late,
             "every member of a group anchors on the instant the group opened"
         );
         let error = plane
-            .join_group(&key, AttachmentId::from_raw(4), &identity, &alice)
+            .join_group(
+                &key,
+                AttachmentId::from_raw(4),
+                SessionId::from_raw(3),
+                &identity,
+                &alice,
+                false,
+            )
+            .await
             .unwrap_err();
 
         assert!(error.to_string().contains("label of its own"), "{error}");
@@ -5280,8 +6167,8 @@ m=audio 41000 RTP/AVP 111\r\na=rtpmap:111 opus/48000/2\r\n",
         assert_eq!(counters.group_joins_refused.load(Ordering::Relaxed), 1);
     }
 
-    #[test]
-    fn one_group_records_one_recording_and_says_so_when_asked_for_two() {
+    #[tokio::test]
+    async fn one_group_records_one_recording_and_says_so_when_asked_for_two() {
         let plane = plane_with_recording(recording_support());
         let first = identity("acct-42/rec-99.wav");
         let second = identity("acct-42/rec-100.wav");
@@ -5294,17 +6181,23 @@ m=audio 41000 RTP/AVP 111\r\na=rtpmap:111 opus/48000/2\r\n",
             .join_group(
                 &key,
                 AttachmentId::from_raw(2),
+                SessionId::from_raw(1),
                 &first,
                 &participant_targets(&first, "alice", TrackSelector::All, Attribution::Explicit),
+                false,
             )
+            .await
             .unwrap();
         let error = plane
             .join_group(
                 &key,
                 AttachmentId::from_raw(3),
+                SessionId::from_raw(2),
                 &second,
                 &participant_targets(&second, "bob", TrackSelector::All, Attribution::Explicit),
+                false,
             )
+            .await
             .unwrap_err();
 
         assert!(error.to_string().contains("rec-99"), "{error}");
@@ -5314,8 +6207,8 @@ m=audio 41000 RTP/AVP 111\r\na=rtpmap:111 opus/48000/2\r\n",
         );
     }
 
-    #[test]
-    fn a_group_dies_with_its_last_member() {
+    #[tokio::test]
+    async fn a_group_dies_with_its_last_member() {
         let plane = plane_with_recording(recording_support());
         let identity = identity("acct-42/rec-99.wav");
         let key = GroupKey {
@@ -5328,6 +6221,7 @@ m=audio 41000 RTP/AVP 111\r\na=rtpmap:111 opus/48000/2\r\n",
                 .join_group(
                     &key,
                     *member,
+                    SessionId::from_raw(index as u64 + 1),
                     &identity,
                     &participant_targets(
                         &identity,
@@ -5335,15 +6229,17 @@ m=audio 41000 RTP/AVP 111\r\na=rtpmap:111 opus/48000/2\r\n",
                         TrackSelector::Only(Track::Customer),
                         Attribution::Explicit,
                     ),
+                    false,
                 )
+                .await
                 .unwrap();
         }
         let counters = &plane.config.recording.counters;
         assert_eq!(counters.group_members_live.load(Ordering::Relaxed), 2);
 
-        plane.leave_group(&key, members[0]);
+        plane.leave_group(&key, members[0]).await;
         assert_eq!(counters.groups_live.load(Ordering::Relaxed), 1);
-        plane.leave_group(&key, members[1]);
+        plane.leave_group(&key, members[1]).await;
 
         assert_eq!(counters.groups_live.load(Ordering::Relaxed), 0);
         assert_eq!(counters.group_members_live.load(Ordering::Relaxed), 0);
@@ -5353,6 +6249,7 @@ m=audio 41000 RTP/AVP 111\r\na=rtpmap:111 opus/48000/2\r\n",
             .join_group(
                 &key,
                 members[0],
+                SessionId::from_raw(1),
                 &identity,
                 &participant_targets(
                     &identity,
@@ -5360,9 +6257,642 @@ m=audio 41000 RTP/AVP 111\r\na=rtpmap:111 opus/48000/2\r\n",
                     TrackSelector::Only(Track::Customer),
                     Attribution::Explicit,
                 ),
+                false,
             )
+            .await
             .expect("the same group name is free once the last member has gone");
         assert_eq!(counters.groups_live.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn a_group_name_reused_on_a_second_pod_joins_it_instead_of_opening_another() {
+        let store = Arc::new(MemorySessionStore::default());
+        let first = plane_sharing_groups(recording_support_owned("pod-a"), Arc::clone(&store));
+        let second = plane_sharing_groups(recording_support_owned("pod-b"), Arc::clone(&store));
+        let identity = identity("acct-42/rec-99.wav");
+        let key = GroupKey {
+            account_id: identity.account_id.clone(),
+            group: "conf-9".to_string(),
+        };
+        let alice = participant_targets(
+            &identity,
+            "alice",
+            TrackSelector::Only(Track::Customer),
+            Attribution::Explicit,
+        );
+        let bob = participant_targets(
+            &identity,
+            "bob",
+            TrackSelector::Only(Track::Customer),
+            Attribution::Explicit,
+        );
+
+        let opened = first
+            .join_group(
+                &key,
+                AttachmentId::from_raw(2),
+                SessionId::from_raw(1),
+                &identity,
+                &alice,
+                false,
+            )
+            .await
+            .expect("the first member opens the group");
+        first.groups.lock().unwrap().clear();
+        let joined = second
+            .join_group(
+                &key,
+                AttachmentId::from_raw(3),
+                SessionId::from_raw(2),
+                &identity,
+                &bob,
+                false,
+            )
+            .await
+            .expect("a member on another pod joins the group that already exists");
+
+        assert_eq!(
+            opened, joined,
+            "a group name reused on a second pod must not open a second half-recording \
+             under the same prefix"
+        );
+        let record = store
+            .group_record(&key.to_string())
+            .expect("the group is a shared record, not one pod's memory");
+        assert_eq!(record.recording_id, "rec-99");
+        assert_eq!(record.format, "wav");
+        assert_eq!(
+            record.created_by, "pod-a",
+            "the pod that opened the group owns its anchor"
+        );
+        assert_eq!(
+            store.group_members(&key.to_string()),
+            BTreeMap::from([
+                ("acct-42/rec-99/alice.wav".to_string(), "pod-a".to_string()),
+                ("acct-42/rec-99/bob.wav".to_string(), "pod-b".to_string()),
+            ]),
+            "the participant set says which pod writes which object"
+        );
+
+        let error = second
+            .join_group(
+                &key,
+                AttachmentId::from_raw(4),
+                SessionId::from_raw(3),
+                &identity,
+                &alice,
+                false,
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("label of its own"), "{error}");
+        assert!(
+            error.to_string().contains("pod-a"),
+            "a cross-pod refusal must name the pod already writing that object: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_adopted_member_takes_its_seat_back_from_the_pod_that_died() {
+        let store = Arc::new(MemorySessionStore::default());
+        let dead = plane_sharing_groups(recording_support_owned("pod-a"), Arc::clone(&store));
+        let adopter = plane_sharing_groups(recording_support_owned("pod-b"), Arc::clone(&store));
+        let identity = identity("acct-42/rec-99.wav");
+        let key = GroupKey {
+            account_id: identity.account_id.clone(),
+            group: "conf-9".to_string(),
+        };
+        let alice = participant_targets(
+            &identity,
+            "alice",
+            TrackSelector::Only(Track::Customer),
+            Attribution::Explicit,
+        );
+        let opened = dead
+            .join_group(
+                &key,
+                AttachmentId::from_raw(2),
+                SessionId::from_raw(1),
+                &identity,
+                &alice,
+                false,
+            )
+            .await
+            .expect("the member records on the pod that dies");
+
+        let refused = adopter
+            .join_group(
+                &key,
+                AttachmentId::from_raw(3),
+                SessionId::from_raw(1),
+                &identity,
+                &alice,
+                false,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            refused.to_string().contains("label of its own"),
+            "a fresh attach must not silently overwrite a live member's object: {refused}"
+        );
+
+        let adopted = adopter
+            .join_group(
+                &key,
+                AttachmentId::from_raw(4),
+                SessionId::from_raw(1),
+                &identity,
+                &alice,
+                true,
+            )
+            .await
+            .expect("an adopter whose lease claim already arbitrated takes the seat back");
+
+        assert_eq!(
+            opened, adopted,
+            "an adopted member keeps the anchor the group opened on"
+        );
+        assert_eq!(
+            store.group_members(&key.to_string()),
+            BTreeMap::from([("acct-42/rec-99/alice.wav".to_string(), "pod-b".to_string())]),
+            "the seat now names the pod that finishes the object"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_group_the_store_cannot_answer_for_is_refused_rather_than_kept_locally() {
+        let store = Arc::new(MemorySessionStore::default());
+        let plane = plane_sharing_groups(recording_support(), Arc::clone(&store));
+        let identity = identity("acct-42/rec-99.wav");
+        let key = GroupKey {
+            account_id: identity.account_id.clone(),
+            group: "conf-9".to_string(),
+        };
+        store.set_unreachable(true);
+
+        let error = plane
+            .join_group(
+                &key,
+                AttachmentId::from_raw(2),
+                SessionId::from_raw(1),
+                &identity,
+                &participant_targets(
+                    &identity,
+                    "alice",
+                    TrackSelector::Only(Track::Customer),
+                    Attribution::Explicit,
+                ),
+                false,
+            )
+            .await
+            .unwrap_err();
+
+        assert!(
+            error.to_string().contains("session registry"),
+            "a store this pod cannot read must be named in the refusal: {error}"
+        );
+        let counters = &plane.config.recording.counters;
+        assert_eq!(counters.group_joins_refused.load(Ordering::Relaxed), 1);
+        assert_eq!(counters.groups_live.load(Ordering::Relaxed), 0);
+        assert_eq!(counters.group_members_live.load(Ordering::Relaxed), 0);
+        assert!(
+            plane.groups.lock().unwrap().is_empty(),
+            "a half-group in one pod's memory is worse than no group"
+        );
+    }
+
+    #[tokio::test]
+    async fn two_pods_sharing_one_store_pad_their_members_back_to_one_anchor() {
+        let bucket = Arc::new(BucketSink::default());
+        let store = Arc::new(MemorySessionStore::default());
+        let first = bucket_plane_of(&bucket, &store, "pod-a");
+        let second = bucket_plane_of(&bucket, &store, "pod-b");
+        let mut alice = seat_peer(&first, 1, "cross-pod").await;
+
+        first
+            .open_attachment(recording_attachment(
+                11,
+                alice.session,
+                "acct-7/parties.wav",
+                TrackSelector::Only(Track::Customer),
+                "parties",
+                "alice",
+            ))
+            .await
+            .expect("the first pod opens the group");
+        for _ in 0..8 {
+            alice.speak(1_000, 4);
+            tokio::time::sleep(Duration::from_millis(80)).await;
+        }
+
+        let mut bob = seat_peer(&second, 2, "cross-pod").await;
+        second
+            .open_attachment(recording_attachment(
+                12,
+                bob.session,
+                "acct-7/parties.wav",
+                TrackSelector::Only(Track::Customer),
+                "parties",
+                "bob",
+            ))
+            .await
+            .expect("a member on a second pod joins the group the first pod opened");
+        for _ in 0..8 {
+            alice.speak(1_000, 4);
+            bob.speak(2_000, 4);
+            tokio::time::sleep(Duration::from_millis(80)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        first
+            .close_attachment(alice.session, AttachmentId::from_raw(11))
+            .await
+            .expect("the first pod's member closes");
+        second
+            .close_attachment(bob.session, AttachmentId::from_raw(12))
+            .await
+            .expect("the second pod's member closes");
+        first.await_uploads().await;
+        second.await_uploads().await;
+
+        let mut keys = bucket.keys();
+        keys.sort();
+        assert_eq!(
+            keys,
+            vec![
+                "acct-7/parties/alice.wav".to_string(),
+                "acct-7/parties/bob.wav".to_string(),
+            ],
+            "one prefix, one object per participant, across two pods"
+        );
+        let (_, alice_samples) = recorded_wav(&bucket.body("acct-7/parties/alice.wav"));
+        let (_, bob_samples) = recorded_wav(&bucket.body("acct-7/parties/bob.wav"));
+        let lead = bob_samples
+            .iter()
+            .position(|sample| *sample != 0)
+            .unwrap_or(bob_samples.len());
+        assert!(
+            lead >= 8_000 / 4,
+            "the second pod's member must be padded back to the anchor the first pod \
+             stamped: {lead} samples"
+        );
+        let slack = 8_000usize / 2;
+        assert!(
+            bob_samples.len() + slack >= alice_samples.len()
+                && bob_samples.len() <= alice_samples.len() + slack,
+            "two members of one group on two pods must be the same length: {} against {}",
+            bob_samples.len(),
+            alice_samples.len()
+        );
+
+        first
+            .close_session(alice.session)
+            .await
+            .expect("a conference leg closes");
+        second
+            .close_session(bob.session)
+            .await
+            .expect("a conference leg closes");
+    }
+
+    fn room_session(id: u64, group: &str) -> SessionView {
+        SessionView {
+            id: SessionId::from_raw(id),
+            external_id: format!("room-{id}"),
+            call_id: String::new(),
+            from_tags: Vec::new(),
+            attribution: Attribution::Explicit,
+            group: group.to_string(),
+            ..session(SessionKind::Mix, "")
+        }
+    }
+
+    async fn open_room(plane: &TapPlane, id: u64, group: &str) -> SessionId {
+        plane
+            .open_session(room_session(id, group))
+            .await
+            .expect("a room session opens or adopts its conference");
+        SessionId::from_raw(id)
+    }
+
+    fn lead_samples(samples: &[i16]) -> usize {
+        samples
+            .iter()
+            .position(|sample| *sample != 0)
+            .unwrap_or(samples.len())
+    }
+
+    #[tokio::test]
+    async fn a_room_session_opened_before_anybody_joins_records_the_wait_and_then_the_room() {
+        let bucket = Arc::new(BucketSink::default());
+        let plane = bucket_plane(&bucket);
+        let room = open_room(&plane, 9, "board-room").await;
+        plane
+            .open_attachment(recording_attachment(
+                11,
+                room,
+                "acct-7/room.wav",
+                TrackSelector::Only(Track::Mixed),
+                "",
+                "room",
+            ))
+            .await
+            .expect("the room session records the room, member or no member");
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        let mut alice = seat_peer(&plane, 1, "board-room").await;
+        let mut bob = seat_peer(&plane, 2, "board-room").await;
+        for _ in 0..6 {
+            alice.speak(1_000, 4);
+            bob.speak(2_000, 4);
+            tokio::time::sleep(Duration::from_millis(80)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        plane
+            .close_session(room)
+            .await
+            .expect("the room session closes on its own end-session");
+        plane.await_uploads().await;
+
+        let (channels, samples) = recorded_wav(&bucket.body("acct-7/room.wav"));
+        assert_eq!(channels, 1, "a room object is one mono mix");
+        let lead = lead_samples(&samples);
+        assert!(
+            lead >= 8_000 / 4,
+            "the room object opens with the silence nobody spoke into: {lead} samples"
+        );
+        let loudest = samples.iter().copied().max().unwrap_or(0);
+        assert!(
+            (2_700..=3_300).contains(&loudest),
+            "and then carries both members summed: {loudest}"
+        );
+
+        assert_eq!(
+            plane.metrics().snapshot().conferences_live,
+            1,
+            "ending the room session leaves the members mixing"
+        );
+        assert!(
+            (1_600..=2_400).contains(&alice.loudest_ear()),
+            "alice still hears bob after the room session ended"
+        );
+        for peer in [&alice, &bob] {
+            plane
+                .close_session(peer.session)
+                .await
+                .expect("a conference leg closes");
+        }
+        assert_eq!(plane.metrics().snapshot().conferences_live, 0);
+    }
+
+    #[tokio::test]
+    async fn a_room_recording_attached_late_starts_at_the_rooms_open_and_matches_its_participants()
+    {
+        let bucket = Arc::new(BucketSink::default());
+        let plane = bucket_plane(&bucket);
+        let mut alice = seat_peer(&plane, 1, "late-room").await;
+        let mut bob = seat_peer(&plane, 2, "late-room").await;
+        for _ in 0..6 {
+            alice.speak(1_000, 4);
+            bob.speak(2_000, 4);
+            tokio::time::sleep(Duration::from_millis(80)).await;
+        }
+
+        let room = open_room(&plane, 9, "late-room").await;
+        plane
+            .open_attachment(recording_attachment(
+                11,
+                room,
+                "acct-7/room.wav",
+                TrackSelector::Only(Track::Mixed),
+                "",
+                "room",
+            ))
+            .await
+            .expect("a room session adopts a conference that is already mixing");
+        for (id, session, label) in [(12u64, alice.session, "alice"), (13, bob.session, "bob")] {
+            plane
+                .open_attachment(recording_attachment(
+                    id,
+                    session,
+                    "acct-7/parties.wav",
+                    TrackSelector::Only(Track::Customer),
+                    "parties",
+                    label,
+                ))
+                .await
+                .expect("the participants record one object each");
+        }
+        for _ in 0..6 {
+            alice.speak(1_000, 4);
+            bob.speak(2_000, 4);
+            tokio::time::sleep(Duration::from_millis(80)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        for (session, id) in [(room, 11u64), (alice.session, 12), (bob.session, 13)] {
+            plane
+                .close_attachment(session, AttachmentId::from_raw(id))
+                .await
+                .expect("a recording attachment closes and uploads");
+        }
+        plane.await_uploads().await;
+
+        let (_, room_samples) = recorded_wav(&bucket.body("acct-7/room.wav"));
+        let room_lead = lead_samples(&room_samples);
+        assert!(
+            room_lead >= 8_000 / 4,
+            "a room object attached late is padded back to the conference's open: \
+             {room_lead} samples"
+        );
+        let (_, alice_samples) = recorded_wav(&bucket.body("acct-7/parties/alice.wav"));
+        assert!(
+            lead_samples(&alice_samples) >= 8_000 / 4,
+            "and so is a participant group opened at the same late moment, because both \
+             anchor on the conference"
+        );
+        let slack = 8_000usize / 2;
+        assert!(
+            room_samples.len() + slack >= alice_samples.len()
+                && room_samples.len() <= alice_samples.len() + slack,
+            "the two shapes are sample-aligned by construction: {} against {}",
+            room_samples.len(),
+            alice_samples.len()
+        );
+
+        for peer in [&alice, &bob] {
+            plane
+                .close_session(peer.session)
+                .await
+                .expect("a conference leg closes");
+        }
+    }
+
+    #[tokio::test]
+    async fn the_room_object_outlives_a_member_and_closes_when_the_last_one_leaves() {
+        let bucket = Arc::new(BucketSink::default());
+        let plane = bucket_plane(&bucket);
+        let witness = Arc::new(WitnessedObservations::default());
+        plane.observe_through(Arc::downgrade(&witness) as Weak<dyn ObservationSink>);
+        let room = open_room(&plane, 9, "outlives").await;
+        plane
+            .open_attachment(recording_attachment(
+                11,
+                room,
+                "acct-7/room.wav",
+                TrackSelector::Only(Track::Mixed),
+                "",
+                "room",
+            ))
+            .await
+            .expect("the room records itself");
+        let mut alice = seat_peer(&plane, 1, "outlives").await;
+        let mut bob = seat_peer(&plane, 2, "outlives").await;
+        for _ in 0..5 {
+            alice.speak(1_000, 4);
+            bob.speak(2_000, 4);
+            tokio::time::sleep(Duration::from_millis(80)).await;
+        }
+
+        plane
+            .close_session(alice.session)
+            .await
+            .expect("a conference leg closes");
+        assert_eq!(
+            plane.metrics().snapshot().recordings_live,
+            1,
+            "the member who left did not own the room object"
+        );
+        assert!(
+            bucket.keys().is_empty(),
+            "and nothing was uploaded when she left: {:?}",
+            bucket.keys()
+        );
+        for _ in 0..5 {
+            bob.speak(2_000, 4);
+            tokio::time::sleep(Duration::from_millis(80)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        plane
+            .close_session(bob.session)
+            .await
+            .expect("the last conference leg closes");
+        plane.await_uploads().await;
+
+        assert_eq!(
+            bucket.keys(),
+            vec!["acct-7/room.wav".to_string()],
+            "the last member out ends the room session, which uploads the room object"
+        );
+        assert_eq!(plane.live_sessions(), 0, "the room session ended itself");
+        assert_eq!(plane.metrics().snapshot().conferences_live, 0);
+        assert_eq!(plane.metrics().snapshot().conference.rooms_auto_ended, 1);
+        let finished = witness.finished();
+        assert_eq!(finished.len(), 1, "{finished:?}");
+        assert_eq!(finished[0].0, room);
+        assert!(finished[0].1.contains("last member"), "{finished:?}");
+
+        let (_, samples) = recorded_wav(&bucket.body("acct-7/room.wav"));
+        let opens = samples.len() * 3 / 10;
+        let closes = samples.len() * 9 / 10;
+        let with_alice = samples[..opens].iter().copied().max().unwrap_or(0);
+        let after_she_left = samples[samples.len() / 2..closes]
+            .iter()
+            .copied()
+            .max()
+            .unwrap_or(0);
+        assert!(
+            (2_700..=3_300).contains(&with_alice),
+            "the object carried both members while both were in the room: {with_alice}"
+        );
+        assert!(
+            (1_600..=2_400).contains(&after_she_left),
+            "and kept recording bob alone after alice left: {after_she_left}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_emptied_room_lingers_and_a_member_that_rejoins_cancels_the_linger() {
+        const LINGER: Duration = Duration::from_millis(300);
+        let plane = Arc::new(plane_lingering_for(RecordingSupport::default(), LINGER));
+        plane.linger_through(Arc::downgrade(&plane));
+        let room = open_room(&plane, 9, "linger-room").await;
+        let alice = seat_peer(&plane, 1, "linger-room").await;
+
+        plane
+            .close_session(alice.session)
+            .await
+            .expect("the only conference leg closes");
+        assert_eq!(
+            plane.metrics().snapshot().conferences_live,
+            1,
+            "an emptied conference with a room session is held, not closed"
+        );
+
+        let bob = seat_peer(&plane, 2, "linger-room").await;
+        tokio::time::sleep(LINGER * 2).await;
+        assert_eq!(
+            plane.metrics().snapshot().conference_members_live,
+            1,
+            "a member that rejoined inside the linger cancelled it"
+        );
+        assert_eq!(plane.live_sessions(), 2);
+
+        plane
+            .close_session(bob.session)
+            .await
+            .expect("the last conference leg closes");
+        assert_eq!(plane.live_sessions(), 1, "the linger is running again");
+        tokio::time::sleep(LINGER * 3).await;
+        assert_eq!(
+            plane.live_sessions(),
+            0,
+            "the linger expired, so the room session ended itself"
+        );
+        assert_eq!(plane.metrics().snapshot().conferences_live, 0);
+        assert!(plane.metrics().snapshot().conference.rooms_auto_ended >= 1);
+        let _ = room;
+    }
+
+    #[tokio::test]
+    async fn a_room_session_is_refused_a_recording_group_and_a_second_owner() {
+        let bucket = Arc::new(BucketSink::default());
+        let plane = bucket_plane(&bucket);
+        let room = open_room(&plane, 9, "one-owner").await;
+        let error = plane
+            .open_attachment(recording_attachment(
+                11,
+                room,
+                "acct-7/parties.wav",
+                TrackSelector::Only(Track::Mixed),
+                "parties",
+                "room",
+            ))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("no participant seat"), "{error}");
+
+        let error = plane
+            .open_session(SessionView {
+                id: SessionId::from_raw(10),
+                external_id: "room-10".to_string(),
+                ..room_session(10, "one-owner")
+            })
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("already owned by"), "{error}");
+
+        plane
+            .close_session(room)
+            .await
+            .expect("the room session closes");
+        assert_eq!(
+            plane.metrics().snapshot().conferences_live,
+            0,
+            "the room session was the only thing holding the conference open"
+        );
     }
 
     #[test]
@@ -6174,6 +7704,244 @@ m=audio 41000 RTP/AVP 111\r\na=rtpmap:111 opus/48000/2\r\n",
         assert!(
             bob_after.member.expect("bob is still seated").mute,
             "member state has no lease, so it survives every other membership change"
+        );
+
+        room.close().await;
+    }
+
+    #[tokio::test]
+    async fn a_leased_member_flag_counts_down_over_the_wire_and_expires_as_its_own_cause() {
+        use control_api::proto;
+        use control_api::proto::media_control_client::MediaControlClient;
+
+        let plane = Arc::new(plane());
+        let (room, _controller) = WiredRoom::with_plane(Arc::clone(&plane)).await;
+        let mut client = MediaControlClient::connect(room.endpoint.clone())
+            .await
+            .expect("a client reaches the control port");
+
+        let mut peers = Vec::new();
+        for member in ["alice", "bob"] {
+            let (peer, offer) = silent_peer();
+            peers.push(peer);
+            client
+                .create_session(proto::CreateSessionRequest {
+                    external_id: member.to_string(),
+                    kind: proto::SessionKind::Inline as i32,
+                    call_id: format!("call-{member}"),
+                    from_tags: Vec::new(),
+                    rtpengine_node: String::new(),
+                    mix: false,
+                    idempotency_key: String::new(),
+                    sdp_offer: offer,
+                    group: "leasing-wire".to_string(),
+                })
+                .await
+                .expect("an inline leg is answered and seated");
+        }
+        client
+            .attach(proto::AttachRequest {
+                session: Some(wire_reference("bob")),
+                transport: proto::Transport::GrpcStream as i32,
+                capabilities: vec![proto::Capability::Sink as i32],
+                selector: None,
+                format: None,
+                authoritative: false,
+                label: "supervisor".to_string(),
+                endpoint: "grpc-target".to_string(),
+                group: String::new(),
+                metadata: [
+                    (
+                        MEMBER_MUTE_METADATA_KEY.to_string(),
+                        MEMBER_FLAG_ON.to_string(),
+                    ),
+                    (
+                        MEMBER_STATE_TTL_METADATA_KEY.to_string(),
+                        "60000".to_string(),
+                    ),
+                ]
+                .into_iter()
+                .collect(),
+                idempotency_key: String::new(),
+            })
+            .await
+            .expect("a leased mute rides on an attachment of bob's own session");
+
+        let leased = client
+            .describe_session(wire_reference("bob"))
+            .await
+            .expect("bob describes")
+            .into_inner()
+            .member
+            .expect("bob is seated");
+        assert!(leased.mute, "the mute is on");
+        assert!(
+            (1..=60_000).contains(&leased.mute_expires_in_ms),
+            "and a ui can see how long it has left: {}",
+            leased.mute_expires_in_ms
+        );
+        assert_eq!(leased.deaf_expires_in_ms, 0);
+        assert_eq!(leased.hold_expires_in_ms, 0);
+
+        let mut events = client
+            .watch_events(proto::WatchRequest {
+                session: Some(wire_reference("bob")),
+            })
+            .await
+            .expect("a watcher on bob's session")
+            .into_inner();
+
+        let released = plane.sweep_member_state(Instant::now() + Duration::from_secs(61));
+        assert_eq!(released.len(), 1, "the lease ran out");
+
+        let event = events
+            .message()
+            .await
+            .expect("the stream is live")
+            .expect("an expiry reaches the bus");
+        match event.payload {
+            Some(proto::media_event::Payload::MemberControlled(controlled)) => {
+                assert!(!controlled.mute, "the flag is off");
+                assert!(!controlled.deaf && !controlled.hold);
+                assert_eq!(
+                    controlled.cause,
+                    proto::MemberControlCause::Expired as i32,
+                    "and a consumer can tell a lease that ran out from a controller that asked"
+                );
+            }
+            other => panic!("expected a member_controlled payload, got {other:?}"),
+        }
+
+        let lifted = client
+            .describe_session(wire_reference("bob"))
+            .await
+            .expect("bob describes again")
+            .into_inner()
+            .member
+            .expect("bob is still seated");
+        assert!(!lifted.mute, "no off was ever sent");
+        assert_eq!(lifted.mute_expires_in_ms, 0);
+
+        room.close().await;
+    }
+
+    #[tokio::test]
+    async fn describing_a_room_session_reads_the_conferences_open_and_its_members() {
+        use control_api::proto;
+        use control_api::proto::media_control_client::MediaControlClient;
+
+        let plane = Arc::new(plane());
+        let (room, _controller) = WiredRoom::with_plane(Arc::clone(&plane)).await;
+        let mut client = MediaControlClient::connect(room.endpoint.clone())
+            .await
+            .expect("a client reaches the control port");
+
+        let mut peers = Vec::new();
+        for member in ["alice", "bob"] {
+            let (peer, offer) = silent_peer();
+            peers.push(peer);
+            client
+                .create_session(proto::CreateSessionRequest {
+                    external_id: member.to_string(),
+                    kind: proto::SessionKind::Inline as i32,
+                    call_id: format!("call-{member}"),
+                    from_tags: Vec::new(),
+                    rtpengine_node: String::new(),
+                    mix: false,
+                    idempotency_key: String::new(),
+                    sdp_offer: offer,
+                    group: "sales-standup".to_string(),
+                })
+                .await
+                .expect("an inline leg is answered and seated");
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        let before_the_room = control_api::convert::unix_ms(SystemTime::now());
+
+        let created = client
+            .create_session(proto::CreateSessionRequest {
+                external_id: "the-room".to_string(),
+                kind: proto::SessionKind::Mix as i32,
+                call_id: String::new(),
+                from_tags: Vec::new(),
+                rtpengine_node: String::new(),
+                mix: false,
+                idempotency_key: String::new(),
+                sdp_offer: String::new(),
+                group: "sales-standup".to_string(),
+            })
+            .await
+            .expect("a room session adopts the conference its members opened")
+            .into_inner();
+        assert_eq!(created.kind, proto::SessionKind::Mix as i32);
+        assert!(created.sdp_answer.is_empty(), "a room answers no offer");
+
+        let described = client
+            .describe_session(wire_reference("the-room"))
+            .await
+            .expect("the room describes")
+            .into_inner();
+        assert!(
+            described.member.is_none(),
+            "the room is not a member of itself"
+        );
+        let view = described.conference.expect("the room enumerates itself");
+        assert_eq!(view.group, "sales-standup");
+        assert_eq!(view.member_count, 2);
+        assert_eq!(
+            view.members,
+            vec!["alice".to_string(), "bob".to_string()],
+            "the room reads its members back in seating order"
+        );
+        assert_eq!(view.room_session, "the-room");
+        assert!(
+            described.opened_at_unix_ms > 0 && described.opened_at_unix_ms + 100 <= before_the_room,
+            "a room session reports the conference's open, not its own creation: {} against \
+             {before_the_room}",
+            described.opened_at_unix_ms
+        );
+
+        let alice = client
+            .describe_session(wire_reference("alice"))
+            .await
+            .expect("a member describes")
+            .into_inner();
+        assert_eq!(
+            alice
+                .conference
+                .expect("a member enumerates its room")
+                .room_session,
+            "the-room",
+            "every member can find the session that owns the room recording"
+        );
+        assert!(
+            alice.member.is_some(),
+            "a member still reads its own state back"
+        );
+        assert!(
+            described.opened_at_unix_ms >= alice.opened_at_unix_ms,
+            "the conference opened when its first leg was seated, which is at or after \
+             that leg's own create: {} against {}",
+            described.opened_at_unix_ms,
+            alice.opened_at_unix_ms
+        );
+
+        client
+            .destroy_session(wire_reference("the-room"))
+            .await
+            .expect("the room session ends");
+        let alice_after = client
+            .describe_session(wire_reference("alice"))
+            .await
+            .expect("a member describes")
+            .into_inner();
+        assert_eq!(
+            alice_after
+                .conference
+                .expect("the room is still mixing")
+                .room_session,
+            "",
+            "the members keep mixing with no room session of their own"
         );
 
         room.close().await;

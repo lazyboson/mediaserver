@@ -20,7 +20,13 @@ pub use controller::{
     EventSink, InlineEgressSink, MediaPlane, MediaPlaneError, ObservationSink, OpenedSession,
     PlaybackSource, SessionController, StreamFrame,
 };
-pub use server::{serve_authenticated_until, serve_on, serve_on_until, serve_shared_until};
+pub use server::{
+    serve_authenticated_until, serve_on, serve_on_until, serve_shared_until, WireFacing,
+};
+pub use session_core::{
+    reserved_metadata_refusal, RESERVED_METADATA_PREFIX, RESUME_MS_METADATA_KEY,
+    SPILL_OWNER_METADATA_KEY,
+};
 pub use stream::MediaStreamService;
 pub use telcompat::TelCompat;
 pub use tonic;

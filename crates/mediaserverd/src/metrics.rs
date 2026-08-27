@@ -4,6 +4,7 @@ use crate::event_pump::PumpCounters;
 use crate::health::{Readiness, HEALTHZ_PATH, READYZ_PATH};
 use crate::media_ports::MediaPortAllocator;
 use crate::registry_keeper::KeeperCounters;
+use crate::rtpengine_capability::{NodeCapabilityLog, NodeSample};
 use crate::tap_plane::TapPlaneMetrics;
 use control_api::SessionController;
 use std::fmt::Write as _;
@@ -29,6 +30,7 @@ pub struct MetricsSources {
     pub drain: Arc<DrainState>,
     pub ports: Arc<MediaPortAllocator>,
     pub readiness: Arc<Readiness>,
+    pub capabilities: Arc<NodeCapabilityLog>,
 }
 
 pub struct HttpResponse {
@@ -282,6 +284,16 @@ pub fn render(sources: &MetricsSources) -> String {
         snapshot.conference.member_controls,
     );
     counter(
+        "mss_conference_member_state_expired_total",
+        "Member flags this pod lifted itself because their lease ran out unrefreshed",
+        snapshot.conference.member_state_expired,
+    );
+    counter(
+        "mss_conference_rooms_auto_ended_total",
+        "Room sessions that ended themselves because their conference emptied",
+        snapshot.conference.rooms_auto_ended,
+    );
+    counter(
         "mss_conference_prompt_frames_total",
         "Frames a prompt played into the whole room contributed to the mix",
         snapshot.conference.prompt_frames,
@@ -377,6 +389,16 @@ pub fn render(sources: &MetricsSources) -> String {
         snapshot.recording_segment_spill_failures,
     );
     counter(
+        "mss_recording_spill_lost_ownership_total",
+        "Closed segments not spilled because another pod had adopted the spill journal",
+        snapshot.recording_spill_lost_ownership,
+    );
+    counter(
+        "mss_recording_spill_foreign_manifests",
+        "Spill journals left alone on this pod's start because another pod owns them",
+        snapshot.recording_spill_foreign_manifests,
+    );
+    counter(
         "mss_recording_salvaged_total",
         "Recordings uploaded from segments an earlier life of this pod left on disk",
         snapshot.recording_salvaged,
@@ -452,6 +474,12 @@ pub fn render(sources: &MetricsSources) -> String {
         "mss_conferences_live",
         "Conference mixes this pod is running",
         snapshot.conferences_live,
+    );
+    gauge(
+        "mss_conference_rooms_live",
+        "Conferences whose room is itself a session (CreateSession kind=mix), the shape a \
+         room recording belongs on",
+        snapshot.conference_rooms_live,
     );
     gauge(
         "mss_conference_members_live",
@@ -631,11 +659,6 @@ pub fn render(sources: &MetricsSources) -> String {
             keeper.inline_not_adopted.load(Ordering::Relaxed),
         );
         counter(
-            "mss_registry_grouped_not_adopted_total",
-            "Recording-group members not restored on the adopting pod",
-            keeper.grouped_not_adopted.load(Ordering::Relaxed),
-        );
-        counter(
             "mss_registry_surrendered_total",
             "Sessions this pod gave up because another pod holds their lease",
             keeper.surrendered.load(Ordering::Relaxed),
@@ -739,6 +762,79 @@ pub fn render(sources: &MetricsSources) -> String {
         );
     }
 
+    let samples = sources.capabilities.samples();
+    if !samples.is_empty() {
+        let now = std::time::Instant::now();
+        let _ = writeln!(
+            out,
+            "# HELP mss_rtpengine_tap_kernel_verdict Whether this daemon's taps can ride the \
+             rtpengine kernel path, as judged on the last statistics probe of each node"
+        );
+        let _ = writeln!(out, "# TYPE mss_rtpengine_tap_kernel_verdict gauge");
+        for (node, sample) in &samples {
+            let _ = writeln!(
+                out,
+                "mss_rtpengine_tap_kernel_verdict{{node=\"{node}\",verdict=\"{}\"}} 1",
+                sample.verdict.name()
+            );
+        }
+        let mut node_gauge = |name: &str, help: &str, of: &dyn Fn(&NodeSample) -> u64| {
+            let _ = writeln!(out, "# HELP {name} {help}");
+            let _ = writeln!(out, "# TYPE {name} gauge");
+            for (node, sample) in &samples {
+                let _ = writeln!(out, "{name}{{node=\"{node}\"}} {}", of(sample));
+            }
+        };
+        node_gauge(
+            "mss_rtpengine_relayed_packets_kernel",
+            "Packets this rtpengine node has relayed in the kernel module since it started",
+            &|sample| sample.relayed_packets_kernel,
+        );
+        node_gauge(
+            "mss_rtpengine_relayed_packets_user",
+            "Packets this rtpengine node has relayed in userspace since it started",
+            &|sample| sample.relayed_packets_user,
+        );
+        node_gauge(
+            "mss_rtpengine_media_kernel",
+            "Media streams this rtpengine node is forwarding in the kernel module now",
+            &|sample| sample.media_kernel,
+        );
+        node_gauge(
+            "mss_rtpengine_media_userspace",
+            "Media streams this rtpengine node is forwarding in userspace now",
+            &|sample| sample.media_userspace,
+        );
+        node_gauge(
+            "mss_rtpengine_media_mixed",
+            "Media streams this rtpengine node is forwarding in both the kernel and userspace now",
+            &|sample| sample.media_mixed,
+        );
+        node_gauge(
+            "mss_rtpengine_transcoded_media",
+            "Media streams this rtpengine node is transcoding now",
+            &|sample| sample.transcoded_media,
+        );
+        node_gauge(
+            "mss_rtpengine_sessions_live",
+            "Sessions this rtpengine node is managing now",
+            &|sample| sample.sessions_live,
+        );
+        let _ = writeln!(
+            out,
+            "# HELP mss_rtpengine_sample_age_seconds Seconds since the statistics probe that \
+             produced this node's sample"
+        );
+        let _ = writeln!(out, "# TYPE mss_rtpengine_sample_age_seconds gauge");
+        for (node, sample) in &samples {
+            let _ = writeln!(
+                out,
+                "mss_rtpengine_sample_age_seconds{{node=\"{node}\"}} {:.3}",
+                sample.age_seconds(now)
+            );
+        }
+    }
+
     let _ = writeln!(
         out,
         "# HELP mss_build_info Version of this mediaserverd binary"
@@ -816,6 +912,12 @@ mod tests {
     use std::net::IpAddr;
 
     fn sources() -> MetricsSources {
+        with_capabilities(Arc::new(
+            crate::rtpengine_capability::NodeCapabilityLog::new(true),
+        ))
+    }
+
+    fn with_capabilities(capabilities: Arc<NodeCapabilityLog>) -> MetricsSources {
         let drain = DrainState::shared();
         let plane = TapPlane::new(TapPlaneConfig {
             default_node: None,
@@ -828,7 +930,9 @@ mod tests {
             cookie_prefix: 1,
             sdp_session_id: 1,
             recording: crate::recorder::RecordingSupport::default(),
-            capabilities: Arc::new(crate::rtpengine_capability::NodeCapabilityLog::new(true)),
+            capabilities: Arc::clone(&capabilities),
+            conference_linger: std::time::Duration::ZERO,
+            member_state_ttl: std::time::Duration::ZERO,
         });
         MetricsSources {
             tap: plane.metrics(),
@@ -839,6 +943,7 @@ mod tests {
             drain: Arc::clone(&drain),
             ports: crate::media_ports::MediaPortAllocator::ephemeral(),
             readiness: crate::health::Readiness::shared(drain),
+            capabilities,
         }
     }
 
@@ -894,6 +999,8 @@ mod tests {
             "mss_recording_groups_live",
             "mss_recording_group_members_live",
             "mss_recording_group_joins_refused_total",
+            "mss_recording_spill_lost_ownership_total",
+            "mss_recording_spill_foreign_manifests",
         ] {
             assert!(text.contains(name), "missing {name} in:\n{text}");
         }
@@ -910,6 +1017,16 @@ mod tests {
         ] {
             assert!(text.contains(name), "missing {name} in:\n{text}");
         }
+    }
+
+    #[test]
+    fn the_exposition_counts_the_member_state_leases_this_pod_lifted_itself() {
+        let text = render(&sources());
+        assert!(
+            text.contains("mss_conference_member_state_expired_total 0"),
+            "a pod with no conference still declares the series:\n{text}"
+        );
+        assert!(text.contains("mss_conference_member_controls_total"));
     }
 
     #[test]
@@ -1044,6 +1161,73 @@ mod tests {
             "{text}"
         );
         assert!(!text.contains("dependency=\"kafka\""), "{text}");
+    }
+
+    #[test]
+    fn the_exposition_carries_the_kernel_verdict_and_relay_split_of_every_probed_node() {
+        let capabilities = Arc::new(crate::rtpengine_capability::NodeCapabilityLog::new(false));
+        let first: std::net::SocketAddr = "127.0.0.1:22222".parse().unwrap();
+        let second: std::net::SocketAddr = "127.0.0.2:22222".parse().unwrap();
+        let taken = std::time::Instant::now();
+        let mut userspace = rtpengine_ng::RtpengineStatistics {
+            kernel_counters_present: true,
+            ..rtpengine_ng::RtpengineStatistics::default()
+        };
+        userspace.totals.packets = 9000;
+        userspace.totals.packets_in_userspace = 9000;
+        userspace.current.media_in_userspace = 4;
+        userspace.current.transcoded_media = 2;
+        userspace.current.sessions_total = 3;
+        let mut kernel = userspace.clone();
+        kernel.totals.packets_in_kernel = 7000;
+        kernel.current.media_in_kernel = 6;
+        kernel.current.media_in_both = 1;
+        capabilities.record(first, NodeSample::from_statistics(&userspace, false, taken));
+        capabilities.record(second, NodeSample::from_statistics(&kernel, false, taken));
+        let text = render(&with_capabilities(capabilities));
+        assert!(
+            text.contains(
+                "mss_rtpengine_tap_kernel_verdict{node=\"127.0.0.1:22222\",verdict=\"ThisNodeIsNotUsingTheKernelModule\"} 1"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "mss_rtpengine_tap_kernel_verdict{node=\"127.0.0.2:22222\",verdict=\"TapsMayRideTheKernelPath\"} 1"
+            ),
+            "{text}"
+        );
+        for expected in [
+            "mss_rtpengine_relayed_packets_kernel{node=\"127.0.0.1:22222\"} 0",
+            "mss_rtpengine_relayed_packets_user{node=\"127.0.0.1:22222\"} 9000",
+            "mss_rtpengine_media_kernel{node=\"127.0.0.1:22222\"} 0",
+            "mss_rtpengine_media_userspace{node=\"127.0.0.1:22222\"} 4",
+            "mss_rtpengine_media_mixed{node=\"127.0.0.1:22222\"} 0",
+            "mss_rtpengine_transcoded_media{node=\"127.0.0.1:22222\"} 2",
+            "mss_rtpengine_sessions_live{node=\"127.0.0.1:22222\"} 3",
+            "mss_rtpengine_relayed_packets_kernel{node=\"127.0.0.2:22222\"} 7000",
+            "mss_rtpengine_media_kernel{node=\"127.0.0.2:22222\"} 6",
+            "mss_rtpengine_media_mixed{node=\"127.0.0.2:22222\"} 1",
+        ] {
+            assert!(text.contains(expected), "{expected} missing from {text}");
+        }
+        assert!(
+            text.contains("mss_rtpengine_sample_age_seconds{node=\"127.0.0.1:22222\"} 0."),
+            "{text}"
+        );
+        assert_eq!(
+            text.matches("# TYPE mss_rtpengine_relayed_packets_kernel gauge")
+                .count(),
+            1,
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn a_pod_that_has_probed_no_node_exports_no_rtpengine_node_series() {
+        let text = render(&sources());
+        assert!(!text.contains("mss_rtpengine_tap_kernel_verdict"), "{text}");
+        assert!(!text.contains("mss_rtpengine_sample_age_seconds"), "{text}");
     }
 
     #[test]

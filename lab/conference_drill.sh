@@ -17,9 +17,26 @@
 #   mute     member A is muted by metadata on one of A's attachments
 #   unmute   and restored
 #
+# With MUTE_TTL_MS set (item 56) the mute phase carries a lease instead:
+# `mss_ctl member <A> mute on ttl $MUTE_TTL_MS`, and the unmute phase sends NO
+# `off` at all -- it waits out the rest of the lease plus one control-world
+# sweep and asserts that mss_conference_member_state_expired_total moved, which
+# is the D22 assertion in one number. The lease must outlast the mute window
+# (MUTE_TTL_MS > PHASE_SECONDS * 1000) or the ear expectations for that window
+# would be judging a member who came back inside it; the drill refuses a
+# shorter one by name.
+#
+#   leave    A hangs up while B and C keep talking, and the room keeps recording
+#
 # A monitor consumer (SINK, selector only=mixed) listens to the room the whole
-# way through, and two recordings run at once: the room as ONE mixed object,
-# and a recording group with one object per participant.
+# way through, and two recordings run at once: the room as ONE mixed object and
+# a recording group with one object per participant. Since item 55 the room
+# object hangs off the ROOM SESSION -- `mss_ctl create <id> --kind mix --group
+# <conference>`, a session with no leg that owns the conference's clock -- so
+# the room recording survives A leaving (D20), and every object in the drill is
+# anchored on the conference's own open. That is what the length comparison at
+# the end is for: room, B and C run from the conference's open to the drill's
+# end and must agree, while A's object stops when A does.
 #
 # lab/conference_report.py judges the ear timelines against the phase windows,
 # and the pulled recordings against their own expectations. Nothing here is a
@@ -51,10 +68,18 @@ TONE_AMPLITUDE=${TONE_AMPLITUDE:-6000}
 WHISPER_HZ=${WHISPER_HZ:-1760}
 STAMP=$(date +%s)
 GROUP=${GROUP:-conf-$STAMP}
+# How long B and C keep talking, and the room keeps recording, after A leaves.
+AFTER_A_SECONDS=${AFTER_A_SECONDS:-6}
+# 0 = the pre-item-56 shape: mute on, then mute off. Non-zero leases the mute
+# and lets it lift itself.
+MUTE_TTL_MS=${MUTE_TTL_MS:-0}
+# One control-world sweep (MEMBER_STATE_SWEEP in main.rs is 500 ms) plus slack.
+LEASE_SWEEP_SECONDS=${LEASE_SWEEP_SECONDS:-1.5}
 ACCOUNT=${ACCOUNT:-acct-conf}
 ROOM_KEY="$ACCOUNT/room-$STAMP.wav"
 PARTY_KEY="$ACCOUNT/party-$STAMP.wav"
 IO_DIR=${IO_DIR:-$REPO/lab/out/conference-$STAMP}
+ROOM_SESSION="conf-$STAMP-room"
 
 export DOCKER_API_VERSION=${DOCKER_API_VERSION:-1.43}
 CTL="$REPO/target/debug/examples/mss_ctl"
@@ -98,6 +123,7 @@ cleanup() {
     docker rm -f "conf-peer-$peer" >/dev/null 2>&1 || true
     "$CTL" "http://$CONTROL" destroy "conf-$STAMP-$peer" >/dev/null 2>&1 || true
   done
+  "$CTL" "http://$CONTROL" destroy "$ROOM_SESSION" >/dev/null 2>&1 || true
   docker rm -f conf-monitor conf-injector >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
@@ -161,11 +187,19 @@ seat_peer() {
   done
 }
 
+say "opening the room itself as a session: $ROOM_SESSION owns conference $GROUP"
+ROOM_OPENED=$("$CTL" "http://$CONTROL" create "$ROOM_SESSION" --kind mix \
+  --group "$GROUP")
+case "$ROOM_OPENED" in
+  ok:*"$GROUP"*) say "the room session is open on conference $GROUP" ;;
+  *) say "the room session did not open: $ROOM_OPENED"; exit 1 ;;
+esac
+
 for peer in a b; do start_peer "$peer"; done
 for peer in a b; do seat_peer "$peer"; done
 
-say "recording the room as ONE mixed object at $ROOM_KEY"
-ROOM=$("$CTL" "http://$CONTROL" record "conf-$STAMP-a" "$ROOM_KEY" room "" mixed |
+say "recording the room as ONE mixed object at $ROOM_KEY, on the room session"
+ROOM=$("$CTL" "http://$CONTROL" record "$ROOM_SESSION" "$ROOM_KEY" room "" mixed |
   attachment_of)
 [ -n "$ROOM" ] || { say "the room recorder did not attach"; exit 1; }
 
@@ -235,18 +269,51 @@ curl -s "http://$METRICS/metrics" | grep -E '^mss_conference_(whispers|route)' |
 say "letting the whisper drain out of the egress before muting"
 sleep 2
 
-say "phase mute: silencing member A everywhere by metadata on $PARTY_A"
-"$CTL" "http://$CONTROL" member "$PARTY_A" mute on
+if [ "$MUTE_TTL_MS" = 0 ]; then
+  say "phase mute: silencing member A everywhere by metadata on $PARTY_A"
+  "$CTL" "http://$CONTROL" member "$PARTY_A" mute on
+else
+  if [ "$MUTE_TTL_MS" -le $((PHASE_SECONDS * 1000)) ]; then
+    say "MUTE_TTL_MS=$MUTE_TTL_MS must outlast the mute window of ${PHASE_SECONDS}s"
+    exit 2
+  fi
+  say "phase mute: silencing member A with a ${MUTE_TTL_MS} ms lease and no off to follow"
+  "$CTL" "http://$CONTROL" member "$PARTY_A" mute on ttl "$MUTE_TTL_MS"
+fi
 MUTE_FROM=$(now)
 sleep "$PHASE_SECONDS"
 MUTE_TO=$(now)
 curl -s "http://$METRICS/metrics" | grep -E '^mss_conference_(muted|deaf|held|member)' || true
 
-say "phase unmute: A comes back"
-"$CTL" "http://$CONTROL" member "$PARTY_A" mute off
+if [ "$MUTE_TTL_MS" = 0 ]; then
+  say "phase unmute: A comes back"
+  "$CTL" "http://$CONTROL" member "$PARTY_A" mute off
+else
+  say "phase unmute: nobody sends off; the lease runs out and MSS lifts the mute"
+  sleep "$(awk "BEGIN { left = $MUTE_TTL_MS / 1000.0 - $PHASE_SECONDS
+    if (left < 0) left = 0
+    print left + $LEASE_SWEEP_SECONDS }")"
+  EXPIRED=$(curl -s "http://$METRICS/metrics" |
+    awk '/^mss_conference_member_state_expired_total /{print $2}')
+  say "member state leases this pod lifted itself: ${EXPIRED:-none}"
+  if [ "${EXPIRED:-0}" = 0 ]; then
+    say "FAIL the mute lease never expired (D22)"
+    exit 1
+  fi
+  curl -s "http://$METRICS/metrics" | grep -E '^mss_conference_(muted|member_state)' || true
+fi
 UNMUTE_FROM=$(now)
 sleep "$PHASE_SECONDS"
 UNMUTE_TO=$(now)
+
+say "phase leave: A hangs up, and the room must keep recording without her"
+docker stop -t 6 conf-peer-a >/dev/null 2>&1 || true
+"$CTL" "http://$CONTROL" destroy "conf-$STAMP-a" >/dev/null
+LEAVE_FROM=$(now)
+sleep "$AFTER_A_SECONDS"
+LEAVE_TO=$(now)
+curl -s "http://$METRICS/metrics" |
+  grep -E '^mss_conference_(rooms_live|members_live)|^mss_recordings_live' || true
 
 say "conference metrics"
 curl -s "http://$METRICS/metrics" |
@@ -256,7 +323,8 @@ say "stopping the monitor and uploading every recording"
 touch "$IO_DIR/stop-monitor"
 docker wait conf-monitor >/dev/null 2>&1 || true
 docker logs conf-monitor 2>&1 | tail -6
-for attachment in "$ROOM" "$PARTY_A" "$PARTY_B" "$PARTY_C"; do
+# A's participant object was already closed and uploaded when A's session ended.
+for attachment in "$ROOM" "$PARTY_B" "$PARTY_C"; do
   "$CTL" "http://$CONTROL" detach "$attachment" >/dev/null
 done
 sleep 3
@@ -278,6 +346,7 @@ phases = [
     {"phase": "three", "from": $THREE_FROM, "to": $THREE_TO},
     {"phase": "mute", "from": $MUTE_FROM, "to": $MUTE_TO},
     {"phase": "unmute", "from": $UNMUTE_FROM, "to": $UNMUTE_TO},
+    {"phase": "leave", "from": $LEAVE_FROM, "to": $LEAVE_TO},
 ]
 ears = []
 for name, own in (("a", 440), ("b", 880), ("c", 1320)):
@@ -312,6 +381,9 @@ expect = [
     {"phase": "unmute", "ear": "c", "present": [440, 880], "absent": [1320, 1760]},
     {"phase": "unmute", "ear": "monitor",
      "present": [440, 880, 1320], "absent": [1760]},
+    {"phase": "leave", "ear": "b", "present": [1320], "absent": [440, 880, 1760]},
+    {"phase": "leave", "ear": "c", "present": [880], "absent": [440, 1320, 1760]},
+    {"phase": "leave", "ear": "monitor", "present": [880, 1320], "absent": [440]},
 ]
 manifest = {
     "phases": phases,
@@ -359,11 +431,32 @@ say "=== recordings ==="
 WAVS_STATUS=0
 python3 "$HERE/conference_report.py" wavs "$IO_DIR/recordings.json" || WAVS_STATUS=$?
 
-say "=== the recording group's files must all be one length ==="
+say "=== the room object and the members who stayed must be one length ==="
 LENGTH_STATUS=0
 python3 "$HERE/conference_report.py" lengths "$LENGTH_TOLERANCE_MS" \
-  "$IO_DIR"/party-a.wav "$IO_DIR"/party-b.wav "$IO_DIR"/party-c.wav ||
+  "$IO_DIR"/room.wav "$IO_DIR"/party-b.wav "$IO_DIR"/party-c.wav ||
   LENGTH_STATUS=$?
+
+say "=== and A, who left first, must be shorter by the time she was gone ==="
+LEFT_STATUS=0
+python3 - "$IO_DIR/room.wav" "$IO_DIR/party-a.wav" "$AFTER_A_SECONDS" <<'PYEOF' || LEFT_STATUS=$?
+import sys, wave
+
+
+def ms(path):
+    with wave.open(path, "rb") as source:
+        return 1000.0 * source.getnframes() / source.getframerate()
+
+
+room, party_a, gone = ms(sys.argv[1]), ms(sys.argv[2]), float(sys.argv[3]) * 1000
+print(f"  room {room:.0f} ms, party-a {party_a:.0f} ms, A was gone {gone:.0f} ms")
+if room - party_a < gone * 0.5:
+    raise SystemExit(
+        f"FAIL the room object is only {room - party_a:.0f} ms longer than the "
+        "member who left: a room recording that ends with a member is D20"
+    )
+print("the room outlived the member who owned nothing")
+PYEOF
 
 say "=== wav_summary of every artifact ==="
 TONE_CANDIDATES="$EAR_TONES" python3 "$HERE/webrtc/wav_summary.py" \
@@ -372,8 +465,10 @@ TONE_CANDIDATES="$EAR_TONES" python3 "$HERE/webrtc/wav_summary.py" \
 
 say "artifacts in $IO_DIR"
 REACHED_END=1
-[ "$EARS_STATUS" = 0 ] && [ "$WAVS_STATUS" = 0 ] && [ "$LENGTH_STATUS" = 0 ] || {
-  say "FAILED: ears=$EARS_STATUS wavs=$WAVS_STATUS lengths=$LENGTH_STATUS"
+[ "$EARS_STATUS" = 0 ] && [ "$WAVS_STATUS" = 0 ] && [ "$LENGTH_STATUS" = 0 ] &&
+  [ "$LEFT_STATUS" = 0 ] || {
+  say "FAILED: ears=$EARS_STATUS wavs=$WAVS_STATUS lengths=$LENGTH_STATUS \
+outlived=$LEFT_STATUS"
   exit 1
 }
 say "done"
