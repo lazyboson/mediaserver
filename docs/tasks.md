@@ -14,7 +14,7 @@ Status as of **2026-08-27**.
 | **M2 — Phase-0 spike** | real NG subscribe against lab rtpengine, both legs jitter-buffered to WAV, per-tap cost | ✅ **code done**; 3 org-side items open (below) |
 | **M3 — fan-out hub** | per-session pub/sub, N consumers, WS-Twilio adapter, pause/resume/send_text parity | ✅ done |
 | **M4 — control plane** | `MediaControl` gRPC, session state machine, Kafka events, Redis registry, tenant-flag pilot | 🔶 **code complete** — pilot gates: translator merge (external), and the consumer half of the barge-in number — **every MSS-owned hop is measured (item 5, 2026-08-23: cut-through p95 4.8 ms from a real consumer `SpeechReport`)**, the D19 ingress gap it found being fixed in item 28. The gRPC lab proof (item 10) and the **live pod-kill drill (item 11, gap 14.41 s)** are both **done 2026-08-22**; the D14 orphan subscription the drill found is **fixed (item 25, 2026-08-23)**, fake- and Redis-verified rather than re-measured live |
-| **M5 — recording (Phase 2)** | per-leg taps → stereo segmenter → S3, identity + callback contract, dual-recording | 🔶 **code complete (2026-08-22)** — a live tapped call recorded end to end to a real MinIO, callbacks read off `mss.events` (2026-08-22, item 10's drill); **recording groups** — N sessions recorded as one recording, one mono object per participant, time-aligned on the group's open instant since item 29 — landed 2026-08-23 (item 21); FS byte-parity **measured against a real FS recording** 2026-08-23 (item 31): container/layout/rms exact, a re-aligned 2 s window agrees 1.0000 at mean diff 0.6/32768; owed: a two-party production-FS comparison and a human listen |
+| **M5 — recording (Phase 2)** | per-leg taps → stereo segmenter → S3, identity + callback contract, dual-recording | 🔶 **code complete (2026-08-22)** — a live tapped call recorded end to end to a real MinIO, callbacks read off `mss.events` (2026-08-22, item 10's drill); **recording groups** — N sessions recorded as one recording, one mono object per participant, time-aligned on the group's open instant since item 29 — landed 2026-08-23 (item 21); FS byte-parity **measured against a real FS recording** 2026-08-23 (item 31): container/layout/rms exact, a re-aligned 2 s window agrees 1.0000 at mean diff 0.6/32768; owed: a two-party production-FS comparison and a human listen. **Store choice (item 58, 2026-08-27):** the same recorder now writes to S3 (default) or a shared filesystem tree at `MSS_RECORDING_ROOT` — one variable, the frozen identity verbatim, `file://` in the event; unit-verified on a real temp directory, never yet on a live call |
 | M6+ | Phases 3–4 (interactive media, full media plane) | 🔶 **Phase 3 code complete and lab-verified (items 32–35, 2026-08-23)** — an inline leg answers an SDP offer, is spoken to over a continuous inject stream, and barges in **p50 12.2 ms / p95 20.4 ms** measured against a real RTP peer. **Phase 4 is code complete and lab-verified too (2026-08-24):** the N-way mix matrix (item 36) and **conferences of inline legs** (item 37, 2026-08-24 — one clock per conference, each leg hears everybody but itself, mixed track on the hub) and **monitor / whisper / barge as metadata-named matrix cells** (item 38, 2026-08-24 — `only=mixed` is the monitor, `mix_target=<member>|all` on an INJECT attachment is the whisper and the barge flip) are code complete and verified over in-process sockets, as is **native conference recording** (item 39, 2026-08-24 — one mono object for the room via `only=mixed`, one object per participant via a recording group, both at once, the shape named in `RecordingStarted`) and **the conference feature tail** (item 40, 2026-08-24 — `member_mute`/`member_deaf`/`member_hold` as metadata verbs, `StartPlayback{target_tag=all}` as a prompt into the room, `mix_source=leg` for a coach's own voice, plus the generic feature list and the adapter parity table in architecture.md Appendix B). **All of it is lab-verified on real sockets (item 41, 2026-08-24):** three container peers in one conference, twenty tone-per-phase assertions green at a ≥30:1 margin — minus-self, monitor, whisper isolation, the barge flip, mute/unmute off every ear and off the mixed track, and both recording shapes landing in MinIO at once. Production integration (a SIP proxy's B2B leg into a conference) and the org-gated criteria remain |
 
 ### What landed, concretely
@@ -3997,7 +3997,7 @@ sample, visible only as a growing `mss_rtpengine_sample_age_seconds`.
 
 ## Recording store selection — the one storage decision that is the deployment's
 
-### 58. A flag picks the recording store: S3 or a FreeSWITCH-style filesystem — ⬜ NEXT
+### 58. A flag picks the recording store: S3 or a FreeSWITCH-style filesystem — ✅ DONE (2026-08-27)
 **Where:** `crates/mediaserverd/src/recorder.rs` (a second `RecordingSink`),
 `recording_spill.rs` (no change intended — `ObjectSpill` already takes any
 sink), `lab/preflight.sh`, `deploy/k8s`, `docs/deploy.md`.
@@ -4059,6 +4059,39 @@ variable with everything else unchanged, and a recording made with
 `MSS_RECORDING_STORE=filesystem` is a WAV at
 `<root>/${accountID}/${recordingID}.wav` that `track_dump.py` reads, announced by
 an `UploadCompleted` whose URI starts `file://`.
+**What shipped:** `MSS_RECORDING_STORE` ∈ {`s3` (default, unchanged), `filesystem`}
+decided by a **pure** `decide_store(store, root, cross_set)` — so the matrix is
+tested without touching the process environment — which refuses to start on an
+unknown store, on `filesystem` with no root, and on a relative root, and names the
+cross-set variables in one `warn!` before ignoring them. `filesystem` runs the
+write/rename/delete probe on `MSS_RECORDING_ROOT` at startup
+(`probe_recording_root`) and refuses to start if it fails. `FilesystemRecordingSink`
+(`tokio::fs`, **not** `object_store`'s `fs` backend, whose path rules differ) lands
+every file atomically through a sibling `.<basename>.<owner>.part` +`sync_all` +
+`rename`, validates keys so none can leave the root, returns
+`file://<root>/<key>` for `UploadCompleted.uri`, and implements `list` to the S3
+sink's contract exactly — recursive under a `/`-trimmed prefix, keys relative to
+the root, `.part` files invisible — which is what `ObjectSpill`/`salvage` depend
+on. `MSS_RECORDING_SPILL_TO` gained `store` as the synonym for `s3`, so the
+journal lands at `<root>/_spill/…` and cross-pod adoption works on a shared
+filesystem too. The transport name `file-s3`/`TRANSPORT_FILE_S3` is untouched
+(Constitution VII), and the no-overwrite rule stayed where it already lived —
+`recording_spill::salvage`'s `exists` check — rather than being duplicated in the
+sink. Also shipped: `lab/preflight.sh --recording-root DIR` (the same probe, and
+an S3 check that SKIPs under the filesystem store),
+`deploy/k8s/overlays/filesystem-recording` (RWX PVC with a placeholder storage
+class at `/var/lib/mediaserverd/recordings`), `validate_fields.py` asserting that
+a `filesystem` store's root is a mounted volume backed by a `ReadWriteMany` claim
+(`validate.sh`: 4 overlays render, 104 field assertions pass), the deploy.md rows
+and "which store" paragraph, the architecture.md clause, and an
+implementation-notes section. **Evidence: unit tests on a real temporary
+directory** — the five sink methods, the `.part` file invisible to `list` and gone
+after `put`, refused escaping keys, an `ObjectSpill` journal round trip whose
+`salvage` writes the WAV at `<root>/acct-42/rec-99.wav`, the probe, and the
+`decide_store` matrix. **The lab drill did NOT run: no Docker daemon on this
+machine**, so no live call has been recorded to a filesystem store and no
+`file://` `UploadCompleted` has been seen on the bus — that is what a pilot owes
+this item.
 
 ## Open defects and soft spots
 
