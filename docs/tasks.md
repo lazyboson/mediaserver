@@ -3515,6 +3515,41 @@ scan empty, `cargo deny check all` — advisories, bans, licenses, sources ok.
    (one prefix, two objects, equal lengths, the cross-pod refusal messages) go
    in [lab.md](lab.md), and D16's row stays honest until they do.
 
+**Hardening (2026-08-27) — the reserved metadata keys were not refused on the
+wire.** `mss.recording.resumeMs` and `mss.recording.spillOwner` are the
+keeper's private channel into `attach`, but `RegistryKeeper` reaches the
+controller through the **same** `SessionController::attach(Request<AttachRequest>)`
+the gRPC server serves, and nothing refused those keys from a client. Any
+authenticated caller could silence-pad a recording (pre-existing since item 30)
+and, after this item, set `take_over` and claim another pod's recording-group
+seat. Low severity — the bearer token is cluster-internal — and now closed:
+`WireFacing(Arc<SessionController>)` in `control-api/src/server.rs` implements
+`MediaControl` by delegation and refuses `INVALID_ARGUMENT`, naming the key, for
+any metadata key under `RESERVED_METADATA_PREFIX` (`mss.`) in `attach` and
+`update_attachment`; `serve_authenticated_until` serves that wrapper while the
+keeper and every in-process caller keep the bare `Arc`. The prefix and the two
+key constants moved to `session-core/src/metadata.rs` (control-api cannot see
+`mediaserverd`) with `recorder.rs` re-exporting the names it already used, so
+nothing else moved. **`mss.` rather than `mss.recording.` was verified safe**:
+a session-core test pins every client-facing key this API documents — the eight
+telcompat/Twilio keys and the six `mix_*`/`member_*` verbs — as still allowed.
+**The `the legacy verb API` façade needed the guard too and is not covered by `WireFacing`**:
+it is served over the same socket but calls the controller *in-process*, and
+`stream_metadata` copies caller metadata straight through, so
+`TelCompat::attach_sink` — the single funnel for every façade attach — checks it
+itself. Verified over a **real socket**
+(`control-api/tests/over_the_wire.rs`): an `Attach` carrying
+`mss.recording.resumeMs` and one carrying `mss.recording.spillOwner` are both
+refused `INVALID_ARGUMENT` with the key in the message, an `UpdateAttachment`
+carrying `spillOwner` likewise, an `Attach` carrying `accountId` / `streamSid` /
+a free-form `tenant.note` still succeeds, and a legacy `StartStream` carrying
+`resumeMs` is refused through the façade — while the keeper's own rebuild tests,
+which carry both keys in-process, stay green. That contrast is the proof the
+guard sits at the right layer. Five session-core unit tests cover the predicate
+itself, including that the named key is the lexicographically first reserved one
+so the message is reproducible out of an unordered map, and that
+`x-mss.recording` is *not* reserved.
+
 **Residual.** Placement is still not a thing (D8) — a group's sessions land
 wherever they land; the difference is that they no longer *have* to share a
 pod. Cross-pod head alignment is only as good as NTP, and MSS neither measures

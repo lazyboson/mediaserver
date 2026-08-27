@@ -273,3 +273,148 @@ async fn one_port_serves_both_the_new_api_and_the_legacy_the legacy verb API_ver
         .expect("drain")
         .unwrap();
 }
+
+async fn attached_over_the_wire(
+    client: &mut MediaControlClient<tonic::transport::Channel>,
+    external_id: &str,
+    metadata: std::collections::HashMap<String, String>,
+) -> Result<proto::Attachment, tonic::Status> {
+    client
+        .create_session(proto::CreateSessionRequest {
+            external_id: external_id.to_string(),
+            kind: proto::SessionKind::Tap as i32,
+            call_id: format!("call-{external_id}"),
+            from_tags: vec!["from-a".to_string()],
+            rtpengine_node: "rtpengine-1".to_string(),
+            mix: false,
+            idempotency_key: String::new(),
+            sdp_offer: String::new(),
+            group: String::new(),
+        })
+        .await?;
+    client
+        .attach(proto::AttachRequest {
+            session: Some(proto::SessionRef {
+                id: Some(proto::session_ref::Id::ExternalId(external_id.to_string())),
+            }),
+            transport: proto::Transport::GrpcStream as i32,
+            capabilities: vec![proto::Capability::Sink as i32],
+            selector: None,
+            format: None,
+            authoritative: false,
+            label: "rtt".to_string(),
+            endpoint: "grpc-target".to_string(),
+            group: String::new(),
+            metadata,
+            idempotency_key: String::new(),
+        })
+        .await
+        .map(tonic::Response::into_inner)
+}
+
+#[tokio::test]
+async fn a_client_cannot_send_the_registrys_own_reserved_metadata_over_the_wire() {
+    let (endpoint, stop, serving) = listening().await;
+    let mut client = MediaControlClient::connect(endpoint.clone()).await.unwrap();
+
+    for (index, reserved) in [
+        control_api::RESUME_MS_METADATA_KEY,
+        control_api::SPILL_OWNER_METADATA_KEY,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let refused = attached_over_the_wire(
+            &mut client,
+            &format!("req-reserved-{index}"),
+            std::collections::HashMap::from([(reserved.to_string(), "5000".to_string())]),
+        )
+        .await
+        .expect_err("a reserved metadata key must not reach the controller");
+        assert_eq!(refused.code(), tonic::Code::InvalidArgument);
+        assert!(
+            refused.message().contains(reserved),
+            "the refusal must name the key: {}",
+            refused.message()
+        );
+    }
+
+    let allowed = attached_over_the_wire(
+        &mut client,
+        "req-ordinary",
+        std::collections::HashMap::from([
+            ("accountId".to_string(), "acct-1".to_string()),
+            ("streamSid".to_string(), "MZ-9".to_string()),
+            ("tenant.note".to_string(), "free form".to_string()),
+        ]),
+    )
+    .await
+    .expect("ordinary metadata is none of the guard's business");
+
+    let refused = client
+        .update_attachment(proto::UpdateAttachmentRequest {
+            attachment_id: allowed.attachment_id.clone(),
+            paused: Some(true),
+            selector: None,
+            format: None,
+            idempotency_key: String::new(),
+            metadata: std::collections::HashMap::from([(
+                control_api::SPILL_OWNER_METADATA_KEY.to_string(),
+                "pod-z".to_string(),
+            )]),
+        })
+        .await
+        .expect_err("update_attachment is the second door into the same state");
+    assert_eq!(refused.code(), tonic::Code::InvalidArgument);
+    assert!(
+        refused
+            .message()
+            .contains(control_api::SPILL_OWNER_METADATA_KEY),
+        "{}",
+        refused.message()
+    );
+
+    let _ = stop.send(());
+    tokio::time::timeout(std::time::Duration::from_secs(5), serving)
+        .await
+        .expect("drain")
+        .unwrap();
+}
+
+#[tokio::test]
+async fn the_legacy_facade_refuses_reserved_metadata_too() {
+    use control_api::telcompat_proto::tel_service_client::TelServiceClient;
+    use control_api::telcompat_proto::StreamRequest;
+
+    let (endpoint, stop, serving) = listening().await;
+    let mut legacy = TelServiceClient::connect(endpoint.clone()).await.unwrap();
+
+    let refused = legacy
+        .start_stream(StreamRequest {
+            request_uuid: "req-legacy-reserved".to_string(),
+            acc_id: "acct-1".to_string(),
+            stream_sid: "MZ-1".to_string(),
+            ws_url: "wss-endpoint".to_string(),
+            metadata: std::collections::HashMap::from([(
+                control_api::RESUME_MS_METADATA_KEY.to_string(),
+                "60000".to_string(),
+            )]),
+            ..Default::default()
+        })
+        .await
+        .expect_err("the facade copies caller metadata straight into attach");
+    assert_eq!(refused.code(), tonic::Code::InvalidArgument);
+    assert!(
+        refused
+            .message()
+            .contains(control_api::RESUME_MS_METADATA_KEY),
+        "{}",
+        refused.message()
+    );
+
+    let _ = stop.send(());
+    tokio::time::timeout(std::time::Duration::from_secs(5), serving)
+        .await
+        .expect("drain")
+        .unwrap();
+}
