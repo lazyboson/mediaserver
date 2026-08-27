@@ -81,6 +81,7 @@ pub struct TapPlaneConfig {
     pub recording: RecordingSupport,
     pub capabilities: Arc<NodeCapabilityLog>,
     pub conference_linger: Duration,
+    pub member_state_ttl: Duration,
 }
 
 struct ResolvedNode {
@@ -2125,6 +2126,11 @@ impl TapPlane {
         session: SessionId,
         control: MemberControl,
     ) -> Result<(), MediaPlaneError> {
+        let lease_ms = control.lease_ms(self.config.member_state_ttl.as_millis() as u64);
+        let control = MemberControl {
+            ttl_ms: Some(lease_ms),
+            ..control
+        };
         let name = self.conference_of(session)?;
         {
             let mut held = self
@@ -2144,9 +2150,34 @@ impl TapPlane {
             mute = ?control.mute,
             deaf = ?control.deaf,
             hold = ?control.hold,
+            lease_ms,
             "a member control verb arrived for this conference leg"
         );
         Ok(())
+    }
+
+    pub fn sweep_member_state(&self, now: Instant) -> Vec<(SessionId, MemberControl)> {
+        let released = match self.conferences.lock() {
+            Ok(mut held) => held
+                .values_mut()
+                .flat_map(|conference| conference.expire_member_state(now))
+                .collect::<Vec<_>>(),
+            Err(_) => {
+                warn!("the conference table is poisoned; no member state lease can be swept");
+                Vec::new()
+            }
+        };
+        for (session, expired) in &released {
+            self.observe(
+                *session,
+                Observation::MemberStateExpired {
+                    mute: expired.mute == Some(false),
+                    deaf: expired.deaf == Some(false),
+                    hold: expired.hold == Some(false),
+                },
+            );
+        }
+        released
     }
 
     fn play_into_room(
@@ -3497,8 +3528,9 @@ mod tests {
     use media_core::AudioFormat;
     use session_core::mix::{
         MEMBER_DEAF_METADATA_KEY, MEMBER_FLAG_OFF, MEMBER_FLAG_ON, MEMBER_HOLD_METADATA_KEY,
-        MEMBER_MUTE_METADATA_KEY, MIX_MONITOR_EXCLUDE, MIX_MONITOR_METADATA_KEY, MIX_SOURCE_LEG,
-        MIX_SOURCE_METADATA_KEY, MIX_TARGET_EVERYONE, MIX_TARGET_METADATA_KEY,
+        MEMBER_MUTE_METADATA_KEY, MEMBER_STATE_TTL_METADATA_KEY, MIX_MONITOR_EXCLUDE,
+        MIX_MONITOR_METADATA_KEY, MIX_SOURCE_LEG, MIX_SOURCE_METADATA_KEY, MIX_TARGET_EVERYONE,
+        MIX_TARGET_METADATA_KEY,
     };
     use session_core::{Capabilities, PlaybackId};
     use std::collections::BTreeMap;
@@ -3660,7 +3692,26 @@ mod tests {
         plane_lingering_for(recording, Duration::ZERO)
     }
 
+    fn plane_leasing_member_state_for(member_state_ttl: Duration) -> TapPlane {
+        let plane = plane_configured(
+            RecordingSupport::default(),
+            Duration::ZERO,
+            member_state_ttl,
+        );
+        plane
+            .share_groups_through(Arc::new(MemorySessionStore::default()) as Arc<dyn SessionStore>);
+        plane
+    }
+
     fn plane_lingering_for(recording: RecordingSupport, conference_linger: Duration) -> TapPlane {
+        plane_configured(recording, conference_linger, Duration::ZERO)
+    }
+
+    fn plane_configured(
+        recording: RecordingSupport,
+        conference_linger: Duration,
+        member_state_ttl: Duration,
+    ) -> TapPlane {
         TapPlane::new(TapPlaneConfig {
             default_node: None,
             local_media_address: IpAddr::from([127, 0, 0, 1]),
@@ -3674,6 +3725,7 @@ mod tests {
             recording,
             capabilities: Arc::new(NodeCapabilityLog::new(true)),
             conference_linger,
+            member_state_ttl,
         })
     }
 
@@ -3693,6 +3745,7 @@ mod tests {
             recording: RecordingSupport::default(),
             capabilities: Arc::new(NodeCapabilityLog::new(true)),
             conference_linger: Duration::ZERO,
+            member_state_ttl: Duration::ZERO,
         })
     }
 
@@ -3728,6 +3781,7 @@ mod tests {
             recording: RecordingSupport::default(),
             capabilities: Arc::new(NodeCapabilityLog::new(true)),
             conference_linger: Duration::ZERO,
+            member_state_ttl: Duration::ZERO,
         })
     }
 
@@ -4136,6 +4190,16 @@ a=rtpmap:101 telephone-event/8000\r\na=ptime:20\r\n"
 
         fn finished(&self) -> Vec<(SessionId, String)> {
             self.finished.lock().unwrap().clone()
+        }
+
+        fn member_state_expiries(&self) -> Vec<(SessionId, Observation)> {
+            self.seen
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(_, seen)| matches!(seen, Observation::MemberStateExpired { .. }))
+                .cloned()
+                .collect()
         }
     }
 
@@ -5164,6 +5228,213 @@ m=audio {peer_port} RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\na=ptime:{ptime_ms}\r\n"
         );
 
         for peer in [&alice, &bob, &carol] {
+            plane
+                .close_session(peer.session)
+                .await
+                .expect("a conference leg closes");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_muted_members_lease_lifts_the_mute_with_no_off_and_a_refresh_holds_it() {
+        let plane = plane();
+        let witness = Arc::new(WitnessedObservations::default());
+        plane.observe_through(Arc::downgrade(&witness) as Weak<dyn ObservationSink>);
+        let mut alice = seat_peer(&plane, 1, "leasing").await;
+        let mut bob = seat_peer(&plane, 2, "leasing").await;
+        let mut carol = seat_peer(&plane, 3, "leasing").await;
+        let SessionHandles { hub, .. } = plane
+            .session_handles(alice.session)
+            .expect("the conference leg is live here");
+        let mut monitor = hub
+            .attach(512, TrackSelection::Only(Track::Mixed))
+            .expect("the hub takes a monitor that wants the mix only");
+
+        plane
+            .open_attachment(member_attachment(
+                bob.session,
+                7,
+                &[
+                    (MEMBER_MUTE_METADATA_KEY, MEMBER_FLAG_ON),
+                    (MEMBER_STATE_TTL_METADATA_KEY, "500"),
+                ],
+            ))
+            .await
+            .expect("a member verb may name how long it holds");
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        assert_eq!(plane.metrics().snapshot().conference_members_muted, 1);
+        let leased = plane
+            .member_state(bob.session)
+            .expect("a seated member reads its own state back");
+        assert!(
+            (1..=500).contains(&leased.mute_expires_in_ms),
+            "the mute counts down to the moment it lifts: {}",
+            leased.mute_expires_in_ms
+        );
+        assert_eq!(
+            leased.deaf_expires_in_ms, 0,
+            "deaf was never set, so it has no lease"
+        );
+
+        let _ = loudest_mixed(&mut monitor);
+        everybody_speaks(&mut alice, &mut bob, &mut carol).await;
+        let alice_ear = alice.loudest_ear();
+        let mixed = loudest_mixed(&mut monitor);
+        assert!(
+            about(4_000, alice_ear),
+            "bob is muted for as long as nobody sweeps, even past his deadline: {alice_ear}"
+        );
+        assert!(
+            about(5_000, mixed),
+            "and the recording feed agrees: {mixed}"
+        );
+        assert_eq!(
+            plane.metrics().snapshot().conference_members_muted,
+            1,
+            "the mix thread keeps no timer of its own; a deadline that passed is not applied \
+             until the control world sweeps"
+        );
+
+        plane
+            .update_attachment(member_attachment(
+                bob.session,
+                7,
+                &[
+                    (MEMBER_MUTE_METADATA_KEY, MEMBER_FLAG_ON),
+                    (MEMBER_STATE_TTL_METADATA_KEY, "60000"),
+                ],
+            ))
+            .await
+            .expect("setting the flag on again with a ttl is the refresh");
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        assert!(
+            plane.sweep_member_state(Instant::now()).is_empty(),
+            "a refresh before the sweep moves the deadline out, so nothing expires"
+        );
+        assert_eq!(plane.metrics().snapshot().conference_members_muted, 1);
+
+        let released = plane.sweep_member_state(Instant::now() + Duration::from_secs(61));
+        assert_eq!(released.len(), 1, "one member's lease ran out");
+        assert_eq!(released[0].0, bob.session);
+        assert_eq!(
+            released[0].1.mute,
+            Some(false),
+            "the sweep releases, like an off"
+        );
+        assert_eq!(
+            released[0].1.deaf, None,
+            "and only the flag that was leased"
+        );
+        assert_eq!(
+            witness.member_state_expiries(),
+            vec![(
+                bob.session,
+                Observation::MemberStateExpired {
+                    mute: true,
+                    deaf: false,
+                    hold: false
+                }
+            )],
+            "the expiry is observed once, on the member's own session"
+        );
+        assert_eq!(
+            plane.metrics().snapshot().conference.member_state_expired,
+            1
+        );
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        assert_eq!(
+            plane.metrics().snapshot().conference_members_muted,
+            0,
+            "no off was ever sent"
+        );
+        assert_eq!(
+            plane
+                .member_state(bob.session)
+                .expect("bob is still seated")
+                .mute_expires_in_ms,
+            0,
+            "a lifted flag reports no lease"
+        );
+
+        let _ = loudest_mixed(&mut monitor);
+        everybody_speaks(&mut alice, &mut bob, &mut carol).await;
+        let alice_ear = alice.loudest_ear();
+        let mixed = loudest_mixed(&mut monitor);
+        assert!(
+            about(6_000, alice_ear),
+            "alice hears bob again without anybody asking for it: {alice_ear}"
+        );
+        assert!(
+            about(7_000, mixed),
+            "and the whole room is back on the record: {mixed}"
+        );
+
+        for peer in [&alice, &bob, &carol] {
+            plane
+                .close_session(peer.session)
+                .await
+                .expect("a conference leg closes");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_deployment_default_leases_a_member_flag_that_names_no_ttl_of_its_own() {
+        let plane = plane_leasing_member_state_for(Duration::from_millis(400));
+        let alice = seat_peer(&plane, 1, "default-lease").await;
+        let bob = seat_peer(&plane, 2, "default-lease").await;
+
+        plane
+            .open_attachment(member_attachment(
+                bob.session,
+                7,
+                &[(MEMBER_DEAF_METADATA_KEY, MEMBER_FLAG_ON)],
+            ))
+            .await
+            .expect("a member verb that names no lease takes the pod's default");
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        let leased = plane.member_state(bob.session).expect("bob is seated");
+        assert!(
+            (1..=400).contains(&leased.deaf_expires_in_ms),
+            "the deployment default is the lease: {}",
+            leased.deaf_expires_in_ms
+        );
+        assert_eq!(plane.metrics().snapshot().conference_members_deaf, 1);
+
+        assert!(plane.sweep_member_state(Instant::now()).is_empty());
+        let released = plane.sweep_member_state(Instant::now() + Duration::from_millis(500));
+        assert_eq!(released.len(), 1);
+        assert_eq!(released[0].1.deaf, Some(false));
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        assert_eq!(plane.metrics().snapshot().conference_members_deaf, 0);
+
+        plane
+            .open_attachment(member_attachment(
+                alice.session,
+                8,
+                &[
+                    (MEMBER_HOLD_METADATA_KEY, MEMBER_FLAG_ON),
+                    (MEMBER_STATE_TTL_METADATA_KEY, "0"),
+                ],
+            ))
+            .await
+            .expect("an explicit zero outranks the deployment default");
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        assert_eq!(
+            plane
+                .member_state(alice.session)
+                .expect("alice is seated")
+                .hold_expires_in_ms,
+            0
+        );
+        assert!(
+            plane
+                .sweep_member_state(Instant::now() + Duration::from_secs(3600))
+                .is_empty(),
+            "an unleased flag is never swept, which is the pre-lease behaviour"
+        );
+        assert_eq!(plane.metrics().snapshot().conference_members_held, 1);
+
+        for peer in [&alice, &bob] {
             plane
                 .close_session(peer.session)
                 .await
@@ -7434,6 +7705,122 @@ m=audio 41000 RTP/AVP 111\r\na=rtpmap:111 opus/48000/2\r\n",
             bob_after.member.expect("bob is still seated").mute,
             "member state has no lease, so it survives every other membership change"
         );
+
+        room.close().await;
+    }
+
+    #[tokio::test]
+    async fn a_leased_member_flag_counts_down_over_the_wire_and_expires_as_its_own_cause() {
+        use control_api::proto;
+        use control_api::proto::media_control_client::MediaControlClient;
+
+        let plane = Arc::new(plane());
+        let (room, _controller) = WiredRoom::with_plane(Arc::clone(&plane)).await;
+        let mut client = MediaControlClient::connect(room.endpoint.clone())
+            .await
+            .expect("a client reaches the control port");
+
+        let mut peers = Vec::new();
+        for member in ["alice", "bob"] {
+            let (peer, offer) = silent_peer();
+            peers.push(peer);
+            client
+                .create_session(proto::CreateSessionRequest {
+                    external_id: member.to_string(),
+                    kind: proto::SessionKind::Inline as i32,
+                    call_id: format!("call-{member}"),
+                    from_tags: Vec::new(),
+                    rtpengine_node: String::new(),
+                    mix: false,
+                    idempotency_key: String::new(),
+                    sdp_offer: offer,
+                    group: "leasing-wire".to_string(),
+                })
+                .await
+                .expect("an inline leg is answered and seated");
+        }
+        client
+            .attach(proto::AttachRequest {
+                session: Some(wire_reference("bob")),
+                transport: proto::Transport::GrpcStream as i32,
+                capabilities: vec![proto::Capability::Sink as i32],
+                selector: None,
+                format: None,
+                authoritative: false,
+                label: "supervisor".to_string(),
+                endpoint: "grpc-target".to_string(),
+                group: String::new(),
+                metadata: [
+                    (
+                        MEMBER_MUTE_METADATA_KEY.to_string(),
+                        MEMBER_FLAG_ON.to_string(),
+                    ),
+                    (
+                        MEMBER_STATE_TTL_METADATA_KEY.to_string(),
+                        "60000".to_string(),
+                    ),
+                ]
+                .into_iter()
+                .collect(),
+                idempotency_key: String::new(),
+            })
+            .await
+            .expect("a leased mute rides on an attachment of bob's own session");
+
+        let leased = client
+            .describe_session(wire_reference("bob"))
+            .await
+            .expect("bob describes")
+            .into_inner()
+            .member
+            .expect("bob is seated");
+        assert!(leased.mute, "the mute is on");
+        assert!(
+            (1..=60_000).contains(&leased.mute_expires_in_ms),
+            "and a ui can see how long it has left: {}",
+            leased.mute_expires_in_ms
+        );
+        assert_eq!(leased.deaf_expires_in_ms, 0);
+        assert_eq!(leased.hold_expires_in_ms, 0);
+
+        let mut events = client
+            .watch_events(proto::WatchRequest {
+                session: Some(wire_reference("bob")),
+            })
+            .await
+            .expect("a watcher on bob's session")
+            .into_inner();
+
+        let released = plane.sweep_member_state(Instant::now() + Duration::from_secs(61));
+        assert_eq!(released.len(), 1, "the lease ran out");
+
+        let event = events
+            .message()
+            .await
+            .expect("the stream is live")
+            .expect("an expiry reaches the bus");
+        match event.payload {
+            Some(proto::media_event::Payload::MemberControlled(controlled)) => {
+                assert!(!controlled.mute, "the flag is off");
+                assert!(!controlled.deaf && !controlled.hold);
+                assert_eq!(
+                    controlled.cause,
+                    proto::MemberControlCause::Expired as i32,
+                    "and a consumer can tell a lease that ran out from a controller that asked"
+                );
+            }
+            other => panic!("expected a member_controlled payload, got {other:?}"),
+        }
+
+        let lifted = client
+            .describe_session(wire_reference("bob"))
+            .await
+            .expect("bob describes again")
+            .into_inner()
+            .member
+            .expect("bob is still seated");
+        assert!(!lifted.mute, "no off was ever sent");
+        assert_eq!(lifted.mute_expires_in_ms, 0);
 
         room.close().await;
     }

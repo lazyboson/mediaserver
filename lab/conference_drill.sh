@@ -17,6 +17,15 @@
 #   mute     member A is muted by metadata on one of A's attachments
 #   unmute   and restored
 #
+# With MUTE_TTL_MS set (item 56) the mute phase carries a lease instead:
+# `mss_ctl member <A> mute on ttl $MUTE_TTL_MS`, and the unmute phase sends NO
+# `off` at all -- it waits out the rest of the lease plus one control-world
+# sweep and asserts that mss_conference_member_state_expired_total moved, which
+# is the D22 assertion in one number. The lease must outlast the mute window
+# (MUTE_TTL_MS > PHASE_SECONDS * 1000) or the ear expectations for that window
+# would be judging a member who came back inside it; the drill refuses a
+# shorter one by name.
+#
 #   leave    A hangs up while B and C keep talking, and the room keeps recording
 #
 # A monitor consumer (SINK, selector only=mixed) listens to the room the whole
@@ -61,6 +70,11 @@ STAMP=$(date +%s)
 GROUP=${GROUP:-conf-$STAMP}
 # How long B and C keep talking, and the room keeps recording, after A leaves.
 AFTER_A_SECONDS=${AFTER_A_SECONDS:-6}
+# 0 = the pre-item-56 shape: mute on, then mute off. Non-zero leases the mute
+# and lets it lift itself.
+MUTE_TTL_MS=${MUTE_TTL_MS:-0}
+# One control-world sweep (MEMBER_STATE_SWEEP in main.rs is 500 ms) plus slack.
+LEASE_SWEEP_SECONDS=${LEASE_SWEEP_SECONDS:-1.5}
 ACCOUNT=${ACCOUNT:-acct-conf}
 ROOM_KEY="$ACCOUNT/room-$STAMP.wav"
 PARTY_KEY="$ACCOUNT/party-$STAMP.wav"
@@ -255,15 +269,39 @@ curl -s "http://$METRICS/metrics" | grep -E '^mss_conference_(whispers|route)' |
 say "letting the whisper drain out of the egress before muting"
 sleep 2
 
-say "phase mute: silencing member A everywhere by metadata on $PARTY_A"
-"$CTL" "http://$CONTROL" member "$PARTY_A" mute on
+if [ "$MUTE_TTL_MS" = 0 ]; then
+  say "phase mute: silencing member A everywhere by metadata on $PARTY_A"
+  "$CTL" "http://$CONTROL" member "$PARTY_A" mute on
+else
+  if [ "$MUTE_TTL_MS" -le $((PHASE_SECONDS * 1000)) ]; then
+    say "MUTE_TTL_MS=$MUTE_TTL_MS must outlast the mute window of ${PHASE_SECONDS}s"
+    exit 2
+  fi
+  say "phase mute: silencing member A with a ${MUTE_TTL_MS} ms lease and no off to follow"
+  "$CTL" "http://$CONTROL" member "$PARTY_A" mute on ttl "$MUTE_TTL_MS"
+fi
 MUTE_FROM=$(now)
 sleep "$PHASE_SECONDS"
 MUTE_TO=$(now)
 curl -s "http://$METRICS/metrics" | grep -E '^mss_conference_(muted|deaf|held|member)' || true
 
-say "phase unmute: A comes back"
-"$CTL" "http://$CONTROL" member "$PARTY_A" mute off
+if [ "$MUTE_TTL_MS" = 0 ]; then
+  say "phase unmute: A comes back"
+  "$CTL" "http://$CONTROL" member "$PARTY_A" mute off
+else
+  say "phase unmute: nobody sends off; the lease runs out and MSS lifts the mute"
+  sleep "$(awk "BEGIN { left = $MUTE_TTL_MS / 1000.0 - $PHASE_SECONDS
+    if (left < 0) left = 0
+    print left + $LEASE_SWEEP_SECONDS }")"
+  EXPIRED=$(curl -s "http://$METRICS/metrics" |
+    awk '/^mss_conference_member_state_expired_total /{print $2}')
+  say "member state leases this pod lifted itself: ${EXPIRED:-none}"
+  if [ "${EXPIRED:-0}" = 0 ]; then
+    say "FAIL the mute lease never expired (D22)"
+    exit 1
+  fi
+  curl -s "http://$METRICS/metrics" | grep -E '^mss_conference_(muted|member_state)' || true
+fi
 UNMUTE_FROM=$(now)
 sleep "$PHASE_SECONDS"
 UNMUTE_TO=$(now)

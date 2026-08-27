@@ -1,8 +1,11 @@
 use crate::attribution::Attribution;
 use crate::capability::{Capabilities, Transport};
-use crate::event::{ConsumerEvent, EventKind, MediaEvent, Observation};
+use crate::event::{ConsumerEvent, EventKind, MediaEvent, MemberControlCause, Observation};
 use crate::ids::{AttachmentId, PlaybackId, SessionId};
-use crate::mix::{MemberControl, MixRoute};
+use crate::mix::{
+    MemberControl, MixRoute, MEMBER_DEAF_METADATA_KEY, MEMBER_FLAG_OFF, MEMBER_FLAG_ON,
+    MEMBER_HOLD_METADATA_KEY, MEMBER_MUTE_METADATA_KEY,
+};
 use media_core::{AudioFormat, Track};
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeMap, VecDeque};
@@ -872,9 +875,53 @@ impl SessionRegistry {
                     tracks,
                 }
             }
+            Observation::MemberStateExpired { mute, deaf, hold } => {
+                self.release_member_state(session, MemberControl::releasing(mute, deaf, hold))
+            }
         };
         self.push_event(session, None, true, kind);
         Ok(())
+    }
+
+    fn release_member_state(&mut self, session: SessionId, released: MemberControl) -> EventKind {
+        let held = self
+            .sessions
+            .get(&session)
+            .map(|record| record.attachments.clone())
+            .unwrap_or_default();
+        let releases = [
+            (MEMBER_MUTE_METADATA_KEY, released.mute),
+            (MEMBER_DEAF_METADATA_KEY, released.deaf),
+            (MEMBER_HOLD_METADATA_KEY, released.hold),
+        ];
+        let mut mute = false;
+        let mut deaf = false;
+        let mut hold = false;
+        for attachment in held {
+            let Some(record) = self.attachments.get_mut(&attachment) else {
+                continue;
+            };
+            for (key, release) in releases {
+                let declared_on =
+                    record.metadata.get(key).map(String::as_str) == Some(MEMBER_FLAG_ON);
+                if release == Some(false) && declared_on {
+                    record
+                        .metadata
+                        .insert(key.to_string(), MEMBER_FLAG_OFF.to_string());
+                }
+            }
+            if let Ok(Some(carried)) = MemberControl::from_metadata(&record.metadata) {
+                mute |= carried.muted();
+                deaf |= carried.deafened();
+                hold |= carried.held();
+            }
+        }
+        EventKind::MemberControlled {
+            mute,
+            deaf,
+            hold,
+            cause: MemberControlCause::Expired,
+        }
     }
 
     pub fn record_attribution(
@@ -1045,6 +1092,7 @@ fn member_controlled(control: &MemberControl) -> EventKind {
         mute: control.muted(),
         deaf: control.deafened(),
         hold: control.held(),
+        cause: MemberControlCause::Requested,
     }
 }
 
@@ -1662,6 +1710,93 @@ mod tests {
     }
 
     #[test]
+    fn a_member_state_lease_that_runs_out_is_audited_as_expired_and_leaves_the_metadata_off() {
+        let (mut registry, session) = started();
+        let id = registry.attach(rtt(session)).unwrap().id;
+        registry
+            .update_attachment(
+                id,
+                AttachmentUpdate {
+                    metadata: Some(BTreeMap::from([
+                        (
+                            MEMBER_MUTE_METADATA_KEY.to_string(),
+                            MEMBER_FLAG_ON.to_string(),
+                        ),
+                        (
+                            MEMBER_HOLD_METADATA_KEY.to_string(),
+                            MEMBER_FLAG_ON.to_string(),
+                        ),
+                        (
+                            crate::mix::MEMBER_STATE_TTL_METADATA_KEY.to_string(),
+                            "300".to_string(),
+                        ),
+                    ])),
+                    ..AttachmentUpdate::default()
+                },
+            )
+            .unwrap();
+        registry.drain_events();
+
+        registry
+            .observe(
+                session,
+                Observation::MemberStateExpired {
+                    mute: true,
+                    deaf: false,
+                    hold: false,
+                },
+            )
+            .expect("the media plane reports the lease it lifted");
+        let audited = registry.drain_events().pop().expect("one expiry event");
+        assert_eq!(
+            audited.kind,
+            EventKind::MemberControlled {
+                mute: false,
+                deaf: false,
+                hold: true,
+                cause: MemberControlCause::Expired,
+            },
+            "the event reports the state that is left, and the hold that was never leased stays"
+        );
+        assert_eq!(audited.attachment, None, "no attachment asked for this one");
+        assert_eq!(audited.seq, 2, "an expiry takes the session's next seq");
+
+        let carried = registry.attachment_view(id).unwrap().metadata;
+        assert_eq!(
+            carried.get(MEMBER_MUTE_METADATA_KEY).map(String::as_str),
+            Some(MEMBER_FLAG_OFF),
+            "the registry's own mirror is off, so the next update diffs against reality"
+        );
+        assert_eq!(
+            carried.get(MEMBER_HOLD_METADATA_KEY).map(String::as_str),
+            Some(MEMBER_FLAG_ON)
+        );
+
+        registry
+            .update_attachment(
+                id,
+                AttachmentUpdate {
+                    metadata: Some(BTreeMap::from([(
+                        MEMBER_MUTE_METADATA_KEY.to_string(),
+                        MEMBER_FLAG_ON.to_string(),
+                    )])),
+                    ..AttachmentUpdate::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            registry.drain_events().pop().map(|event| event.kind),
+            Some(EventKind::MemberControlled {
+                mute: true,
+                deaf: false,
+                hold: true,
+                cause: MemberControlCause::Requested,
+            }),
+            "muting again after an expiry is a change, not a no-op swallowed by a stale mirror"
+        );
+    }
+
+    #[test]
     fn muting_a_member_is_audited_the_same_way_a_whisper_is() {
         let (mut registry, session) = started();
         let id = registry.attach(rtt(session)).unwrap().id;
@@ -1685,6 +1820,7 @@ mod tests {
                 mute: true,
                 deaf: false,
                 hold: false,
+                cause: MemberControlCause::Requested,
             }),
             "a member verb needs no capability and no new rpc, only an audit trail"
         );
@@ -1707,6 +1843,7 @@ mod tests {
                 mute: true,
                 deaf: false,
                 hold: true,
+                cause: MemberControlCause::Requested,
             }),
             "the merged metadata is the member's declared state, not just the last verb"
         );

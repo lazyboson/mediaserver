@@ -3,7 +3,8 @@ use media_core::{AudioFormat, Encoding, Track};
 use session_core::mix::{MIX_SOURCE_INJECT, MIX_SOURCE_LEG};
 use session_core::{
     AttachmentId, Attribution, Capabilities, ConsumerEvent, ControlError, EventKind, MediaEvent,
-    MemberStateView, MixSource, PlaybackId, SessionId, SessionKind, TrackSelector, Transport,
+    MemberControlCause, MemberStateView, MixSource, PlaybackId, SessionId, SessionKind,
+    TrackSelector, Transport,
 };
 use std::str::FromStr;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -65,6 +66,9 @@ pub fn member_state_wire(state: &MemberStateView) -> proto::MemberState {
         deaf: state.deaf,
         hold: state.hold,
         mix_source: source_name(state.source).to_string(),
+        mute_expires_in_ms: state.mute_expires_in_ms,
+        deaf_expires_in_ms: state.deaf_expires_in_ms,
+        hold_expires_in_ms: state.hold_expires_in_ms,
         routes: state
             .routes
             .iter()
@@ -78,6 +82,13 @@ pub fn member_state_wire(state: &MemberStateView) -> proto::MemberState {
                     .unwrap_or_default(),
             })
             .collect(),
+    }
+}
+
+pub fn member_control_cause_wire(cause: MemberControlCause) -> i32 {
+    match cause {
+        MemberControlCause::Requested => proto::MemberControlCause::Requested as i32,
+        MemberControlCause::Expired => proto::MemberControlCause::Expired as i32,
     }
 }
 
@@ -391,9 +402,17 @@ fn payload_wire(kind: EventKind, attribution: Attribution) -> proto::media_event
             mix_target: target,
             monitor_audible,
         }),
-        EventKind::MemberControlled { mute, deaf, hold } => {
-            Payload::MemberControlled(proto::MemberControlled { mute, deaf, hold })
-        }
+        EventKind::MemberControlled {
+            mute,
+            deaf,
+            hold,
+            cause,
+        } => Payload::MemberControlled(proto::MemberControlled {
+            mute,
+            deaf,
+            hold,
+            cause: member_control_cause_wire(cause),
+        }),
         EventKind::AttachmentDown { label, reason } => {
             Payload::AttachmentDown(proto::AttachmentDown { label, reason })
         }
