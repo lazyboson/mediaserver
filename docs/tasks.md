@@ -1096,11 +1096,14 @@ the *first* call's answer — both "calls" claimed ports 30028/30042. It is the
 D12 shape on the driver side. `COOKIE_PREFIX` (default `lab`, so every existing
 drill is unchanged) fixes it; with distinct prefixes the two calls get distinct
 ports.
-**Left open, filed as D16:** a group lives in one pod's memory. The group is
-persisted on the attachment, but `RegistryKeeper::rebuild` **refuses** to
-restore a grouped recording on an adopting pod (counted `grouped_not_adopted`)
-rather than split one recording across two pods. Placement — scheduling a
-group's sessions onto one pod — is the real fix and does not exist (D8).
+**Left open at the time, filed as D16 — closed by item 54 (2026-08-27):** a
+group lived in one pod's memory. The group was persisted on the attachment, but
+`RegistryKeeper::rebuild` **refused** to restore a grouped recording on an
+adopting pod (counted `grouped_not_adopted`) rather than split one recording
+across two pods. Item 54 moved the group into the session store instead, so a
+member joins from any pod and an adopter rejoins; `grouped_not_adopted` no
+longer exists. Placement (D8) is still absent, but no longer a correctness
+requirement.
 
 ### 22. (number unused)
 
@@ -3265,10 +3268,12 @@ on 2026-08-26 and that these items rely on:
   `SegmentJournal::{open, append, read_back, discard}` plus
   `recording_spill::salvage` — and `RecordingSink` (`recorder.rs:528`) is the
   trait every fake implements (`MemorySink`, `BucketSink`, `NowhereSink`).
-- The recording group lives only in `TapPlane::groups`
-  (`tap_plane.rs:447`) with `opened_at: Instant`; nothing about groups or
-  conferences is in Redis. `registry_keeper::rebuild` skips grouped
-  attachments (`grouped_not_adopted`, `registry_keeper.rs:378–389`).
+- The recording group lived only in `TapPlane::groups` (`tap_plane.rs:447`)
+  with `opened_at: Instant`, and nothing about groups or conferences was in
+  Redis. **Item 54 changed the group half of that**: the group is a record
+  under `mss:group:…`, `opened_at` is a `SystemTime`, `registry_keeper::rebuild`
+  no longer skips grouped attachments and `grouped_not_adopted` is gone.
+  Conferences are still nowhere in Redis, which is item 55's business.
 - A `Conference` (`conference.rs:114`) has **no open instant**; the mix thread
   keeps a local `started: Instant` and publishes the mixed track on each
   member's own clock (`seated_at_frame`, `conference.rs:350/659`).
@@ -3412,7 +3417,115 @@ still lost (that is what the spill interval buys), `MAX_RECORDING` is still 2 h,
 and a `kill -9` between detach and upload still loses the `UploadCompleted`
 event (D11's residual) even though the audio is now salvageable from any pod.
 
-### 54. Recording groups as a shared record, not one pod's memory (D16)
+### 54. Recording groups as a shared record, not one pod's memory (D16) — ✅ DONE (2026-08-27)
+
+**What shipped.** A recording group stopped being one pod's memory and became a
+record every pod can read; `TapPlane::groups` is now the in-process cache in
+front of it, and nothing above `join_group` changed shape.
+
+- Two keys beside the session keys, same namespace prefix:
+  `mss:group:<account>/<group>` → JSON
+  `GroupRecord { recording_id, format, opened_at_unix_ms, created_by }`, created
+  with `SET NX` so the loser of a race reads the winner back and two
+  first-members on two pods agree on one recording and one anchor; and
+  `mss:group:<account>/<group>:members` → hash `object key → owner pod`, where
+  `HSETNX` **is** the duplicate-participant refusal. `HDEL` on leave, both keys
+  `DEL`ed (best effort) when the hash empties, and both `EXPIRE`d at
+  `GROUP_RECORD_TTL` (3 h = `MAX_RECORDING` + 1 h) on every join as the backstop
+  against a pod that dies without leaving.
+- `SessionStore` gained `open_or_join_group` / `leave_group`, implemented by
+  `RedisSessionStore` with those commands and mirrored exactly by
+  `MemorySessionStore`, so every `TapPlane` test now runs the store path with no
+  Redis anywhere. `TapPlane::share_groups_through(Arc<dyn SessionStore>)` is a
+  `OnceLock` set from `main.rs` beside the keeper — the `discover_through`
+  idiom. **No store configured keeps the old pod-local behaviour**, which is
+  correct for a single pod.
+- `registry_keeper::rebuild` stopped skipping grouped attachments; the
+  `grouped_not_adopted` counter and `mss_registry_grouped_not_adopted_total` are
+  **deleted** from code and docs, because the behaviour they counted no longer
+  exists.
+- `lab/group_recording_drill.sh` gained `PODS=2`: pod-starting became a
+  `start_pod` function, a second pod comes up at 172.31.99.123 (control 19092,
+  metrics 19093), both pods get `MSS_REDIS_URL` pointing at the lab redis, and
+  bob's create/record/detach and both live refusals go to pod B. `PODS=1` is
+  byte-for-byte the drill that ran before.
+
+**Decisions, as specified and as built.**
+
+- **The anchor is wall-clock.** `RecordingGroup.opened_at`,
+  `RecorderSpec.group_anchor` and `recorder::absorb`'s lead computation are all
+  `SystemTime`; the record carries unix ms. Two pods cannot compare each other's
+  `Instant`s, so cross-pod alignment is exactly as good as the nodes' clock
+  sync — a skew of *s* misaligns two participants by *s*, and deploy.md says so
+  next to the key table. The `resume_ms > 0` rule that clears `group_anchor` is
+  untouched: an adopted recording's spilled frames already carry the lead.
+- **A store error is a refusal, never a silent local group.** `join_group`'s
+  failure path counts `group_joins_refused` and names the registry in the
+  message. A member that cannot see the group would open a second
+  half-recording under a prefix another pod is already writing, so a
+  half-group is worse than no group.
+- **Adoption takes its seat back instead of being refused by it.** The dead
+  pod's seat is still in the members hash, so a plain `HSETNX` would refuse the
+  adopter its own object. `open_or_join_group` takes `take_over`, and
+  `open_recording_attachment` sets it when the attach carries
+  `mss.recording.spillOwner` — the metadata key `rebuild` adds and nothing else
+  does. The lease claim already arbitrated that session's ownership; the `HSET`
+  records an outcome, it does not race for one.
+- **Order inside `join_group`:** sync local precheck (cheap, and it keeps the
+  single-pod refusal messages byte-identical), then the store round trip, then a
+  sync commit into the cache — the group lock is never held across the await,
+  and a commit that fails after the store accepted releases the seat again. One
+  Redis round trip per grouped attachment, in the control world, never on a
+  frame path.
+- **`group_anchor_for(session)` is the seam item 55 fills.** It returns
+  `SystemTime::now()` today. When a conference owns its recording, the first
+  member of a new group whose session is a conference member must anchor on the
+  conference's open instant, and this is the one function that changes.
+
+**Verified — unit tests against `MemorySessionStore` and the tap_plane fakes.
+Nothing here ran against real Redis, real MinIO or a real pod:** the lab Docker
+stack was down for this session (Docker Desktop not running).
+
+| Test | What it proves |
+| --- | --- |
+| `tap_plane::two_pods_sharing_one_store_pad_their_members_back_to_one_anchor` | the whole point, end to end on real sockets: two `TapPlane`s ("pod-a", "pod-b") sharing one `MemorySessionStore` and one `BucketSink`, alice recording on pod A and bob joining the same group on pod B ~0.6 s later. One prefix, two objects, and **bob's WAV opens with ≥ 250 ms of zeros** back to the anchor pod A stamped, with the two lengths equal to within half a second. Point pod B at its own store and it fails at 168 samples of lead — measured, not assumed |
+| `tap_plane::a_group_name_reused_on_a_second_pod_joins_it_instead_of_opening_another` | pod A opens the group and its cache is then dropped; pod B's join returns **the same anchor**, `created_by` stays pod A, and the members hash names which pod writes which object. A reused participant label on pod B is refused with a message naming **pod-a** |
+| `tap_plane::an_adopted_member_takes_its_seat_back_from_the_pod_that_died` | the same participant on a second pod is refused without `take_over` and seated with it, keeping the original anchor, and the seat then names the adopting pod |
+| `tap_plane::a_group_the_store_cannot_answer_for_is_refused_rather_than_kept_locally` | an unreachable store refuses the grouped attach naming the registry, counts one refusal, and leaves `groups_live` / `group_members_live` at 0 with an empty local table |
+| `registry_keeper::a_grouped_recording_is_rebuilt_on_the_adopting_pod_with_its_group` | the rewritten adoption test: the grouped `FILE_S3` attachment **is** rebuilt on pod B and re-attached **with `group=conf-9`**, where it used to be skipped and counted |
+| the pre-existing group tests (refusal shapes, one-recording-per-group, group dies with its last member, the recorder's lead-silence and padded-tail tests) | unchanged and green, now running through `MemorySessionStore` because `plane()` installs one by default — the single-pod messages and counters did not move |
+
+Gate, run as separate commands: `cargo test --workspace` green (304
+mediaserverd unit tests, every other target unchanged), `cargo fmt --all
+--check` clean, `cargo clippy --all-targets -- -D warnings` clean, the comment
+scan empty, `cargo deny check all` — advisories, bans, licenses, sources ok.
+
+**Owed, and it is the honest half of this item.**
+
+1. `tests/redis_registry.rs::two_pods_opening_one_recording_group_agree_on_one_anchor`
+   is written and env-gated on `MSS_TEST_REDIS_URL`; it has **never run**. Six
+   concurrent `open_or_join_group` calls with six distinct participant labels
+   must produce one `created_by` and one `opened_at_unix_ms` (the `SET NX`
+   race), a TTL inside `GROUP_RECORD_TTL`, a reused label refused as
+   `ParticipantHeld` naming its pod, a second recording id refused as
+   `RecordsAnother`, and both keys gone (`TTL == -2`) once the last member
+   leaves. Run it the next time the lab is up:
+   `MSS_TEST_REDIS_URL=redis://127.0.0.1:6379 cargo test -p mediaserverd --test redis_registry`.
+2. `PODS=2 ./lab/group_recording_drill.sh` — the two-pod drill. Its numbers
+   (one prefix, two objects, equal lengths, the cross-pod refusal messages) go
+   in [lab.md](lab.md), and D16's row stays honest until they do.
+
+**Residual.** Placement is still not a thing (D8) — a group's sessions land
+wherever they land; the difference is that they no longer *have* to share a
+pod. Cross-pod head alignment is only as good as NTP, and MSS neither measures
+nor reports node clock skew. A conference still does not survive a pod loss,
+because a conference member is an inline session and inline sessions are never
+adoptable — that is D20/item 55 territory, not this one. Nothing expires a
+group record early: a pod that dies without leaving holds its seats for up to
+3 h, which blocks only that participant *label* in that group, and only until
+the record expires.
+
+### 54b. (original description, for reference) Recording groups as a shared record
 **Where:** `crates/mediaserverd/src/{session_store.rs,tap_plane.rs,registry_keeper.rs,recorder.rs}`,
 `lab/group_recording_drill.sh`.
 **What:** move what a `RecordingGroup` *is* — its `recording_id`, format, open
@@ -3642,7 +3755,7 @@ sample, visible only as a growing `mss_rtpengine_sample_age_seconds`.
 | D20 | **A room recording belongs to a member, not to the conference.** The mixed-track `FILE_S3` attachment hangs off one member session, so the object ends when *that* member leaves even though the conference keeps mixing — and its t=0 is its attach moment, not the conference's open, so it aligns with the per-participant objects only if both are attached together. Fix shape: a conference-scoped recording owner (an attachment on the conference rather than on a leg) with the conference's `opened_at` as its anchor | `tap_plane.rs`, `conference.rs` | medium once a tenant records conferences whose members come and go |
 | ~~D21~~ | ~~**DTMF digits never reach the event bus.** A tapped or inline leg's digits are delivered to consumers (WS `dtmf` frames, gRPC `DtmfFrame`) and counted in `mss_ingest_dtmf_digits_total`, but nothing publishes `Observation::Dtmf`, so `mss.events` carries no digit~~ — **fixed 2026-08-26 (item 48)**: every press on a tap leg or an inline leg is published as a session-level `MediaEvent` carrying `digit`, `track` (attribution-aware, so `leg_a`/`leg_b` when unproven), `duration_ms` (through the negotiated RTP clock) and the event's `rtp_timestamp`. **No capability and no consumer**: unlike `SpeechReport`, which a consumer *claims* and which is gated on `CAPABILITY_EVENTS`, a digit is a property of the call MSS decoded itself, so it goes out whenever the session exists. RFC 4733's three end retransmissions stay one event. The capture thread hands presses to the control plane over a bounded lock-free queue that counts refusals (`mss_dtmf_events_dropped_total`) rather than blocking the media path. Live-proved with no consumer attached (`lab/dtmf_event_drill.sh`). **Residual, by design:** MSS interprets no digit — no menu, no collection, no inter-digit timer (item 40: conference control is API-first) — and nothing rate-limits presses beyond the queue's drop counter | `digits.rs`, `tap_spike.rs`, `tap_plane.rs`, `registry.rs` | closed |
 | D22 | 🔶 **Member state has no owner and no lease** — read-back landed (item 49, 2026-08-26): `DescribeSession` on a member session reports its `mute`/`deaf`/`hold`, its mix routes and the room's members, read from the control-world mirror. What remains: `member_mute`/`member_deaf`/`member_hold` still outlive the attachment that set them (item 40) with no expiry, so a controller that dies between `on` and `off` leaves a member muted for the life of the conference — recoverable now by reconciling the room on reconnect, but nothing reclaims it. A lease needs an owner this API does not model (item 40 rejected the attachment as owner) | `conference.rs`, `tap_plane.rs`, `registry.rs` | medium once a tenant drives mute from a UI |
-| D16 | **A recording group is one pod's memory.** `TapPlane` holds the group, so every member of a conference recording must attach to the same pod: there is no placement that guarantees it (D8), a member whose session is adopted elsewhere is **refused** rather than restored (`grouped_not_adopted`, so the participant's file simply ends at the pod that died — the D9 shape per participant), and a group name reused on a second pod silently produces a second half-recording under the same prefix. Fix shape: schedule a group's sessions onto one pod, or move the group into shared storage so any pod can serve a member | `tap_plane.rs`, `registry_keeper.rs` | medium once a tenant records conferences across pods |
+| ~~D16~~ | ~~**A recording group is one pod's memory.**~~ — **fixed 2026-08-27 (item 54)**: the group moved into the session store. `mss:group:<account>/<group>` (`SET NX`, so two first-members on two pods agree on one recording and one anchor) plus a `mss:group:…:members` hash keyed by object key and valued by owner pod (`HSETNX` is the duplicate-participant refusal, and it can now name the pod holding the seat), both expiring at `MAX_RECORDING + 1 h`. A member may attach on **any** pod, `registry_keeper::rebuild` **rebuilds** a grouped attachment with its group instead of skipping it (`grouped_not_adopted` is deleted), and a reused group name joins the existing group instead of opening a second half-recording under the same prefix. The group's open instant became **wall-clock** (`SystemTime`) so two pods can share it, which makes cross-pod alignment as good as the nodes' NTP — deploy.md says so beside the new key table. A store MSS cannot read is a **refusal** of the grouped attachment, counted, never a silent local group. **Verified against `MemorySessionStore` and the in-crate recording fakes only** — including two planes sharing one store whose second pod's object opens with the lead silence back to the first pod's anchor; the env-gated Redis `SET NX` race test and `PODS=2 lab/group_recording_drill.sh` are written but have **never run**. **What remains:** those two runs, and placement (D8) — which is now an optimisation rather than a correctness requirement | `session_store.rs`, `tap_plane.rs`, `registry_keeper.rs`, `recorder.rs` | closed (two runs owed) |
 | ~~D13~~ | ~~`StreamStart` (and the Twilio `start` frame's `tracks`) advertises `["customer","agent"]` for `TrackSelector::All`, but a silent `mixed` track is delivered too~~ — **fixed 2026-08-23 (item 27)**: the hub selection split into `All` (every track, including `mixed`) and `Speakers` (customer + agent). Consumers get `Speakers`, so delivery matches the advertisement exactly; the **recorder keeps `All`** because injected bot speech belongs in the recording. The frozen Twilio start frame and `StreamStart.tracks` were not touched — the delivery was brought in line with them. A consumer that wants the injected track can still ask for it by name (`TrackSelector::Only(Mixed)`). Replay-verified | `hub.rs`, `tap_plane.rs` | closed |
 | ~~D17~~ | ~~**Leg labels invert when the caller's from-tag is not given.** With `from_tags` unspecified (`-`), `TapPlane` labels the two legs in the order rtpengine's `query` returns them, and in the two-node drill that put **FreeSWITCH's** tag first — so `customer` and `agent` were swapped in the recording and in the `tracks` a consumer sees~~ — **fixed 2026-08-26 (item 47)**: the order was in fact `BTreeMap` order, i.e. lexicographic by tag. MSS now refuses to name a direction it cannot back up: `attribution=explicit` when a from-tag was supplied (and for every inline leg), `inferred` when rtpengine's per-participant `created` seconds strictly order the legs, `unknown` otherwise — and under `unknown` the gRPC tracks, the event payload tracks and the recording object keys are `leg_a`/`leg_b`, with a WARN log, a `LegsAttributed` event and `attribution` on `DescribeSession` and on every event envelope. The frozen WS Twilio names never move. Live-proved on a call built to invert (callee tag sorting first): `unknown` + `leg_a`/`leg_b` with no from-tag, `explicit` + `customer`/`agent` with one. **Residual, and it is the vendor's:** `created` is stamped per *dialogue*, so the two legs of one call always tie — `inferred` cannot fire for a two-party call on rtpengine 14.1.1.8, and an integrator who needs speaker attribution **must** pass the caller's from-tag (`docs/deploy.md`, "Leg attribution") | `tap_plane.rs`, `attribution.rs` | closed (residual is the vendor's) |
 | ~~D18~~ | ~~**Recording-group members are not time-aligned.** Each member's file anchored on **its own first frame**, so a late joiner's file started at its join moment and two members of one group differed in length (90.32 s vs 90.26 s in the two-node drill), leaving reassembly to the event timeline~~ — **fixed 2026-08-23 (item 29)**: a recording group stamps `opened_at` when its first member joins and every later member's segmenter pads its first segment with silence from that anchor to its own first frame (`Segmenter::lead_with_silence`, reported as `lead_silence_frames`), padded once per recording so pause/resume cannot double-count it. Replay-verified (late joiner padded, two members equal length, the pause interaction, and a WAV read back out of a fake sink) **and live**: the drill's staggered re-run had bob join 5 s late and his object came back opening with 5016 ms of zeros, 25.116 s against alice's 25.030 s. **Residual:** equal length still assumes the members stop together — the 86 ms here was D11's blocking detach, closed by item 50, and D16 keeps the anchor inside one pod's clock | `recorder.rs`, `tap_plane.rs` | closed (residual documented) |

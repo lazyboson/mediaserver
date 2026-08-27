@@ -158,6 +158,33 @@ can be neutralised in a ConfigMap without deleting it.
 Events are **at-least-once** since defect D5: a consumer must dedupe by
 `(external_id, seq)`. `seq` is gapless per session, so a hole is visible.
 
+#### What MSS keeps in Redis
+
+Everything lives under one namespace prefix (`mss:`). Nothing here is a cache
+you may clear while calls are up.
+
+| Key | Shape | Written by | Expiry |
+| --- | --- | --- | --- |
+| `mss:session:<externalId>` | JSON `PersistedSession` — call-id, from-tags, rtpengine node, tap to-tag, every attachment | the owning pod's keeper tick | none; deleted when the session ends |
+| `mss:lease:<externalId>` | the owner pod's name, `SET NX` | the owner, renewed every 5 s | **15 s** — its expiry is what makes a session adoptable |
+| `mss:sessions` | a set of every known `externalId` | the owner | none; members are removed on destroy |
+| `mss:group:<accountId>/<group>` | JSON `{recording_id, format, opened_at_unix_ms, created_by}`, created with `SET NX` so the loser of a race reads the winner back | the **first** member of a recording group, on any pod | **3 h** (`MAX_RECORDING` + 1 h), refreshed on every join |
+| `mss:group:<accountId>/<group>:members` | hash `object key → owner pod`; `HSETNX` is the duplicate-participant refusal | every member, on its own pod | 3 h, refreshed on every join; both keys are deleted when the hash empties |
+| `<MSS_DISCOVERY_REDIS_KEY_PREFIX><SIP Call-ID>` | the rtpengine node map below — **written by your proxy**, only read by MSS | your proxy | yours |
+
+The two `mss:group:` keys are what make a recording group a shared record
+instead of one pod's memory (item 54): a member can join from any pod, an
+adopted member rejoins the group it was already in, and a group name reused on
+a second pod finds the existing group instead of opening a second
+half-recording under the same object prefix. Because the group's open instant
+is now **wall-clock** (unix ms in the record) rather than one pod's monotonic
+clock, cross-pod time alignment of a group's participant objects is only as
+good as the nodes' clock sync: **a skew of *s* between two nodes misaligns
+their two participants by *s***. Kubernetes nodes run NTP, so this is normally
+single-digit milliseconds — but if you disable it, alignment goes with it. A
+pod that has `MSS_REDIS_URL` unset keeps groups in its own memory, which is
+correct for a single pod and wrong for two.
+
 ### Recording
 
 | Variable | Default | Meaning | When to change | Added by |
@@ -515,7 +542,8 @@ simply ask again. Nothing else in the system has that property.
 | **Attachments MSS dials out to** (`WS_TWILIO`, `file-s3`) | yes | re-established by the adopter along with the tap |
 | **Attachments that dial into MSS** (`GRPC_STREAM`) | no, by construction | the consumer's HTTP/2 connection died with the pod; it must reattach. This is why the Service is headless — a client resolving all pod IPs notices |
 | **Inline legs** (Phase 3) | **no** | the peer's SDP points at a socket that no longer exists. This fails like any media endpoint failure and needs recovery at call-control level |
-| **Conferences** (Phase 4) | **no** | the mixer is pod-local; a room does not move. Defect D16 — pod-local groups — is open pending a placement decision |
+| **Conferences** (Phase 4) | **no** | the mixer is pod-local; a room does not move. This fails like an inline leg, because a conference member *is* one |
+| **Recording groups** | **yes, with `MSS_REDIS_URL` set** | the group is a record in Redis (`mss:group:…` above), not one pod's memory: a member's adopted session rejoins the group, a member may attach on any pod, and the group's wall-clock anchor keeps every participant object aligned across pods. Without Redis a group is pod-local, and a member adopted elsewhere opens an ungrouped file. What placement still does not do (D8) is *choose* one pod for a group — it no longer has to |
 | **Recordings** | **yes, with `MSS_RECORDING_SPILL_TO=s3`** | closed segments spill every `MSS_RECORDING_SPILL_SECONDS` into the recording bucket, the adopting pod reads them back and pads only what the dead pod had not spilled yet, so the worst case is one spill interval on **any** pod (`mss_recording_frames_lost_on_adopt_total` says how much). With the default `disk` that guarantee holds only for a **same-pod** restart, because a cross-pod adopter cannot read the dead pod's disk — it recovers nothing and pads the whole recording. Either way the journals of recordings that never finished need a bucket lifecycle rule on `_spill/`: MSS implements no retention. Never measured on a live pod kill with a recorder attached — see [item 53](tasks.md) |
 | **Events** | yes | at-least-once with a bounded retry backlog; a pod death or an overfull backlog still loses events, and the gapless per-session `seq` makes the hole visible |
 
@@ -629,6 +657,18 @@ Read these three together when a pod dies mid-recording:
 | `mss_recording_spill_lost_ownership_total` | closed segments **not** spilled because another pod had already adopted the journal. Non-zero means a partitioned-but-alive pod was still recording a call it no longer owns — the registry's `mss_registry_lost_total` should say the same thing |
 | `mss_recording_spill_foreign_manifests` | journals this pod's startup salvage left alone because their manifest names another owner. Expected and healthy after a rolling restart; a number that only grows means journals nobody is finishing, which is what the `_spill/` lifecycle rule is for |
 | `mss_recording_salvaged_total` / `…_salvage_skipped_total` / `…_salvage_failures_total` | what this pod's start did with its *own* leftover journals: uploaded, left alone because the object already existed, or failed |
+
+### Recording group series (item 54)
+
+A recording group writes one object per participant under one prefix. These
+three say whether the group is healthy; all three exist whether or not Redis is
+configured, because the gauges are per pod.
+
+| Series | Meaning |
+| --- | --- |
+| `mss_recording_groups_live` | recording groups with at least one member **on this pod**. Sum across pods to see a cross-pod group counted once per pod that holds a member of it |
+| `mss_recording_group_members_live` | members of those groups on this pod. One per `FILE_S3` attachment that named a group |
+| `mss_recording_group_joins_refused_total` | grouped attachments refused, by one of four reasons the log names: a participant label already writing that object (now including one held **by another pod**), a member naming a different `recordingID` or format inside an existing group, a non-empty group on any transport but `FILE_S3`, and — since item 54 — a **session registry MSS could not read**. That last one is deliberate: a member that cannot see the group would open a second half-recording under the same prefix, so it is refused instead |
 
 ### rtpengine node series (item 57)
 

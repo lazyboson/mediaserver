@@ -10,7 +10,7 @@ use session_core::{Observation, SessionId};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 use tokio::sync::{mpsc, oneshot, OwnedSemaphorePermit, Semaphore};
 use tracing::{info, warn};
 
@@ -914,7 +914,7 @@ pub struct RecorderSpec {
     pub targets: Vec<RecordingTarget>,
     pub sample_rate_hz: u32,
     pub max_duration: Duration,
-    pub group_anchor: Option<Instant>,
+    pub group_anchor: Option<SystemTime>,
     pub resume_ms: u64,
 }
 
@@ -1656,7 +1656,7 @@ fn settle_spill(
     }
 }
 
-fn absorb(segmenter: &mut Segmenter, event: TapEvent, group_anchor: &mut Option<Instant>) {
+fn absorb(segmenter: &mut Segmenter, event: TapEvent, group_anchor: &mut Option<SystemTime>) {
     if let TapEvent::Media {
         track,
         timestamp_ms,
@@ -1665,7 +1665,7 @@ fn absorb(segmenter: &mut Segmenter, event: TapEvent, group_anchor: &mut Option<
     } = event
     {
         if let Some(anchor) = group_anchor.take() {
-            let lead = Instant::now().saturating_duration_since(anchor);
+            let lead = SystemTime::now().duration_since(anchor).unwrap_or_default();
             if segmenter.lead_with_silence(lead) {
                 info!(
                     lead_silence_ms = lead.as_millis() as u64,
@@ -2728,7 +2728,7 @@ mod tests {
     fn group_spec_anchored(labels: &[(&str, Layout)], lead: Duration) -> RecorderSpec {
         RecorderSpec {
             group_anchor: Some(
-                std::time::Instant::now()
+                SystemTime::now()
                     .checked_sub(lead)
                     .expect("this machine's clock has no room for a lead"),
             ),
