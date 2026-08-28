@@ -1,0 +1,30 @@
+# Builds the `rig-freeswitch:latest` that docker-compose.microsip.yml has always
+# named but that no file in this repo ever produced, from whatever FreeSWITCH
+# image the deployment already has:
+#
+#   docker compose -f docker-compose.microsip.yml -f docker-compose.rig.yml \
+#     build freeswitch
+#   docker compose -f docker-compose.microsip.yml -f docker-compose.rig.yml \
+#     up -d rtpengine opensips freeswitch call-watcher redpanda redis \
+#           minio minio-init mock-bridge mss-control
+#
+# Point it at a different base with FS_BASE_IMAGE. The mounts here are the
+# source-build paths (/usr/local/freeswitch/conf); the mount the microsip file
+# already carries is the Debian-package path, and both being present is
+# harmless -- FreeSWITCH reads whichever tree its own build uses.
+#
+# On a host with ~4 GB of RAM, add `--memory=512M --reserve-memory=0M` to the
+# redpanda command as well: unbounded, it reserves most of the machine and
+# leaves nothing for FreeSWITCH, rtpengine, MinIO and a Rust daemon.
+services:
+  freeswitch:
+    image: rig-freeswitch:latest
+    build:
+      context: ./freeswitch/rig
+      args:
+        BASE: ${FS_BASE_IMAGE:-freeswitch:v1.10.12_v1.2.7_v2.0.10_AI}
+    environment:
+      LOG_DIR: ${FS_LOG_DIR:-/tmp/fslog}
+    volumes:
+      - ./freeswitch/internal.xml:/usr/local/freeswitch/conf/sip_profiles/internal.xml:ro
+      - ./freeswitch/dialplan-default.xml:/usr/local/freeswitch/conf/dialplan/default.xml:ro

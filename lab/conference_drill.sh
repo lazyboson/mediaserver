@@ -221,13 +221,18 @@ seat_peer c
 PARTY_C=$("$CTL" "http://$CONTROL" record "conf-$STAMP-c" "$PARTY_KEY" c "$GROUP" \
   customer | attachment_of)
 
-say "attaching the monitor consumer (SINK, only=mixed)"
+# The monitor hangs off the ROOM session, not off a member. Attaching it to
+# party A was a leftover from before item 55 made the room a session: A is the
+# member the leave phase removes, so the server ended the monitor's stream
+# mid-run and this drill could never satisfy its own leave/monitor expectation.
+# The room session is what owns the conference and carries the room recording.
+say "attaching the monitor consumer to $ROOM_SESSION (SINK, only=mixed)"
 docker rm -f conf-monitor >/dev/null 2>&1 || true
 docker run -d --name conf-monitor --network "$NET" \
   -v "$HERE/conference_actor.py:/conference_actor.py:ro" \
   -v "$REPO/lab/out/pb:/pb:ro" -v "$IO_DIR:/io" \
   -e ROLE=monitor -e NAME=monitor -e TRACK=mixed -e IO_DIR=/io -e STUBS=/pb \
-  -e CONTROL="$CONTROL_IN_NET" -e EXTERNAL_ID="conf-$STAMP-a" \
+  -e CONTROL="$CONTROL_IN_NET" -e EXTERNAL_ID="$ROOM_SESSION" \
   -e EAR_TONES="$EAR_TONES" -e RUN_SECONDS=600 \
   -e MSS_AUTH_TOKEN="${MSS_AUTH_TOKEN:-}" -e PIP_DISABLE_PIP_VERSION_CHECK=1 \
   python:3-slim sh -c 'pip install --quiet grpcio protobuf && python3 /conference_actor.py' \

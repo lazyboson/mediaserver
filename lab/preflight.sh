@@ -305,6 +305,23 @@ def media_port_of(answer):
     return int(ports[0]) if ports else None
 
 
+def bind_failure(address):
+    """Returns the OSError from binding a probe socket on address, or None.
+
+    An unbindable --local-ip used to reach socket.bind() inside check_ng and
+    leave a traceback on stdout, which breaks this tool's one promise: every
+    line is PASS, FAIL or SKIP.
+    """
+    probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        probe.bind((address, 0))
+        return None
+    except OSError as failure:
+        return failure
+    finally:
+        probe.close()
+
+
 def check_ng():
     """NG ping, then the whole tap handshake against a call this tool creates:
     offer, answer, subscribe request, subscribe answer, RTP through it,
@@ -339,6 +356,15 @@ def check_ng():
     record("PASS", "ng_ping", f"rtpengine at {host}:{port} answered pong in {elapsed:.0f} ms")
 
     local = LOCAL_IP if LOCAL_IP and LOCAL_IP != "0.0.0.0" else ng.local_address()
+    unbindable = bind_failure(local)
+    if unbindable is not None:
+        record("FAIL", "ng_subscribe",
+               f"cannot bind a probe socket on {local} ({unbindable}) -- "
+               f"--local-ip / MSS_TAP_LOCAL_IP has to be an address of the host "
+               f"running preflight, which is where these probe sockets open")
+        record("SKIP", "ng_tap_media", "no probe socket could be bound")
+        ng.close()
+        return
     call_id = f"mss-preflight-{RUN}"
     from_tag = f"preflight-a-{RUN}"
     to_tag = f"preflight-b-{RUN}"
