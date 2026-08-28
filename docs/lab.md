@@ -2325,6 +2325,7 @@ Every headline number in this file reproduced on unfamiliar hardware.
 | `event_outage_drill.sh` | 60/60 events across a 30 s outage | as recorded |
 | `dtmf_event_drill.sh` | 14 events, 0 dropped, correct digit per track | as recorded |
 | `preflight.sh` | **9 PASS, 0 FAIL, 5 SKIP** against the live lab | as recorded |
+| `node_discovery_drill.sh` | PASS on 2026-08-28: a session naming **no** node and no from-tags landed on the anchoring rtpengine (hits 0 -> 1) and carried 1196 datagrams with `attribution=explicit` from the proxy's `caller_tag`; an unmapped call-id was refused against the black-hole default rather than guessed (misses 0 -> 1) | as recorded |
 | `fsless_call_drill.sh` | ear_a +1000=1183 / −440=0, ear_b +440=1348 / −1000=3, FreeSWITCH `exited` throughout | as recorded on its branch |
 
 `event_outage_drill.sh` must be run as `./lab/event_outage_drill.sh`, not
