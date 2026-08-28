@@ -2349,6 +2349,22 @@ So the claim item 53 made against fakes -- that a pod death costs the spill
 interval rather than the call -- now has a live number, and it is the adoption
 gap that dominates it, not the spill.
 
+**D16, a recording group across two pods** (`PODS=2
+lab/group_recording_drill.sh`). Two pods on one Redis, the second member joining
+5 s late on the *other* pod: pod B joined the group **pod A had opened** and
+padded bob's file back to pod A's anchor (`lead_silence_ms` 5176 against the
+first member's 183), so both participant objects came back the same length -- a
+staggered join is padded, not shifted, across a pod boundary as well as within
+one. The duplicate-label refusal also crossed pods and named the pod holding the
+seat ("already has a participant writing .../alice.wav, on pod pod-group"),
+which is what item 54's `HSETNX` was for;
+`mss_recording_group_joins_refused_total` moved 0 -> 2. The frozen two-leg
+identity is correctly absent for a grouped recording.
+
+Note that this drill builds in a target volume of its own and drops it on the
+way out, so every `PODS=2` run pays a full cold build -- about ten minutes on a
+2-vCPU box.
+
 ### FS parity: what a tone source can and cannot show
 
 `fs_parity_drill.sh` ran three times here and its byte comparison failed every
