@@ -78,6 +78,15 @@ cleanup() {
     docker logs --tail 40 mss-group-pod 2>&1 | sed 's/^/pod: /' || true
   fi
   say "cleaning up"
+  # Destroy the sessions BEFORE the pods that own them go away. Removing a pod
+  # without destroying its sessions is exactly the pod-loss case the registry is
+  # built for, so the records stayed in the shared Redis and the lab's own pods
+  # adopted them -- two orphans with no call behind them, holding stalled legs
+  # and reporting zero datagrams until somebody noticed. That is what failed the
+  # next soak run: "the Redis registry still holds 2 session(s): conf-alice
+  # conf-bob", twenty hours after this drill exited 0.
+  "$CTL" "$CONTROL" destroy conf-alice >/dev/null 2>&1 || true
+  "$CTL" "$CONTROL_B" destroy conf-bob >/dev/null 2>&1 || true
   docker rm -f mss-group-pod mss-group-pod-b group-driver-a group-driver-b \
     >/dev/null 2>&1 || true
   docker volume rm "$TARGET_VOLUME" >/dev/null 2>&1 || true
