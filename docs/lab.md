@@ -2390,3 +2390,103 @@ So the tolerances in that drill (duration ≤ 200 ms, mean sample difference
 Phase-2 finding** — it says the drill needs real speech to judge byte
 agreement, and now that its exit code is honest (defect 7) that shows up as a
 red run rather than a green one.
+
+## The impairment matrix, on the tap link at last (2026-08-28)
+
+[testing.md](testing.md) calls this "the single highest-value item" on the lab
+list, and the section above records why it had never run: the box that built
+this project has `CONFIG_NET_SCH_NETEM` compiled out, so `lab/soak.py` always
+fell back to damaging the *caller's* RTP upstream of rtpengine. The Debian host
+of the second-box run has netem as a module. `modprobe sch_netem`, and:
+
+```
+$ ./lab/netem.sh probe
+netem: available on eth0 in mss-microsip-rtpengine-1
+```
+
+`soak.py` then reports `impairment injection: tc netem on the tap link` instead
+of the endpoint fallback, and the whole matrix runs where it was meant to.
+
+### Two things had to be fixed before a number here meant anything
+
+**The filter was impairing the control channel.** `netem.sh` steered packets
+into the netem band by **destination address alone**, and rtpengine's NG replies
+are addressed to the pod exactly as the tap's RTP is. Under `loss5` the pods
+logged `ng node did not reply, attempts 3`, a subscribe died, and a pod sat with
+a live session and **zero** datagrams — the phase measured a broken subscription
+rather than a jitter buffer, which is the opposite of the tool's purpose. NG
+replies (source port 22222) are now pinned to the clean band at a higher filter
+priority. `tc filter show` proves the shape: `pref 1 ... flowid 1:1 match
+56ce0000/ffff0000 at 20` is the source port, `pref 2 ... flowid 1:3 match
+ac1f631f at 16` is the destination address.
+
+**Two orphaned sessions were skewing every pod.** The first run failed 116
+assertions, including in the `clean` phase, and the soak named the cause itself:
+*"the Redis registry still holds 2 session(s): conf-alice conf-bob"*.
+`group_recording_drill.sh` removed its ad-hoc pods **without destroying their
+sessions** — which is precisely the pod-loss case the registry exists for, so
+the lab's own pods adopted two orphans that had no call behind them and held
+stalled legs for twenty hours, one of them reporting `underruns: 1439999` over
+an eight-hour leg. The drill destroys its sessions in cleanup now.
+
+### The matrix
+
+Two concurrent calls, 90 s per phase, summed over three pods, deltas taken
+strictly inside each phase. `SOAK_EXIT=0`, 32/32 calls tapped, **zero**
+assertion violations.
+
+| phase | injected on the tap link | datagrams | lost | concealed | late | dup | loss |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| clean | — | 13,702 | 0 | 0 | 0 | 0 | 0.00% |
+| loss1 | `loss 1%` | 14,034 | 119 | 119 | 0 | 0 | **0.84%** |
+| loss5 | `loss 5%` | 13,429 | 599 | 599 | 0 | 0 | **4.27%** |
+| burst | `loss 10% 50%` (see below) | 13,992 | 127 | 127 | 0 | 0 | 0.90% |
+| reorder | `delay 30ms 20ms reorder 25% 50%` | 14,002 | 1 | 1 | **3** | 0 | 0.01% |
+| reorder-far | `delay 120ms 60ms reorder 25% 50%` | 14,117 | 11 | 11 | **7** | 0 | 0.08% |
+| duplicate | `duplicate 1%` | 14,151 | 21 | 21 | 0 | **131** | 0.15% |
+| jitter | `delay 20ms 15ms distribution normal` | 14,083 | 0 | 0 | 1 | 15 | 0.00% |
+
+**`frames_concealed` equals `jitter_lost` in every row**, as it did against the
+endpoint injection — so item 17's G.711 Appendix I concealment has now run on
+the tap link, at the packet.
+
+### Three rows that only this injection point could produce
+
+- **Duplicates reach the tap: 131 of them.** The endpoint run recorded
+  `mss_jitter_duplicates_total` stuck at **0** through a phase that duplicated
+  1% of the caller's packets, and concluded that rtpengine absorbs a duplicate
+  upstream of the subscription — so "only netem on the tap link can reach it".
+  It can, and the dedupe path counts them, with `jitter_resets` at 0.
+- **Late drops exist: 3, then 7 as the delay widens to 120 ms ± 60 ms.**
+  Reorder-beyond-depth was replay-only until here.
+- **Loss accounting is exact, not approximate.** Under the old `burst` spec the
+  qdisc's own counter read `Sent 10548 pkt (dropped 12)` and MSS reported
+  `lost=12` — the same twelve packets, not a rate that merely tracks.
+
+### The `burst` profile was measuring nothing, and that is now fixed
+
+That exactness is what exposed it. `loss 10% 50%` is netem's legacy correlation
+form, and the correlation collapses the effective rate: **0.11% actually
+dropped against a nominal 10%**. The profile has been the matrix's burst row
+since it was written, and it was never bursty and never 10%.
+
+It is `loss gemodel 3.3% 30%` now — Gilbert-Elliott, where `p` is good→bad and
+`r` is bad→good, so steady-state loss is `p/(p+r)` = 10% and a burst runs `1/r`
+≈ 3.3 packets. Measured by the qdisc that applies it:
+
+```
+qdisc netem 30: parent 1:3 limit 1000 loss gemodel p 3.3% r 30% 1-h 100% 1-k 0%
+ Sent 2834670 bytes 10954 pkt (dropped 1119, overlimits 0 requeues 0)
+```
+
+10.2% dropped, and MSS reported **1,073 lost, 1,073 concealed** in-phase with
+the soak still green. So the concealment has now been measured against ~10%
+**bursty** loss on a real link, and the matrix's burst row means what it says.
+
+### What this still does not give
+
+The concealment has never been **judged perceptually** — every claim here is a
+counter agreeing with another counter. `SOAK_CALLS=2` and 90 s phases are a
+smoke-sized matrix on a 2-vCPU box, not the hour-long soak item 19 describes.
+And the impairment lands on the tap link only: nothing here damages the call
+legs themselves, which is the customer-visible path.
