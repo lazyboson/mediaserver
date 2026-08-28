@@ -7,7 +7,7 @@
 #
 #   DOCKER_API_VERSION=1.43 docker compose -f lab/docker-compose.microsip.yml \
 #     up -d rtpengine opensips freeswitch call-watcher redpanda redis \
-#           minio minio-init llm-bridge mss-control
+#           minio minio-init mock-bridge mss-control
 #   ./lab/grpc_stream_drill.sh
 #
 # RECORD=1 also attaches a FILE_S3 recording to the same session (item 15's

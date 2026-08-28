@@ -35,6 +35,8 @@ import random
 import re
 import socket
 import struct
+import subprocess
+import sys
 import time
 import wave
 
@@ -104,8 +106,39 @@ def ulaw_to_linear(byte):
     return -sample if sign else sample
 
 
+def ensure_speech_wav(path):
+    """Returns path, generating a stand-in first if nothing is there.
+
+    out/bridge_tts.wav is what lab/bridge_tts_dump.py captures from the real
+    stream-llm-bridge, and *.wav is gitignored, so a fresh clone has no speech
+    at all: every drill that dials through this script died here with
+    FileNotFoundError before placing a call. The fallback is the lab's own
+    generator at 8 kHz -- tones alternating with digital silence, not speech.
+    That is enough for a drill asking whether audio flowed and where it went,
+    and NOT enough for one judging intelligibility or sample-level parity
+    against another recorder, which is why the substitution is logged.
+    """
+    if os.path.exists(path):
+        return path
+    generator = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "webrtc", "make_agent_audio.py")
+    if not os.path.exists(generator):
+        raise SystemExit(f"{path} is missing, and {generator} is not here to make one")
+    directory = os.path.dirname(path)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+    log(f"{path} is missing; generating a tone stand-in with make_agent_audio.py")
+    subprocess.run(
+        [sys.executable, generator],
+        check=True,
+        env=dict(os.environ, OUT=path, RATE="8000", SECONDS="9",
+                 SOUND_SECONDS="2", SILENCE_SECONDS="1"),
+    )
+    return path
+
+
 def speech_frames():
-    with wave.open(SPEECH_WAV) as w:
+    with wave.open(ensure_speech_wav(SPEECH_WAV)) as w:
         if w.getframerate() != 8000 or w.getnchannels() != 1:
             raise SystemExit(f"{SPEECH_WAV} must be 8kHz mono")
         pcm = struct.unpack(f"<{w.getnframes()}h", w.readframes(w.getnframes()))

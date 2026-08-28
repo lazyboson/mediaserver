@@ -38,11 +38,13 @@ services:
       lab:
         ipv4_address: 172.31.99.20
 
-  # The offline stand-in. Start it with --profile mock when the real bridge
-  # is unavailable or you do not want to spend external API calls.
+  # The default consumer. It speaks the same Twilio Media Streams dialect the
+  # real bridge does, needs no API keys and spends no external calls, so
+  # `docker compose up` works from a clean clone -- which is what the "Running
+  # it" section of docs/lab.md has always claimed. Swap in the real bridge with
+  # `--profile real` (and MSS_CONSUMER_URL, below).
   bridge:
     image: python:3-slim
-    profiles: [mock]
     volumes:
       - ./mock_bridge.py:/mock_bridge.py:ro
     command: ["python3", "/mock_bridge.py"]
@@ -56,14 +58,25 @@ services:
 
   # The real thing, built from ../../stream-llm-bridge with:
   #   docker build -t stream-llm-bridge:local .
-  # Keys come from lab/.env, which is gitignored.
+  # Keys come from lab/.env, which is gitignored. Behind a profile because it
+  # needs an image built outside this repo and two paid API keys:
+  #
+  #   docker compose --profile real up \
+  #     -e MSS_CONSUMER_URL=ws://172.31.99.50:8080/ws
+  #
+  # The keys below default to empty rather than `:?`, because compose
+  # interpolates every service in the file before it filters by profile: a `:?`
+  # here refused to parse the file at all, so `docker compose up rtpengine`
+  # failed for want of a text-to-speech key. The bridge itself reports a
+  # missing key, which is the right place for that error.
   llm-bridge:
     image: stream-llm-bridge:local
+    profiles: [real]
     environment:
       SERVER_PORT: "8080"
       LOG_LEVEL: debug
       USE_LLM: "false"
-      ELEVENLABS_API_KEY: ${ELEVENLABS_API_KEY:?set it in lab/.env}
+      ELEVENLABS_API_KEY: ${ELEVENLABS_API_KEY:-}
       DEEPGRAM_API_KEY: ${DEEPGRAM_API_KEY:-}
       DEEPGRAM_MODEL: ${DEEPGRAM_MODEL:-nova-3}
       WELCOME_MESSAGE: ${WELCOME_MESSAGE:-Hello from the media server.}
@@ -72,11 +85,17 @@ services:
         ipv4_address: 172.31.99.50
 
   mediaserverd:
-    image: rust:1.95-slim-bookworm
+    # media-core -> opus-ffi -> opusic-sys builds a vendored libopus with cmake,
+    # which plain rust:slim does not carry, so this is the same image the
+    # microsip lab uses rather than the bare toolchain image.
+    image: mss-lab-rust:1.95
+    build:
+      context: .
+      dockerfile: Dockerfile.rust
     working_dir: /build
     command: ["cargo", "run", "--quiet", "-p", "mediaserverd"]
     depends_on:
-      llm-bridge:
+      bridge:
         condition: service_started
       call-driver:
         condition: service_healthy
@@ -96,7 +115,7 @@ services:
       MSS_TAP_SECONDS: "15"
       MSS_TAP_OUTPUT: /out/tap.wav
       MSS_TAP_DATAGRAM_LOG_DIR: /out
-      MSS_CONSUMER_URL: ws://172.31.99.50:8080/ws
+      MSS_CONSUMER_URL: ${MSS_CONSUMER_URL:-ws://172.31.99.40:8080/ws}
       MSS_CONSUMER_ACCOUNT_ID: lab-account
       MSS_CONSUMER_STREAM_SID: MZ-lab-1
     networks:
