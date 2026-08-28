@@ -2106,8 +2106,12 @@ assertions are measuring their own distortion.
   B2B leg into a conference is deployment-gated.
 - **One pod.** Conferences, recording groups and member state are all pod-local
   (D16, D22); nothing here survives a pod kill.
-- The monitor is one consumer on **one member's** session, so it inherits D20:
-  the room recording and the monitor both end if *that* member leaves.
+- The monitor is one consumer on the **room** session, which is what item 55
+  opened it for. Until 2026-08-27 this drill attached it to party A instead --
+  a leftover from before the room was a session -- so the server ended the
+  monitor's stream when A left and the drill could not satisfy its own
+  `leave/monitor` expectation. Nothing about the room recording inherits D20
+  any more; the room object outlives every member.
 - `deaf` and `hold` are **not** in this drill — they have socket-level tests
   from item 40 only.
 - Only PCMU at 8 kHz/20 ms. No per-leg resampler exists, and a conference
@@ -2265,3 +2269,124 @@ run, so every other drill sees the lab it has always seen.
 - **No multi-node placement.** The map named the one rtpengine the lab anchors
   calls on. A deployment with several instances is the case the map exists for,
   and it is still deployment-gated.
+
+## The whole suite on a second box, and the twelve things that stopped it (2026-08-27)
+
+Every measurement above was taken on the box that built this project. This is
+the first run of the suite somewhere else: a 2-vCPU / 3.6 GB Debian 11 host with
+docker, no Rust, no rtpengine and no FreeSWITCH of its own. Nothing in the media
+path needed changing. **Twelve environment and drill defects did**, and each one
+is worth knowing because each one presented as a product failure.
+
+### What the box had to be given
+
+`cmake`, `make`, `g++` and docker were already there. Added: rustup pinned to
+`rust-toolchain.toml`'s 1.95.0 (the drills build `mss_ctl` and
+`mss_stream_probe` **on the host**, not in a container), `python3-pip` plus
+`grpcio grpcio-tools protobuf kafka-python-ng numpy`, and **gawk** — see below.
+Redpanda needs `--memory=512M --reserve-memory=0M` on a host this small;
+unbounded it reserves most of the machine and leaves nothing for FreeSWITCH,
+rtpengine, MinIO and a Rust daemon.
+
+### The twelve, and what each cost
+
+| # | What it looked like | What it was |
+| --- | --- | --- |
+| 1 | `docker compose up` refused to parse the lab at all | `${ELEVENLABS_API_KEY:?}` / `${DEEPGRAM_API_KEY:?}`. Compose interpolates **every** service before it filters by profile, so two paid keys were required to bring up rtpengine. Both labs now default to the checked-in `mock_bridge.py`; the real bridge is `--profile real` |
+| 2 | `rig-freeswitch:latest` does not exist | It never existed in this repo. `lab/freeswitch/rig/Dockerfile` builds one from any FreeSWITCH image (`FS_BASE_IMAGE`), reconciling the four ways a source build differs from the Debian package |
+| 3 | mediaserverd would not build in the base lab | `lab/docker-compose.yml` pinned `rust:1.95-slim-bookworm`, which has no cmake, and `media-core -> opus-ffi -> opusic-sys` builds a vendored libopus. The microsip lab had the right image all along |
+| 4 | every SIP drill died before dialling | `host_test_caller.py` requires `out/bridge_tts.wav`, which `*.wav` in `.gitignore` keeps out of the repo. It now falls back to `webrtc/make_agent_audio.py` at 8 kHz and says so |
+| 5 | "no media socket landed in the range — FAILED" | `media_port_drill.sh` parsed `/proc/net/udp` with `strtonum()`, a **gawk** extension. Under Debian's mawk every port read as empty and the drill blamed the product. The hex is converted by hand now |
+| 6 | "FS is not in the path" on a call FreeSWITCH had just answered | `fs_parity_drill.sh` calls bare `fs_cli`, which a source-built FreeSWITCH does not put on PATH. It resolves `$FS_CLI` first |
+| 7 | a parity comparison that FAILED still exited 0 | `recording_parity.py`'s status died in a pipe into `tee`, finished off by `|| true`. The drill propagates it now |
+| 8 | `leave/monitor: no frames arrived in the window` | item 55 made the room a session, but this drill's **monitor** was left attached to party A — then A is the member who leaves. Hosted on `$ROOM_SESSION` the whole drill passes |
+| 9 | `preflight.sh` printed a Python traceback | An unbindable `--local-ip` reached `socket.bind()` inside `check_ng`. A tool whose contract is "every line is PASS, FAIL or SKIP" now reports FAIL and names the cause |
+| 10 | `media_port_drill.sh` failed its idle-pod precondition | `barge_drill.sh` destroyed its session by **session id**, but `mss_ctl` wraps `argv[2]` in `SessionRef::ExternalId` -- the destroy found nothing, the error went to `/dev/null`, and the leaked session still held two ports when the next drill started |
+| 11 | `PODS=2 group_recording_drill.sh`: "listen tcp4 127.0.0.1:19092: bind: address already in use" | Its second pod defaulted to host port **19092**, which is where this lab publishes redpanda's EXTERNAL kafka listener. The default could never bind while the lab it needs was up; it is 19094/19095 now |
+| 12 | `RECORD=1 pod_kill_drill.sh` refused to start, saying the pods needed `MSS_RECORDING_SPILL_TO=s3` when they had it | The gate grepped the pod's log for "spill into the recording **bucket** itself"; the daemon says **store**, and has since item 58 made the store a flag. It matches the structured `"spill_in_store":true` field now, so prose can move without blocking a drill |
+
+Defect 8 is the interesting one: the D20 row in [tasks.md](tasks.md) recorded
+that item 55's rewritten drill **had never run**. This was its first execution,
+and it found the one thing the rewrite missed.
+
+### What the suite measured here
+
+Every headline number in this file reproduced on unfamiliar hardware.
+
+| Drill | Here | Previously recorded |
+| --- | --- | --- |
+| `inline_call_drill.sh` | 20/20, cut-through **p50 11.5 ms**, p95 18.0 | p50 12.2 ms |
+| `barge_drill.sh` | **p50 3.32–3.42 ms** cut-through, bus 0.84 ms | p50 3.5 ms |
+| `conference_drill.sh` | **all** assertions, ≥30:1 tone margins, 60 ms length spread against a 600 ms bar | 61 ms, one assertion unrunnable |
+| `drain_drill.sh` | drained **0.82 s**, exit 0, pod B adopted in **5.5 s** | 14.41 s on SIGKILL |
+| `pod_kill_drill.sh` | one adopter, no lease lost, 2 taps after adoption, 0 after destroy | as recorded |
+| `grpc_stream_drill.sh` | 9678 frames, 0 dropped; 30.02 s of L16/16 kHz | as recorded |
+| `media_port_drill.sh` | sockets on 40100/40102, even only, returned on close | as recorded |
+| `event_outage_drill.sh` | 60/60 events across a 30 s outage | as recorded |
+| `dtmf_event_drill.sh` | 14 events, 0 dropped, correct digit per track | as recorded |
+| `preflight.sh` | **9 PASS, 0 FAIL, 5 SKIP** against the live lab | as recorded |
+| `fsless_call_drill.sh` | ear_a +1000=1183 / −440=0, ear_b +440=1348 / −1000=3, FreeSWITCH `exited` throughout | as recorded on its branch |
+
+`event_outage_drill.sh` must be run as `./lab/event_outage_drill.sh`, not
+`sh lab/...`: its shebang is bash and it uses `set -o pipefail`, which dash
+rejects.
+
+### The runs the defect list had owed
+
+Defects 11 and 12 were each blocking one run that [tasks.md](tasks.md) records
+as never having happened. With them fixed, both ran.
+
+**D9, the live pod kill with a recorder attached** (`RECORD=1
+lab/pod_kill_drill.sh`, pods started with `MSS_RECORDING_SPILL_TO=s3`). Pod A
+spilled one closed segment, took a SIGKILL with no lease release, and pod C
+adopted the session. The object came back at **170.80 s of the 185.57 s
+tapped -- missing 14.77 s against an allowance of 19.25 s** (one 5 s spill
+interval + the 12.25 s adoption gap + 2 s of slack), with
+`frames_lost_on_adopt=0`, four spill segments, one upload, no failures, no lost
+ownership and no foreign manifests. The reserved `_spill/` namespace was empty
+afterwards, because the adopter finished the object and discarded the journal.
+So the claim item 53 made against fakes -- that a pod death costs the spill
+interval rather than the call -- now has a live number, and it is the adoption
+gap that dominates it, not the spill.
+
+**D16, a recording group across two pods** (`PODS=2
+lab/group_recording_drill.sh`). Two pods on one Redis, the second member joining
+5 s late on the *other* pod: pod B joined the group **pod A had opened** and
+padded bob's file back to pod A's anchor (`lead_silence_ms` 5176 against the
+first member's 183), so both participant objects came back the same length -- a
+staggered join is padded, not shifted, across a pod boundary as well as within
+one. The duplicate-label refusal also crossed pods and named the pod holding the
+seat ("already has a participant writing .../alice.wav, on pod pod-group"),
+which is what item 54's `HSETNX` was for;
+`mss_recording_group_joins_refused_total` moved 0 -> 2. The frozen two-leg
+identity is correctly absent for a grouped recording.
+
+Note that this drill builds in a target volume of its own and drops it on the
+way out, so every `PODS=2` run pays a full cold build -- about ten minutes on a
+2-vCPU box.
+
+### FS parity: what a tone source can and cannot show
+
+`fs_parity_drill.sh` ran three times here and its byte comparison failed every
+time, while the things the Phase-2 claim actually rests on held:
+
+| | MSS | FreeSWITCH |
+| --- | --- | --- |
+| container / layout | 2 ch 8000 Hz 16-bit | 2 ch 8000 Hz 16-bit |
+| customer rms | 2326–2374 | 2319–2330 |
+| duration | 25.46–25.64 s | 25.10 s |
+
+With `MSS_TAP_TRANSCODE=on` (A-law leg -> PCMU tap -> L16) the two agree at
+**correlation 0.73**; with `MSS_TAP_TRANSCODE=off`, so MSS companded exactly
+once as FreeSWITCH does, **0.83** and rms within **0.3%**. Neither reaches the
+`identical=1.0000, mean_diff=0.6` this file records for the original run, and
+the reason is the **source**, not the recorder: that run pumped real bridge TTS,
+and this box has no speech to pump (defect 4), so it pumped alternating 440 +
+1000 Hz tones. A pure tone at a fractional offset cannot align sample-exactly,
+and the drill's own alignment search puts the offset at 182–278 ms.
+
+So the tolerances in that drill (duration ≤ 200 ms, mean sample difference
+≤ 200) are only meetable with a broadband source. **Nothing here re-opens the
+Phase-2 finding** — it says the drill needs real speech to judge byte
+agreement, and now that its exit code is honest (defect 7) that shows up as a
+red run rather than a green one.

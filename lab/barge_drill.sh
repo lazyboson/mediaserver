@@ -41,7 +41,10 @@ say() { printf 'barge-drill: %s\n' "$*"; }
 
 cleanup() {
   say "cleaning up"
-  [ -n "${SESSION:-}" ] && "$CTL" "http://$CONTROL" destroy "$SESSION" >/dev/null 2>&1 || true
+  # destroy takes an EXTERNAL id: mss_ctl wraps argv[2] in SessionRef::ExternalId,
+  # so passing $SESSION (a sess-... id) silently found nothing and leaked the
+  # session into whatever drill ran next.
+  [ -n "${SESSION:-}" ] && "$CTL" "http://$CONTROL" destroy "$EXTERNAL_ID" >/dev/null 2>&1 || true
   docker rm -f barge-driver >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
