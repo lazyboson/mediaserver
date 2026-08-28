@@ -27,6 +27,9 @@ RTPENGINE=${RTPENGINE:-mss-microsip-rtpengine-1}
 NETEM_IMAGE=${NETEM_IMAGE:-jambonz/rtpengine}
 DEV=${DEV:-eth0}
 TAP_TARGETS=${TAP_TARGETS:-172.31.99.31 172.31.99.32 172.31.99.33}
+# rtpengine answers NG on this port, so its replies to a pod leave with this as
+# their source port. They must stay OUT of the impaired band -- see below.
+NG_PORT=${NG_PORT:-22222}
 DOCKER_API_VERSION=${DOCKER_API_VERSION:-1.43}
 export DOCKER_API_VERSION
 
@@ -35,7 +38,14 @@ profile_spec() {
     clean|none) echo "" ;;
     loss1) echo "loss 1%" ;;
     loss5) echo "loss 5%" ;;
-    burst) echo "loss 10% 50%" ;;
+    # NOT "loss 10% 50%". That is netem's legacy correlation form, and the
+    # correlation collapses the effective rate: the qdisc's own counter showed
+    # 12 packets dropped out of 10,548 -- 0.11%, not 10% -- and MSS duly
+    # reported exactly 12. The profile measured nothing it claimed to.
+    # gemodel is the Gilbert-Elliott burst model: p is good->bad, r is
+    # bad->good, so the steady-state loss is p/(p+r) = 10% and a burst runs
+    # 1/r = about 3.3 packets.
+    burst) echo "loss gemodel 3.3% 30%" ;;
     reorder) echo "delay 30ms 20ms reorder 25% 50%" ;;
     reorder-far) echo "delay 120ms 60ms reorder 25% 50%" ;;
     duplicate) echo "duplicate 1%" ;;
@@ -67,9 +77,18 @@ case "${1:-probe}" in
     if [ -z "$spec" ]; then
       exec "$0" clear
     fi
-    filters=""
+    # Steering on destination address alone caught rtpengine's NG *control*
+    # replies as well as the tap's RTP, because both are addressed to the pod.
+    # A loss profile then timed out subscribe commands -- "ng node did not
+    # reply, attempts 3" -- so the pod never got a tap at all and the phase
+    # measured a broken subscription instead of the jitter buffer, which is the
+    # opposite of what this tool is for. Control traffic is pinned to the clean
+    # band first, at a higher filter priority, and only what is left of the
+    # pod-bound traffic goes into the netem band.
+    filters="tc filter add dev $DEV protocol ip parent 1: prio 1 u32 \
+match ip sport $NG_PORT 0xffff flowid 1:1;"
     for target in $TAP_TARGETS; do
-      filters="$filters tc filter add dev $DEV protocol ip parent 1: prio 1 u32 \
+      filters="$filters tc filter add dev $DEV protocol ip parent 1: prio 2 u32 \
 match ip dst $target/32 flowid 1:3;"
     done
     in_netns "set -e
@@ -79,7 +98,8 @@ match ip dst $target/32 flowid 1:3;"
       tc qdisc add dev $DEV parent 1:3 handle 30: netem $spec
       $filters
       tc qdisc show dev $DEV"
-    echo "netem: applied '$2' ($spec) to $TAP_TARGETS on $DEV in $RTPENGINE"
+    echo "netem: applied '$2' ($spec) to $TAP_TARGETS on $DEV in $RTPENGINE,"
+  echo "netem: sparing NG control replies from source port $NG_PORT"
     ;;
   show)
     in_netns "tc qdisc show dev $DEV; tc filter show dev $DEV"
