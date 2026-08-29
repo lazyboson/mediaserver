@@ -53,7 +53,7 @@ let ua = null;
 let session = null;
 let statsTimer = null;
 let hangupTimer = null;
-let previous = { packetsSent: 0, packetsReceived: 0, at: 0 };
+let previous = { packetsSent: 0, packetsReceived: 0, currentTime: 0, at: 0 };
 let reported = false;
 let audio = null;
 let toneTrack = null;
@@ -281,12 +281,29 @@ async function sampleStats() {
   el('sending').textContent = outbound
     ? `${describe(outbound)}  ${sentRate.toFixed(1)} pkt/s  ${outbound.packetsSent} total`
     : '—';
+  // Packets arriving is not audio being heard, and this line used to stop at
+  // the packet count. Two more things separate the two: whether the received
+  // stream carries any energy at all (silence and comfort noise are packets),
+  // and whether the element is actually advancing -- currentTime moving is the
+  // only proof playback is running rather than blocked.
+  const remote = el('remote');
+  const advanced = remote.currentTime - (previous.currentTime || 0);
+  const playback = remote.paused
+    ? 'PAUSED'
+    : advanced > 0
+      ? 'playing'
+      : 'stalled';
   el('receiving').textContent = inbound
     ? `${describe(inbound)}  ${recvRate.toFixed(1)} pkt/s  ${inbound.packetsReceived} total`
     + `  lost=${inbound.packetsLost ?? '?'}  jitter=${inbound.jitter ?? '?'}`
+    + `  level=${(inbound.audioLevel ?? 0).toFixed(4)}`
+    + `  energy=${(inbound.totalAudioEnergy ?? 0).toFixed(4)}`
+    + `  element=${playback} t=${remote.currentTime.toFixed(1)}s`
+    + `  muted=${remote.muted} vol=${remote.volume}`
     : '—';
 
   previous = {
+    currentTime: remote.currentTime,
     packetsSent: outbound ? outbound.packetsSent : 0,
     packetsReceived: inbound ? inbound.packetsReceived : 0,
     at: now,
@@ -403,6 +420,52 @@ function toggleMute() {
  * on an answer, keepPayloads can only narrow what the far end offered, so a
  * codec the offer never carried is logged and skipped rather than forced.
  */
+// Connects the far end's audio to the page's <audio> element, and says so.
+//
+// Two things here are the fix for a real failure: a browser that completed DTLS
+// and received 1596 packets from rtpengine while the person in front of it heard
+// nothing.
+//
+// First, WHEN. JsSIP builds the RTCPeerConnection inside ua.call() and emits
+// 'peerconnection' synchronously from it, so handlers attached after the call
+// returns have already missed the event -- and with it every 'track' event that
+// would ever arrive. On the outgoing path nothing was ever attached to the
+// element, which reported itself as paused at t=0.0s while packets piled up in
+// the receiver. So this is called from the event AND directly with the
+// connection once the call exists, and it sweeps getReceivers() for tracks that
+// landed before it got there.
+//
+// Second, WHETHER. Assigning srcObject is not playing: an <audio autoplay>
+// element on a page with no user gesture is blocked and play() rejects, which
+// nothing in the page used to report.
+function attachRemoteAudio(pc) {
+  if (!pc || pc.mssRemoteAttached) return;
+  pc.mssRemoteAttached = true;
+
+  const start = (stream, how) => {
+    const element = el('remote');
+    if (!stream || element.srcObject === stream) return;
+    element.srcObject = stream;
+    log(`remote track attached (${how})`);
+    const started = element.play();
+    if (started && typeof started.catch === 'function') {
+      started
+        .then(() => log(`playback started: muted=${element.muted} volume=${element.volume}`))
+        .catch((error) => log(
+          `PLAYBACK BLOCKED (${error.name}): ${error.message} `
+          + '-- press "arm audio", then dial again'));
+    }
+  };
+
+  pc.addEventListener('track', (event) => start(event.streams[0], 'track event'));
+
+  const already = pc
+    .getReceivers()
+    .map((receiver) => receiver.track)
+    .filter((track) => track && track.kind === 'audio');
+  if (already.length) start(new MediaStream(already), 'receiver already present');
+}
+
 function attachSessionHandlers(current) {
   current.on('sdp', (data) => {
     if (data.originator === 'remote') {
@@ -418,12 +481,7 @@ function attachSessionHandlers(current) {
     else log(`local ${data.type} unchanged: ${after}`);
   });
 
-  current.on('peerconnection', (e) => {
-    e.peerconnection.addEventListener('track', (event) => {
-      el('remote').srcObject = event.streams[0];
-      log('remote track attached');
-    });
-  });
+  current.on('peerconnection', (e) => attachRemoteAudio(e.peerconnection));
 
   current.on('progress', () => log('180/183 progress'));
   current.on('failed', (e) => {
@@ -438,6 +496,7 @@ function attachSessionHandlers(current) {
   });
   current.on('confirmed', () => {
     setState('up');
+    attachRemoteAudio(current.connection);
     const remote = current.connection.remoteDescription;
     el('answered').textContent = describeAudio(remote ? remote.sdp : '');
     log(`negotiated: ${el('answered').textContent}`);
@@ -445,7 +504,7 @@ function attachSessionHandlers(current) {
     el('hangup').disabled = false;
     el('mute').disabled = false;
     reported = false;
-    previous = { packetsSent: 0, packetsReceived: 0, at: 0 };
+    previous = { packetsSent: 0, packetsReceived: 0, currentTime: 0, at: 0 };
     if (statsTimer) clearInterval(statsTimer);
     statsTimer = setInterval(sampleStats, 1000);
 
@@ -533,6 +592,7 @@ async function dial() {
   });
 
   attachSessionHandlers(session);
+  attachRemoteAudio(session.connection);
 }
 
 async function finish(reason) {
@@ -554,7 +614,24 @@ function hangup() {
 /* ---------- wiring ------------------------------------------------------ */
 
 for (const name of ['ws', 'target', 'from', 'bitrate', 'tone']) el(name).value = conf(name);
-for (const name of ['codec', 'ptime', 'source']) el(name).value = conf(name);
+// A <select> whose value is set to something no option carries does not throw
+// and does not keep its old value -- it goes empty. So ?codec=PCMU, which looks
+// obviously right, silently meant "no codec chosen": the page logged
+// codec=PCMU, offered Chrome's full list unchanged, and only worked because MSS
+// picks G.711 out of an offer itself. Matching is case-insensitive now, and a
+// value that matches nothing says so instead of disappearing.
+for (const name of ['codec', 'ptime', 'source']) {
+  const wanted = conf(name);
+  if (wanted === undefined || wanted === null) continue;
+  const options = Array.from(el(name).options).map((option) => option.value);
+  const matched = options.find(
+    (value) => value.toLowerCase() === String(wanted).toLowerCase());
+  if (matched === undefined) {
+    log(`${name}=${wanted} is not one of [${options.join(' ')}]; leaving the default`);
+    continue;
+  }
+  el(name).value = matched;
+}
 for (const name of ['red', 'dtx', 'fec', 'cbr', 'stereo', 'dsp']) el(name).checked = flag(name);
 
 el('arm').addEventListener('click', () => {

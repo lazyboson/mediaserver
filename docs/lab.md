@@ -2619,3 +2619,83 @@ play, which is a real migration cost and is not exercised here. And the rule
 that a lone party is hung up after 20 s is this lab's policy, not a finding:
 a deployment where an agent routinely parks a caller for longer needs a
 different number, or a different rule.
+
+## The browser heard nothing, and the page could not say why (2026-08-29)
+
+`webrtc_agent_drill.sh` measures the agent leg's **transmit** side, and every
+number it reports was right while a person sitting at the browser heard silence.
+The state it was left in for days: rtpengine sent the browser 1596 packets over
+300 KB, DTLS completed, the page logged `remote track attached` — and no sound.
+The suspicion was recorded as "playback or rendering", which is another way of
+saying nobody knew.
+
+Two bugs, both of which fail without saying anything.
+
+### The track handler was registered after the event that creates it
+
+`dial()` does this:
+
+```js
+session = ua.call(target, { ... });   // JsSIP builds the RTCPeerConnection here
+attachSessionHandlers(session);       // ...and emits 'peerconnection' from in there
+```
+
+JsSIP creates the `RTCPeerConnection` inside `ua.call()` and emits
+`peerconnection` **synchronously** from it, so a handler attached on the next
+line has already missed the event — and with it every `track` event that will
+ever arrive. Nothing was connected to the page's `<audio>` element on the
+outgoing path at all. The incoming path attaches its handlers before answering,
+which is why the FreeSWITCH-dials-the-browser direction was never suspect.
+
+`attachRemoteAudio(pc)` is now called both from the event and directly with
+`session.connection` once the call exists, is idempotent, and sweeps
+`getReceivers()` for a track that landed before it got there.
+
+### Assigning srcObject is not playing
+
+The second failure would have hidden the first even after it was fixed. An
+`<audio autoplay>` element on a page that has had no user gesture is blocked
+silently: `play()`'s promise rejects with `NotAllowedError` and nothing else
+reports it. The page now says `PLAYBACK BLOCKED (NotAllowedError)` by name.
+
+### What made both visible: three numbers the page was not printing
+
+The `receiving` line stopped at the packet count, and packets arriving is not
+audio being heard. It now carries `level`, `energy` (silence and comfort noise
+are packets too) and the element's own state, where `currentTime` advancing is
+the only proof playback is running rather than blocked. The bug was obvious the
+first time that line was read:
+
+```
+receiving PCMU 42.0 pkt/s 1928 total lost=0  level=0.0000 energy=0.0000
+          element=PAUSED t=0.0s muted=false vol=1
+```
+
+1928 packets received, zero lost, and an element that had never played a frame.
+After the fix, on the same call path with a second party in the mix
+(`parties=2` in the controller's log):
+
+```
+14:26:26.127  remote track attached (track event)
+14:26:26.140  playback started: muted=false volume=1
+
+receiving PCMU 42.0 pkt/s 596 total  level=0.0055 energy=0.0432
+          element=playing t=12.9s
+```
+
+### And a third silent no-op, found while testing the first two
+
+`?codec=PCMU` never did anything. The select's option values are lowercase, and
+assigning a `<select>` a value no option carries neither throws nor keeps the
+old value — it empties the select. So the page logged `codec=PCMU`, offered
+Chrome's full list unchanged, and only worked because **MSS picks G.711 out of
+an offer itself**. Matching is case-insensitive now and an unmatched value says
+so. The measurement it accidentally produced is worth keeping: a full Chrome
+offer (`opus red g722 pcmu pcma cn telephone-event`) is answered by an MSS
+inline leg as `pcmu`, unassisted.
+
+### What this does not fix
+
+A browser on a **Windows** host on the same network still never completes ICE —
+no packets arrive at all, which is a different failure from this one and is
+still open. Nothing here was judged by a human ear; `energy` is a number.
