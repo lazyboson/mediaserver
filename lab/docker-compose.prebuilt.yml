@@ -1,0 +1,36 @@
+# Run the lab's Rust services from a published image instead of compiling them
+# on the lab host. The default lab deliberately runs `cargo run` out of a
+# mounted source tree, because editing a crate and re-running a drill is the
+# point of the lab; this overlay is for a host that cannot afford a compiler.
+#
+#   docker login ghcr.io                        # a PAT with read:packages
+#   MSS_IMAGE=ghcr.io/lazyboson/mediaserver:main docker compose \
+#     -f docker-compose.microsip.yml -f docker-compose.prebuilt.yml up -d mss-control
+#
+# Pin MSS_IMAGE to a sha- tag when a measurement has to be reproducible; `main`
+# moves. The image is the repo's release Dockerfile, so its entrypoint is the
+# binary and the compose command has to be cleared.
+#
+# What this overlay does NOT solve: the drills also build `mss_ctl` and
+# `mss_stream_probe` on the HOST with cargo, so a host that runs drills still
+# needs the toolchain from rust-toolchain.toml. Only the pods stop compiling.
+services:
+  mss-control:
+    image: ${MSS_IMAGE:-ghcr.io/lazyboson/mediaserver:main}
+    build: !reset null
+    command: []
+
+  mss-control-b:
+    image: ${MSS_IMAGE:-ghcr.io/lazyboson/mediaserver:main}
+    build: !reset null
+    command: []
+
+  mss-control-c:
+    image: ${MSS_IMAGE:-ghcr.io/lazyboson/mediaserver:main}
+    build: !reset null
+    command: []
+
+  mediaserverd:
+    image: ${MSS_IMAGE:-ghcr.io/lazyboson/mediaserver:main}
+    build: !reset null
+    command: []
