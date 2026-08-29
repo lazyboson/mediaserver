@@ -43,7 +43,7 @@ services:
     depends_on: [rtpengine, redpanda, redis]
     entrypoint: ["/bin/sh", "-c"]
     command:
-      - sed -e "s|__ADVERTISED_IP__|${ADVERTISED_IP:-127.0.0.1}|" -e "s|__DISCOVERY__|${DISCOVERY:-off}|g" -e "s|__DISCOVERY_PREFIX__|${DISCOVERY_PREFIX:-mss:call-node:}|g" -e "s|__DISCOVERY_TTL__|${DISCOVERY_TTL:-3600}|g" -e "s|__DISCOVERY_NODE__|${DISCOVERY_NODE:-172.31.99.10:22222}|g" /etc/opensips/opensips.cfg.tmpl > /tmp/opensips.cfg && exec /usr/sbin/opensips -F -f /tmp/opensips.cfg
+      - sed -e "s|__ADVERTISED_IP__|${ADVERTISED_IP:-127.0.0.1}|" -e "s|__DISCOVERY__|${DISCOVERY:-off}|g" -e "s|__DISCOVERY_PREFIX__|${DISCOVERY_PREFIX:-mss:call-node:}|g" -e "s|__DISCOVERY_TTL__|${DISCOVERY_TTL:-3600}|g" -e "s|__DISCOVERY_NODE__|${DISCOVERY_NODE:-172.31.99.10:22222}|g" -e "s|__SHIM_EXTENSION__|${SHIM_EXTENSION:-7001}|g" -e "s|__SHIM_TARGET__|${SHIM_TARGET:-172.31.99.14:5080}|g" -e "s|__CALL_TARGET__|${CALL_TARGET:-172.31.99.80:5060}|g" /etc/opensips/opensips.cfg.tmpl > /tmp/opensips.cfg && exec /usr/sbin/opensips -F -f /tmp/opensips.cfg
     # DISCOVERY=on turns on the call-id -> rtpengine node map (item G11). Off by
     # default, so every existing drill sees the proxy it always saw.
     environment:
