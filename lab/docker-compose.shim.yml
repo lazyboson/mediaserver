@@ -1,0 +1,57 @@
+# The MSS SIP shim: the piece that answers a SIP INVITE with an MSS inline leg.
+#
+# lab/sip_shim.py is a minimal SIP UAS. It takes the offer to
+# MediaControl.CreateSession{kind=INLINE, group=<dialled user>} and puts the SDP
+# answer MSS returns into its 200 OK, so the dialled user part IS the conference
+# group: two phones that dial the same number are two inline legs in one MSS
+# mix, mixed by MSS and recordable by MSS.
+#
+# It is an overlay on docker-compose.microsip.yml (and, for the browser leg,
+# docker-compose.webrtc.yml), and it serves the two shapes in which FreeSWITCH
+# owns no media:
+#
+#   dial 7001  -- FreeSWITCH is not in the call at all. The proxies relay
+#                 straight here, so FreeSWITCH can be stopped outright.
+#                 lab/fsless_call_drill.sh is the machine-verified version.
+#   dial 7200  -- FreeSWITCH answers, decides, and carries nothing: the
+#                 dialplan sets bypass_media and bridges to this shim, and a
+#                 controller on one event socket owns the conference lifecycle.
+#                 lab/fs_control_drill.sh is the machine-verified version.
+#
+# The routing itself is not here -- it is in the proxy configs, keyed on the
+# dialled number (__SHIM_EXTENSION__), so adding this file does not take any
+# existing extension away. 9000, 9196 and 4200 keep reaching FreeSWITCH with
+# this overlay applied.
+#
+#   DOCKER_API_VERSION=1.43 docker compose \
+#     -f lab/docker-compose.microsip.yml -f lab/docker-compose.shim.yml \
+#     up -d rtpengine opensips redis redpanda minio minio-init mss-control \
+#           sip-shim
+#
+# and with the browser agent leg as well, add -f lab/docker-compose.webrtc.yml
+# and the rtpengine-agent, opensips-agent and webrtc-page services.
+
+services:
+
+  # The UAS that answers with an MSS inline leg. It generates its own python
+  # stubs from proto/ at start, so nothing on the host has to be prepared
+  # first: the container is the whole dependency.
+  sip-shim:
+    image: python:3-slim
+    depends_on: [mss-control]
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - pip install --quiet grpcio grpcio-tools protobuf && mkdir -p /pb && python3 -m grpc_tools.protoc -I/proto --python_out=/pb --grpc_python_out=/pb /proto/mediacontrol.proto && exec python3 /sip_shim.py
+    volumes:
+      - ./sip_shim.py:/sip_shim.py:ro
+      - ../proto:/proto:ro
+    environment:
+      - PIP_DISABLE_PIP_VERSION_CHECK=1
+      - STUBS=/pb
+      - CONTROL=${SHIM_CONTROL:-172.31.99.31:50551}
+      - SHIM_IP=${SHIM_IP:-172.31.99.14}
+      - SHIM_PORT=${SHIM_PORT:-5080}
+      - MSS_AUTH_TOKEN=${MSS_AUTH_TOKEN:-}
+    networks:
+      lab:
+        ipv4_address: 172.31.99.14

@@ -1,0 +1,20 @@
+# The agent-facing rtpengine advertises ADVERTISED_IP (or AGENT_ADVERTISED_IP)
+# so a browser on the public internet can send it DTLS-SRTP, exactly as
+# docker-compose.public.yml does for the customer-facing one. Use it with
+# docker-compose.webrtc.yml, which is where this service is defined, and read
+# the warning in docker-compose.public.yml first: it applies here too.
+#
+#   ADVERTISED_IP=<public ip> docker compose <the -f set> \
+#     -f lab/docker-compose.webrtc.yml -f lab/docker-compose.agent-public.yml \
+#     up -d --force-recreate rtpengine-agent
+services:
+  rtpengine-agent:
+    command:
+      - rtpengine
+      - --table=-1
+      - --recording-dir=/tmp
+      - --interface=internal/172.31.99.11
+      - --interface=external/172.31.99.11!${AGENT_ADVERTISED_IP:-${ADVERTISED_IP:?set ADVERTISED_IP or AGENT_ADVERTISED_IP}}
+      - --port-min=${AGENT_RTPE_PORT_MIN:-30100}
+      - --port-max=${AGENT_RTPE_PORT_MAX:-30199}
+      - --log-level=6

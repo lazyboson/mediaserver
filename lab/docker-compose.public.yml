@@ -1,0 +1,30 @@
+# Makes the lab reachable by a softphone or browser on the public internet:
+# rtpengine's "external" interface advertises ADVERTISED_IP instead of the
+# loopback address the on-box drills use, and OpenSIPS advertises the same.
+#
+# NOT safe to leave applied. Every SIP drill in lab/ runs its callers ON the
+# lab host and reaches OpenSIPS at 127.0.0.1, so an SDP advertising a public
+# address sends their RTP out to the host's own public address -- which a cloud
+# NAT typically does not hairpin back, and every one of those drills goes
+# silent with no obvious cause.
+#
+#   apply:  ADVERTISED_IP=<public ip> docker compose <the usual -f set> \
+#             -f lab/docker-compose.public.yml up -d --force-recreate \
+#             rtpengine opensips
+#   revert: drop this -f and --force-recreate the same two services
+#
+# Pass ADVERTISED_IP on the command line and keep it OUT of lab/.env: in .env
+# any later recreate picks it up and quietly breaks the on-box drills.
+#
+# For the browser agent leg, docker-compose.agent-public.yml does the same for
+# the agent-facing rtpengine, and needs docker-compose.webrtc.yml as well.
+services:
+  rtpengine:
+    command:
+      - rtpengine
+      - --table=-1
+      - --recording-dir=/tmp
+      - --interface=internal/172.31.99.10
+      - --interface=external/172.31.99.10!${ADVERTISED_IP:?set ADVERTISED_IP to the host public address}
+      - --port-min=${RTPE_PORT_MIN:-30000}
+      - --port-max=${RTPE_PORT_MAX:-30099}
