@@ -1,0 +1,84 @@
+# The lab compiles mediaserverd inside a container on whatever host runs it, and
+# `PODS=2 lab/group_recording_drill.sh` pays a cold build every run because it
+# removes its own target volume. On a small box that is the single biggest
+# hazard: a 4 GB lab host was wedged twice in one day by a Rust build, not by
+# anything this project does at runtime.
+#
+# So build the images where there is memory to spare, and let the lab pull them.
+# release.yml already publishes on a v* tag; this does the same for ordinary
+# commits, plus the lab's toolchain image, so a lab host never needs a compiler.
+name: Images
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  mediaserverd:
+    name: mediaserverd (release image)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: docker/setup-buildx-action@v4
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Docker metadata
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ env.REGISTRY }}/${{ github.repository }}
+          tags: |
+            type=ref,event=branch
+            type=sha,prefix=sha-
+      - name: Build and push
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  lab-rust:
+    name: lab toolchain image (cmake for opus-ffi)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: docker/setup-buildx-action@v4
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Docker metadata
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ env.REGISTRY }}/${{ github.repository }}/lab-rust
+          tags: |
+            type=ref,event=branch
+            type=sha,prefix=sha-
+      - name: Build and push
+        uses: docker/build-push-action@v7
+        with:
+          context: lab
+          file: lab/Dockerfile.rust
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
