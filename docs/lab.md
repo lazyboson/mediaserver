@@ -2491,3 +2491,131 @@ counter agreeing with another counter. `SOAK_CALLS=2` and 90 s phases are a
 smoke-sized matrix on a 2-vCPU box, not the hour-long soak item 19 describes.
 And the impairment lands on the tap link only: nothing here damages the call
 legs themselves, which is the customer-visible path.
+
+## fs_control_drill.sh — FreeSWITCH answers the call and carries none of it (2026-08-29)
+
+`fsless_call_drill.sh` proves MSS can carry a call with FreeSWITCH **stopped**.
+That is the end state, and it is not the state anybody migrates into. This drill
+proves the shape a deployment moves through first, and the one an operations
+team will actually accept: FreeSWITCH is running and still owns the call — it
+answers, it decides which conference the caller belongs to, it decides when the
+call ends — while every byte of audio belongs to MSS.
+
+The mechanism is one line of dialplan ahead of the bridge:
+
+```xml
+<extension name="control_only_orchestrated">
+  <condition field="destination_number" expression="^(7200)$">
+    <action application="set" data="bypass_media=true"/>
+    <action application="set" data="mss_conference=$1"/>
+    <action application="set" data="hangup_after_bridge=true"/>
+    <action application="bridge" data="sofia/internal/$1@172.31.99.14:5080"/>
+  </condition>
+</extension>
+```
+
+`bypass_media` is set while the channel is still **unanswered**, so FreeSWITCH
+negotiates the caller's SDP against the far leg's and then leaves the RTP path
+entirely. The far leg is `lab/sip_shim.py`, which hands the offer to
+`CreateSession{kind=INLINE, group=7200}` and answers with MSS's SDP — so the
+answer FreeSWITCH relays as its own 200 OK is MSS's answer, and two callers who
+dial 7200 are two inline legs in one MSS mix.
+
+### The run (stamp 1788007501, FreeSWITCH 1.10.12, rtpengine 14.1.1.8)
+
+Two scripted softphones (`lab/host_test_caller.py`, PCMA, real sockets through
+OpenSIPS and rtpengine), 30 s, A speaking 440 Hz and B 1000 Hz.
+
+FreeSWITCH held four channels — an inbound leg and a leg to the shim, per
+caller — and **not one of them counted a single RTP byte**:
+
+```
+e3538cdc-202c-499e-b7b0-65d8c29a4e55  bypass_media=true    application=bridge  rtp_in=_undef_  rtp_out=_undef_
+3757611b-c255-448a-8382-eb99112ea55e  bypass_media=_undef_ application=_undef_ rtp_in=_undef_  rtp_out=_undef_
+79aa416e-f8bf-4831-9f84-bb33ebd85552  bypass_media=true    application=bridge  rtp_in=_undef_  rtp_out=_undef_
+0ef67641-6630-4c3b-9b36-3ccf737678a3  bypass_media=_undef_ application=_undef_ rtp_in=_undef_  rtp_out=_undef_
+```
+
+`_undef_` is FreeSWITCH saying the variable does not exist: not zero bytes
+counted, but no counter ever created, because no RTP session was ever set up.
+Meanwhile the pod reported `mss_conferences_live 1`,
+`mss_conference_members_live 2`, `mss_inline_legs_live 2` and 665 mixed frames,
+and each caller's ear carried the other's tone and not its own:
+
+| ear | the other leg's tone | its own tone |
+| --- | --- | --- |
+| A (heard 1000 Hz) | 1176 | 0 |
+| B (heard 440 Hz) | 1341 | 3 |
+
+That is the whole claim in one table. FreeSWITCH ran throughout — the container
+was `running` before and after — and the audio existed without it.
+
+### Conference lifecycle, and why the media plane must not own it
+
+MSS closes a mix when its last member leaves and deliberately does **not** hang
+up a survivor: what should happen to the other party is a call-control
+decision. Without a rule somewhere, a caller sits in a silent room — two of
+them did here, for 292 s and 494 s, before there was one.
+
+So the rule lives in call control, in a companion service
+([fs-orchestrator](https://github.com/lazyboson/fs-orchestrator)) that holds
+**one inbound event socket for the whole switch** and keeps a map of conference
+to parties. Given `ORCHESTRATOR_LOG`, this drill also drives the three outcomes
+that rule can have and asserts the controller's own account of each:
+
+| outcome | what the drill did | what was observed |
+| --- | --- | --- |
+| the last party alone is hung up | A left at 12:46:08 | `alone_for=20s` at 12:46:28, FreeSWITCH back to 0 channels |
+| a rejoin cancels it | a third party arrived 2 s into the window | `somebody joined during the grace period, so the last party stays  parties=2`, four channels still live |
+| a lonely party leaving is not chased | the survivor hung up 5 s into its own grace window | `the last party hung up during the grace period, so there is nobody to hang up` — no kill attempted |
+
+The third row is the one worth keeping. It was originally the same log line as
+the second, because the timer asked "is this party still alone" and got a
+boolean: a room with **nobody** in it fails "exactly one member" the same way a
+room with two does. An ordinary two-party call ending was therefore reported as
+"somebody joined … the last party stays", and the kill fired at a uuid
+FreeSWITCH had already torn down. Three outcomes need a three-valued answer.
+
+### Two things cost a run each
+
+**`localnet.auto` locks out `fs_cli`.** `mod_event_socket` with no
+`apply-inbound-acl` answers a connection from the docker bridge host with
+`Content-Type: text/rude-rejection / Access Denied, go away.`, so a controller
+outside the container cannot attach at all — while `fs_cli` inside the container
+keeps working and hides it. The obvious fix, `apply-inbound-acl localnet.auto`,
+is a trap: that list is built from FreeSWITCH's own interfaces, so it covers the
+docker subnet but **not `127.0.0.0/8`**, which is how `fs_cli` connects. It
+admits the controller and locks out every drill. It also fails
+unrecognisably — because the module accepts the TCP connection and only then
+refuses, the handshake dies with no `auth/request` and `fs_cli` prints
+
+```
+[ERROR] fs_cli.c:1699 main() Error Connecting []
+```
+
+which reads like nothing is listening, on a port that is open. The rig image now
+declares its own list (`rig_esl`: loopback plus the RFC1918 ranges, deny by
+default) instead of borrowing an automatic one.
+
+**A grace timer from the media phase lands in the middle of round 1.** The
+media phase ends with one caller outliving the other, which arms a timer; it
+fires 20 s later, correctly, in the middle of the lifecycle rounds, where its
+line reads as round 1's. The drill now waits out one grace period between the
+phases before it marks the log.
+
+### What this does not prove
+
+The inline leg has now met a **real SIP endpoint** — FreeSWITCH, as a B2BUA,
+offering to `lab/sip_shim.py` — which is the H5 shape, and the shim is a worked
+example of the plumbing an integrator owes. It is not the whole of it:
+registration and authentication are OpenSIPS's here and untested against the
+shim, a re-INVITE is refused by name (`488`, P3-2), and no transfer, hold or
+mid-call renegotiation has been attempted on one of these legs. Nothing here
+was judged by a human ear, and the audio was tones rather than speech.
+
+A production dialplan does IVR before this bridge, and a media-bypassed
+FreeSWITCH **cannot play a prompt** — every prompt in this shape is MSS's to
+play, which is a real migration cost and is not exercised here. And the rule
+that a lone party is hung up after 20 s is this lab's policy, not a finding:
+a deployment where an agent routinely parks a caller for longer needs a
+different number, or a different rule.

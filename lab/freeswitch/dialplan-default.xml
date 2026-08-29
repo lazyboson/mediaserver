@@ -67,6 +67,44 @@
     <!-- 4200: echo. The first thing a new endpoint should dial, browser or
          softphone: if you cannot hear yourself here, the problem is SIP or RTP
          reachability and has nothing to do with MSS. -->
+    <!-- 7100 and 7200: FreeSWITCH owns the CONTROL and carries no media.
+         bypass_media is set BEFORE the bridge, so FreeSWITCH negotiates the
+         caller's SDP against the far leg's and then drops out of the RTP path
+         entirely. The far leg is lab/sip_shim.py, which hands the offer to MSS
+         as an INLINE leg seated in the group named by the dialled number, so
+         every byte of audio belongs to MSS while the dialplan still decides
+         who is answered, where they are seated and when they are hung up.
+         A media-bypassed FreeSWITCH cannot play a prompt: any prompt the
+         caller hears is MSS's, which is the whole point.
+
+         The two differ only in who ends the call. 7100 is the dialplan on its
+         own. 7200 also names the conference in a channel variable for a
+         controller watching ONE inbound event socket: it sees every party join
+         and leave across the whole switch, keeps conference -> parties in a
+         map, and hangs up whoever is left alone. There is deliberately no
+         socket action here: handing each channel to its own outbound socket
+         would mean one TCP connection per party, which does not scale and is
+         why that shape was dropped. lab/fs_control_drill.sh drives 7200 and
+         asserts, from FreeSWITCH's own channel variables, that it carried
+         nothing. -->
+    <extension name="control_only_to_mss">
+      <condition field="destination_number" expression="^(7100)$">
+        <action application="set" data="bypass_media=true"/>
+        <action application="set" data="hangup_after_bridge=true"/>
+        <action application="log" data="INFO control-only: bridging $1 to the MSS shim, media bypassed"/>
+        <action application="bridge" data="sofia/internal/$1@172.31.99.14:5080"/>
+      </condition>
+    </extension>
+
+    <extension name="control_only_orchestrated">
+      <condition field="destination_number" expression="^(7200)$">
+        <action application="set" data="bypass_media=true"/>
+        <action application="set" data="mss_conference=$1"/>
+        <action application="set" data="hangup_after_bridge=true"/>
+        <action application="bridge" data="sofia/internal/$1@172.31.99.14:5080"/>
+      </condition>
+    </extension>
+
     <extension name="lab_echo">
       <condition field="destination_number" expression="^4200$">
         <action application="answer"/>
