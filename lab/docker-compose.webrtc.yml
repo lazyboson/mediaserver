@@ -57,7 +57,7 @@ services:
     # literally, so a "readable" multi-line version arrives at sh -c as several
     # broken commands instead of one.
     command:
-      - sed -e "s/__ADVERTISED_IP__/${AGENT_ADVERTISED_IP:-${ADVERTISED_IP:-127.0.0.1}}/" -e "s/__RTPE_OFFER_DIR__/${AGENT_RTPE_OFFER_DIR:-external internal}/" -e "s/__RTPE_ANSWER_DIR__/${AGENT_RTPE_ANSWER_DIR:-internal external}/" -e "s/__RTPE_CODEC_FLAGS__/${AGENT_RTPE_CODEC_FLAGS:-}/" /etc/opensips/opensips-agent.cfg.tmpl > /tmp/opensips-agent.cfg && exec /usr/sbin/opensips -F -f /tmp/opensips-agent.cfg
+      - sed -e "s/__ADVERTISED_IP__/${AGENT_ADVERTISED_IP:-${ADVERTISED_IP:-127.0.0.1}}/" -e "s/__RTPE_OFFER_DIR__/${AGENT_RTPE_OFFER_DIR:-external internal}/" -e "s/__RTPE_ANSWER_DIR__/${AGENT_RTPE_ANSWER_DIR:-internal external}/" -e "s/__RTPE_CODEC_FLAGS__/${AGENT_RTPE_CODEC_FLAGS:-}/" -e "s/__SHIM_EXTENSION__/${SHIM_EXTENSION:-7001}/g" -e "s/__SHIM_TARGET__/${AGENT_SHIM_TARGET:-${SHIM_TARGET:-172.31.99.14:5080}}/g" -e "s/__CALL_TARGET__/${AGENT_CALL_TARGET:-${CALL_TARGET:-172.31.99.80:5060}}/g" /etc/opensips/opensips-agent.cfg.tmpl > /tmp/opensips-agent.cfg && exec /usr/sbin/opensips -F -f /tmp/opensips-agent.cfg
     volumes:
       - ./opensips/opensips-agent.cfg:/etc/opensips/opensips-agent.cfg.tmpl:ro
     ports:

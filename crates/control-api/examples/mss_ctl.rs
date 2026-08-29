@@ -12,7 +12,10 @@ mss_ctl <endpoint> inline <external-id> <call-id> <sdp-offer-file> [conference-g
    creates an INLINE session: MSS binds an rtp socket, answers the offer and
    prints the answer sdp for the caller to put in its SIP dialog
 mss_ctl <endpoint> describe <external-id>
-mss_ctl <endpoint> attach <external-id> <ws-url> [label] [authoritative]
+mss_ctl <endpoint> attach <external-id> <ws-url> [label] [authoritative] [inject]
+   inject asks for CAPABILITY_INJECT, without which the consumer's own
+   audio is received and never played into the call (tap_plane only builds
+   an egress for an attachment that holds it)
 mss_ctl <endpoint> consume <external-id> [label] [track]
    a grpc-stream consumer with SINK and EVENTS: it subscribes on
    MediaStream.Subscribe and may report speech back
@@ -181,20 +184,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 eprintln!("{USAGE}");
                 std::process::exit(2);
             }
+            let flags = args.get(5..).unwrap_or(&[]);
+            let flagged = |name: &str| flags.iter().any(|flag| flag == name);
+            let mut capabilities = vec![
+                proto::Capability::Sink as i32,
+                proto::Capability::Events as i32,
+            ];
+            if flagged("inject") {
+                capabilities.push(proto::Capability::Inject as i32);
+            }
             client
                 .attach(proto::AttachRequest {
                     session: Some(reference(&args[2])),
                     transport: proto::Transport::WsTwilio as i32,
-                    capabilities: vec![
-                        proto::Capability::Sink as i32,
-                        proto::Capability::Events as i32,
-                    ],
+                    capabilities,
                     selector: None,
                     format: None,
-                    authoritative: args
-                        .get(5)
-                        .map(|flag| flag == "authoritative")
-                        .unwrap_or(false),
+                    authoritative: flagged("authoritative"),
                     label: args
                         .get(4)
                         .cloned()
