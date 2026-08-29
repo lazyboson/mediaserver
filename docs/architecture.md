@@ -688,10 +688,23 @@ FreeSWITCH itself wraps C libraries (libopus, spandsp, libsndfile, ffmpeg) and o
 | Denoise / AGC | DSP/ML | `nnnoiseless` (pure-Rust RNNoise), speexdsp FFI | No |
 | Tone gen/detect | DSP (Goertzel) | ~100 lines or spandsp FFI | Trivial |
 | TTS | HTTP/gRPC provider clients | plain clients (logic exists in the legacy controller) | No |
-| SIP stack | — | **Not needed**: OpenSIPS remains the SIP layer; MSS answers B2B legs via MI events (the legacy media gateway pattern) | Avoided |
+| SIP stack | Transactions, offer/answer, dialogs | **Adopted, not written**: `crates/sip-uas` on `rvoip-sip-core` (crates.io, MIT). Article XI applies to protocol stacks as it does to codecs — sofia-sip and PJSIP are the alternative via FFI, and a hand-written transaction layer is the fallback, not the plan | No — adopted |
 | SRTP/DTLS | libsrtp | RTPEngine terminates crypto at the edge | Avoided |
 
 Net: ~80% of the FS capability surface we use is commodity libraries or trivial DSP; the ~20% built from scratch (jitter policy, mixer engine, session/fan-out machinery) is precisely the engine this project exists to own. Licensing is permissive throughout (G.729 patents expired; MP3 patent-free).
+
+**Why this row changed (2026-08-30).** It read *"Not needed: OpenSIPS remains the
+SIP layer"* until a deployment review rejected the assumption behind it. An
+answer-only media plane with no SIP interface forces a SIP element in front of it
+for every media-owning call — a second process, a second config, and a second
+failure point in call setup — and it forces the tap-only compromise on anyone who
+does not already run OpenSIPS. It also left mid-call re-INVITE (hold, attended
+transfer, session-timer refresh) with no owner at all. A UAS answers both: it is
+the same offer/answer state machine, and it deletes an intermediary rather than
+adding one. What a media server needs is a fraction of a proxy — UAS
+transactions, offer/answer including re-INVITE, session timers — and explicitly
+**not** a registrar, routing, forking, or a UAC. Answer-only stays a property of
+the design; it now has its own front door.
 
 **GStreamer escape hatch:** `gstreamer-rs` bindings are first-class (GStreamer's own team ships Rust plugins upstream). An MSS variant embedding GStreamer per-session pipelines (`udpsrc → rtpjitterbuffer → decode → audioresample → appsink`, `audiomixer` for conferences) inherits hardened media code at the cost of carrying the GStreamer runtime. Decision: hand-roll the narrow audio-only pipeline; prototype both in Phase 0; keep GStreamer as the Phase-4 mixer fallback.
 
