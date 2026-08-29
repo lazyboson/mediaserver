@@ -4112,3 +4112,62 @@ this addition only because of a specific feature selection, so do not
   the dependency set cargo-deny checked, advisories included;
   without it the image re-resolved dependencies and could ship versions
   CI never saw.
+
+## crates/sip-uas — the SIP front door (scaffolded 2026-08-30)
+
+An answer-only media plane still has to be *reached*, and until now something
+else did the reaching: `lab/sip_shim.py`, 336 lines of Python with in-memory
+dialog state and one instance, terminating the leg FreeSWITCH bridges to and
+translating it into `CreateSession{kind=INLINE, sdp_offer}`. That put a
+single-instance stateful process in the setup and teardown path of every
+media-owning call, and it left mid-call re-INVITE with no owner anywhere. This
+crate replaces it in-process. See architecture §7 for why the "SIP stack — not
+needed" row changed.
+
+**Adopted, not written.** `rvoip-sip-core` (crates.io, MIT) supplies parsing and
+message building. Article XI's rule for codecs applies to protocol stacks too:
+adopt a proven implementation, do not reimplement. The published crate carries
+its own interop evidence against Asterisk and FreeSWITCH — hold/resume, blind
+transfer, RFC 4733 DTMF, UDP and TLS — plus a SIPp matrix to 2000 CPS. Its own
+README declines to call that carrier certification, and neither do we.
+Deliberately *not* taken: the `rvoip-sip` umbrella, which brings call-control
+and media opinions this repository already has its own answers for. Only the
+parsing and building layer is a dependency; `rvoip-sip-transport` and
+`rvoip-sip-dialog` are the next candidates when transactions land.
+
+**Sans-IO, like everything else here.** `Invite::from_datagram` takes bytes and
+returns intent; `answered_with`, `refused_with` and `trying` take intent and
+return bytes. No sockets, no tasks, no clock — so every case is a unit test and
+none of it needs a network to exercise. The dialled user part is read as the
+conference group, which is the contract the shim already established.
+
+**What it does today**
+
+| | |
+| --- | --- |
+| parse an INVITE, reject anything else by method name | done |
+| read the call-id, the dialled group, and the SDP offer | done |
+| build a 200 OK carrying the session layer's SDP answer | done |
+| build a refusal with a reason phrase the caller will log | done |
+| build a 100 Trying | done |
+
+**What it does not do yet, in the order it matters**
+
+1. **No transport.** Nothing listens on a socket. Wiring is a Tokio task in the
+   control plane — never on a media thread — and `rvoip-sip-transport` is the
+   candidate rather than a hand-rolled UDP loop.
+2. **No transactions.** No retransmission handling, no ACK matching, no CANCEL
+   race handling, no timers. `rvoip-sip-dialog` is the candidate.
+3. **No re-INVITE**, which is the whole reason for preferring a UAS over a
+   proxy in front: hold, attended transfer and session-timer refresh all
+   re-offer, and today MSS has no answer for any of them. Until this lands the
+   gap is unchanged, only relocated.
+4. **Not wired to `session-core`.** `answered_with` takes an SDP answer as a
+   parameter; nothing yet calls `CreateSession` to obtain one. The front door
+   must stay a second entrance onto the existing session API, never a parallel
+   implementation of it.
+5. **Not fuzzed.** `a_front_door_open_to_the_network_returns_errors_instead_of_panicking`
+   covers seven hostile datagrams, and the parse is wrapped in
+   `catch_unwind` so a panic in a dependency becomes a refusal rather than a
+   lost transaction. That is a seatbelt, not a substitute for a fuzz target —
+   this is the one surface in the process a stranger can reach.
