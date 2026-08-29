@@ -630,14 +630,26 @@ mod tests {
         format!(r#"{{"event":"media","media":{{"payload":"{payload}"}}}}"#)
     }
 
-    fn payloads(peer: &std::net::UdpSocket) -> Vec<Vec<u8>> {
+    const PAYLOAD_GRACE: Duration = Duration::from_secs(2);
+
+    fn payloads_expecting(peer: &std::net::UdpSocket, want: usize) -> Vec<Vec<u8>> {
+        let deadline = std::time::Instant::now() + PAYLOAD_GRACE;
         let mut seen = Vec::new();
         let mut buf = [0u8; 2048];
-        while let Ok((len, _)) = peer.recv_from(&mut buf) {
-            let packet = media_core::rtp::RtpPacket::parse(&buf[..len]).unwrap();
-            seen.push(packet.payload.to_vec());
+        loop {
+            match peer.recv_from(&mut buf) {
+                Ok((len, _)) => {
+                    let packet = media_core::rtp::RtpPacket::parse(&buf[..len]).unwrap();
+                    seen.push(packet.payload.to_vec());
+                }
+                Err(_) => {
+                    if seen.len() >= want || std::time::Instant::now() >= deadline {
+                        return seen;
+                    }
+                    std::thread::yield_now();
+                }
+            }
         }
-        seen
     }
 
     #[tokio::test]
@@ -670,7 +682,7 @@ mod tests {
         let epoch = std::time::Instant::now();
         egress.pump(epoch);
         egress.pump(epoch + Duration::from_millis(20));
-        let heard = payloads(&peer);
+        let heard = payloads_expecting(&peer, 2);
         assert_eq!(heard.len(), 2);
         assert_eq!(heard[0][0], g711::linear_to_ulaw(4_000));
     }
@@ -694,7 +706,7 @@ mod tests {
         .await;
         let epoch = std::time::Instant::now();
         egress.pump(epoch);
-        let _ = payloads(&peer);
+        let _ = payloads_expecting(&peer, 1);
 
         handle_inbound(
             r#"{"event":"clear","streamSid":"MZ-1"}"#,
@@ -708,7 +720,7 @@ mod tests {
         egress.pump(epoch + Duration::from_millis(20));
 
         assert_eq!(stats.barges, 1);
-        let heard = payloads(&peer);
+        let heard = payloads_expecting(&peer, 1);
         assert_eq!(heard.len(), 1);
         assert_eq!(heard[0][0], g711::linear_to_ulaw(0));
     }
