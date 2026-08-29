@@ -8082,12 +8082,16 @@ m=audio 41000 RTP/AVP 111\r\na=rtpmap:111 opus/48000/2\r\n",
             !second.is_empty() && second != first,
             "the two recordings were different attachments"
         );
+        let mut stored = bucket.keys();
+        stored.sort();
         assert_eq!(
-            bucket.keys(),
+            stored,
             vec![
-                "acct-42/rec-99.wav".to_string(),
-                "acct-42/rec-100.wav".to_string()
-            ]
+                "acct-42/rec-100.wav".to_string(),
+                "acct-42/rec-99.wav".to_string()
+            ],
+            "both recordings reached the store under the frozen identity; the two backgrounded \
+             uploads race, so which one lands first is not part of the contract"
         );
         assert_eq!(counters.uploads_backgrounded.load(Ordering::Relaxed), 2);
         assert_eq!(counters.uploaded.load(Ordering::Relaxed), 2);

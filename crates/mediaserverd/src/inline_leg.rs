@@ -336,20 +336,33 @@ mod tests {
         payload: Vec<u8>,
     }
 
-    fn drain(peer: &UdpSocket) -> Vec<Seen> {
+    const DRAIN_GRACE: Duration = Duration::from_secs(2);
+
+    fn drain_expecting(peer: &UdpSocket, want: usize) -> Vec<Seen> {
+        let deadline = Instant::now() + DRAIN_GRACE;
         let mut seen = Vec::new();
         let mut buf = [0u8; 2048];
-        while let Ok((len, _)) = peer.recv_from(&mut buf) {
-            let packet = RtpPacket::parse(&buf[..len]).expect("the peer receives valid rtp");
-            seen.push(Seen {
-                marker: packet.marker,
-                payload_type: packet.payload_type,
-                sequence: packet.sequence,
-                timestamp: packet.timestamp,
-                payload: packet.payload.to_vec(),
-            });
+        loop {
+            match peer.recv_from(&mut buf) {
+                Ok((len, _)) => {
+                    let packet =
+                        RtpPacket::parse(&buf[..len]).expect("the peer receives valid rtp");
+                    seen.push(Seen {
+                        marker: packet.marker,
+                        payload_type: packet.payload_type,
+                        sequence: packet.sequence,
+                        timestamp: packet.timestamp,
+                        payload: packet.payload.to_vec(),
+                    });
+                }
+                Err(_) => {
+                    if seen.len() >= want || Instant::now() >= deadline {
+                        return seen;
+                    }
+                    std::thread::yield_now();
+                }
+            }
         }
-        seen
     }
 
     #[test]
@@ -361,7 +374,7 @@ mod tests {
             egress.pump(epoch + Duration::from_millis(tick * 20));
         }
 
-        let packets = drain(&peer);
+        let packets = drain_expecting(&peer, 3);
         assert_eq!(packets.len(), 3, "one datagram per ptime tick");
         assert_eq!(packets[0].payload_type, 0);
         assert!(packets[0].marker, "the first talkspurt packet marks itself");
@@ -387,12 +400,12 @@ mod tests {
         assert!(handle.push(vec![2_000i16; 1_600]));
         let epoch = Instant::now();
         egress.pump(epoch);
-        let _ = drain(&peer);
+        let _ = drain_expecting(&peer, 1);
 
         handle.clear();
         egress.pump(epoch + Duration::from_millis(20));
 
-        let packets = drain(&peer);
+        let packets = drain_expecting(&peer, 1);
         assert_eq!(packets.len(), 1);
         assert_eq!(
             packets[0].payload[0],
