@@ -39,3 +39,26 @@ RUN sed -i 's#</include>#  <X-PRE-PROCESS cmd="set" data="external_ip=$${local_i
 #    FreeSWITCH over ESL.
 RUN sed -i 's#<param name="listen-ip" value="::"/>#<param name="listen-ip" value="0.0.0.0"/>#' \
       /usr/local/freeswitch/conf/autoload_configs/event_socket.conf.xml
+
+# 5. Listening is not the same as accepting. With no apply-inbound-acl,
+#    mod_event_socket answered a connection from the docker bridge host with
+#    "Content-Type: text/rude-rejection / Access Denied, go away." -- so a
+#    controller outside the container could not attach at all, while fs_cli
+#    inside it worked and hid the problem.
+#
+#    The obvious one-liner, apply-inbound-acl localnet.auto, is a trap: that
+#    list is built from FreeSWITCH's own interfaces (it logs "Adding
+#    172.31.99.80/255.255.255.0 (allow) to list localnet.auto") and so covers
+#    the docker subnet but NOT 127.0.0.0/8 -- which is how fs_cli connects. It
+#    admits the controller and locks out every drill, and fs_cli reports that as
+#    "Error Connecting []", a TCP-looking error for an ACL refusal.
+#
+#    So the rig declares its own list instead of borrowing an automatic one:
+#    loopback for fs_cli, the RFC1918 ranges for the controller on the bridge
+#    host, deny by default. RFC1918 rather than the lab's literal /24 because
+#    the subnet is compose's to choose, and nothing routable from the internet
+#    is in any of these ranges.
+RUN sed -i 's#<network-lists>#<network-lists>\n    <list name="rig_esl" default="deny">\n      <node type="allow" cidr="127.0.0.0/8"/>\n      <node type="allow" cidr="10.0.0.0/8"/>\n      <node type="allow" cidr="172.16.0.0/12"/>\n      <node type="allow" cidr="192.168.0.0/16"/>\n    </list>#' \
+      /usr/local/freeswitch/conf/autoload_configs/acl.conf.xml \
+ && sed -i 's#<param name="password" value="ClueCon"/>#<param name="password" value="ClueCon"/>\n    <param name="apply-inbound-acl" value="rig_esl"/>#' \
+      /usr/local/freeswitch/conf/autoload_configs/event_socket.conf.xml
