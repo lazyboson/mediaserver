@@ -148,6 +148,8 @@ Three properties this diagram is drawn to make explicit, each argued in §5:
 
 **Session Controller** — the control plane. Exposes the `MediaControl` gRPC API over the Session / Attachment / Playback nouns defined in §5.1 (a `TelCompat` façade translates the legacy controller's the legacy verb API verbs, §5.6). It owns the RTPEngine interaction: for each tap it sends `subscribe request {call-id, from-tag | from-tags, …}` to the RTPEngine instance anchoring that call, receives rtpengine's `a=sendonly` SDP offer, allocates a local RTP port, and replies with `subscribe answer` (`a=recvonly`) — optionally requesting a codec on the subscription leg so rtpengine transcodes at the tap (e.g., ask for PCMU even if the leg is Opus). Teardown is `unsubscribe`. This is the same mechanism SIPREC recording servers use with rtpengine, so it is a stable, supported surface.
 
+**SIP front door** — the second entrance onto exactly the same nouns, and optional: `MSS_SIP_LISTEN` (UDP) answers an INVITE by calling the Session Controller's own `CreateSession{kind=INLINE, group=<dialled user part>}`, one function call earlier than the gRPC service does. It is a UAS and nothing more — transactions, dialogs, offer/answer and session timers, with no registrar, no routing, no forking and no UAC — so "answer-only" is unchanged as a property of the design: MSS answers, it never dials. It is a control-plane Tokio task that never touches a media thread, and the `CreateSession` it makes is spawned so the socket is never stalled behind it. A deployment that drives MSS entirely over gRPC leaves the variable unset and the door shut. Because it is the one port a stranger can address, it is its own trust boundary and carries no bearer check of its own (§7, deploy.md).
+
 **Ingest / codec pipeline** — per subscribed stream: UDP socket → RTP depacketization → **jitter buffer** (sequence reorder, loss detection, PLC — G.711 Appendix I for G.711, libopus's own for Opus) → decode to linear PCM → resample (8 kHz ↔ 16 kHz ↔ 48 kHz) → per-consumer re-encode (L16/16k for ASR, PCMU/8k for Twilio-dialect consumers, Opus for bandwidth-sensitive consumers). One decode per stream, N encodes shared across consumers wanting the same format.
 
 **Fan-out hub** — per session, an in-process pub/sub: one ingest (or two, customer + agent leg), N subscribers. Subscribers attach/detach mid-call. Each subscriber has an independent queue with drop-oldest backpressure and per-subscriber metrics, so one slow ASR endpoint can't stall the RTT stream (a failure mode the legacy media gateway has today — its mark-echo write blocks the RTP pacer).
@@ -162,7 +164,7 @@ Three properties this diagram is drawn to make explicit, each argued in §5:
 
 ### 3.2 Why tap-based ingest scales better than everything you do today
 
-- **Pull, not push.** The MSS *initiates* the subscription toward rtpengine. Session placement is a scheduling decision made by your control plane (any pod with capacity takes the session), not a consequence of SDP routing. This kills the hardest scaling problem the legacy media gateway has — OpenSIPS must route the B2B INVITE to a specific pod whose `RTP_IP` is routable — and replaces it with "pod X asks rtpengine to send to pod X's address."
+- **Pull, not push.** The MSS *initiates* the subscription toward rtpengine. Session placement is a scheduling decision made by your control plane (any pod with capacity takes the session), not a consequence of SDP routing. This kills the hardest scaling problem the legacy media gateway has — OpenSIPS must route the B2B INVITE to a specific pod whose `RTP_IP` is routable — and replaces it with "pod X asks rtpengine to send to pod X's address." **This paragraph is about taps.** An *inline* leg has always been pod-bound — a conference is one pod's mix thread, so whoever opens the leg must pick the pod that owns the room, whether it calls `CreateSession` over gRPC or sends an INVITE to the SIP front door. The front door moves that routing decision from the API caller to whatever routes the INVITE; it does not create the problem and does not solve it. Placement is **D8** in [tasks.md](tasks.md), and it is unowned.
 - **No FS involvement at all** for passive consumers. No media bug, no dummy leg, no conference, no ESL traffic. FS capacity planning decouples from AI/ASR adoption.
 - **RTPEngine does the copy where the packets already are.** The kernel module keeps forwarding the primary media path; the subscription adds one userspace copy per tap on the rtpengine host. This is the same work rtpengine does for SIPREC deployments at scale. (Benchmark note: subscription legs are handled in userspace, so budget rtpengine CPU headroom — see §9 risks.)
 - **N consumers, one tap.** Today three consumers of the same call's audio = three separate FS mechanisms (audio_fork WS + transcribe bug + conference leg). In the MSS it's one subscription, one decode, three subscribers on the hub.
@@ -688,7 +690,7 @@ FreeSWITCH itself wraps C libraries (libopus, spandsp, libsndfile, ffmpeg) and o
 | Denoise / AGC | DSP/ML | `nnnoiseless` (pure-Rust RNNoise), speexdsp FFI | No |
 | Tone gen/detect | DSP (Goertzel) | ~100 lines or spandsp FFI | Trivial |
 | TTS | HTTP/gRPC provider clients | plain clients (logic exists in the legacy controller) | No |
-| SIP stack | Transactions, offer/answer, dialogs | **Adopted, not written**: `crates/sip-uas` on `rvoip-sip-core` (crates.io, MIT). Article XI applies to protocol stacks as it does to codecs — sofia-sip and PJSIP are the alternative via FFI, and a hand-written transaction layer is the fallback, not the plan | No — adopted |
+| SIP stack | Syntax; UAS transactions; dialogs; offer/answer; session timers | **Split**: the syntax layer is adopted — `crates/sip-uas` on `rvoip-sip-core` (crates.io, MIT) parses and builds. **Written here, sans-IO** (decided 2026-08-30, see below): RFC 3261 §17 UAS transactions with RFC 6026's `Accepted` state, RFC 3261 §12 dialogs, and RFC 4028 session timers. sofia-sip and PJSIP via FFI remain the fallback if interop demands a battle-tested stack | Partly — syntax adopted, the state machines owned |
 | SRTP/DTLS | libsrtp | RTPEngine terminates crypto at the edge | Avoided |
 
 Net: ~80% of the FS capability surface we use is commodity libraries or trivial DSP; the ~20% built from scratch (jitter policy, mixer engine, session/fan-out machinery) is precisely the engine this project exists to own. Licensing is permissive throughout (G.729 patents expired; MP3 patent-free).
@@ -705,6 +707,46 @@ adding one. What a media server needs is a fraction of a proxy — UAS
 transactions, offer/answer including re-INVITE, session timers — and explicitly
 **not** a registrar, routing, forking, or a UAC. Answer-only stays a property of
 the design; it now has its own front door.
+
+**Why the transaction layer is written and not adopted (decided 2026-08-30).**
+The row above first read *"adopted, not written"* for the whole stack, with
+`rvoip-sip-transport` and `rvoip-sip-dialog` named as the next dependencies. A
+probe of those crates before taking them changed the decision. Four findings:
+
+1. **There is no transaction crate to pick.** `rvoip-transaction-core` is
+   deprecated — *"removed in the rvoip 3 restructure"* — and its function now
+   lives in `rvoip-sip-dialog` (`src/transaction/`, with the RFC 3261 §17 timer
+   set correctly cited: T1 500 ms, Timer H/J at 64×T1, T4) and in the
+   `rvoip-sip` umbrella this repository already declined.
+2. **The cost is 59 new crates and 24 version skews** against the workspace's
+   339, measured by resolving both candidates. Among them a five-format
+   configuration framework (`config`, `json5`, `ron`, `toml`, `yaml-rust2`,
+   `rust-ini`, `pest`), a full DNS resolver (`hickory-*`, `resolv-conf`,
+   `ipconfig`) and a cache (`moka`) — for a UAS that answers INVITEs on one
+   socket. Two probable `cargo deny` failures come with them: `tiny-keccak`
+   (CC0-1.0, not on the allow-list) and `webpki-roots` (CDLA-Permissive-2.0,
+   where deny.toml's exception names `webpki-root-certs`, a different crate).
+3. **`rvoip-infra-common`, a mandatory transitive dependency of both, installs
+   `mimalloc` as the process-wide `#[global_allocator]` by default.** Its own
+   comment says this happens *"only when this crate is used as a binary, not as
+   a library dependency"*; the `cfg` beneath it is
+   `#[cfg(not(feature = "no-global-allocator"))]`, which says nothing of the
+   kind. Linking it would swap the allocator of a real-time media process as a
+   side effect. It is opt-out-able, and only by reading the vendor's source.
+4. **It is tokio-timer-driven, and this is the one layer that is entirely
+   timers.** Every other protocol and DSP layer here is sans-IO with time as a
+   parameter, which is why a media bug is a unit test. Adopting a runtime-bound
+   timer manager would forfeit exactly that property for Timer G/H/I/J/L.
+   (Timer K bounds a *client* transaction, and there is no UAC here, so it is
+   out of scope by construction rather than unbuilt.)
+
+Article XI's rule holds where its reason holds: adopt the codec math, because
+reimplementing it is a decade of field-found bugs. It does not extend to a
+dependency with 1,385 downloads whose value is a state machine the RFC prints in
+full. What MSS needs is closed and small — the **INVITE server transaction** and
+the **non-INVITE server transaction**, branch matching, and the §17 timers; no
+client transactions, no forking, no UAC. That is written here, sans-IO: bytes
+plus `now` in, actions and timer requests out. The syntax layer stays adopted.
 
 **GStreamer escape hatch:** `gstreamer-rs` bindings are first-class (GStreamer's own team ships Rust plugins upstream). An MSS variant embedding GStreamer per-session pipelines (`udpsrc → rtpjitterbuffer → decode → audioresample → appsink`, `audiomixer` for conferences) inherits hardened media code at the cost of carrying the GStreamer runtime. Decision: hand-roll the narrow audio-only pipeline; prototype both in Phase 0; keep GStreamer as the Phase-4 mixer fallback.
 
