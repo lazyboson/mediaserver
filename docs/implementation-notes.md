@@ -4113,7 +4113,7 @@ this addition only because of a specific feature selection, so do not
   without it the image re-resolved dependencies and could ship versions
   CI never saw.
 
-## crates/sip-uas — the SIP front door (scaffolded 2026-08-30)
+## crates/sip-uas — the SIP front door (scaffolded, transactions, dialogs and session timers, 2026-08-30)
 
 An answer-only media plane still has to be *reached*, and until now something
 else did the reaching: `lab/sip_shim.py`, 336 lines of Python with in-memory
@@ -4132,42 +4132,189 @@ transfer, RFC 4733 DTMF, UDP and TLS — plus a SIPp matrix to 2000 CPS. Its own
 README declines to call that carrier certification, and neither do we.
 Deliberately *not* taken: the `rvoip-sip` umbrella, which brings call-control
 and media opinions this repository already has its own answers for. Only the
-parsing and building layer is a dependency; `rvoip-sip-transport` and
-`rvoip-sip-dialog` are the next candidates when transactions land.
+parsing and building layer is a dependency, and — since the 2026-08-30 probe
+recorded in architecture §7 — it is the only one that will be:
+`rvoip-sip-transport` and `rvoip-sip-dialog` were the named candidates for
+transactions and are no longer taken. There is also no `rvoip-transaction-core`
+to take; it is deprecated and folded into `rvoip-sip-dialog` and the umbrella.
 
-**Sans-IO, like everything else here.** `Invite::from_datagram` takes bytes and
-returns intent; `answered_with`, `refused_with` and `trying` take intent and
-return bytes. No sockets, no tasks, no clock — so every case is a unit test and
-none of it needs a network to exercise. The dialled user part is read as the
-conference group, which is the contract the shim already established.
+**Sans-IO, like everything else here.** Three modules, no sockets, no tasks and
+no clock: `message.rs` turns bytes into intent and intent into bytes,
+`timing.rs` holds T1/T2/T4 and the doubling rule, and `transaction.rs` is the
+RFC 3261 §17 server state machines. Time is a parameter everywhere, so all 33
+tests run without a network.
+
+**Generic on purpose, because this crate is meant to be publishable.** Nothing
+in the public API knows what MSS is. The dialled user part is
+`Invite::request_uri_user`, not `dialled_group` — reading it as a conference
+group is the *application's* contract (the one `lab/sip_shim.py` established),
+and it stays in the caller. `FrontDoorError` became `MessageError` for the same
+reason. The layer hands the application a `Request` and takes back a `Response`;
+what an INVITE *means* is never its business.
+
+**The API is deadline-driven, not timer-callback-driven.**
+
+```
+on_datagram(bytes, from, now) -> Vec<Action>
+respond(key, response, now)   -> Result<Vec<Action>, RespondError>
+poll(now)                     -> Vec<Action>
+next_deadline()               -> Option<Duration>
+```
+
+`Action` is only `Send { datagram, to }` and `Deliver { key, event }`. There is
+deliberately no `StartTimer`/`StopTimer` action: the layer owns its own
+deadlines and the driver asks `next_deadline()` when to wake up. That keeps the
+driver down to a socket and a sleep, and it matches the deadline-anchored rule
+the guidelines already impose on pacing.
+
+**Timer names are behaviour, since a comment cannot say which letter is which.**
+
+| RFC 3261 §17 | in this crate |
+| --- | --- |
+| Timer G — retransmit a non-2xx final | `retransmit_at` on a `Completed` invite |
+| Timer H — give up waiting for the ACK | `give_up_at` on a `Completed` invite |
+| Timer I — absorb ACK retransmissions | `absorb_until` on a `Confirmed` invite |
+| Timer J — absorb request retransmissions | `absorb_until` on a `Completed` non-invite |
+| Timer L (RFC 6026) — the `Accepted` state | `give_up_at` on an `Accepted` invite |
+
+**Three decisions worth knowing.**
+
+1. **A 2xx ACK is matched on Call-ID and CSeq, not on the branch.** The ACK for
+   a 2xx is a new end-to-end transaction and carries its *own* branch, so
+   branch-keying alone never finds the INVITE it acknowledges. The layer tries
+   the branch key first (which is right for a non-2xx ACK, since that one does
+   share the branch) and falls back to `(call_id, cseq)` across transactions in
+   `Accepted`. `the_ack_for_a_two_hundred_arrives_on_its_own_branch_and_still_finds_its_invite`
+   is that rule.
+2. **Timer L is held at 64×T1 on reliable transports too, which RFC 6026 sets
+   to 0.** Terminating the `Accepted` state instantly on TCP would mean the
+   application never receives `Acknowledged` there, and a uniform event on both
+   transports is worth more here than the letter of the timer. Named in
+   `an_accepted_invite_waits_for_its_ack_on_a_reliable_transport_too`.
+3. **CANCEL is answered by the layer; the 487 is the application's.** A CANCEL
+   gets an automatic 200 when it matches a live INVITE in `Proceeding` and an
+   automatic 481 when it does not — there is nothing else either could say —
+   and the INVITE transaction is delivered `Cancelled` so the application sends
+   the 487 itself. That is RFC 3261 §9.2's division of labour. The 100 Trying
+   on an INVITE is automatic for the same reason.
 
 **What it does today**
 
 | | |
 | --- | --- |
-| parse an INVITE, reject anything else by method name | done |
-| read the call-id, the dialled group, and the SDP offer | done |
-| build a 200 OK carrying the session layer's SDP answer | done |
-| build a refusal with a reason phrase the caller will log | done |
-| build a 100 Trying | done |
+| parse an INVITE, read its call-id, dialled user part and SDP offer | done |
+| build a 200 OK, a refusal with a reason phrase, a 100 Trying | done |
+| INVITE server transaction — proceeding / completed / confirmed / accepted | done |
+| non-INVITE server transaction — trying / proceeding / completed | done |
+| branch matching on the topmost Via, with ACK keyed to its INVITE | done |
+| retransmit a final response on the doubling schedule to T2 | done |
+| absorb retransmitted requests without reaching the application twice | done |
+| tell the application when an ACK never arrived, at 64×T1 | done |
+| CANCEL, and the 481 for a CANCEL with nothing to cancel | done |
+| reliable-transport behaviour (no retransmission, no absorb window) | done |
+| dialogs (RFC 3261 §12) — id, tags, remote target, reversed route set | done |
+| in-dialog CSeq ordering, with the 500 for a number that did not advance | done |
+| re-INVITE recognised as in-dialog, with the 500 + `Retry-After` for a second one | done |
+| session timers (RFC 4028) — negotiation, the 422 below Min-SE, expiry | done |
+| 481 for an in-dialog request naming a dialog that does not exist | done |
+
+**What fixes what.** `lab/sip_shim.py` has a replay cache keyed on Call-ID and,
+in its own words, *"no timers"*. So it absorbs a retransmission correctly and
+never retransmits its own 200, and nothing ever expires: an INVITE that is
+answered and never acknowledged holds an MSS session — and a mixer slot —
+forever. `an_invite_whose_ack_never_comes_tells_the_application_at_thirty_two_seconds`
+is that defect written as a test.
+
+**Three more decisions, from the dialog layer.**
+
+4. **The refresher is always the caller.** RFC 4028 lets the UAS pick; an
+   answer-only media plane that made itself the refresher would have to send
+   re-INVITEs, which is a UAC. So a `Session-Expires: 1800;refresher=uas` is
+   answered `refresher=uac`, and on expiry the door **ends the media session and
+   does not send a BYE** — tearing down the dialog is call control's, and MSS
+   has no UAC to do it with. `a_session_expires_above_the_floor_is_negotiated_with_the_caller_refreshing`.
+5. **A re-INVITE whose offer is unchanged is answered with the session's
+   existing SDP answer.** That covers the session-timer refresh and the
+   re-INVITE-to-refresh case completely. An offer that actually differs is still
+   refused **488 by name**, because `session-core` has no renegotiation path —
+   the SIP half of P3-2 is closed and the media half is not.
+6. **A dialog tag is generated per call, and `rvoip-sip-core` cannot be trusted
+   to do it.** `SimpleResponseBuilder::dialog_response` writes the literal
+   string `"local-tag-value"` as the To tag — its own source says *"In a real
+   implementation, generate a unique tag"* — so every concurrent call would
+   share a dialog identity. Neither the front door nor `Invite::answered_with`
+   uses it; both take the tag as a parameter.
+   `two_calls_are_given_different_to_tags` is the regression test.
 
 **What it does not do yet, in the order it matters**
 
-1. **No transport.** Nothing listens on a socket. Wiring is a Tokio task in the
-   control plane — never on a media thread — and `rvoip-sip-transport` is the
-   candidate rather than a hand-rolled UDP loop.
-2. **No transactions.** No retransmission handling, no ACK matching, no CANCEL
-   race handling, no timers. `rvoip-sip-dialog` is the candidate.
-3. **No re-INVITE**, which is the whole reason for preferring a UAS over a
-   proxy in front: hold, attended transfer and session-timer refresh all
-   re-offer, and today MSS has no answer for any of them. Until this lands the
-   gap is unchanged, only relocated.
-4. **Not wired to `session-core`.** `answered_with` takes an SDP answer as a
-   parameter; nothing yet calls `CreateSession` to obtain one. The front door
-   must stay a second entrance onto the existing session API, never a parallel
-   implementation of it.
-5. **Not fuzzed.** `a_front_door_open_to_the_network_returns_errors_instead_of_panicking`
-   covers seven hostile datagrams, and the parse is wrapped in
-   `catch_unwind` so a panic in a dependency becomes a refusal rather than a
-   lost transaction. That is a seatbelt, not a substitute for a fuzz target —
-   this is the one surface in the process a stranger can reach.
+1. **No UAC, deliberately.** No client transactions, no forking, no registrar,
+   no ability to send a BYE or a re-INVITE. This is the boundary the design
+   picked, not an omission: a media plane answers.
+2. **A changed offer still has no answer.** The transaction and the dialog run
+   correctly; `session-core` cannot renegotiate the RTP session, so hold with a
+   changed media description, attended transfer and codec change are refused
+   488. That is the remaining half of P3-2 and it is `session-core` work, not
+   SIP work.
+3. **No TCP or TLS.** `Reliability::Reliable` is implemented and tested, but the
+   driver binds UDP only.
+4. **The mutation sweep is not libFuzzer.** `robustness.rs` drives 25 000
+   deterministically mutated datagrams through the layer on every `cargo test`
+   and the seed is fixed so a failure reproduces. A real fuzz target needs
+   nightly, which the pinned toolchain is not.
+5. **Never met a real SIP endpoint.** The socket is real and the controller is
+   real, but every datagram in the tests is constructed here. FreeSWITCH,
+   OpenSIPS and a softphone are still lab work.
+
+## crates/mediaserverd/src/sip_front_door.rs — the door on the wire (2026-08-30)
+
+The Tokio task that turns the sans-IO layer into a listening port. `serve` binds
+`MSS_SIP_LISTEN`; `serve_on` takes an already-bound socket, which is what the
+tests use so they can pick an ephemeral port. It is a **control-plane task and
+never touches a media thread**.
+
+**One entrance, not two.** The door holds `Arc<SessionController>` and calls
+`create_session` / `destroy_session` on it directly — the same methods the gRPC
+service calls, one function call earlier. There is no parallel session path, and
+that is the rule the front door exists under. It also means the door bypasses
+the wire's bearer check: `MSS_SIP_LISTEN` is its own trust boundary and must be
+firewalled to the signalling elements that should reach it.
+
+**Nothing blocks the socket.** `CreateSession` is spawned and its answer comes
+back over an mpsc channel that the same `select!` loop drains, so retransmissions
+arriving while the media plane is opening a session are still absorbed. The
+automatic 100 Trying goes out before any of it. This is the shim's one
+structural flaw — a blocking control call on the only thread — not carried
+forward.
+
+**The loop sleeps on the earliest deadline** across both the transaction layer
+and the dialog store (`next_deadline()`), capped by a 250 ms idle tick.
+
+| what arrives | what the door does |
+| --- | --- |
+| INVITE, no To tag | negotiate the session timer, then `CreateSession{kind=INLINE, group=<dialled user part>}`; answer 200 with the media plane's SDP, our Contact and a per-call To tag |
+| INVITE below Min-SE | 422 with `Min-SE`, and no session is created |
+| INVITE with no SDP | 488 by name |
+| re-INVITE, offer unchanged or absent | 200 with the same SDP answer, session timer refreshed |
+| re-INVITE, offer changed | 488 by name |
+| second re-INVITE while one is unanswered | 500 with `Retry-After` |
+| in-dialog CSeq that did not advance | 500 |
+| BYE | `DestroySession`, 200, dialog dropped |
+| CANCEL before the answer | 487 to the INVITE, and the session is destroyed |
+| ACK that never comes | at 64×T1 the media session is destroyed rather than leaked |
+| session timer expiry | the media session is ended; **no BYE is sent** |
+| OPTIONS | 200 with `Allow` |
+| in-dialog request naming an unknown dialog | 481 |
+| anything unparsable | nothing at all |
+
+**Verified over real UDP sockets against the real `SessionController`** (ten
+tests, a fake `MediaPlane` supplying the SDP answer): the 100 then the 200
+carrying the plane's own SDP, two calls getting different To tags, BYE closing
+the leg, 481 for an unknown dialog, 422 below the floor, the negotiated
+`Session-Expires` and `Require: timer` on the answer, a refreshing re-INVITE
+answered and a changed one refused, OPTIONS, and four hostile datagrams followed
+by a call that still gets answered.
+
+**Not yet done here:** no metrics are exported for the door (answered and
+refused are counted in the struct and logged at shutdown only), it is UDP only,
+and nothing in `deploy/` opens the port.
