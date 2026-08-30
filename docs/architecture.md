@@ -688,7 +688,7 @@ FreeSWITCH itself wraps C libraries (libopus, spandsp, libsndfile, ffmpeg) and o
 | Denoise / AGC | DSP/ML | `nnnoiseless` (pure-Rust RNNoise), speexdsp FFI | No |
 | Tone gen/detect | DSP (Goertzel) | ~100 lines or spandsp FFI | Trivial |
 | TTS | HTTP/gRPC provider clients | plain clients (logic exists in cigol) | No |
-| SIP stack | Transactions, offer/answer, dialogs | **Adopted, not written**: `crates/sip-uas` on `rvoip-sip-core` (crates.io, MIT). Article XI applies to protocol stacks as it does to codecs — sofia-sip and PJSIP are the alternative via FFI, and a hand-written transaction layer is the fallback, not the plan | No — adopted |
+| SIP stack | Syntax; UAS transactions; offer/answer | **Split**: the syntax layer is adopted — `crates/sip-uas` on `rvoip-sip-core` (crates.io, MIT) parses and builds. The **UAS transaction layer is written here, sans-IO** (decided 2026-08-30, see below); sofia-sip and PJSIP via FFI remain the fallback if interop demands a battle-tested stack | Partly — syntax adopted, transactions owned |
 | SRTP/DTLS | libsrtp | RTPEngine terminates crypto at the edge | Avoided |
 
 Net: ~80% of the FS capability surface we use is commodity libraries or trivial DSP; the ~20% built from scratch (jitter policy, mixer engine, session/fan-out machinery) is precisely the engine this project exists to own. Licensing is permissive throughout (G.729 patents expired; MP3 patent-free).
@@ -705,6 +705,44 @@ adding one. What a media server needs is a fraction of a proxy — UAS
 transactions, offer/answer including re-INVITE, session timers — and explicitly
 **not** a registrar, routing, forking, or a UAC. Answer-only stays a property of
 the design; it now has its own front door.
+
+**Why the transaction layer is written and not adopted (decided 2026-08-30).**
+The row above first read *"adopted, not written"* for the whole stack, with
+`rvoip-sip-transport` and `rvoip-sip-dialog` named as the next dependencies. A
+probe of those crates before taking them changed the decision. Four findings:
+
+1. **There is no transaction crate to pick.** `rvoip-transaction-core` is
+   deprecated — *"removed in the rvoip 3 restructure"* — and its function now
+   lives in `rvoip-sip-dialog` (`src/transaction/`, with the RFC 3261 §17 timer
+   set correctly cited: T1 500 ms, Timer H/J at 64×T1, T4) and in the
+   `rvoip-sip` umbrella this repository already declined.
+2. **The cost is 59 new crates and 24 version skews** against the workspace's
+   339, measured by resolving both candidates. Among them a five-format
+   configuration framework (`config`, `json5`, `ron`, `toml`, `yaml-rust2`,
+   `rust-ini`, `pest`), a full DNS resolver (`hickory-*`, `resolv-conf`,
+   `ipconfig`) and a cache (`moka`) — for a UAS that answers INVITEs on one
+   socket. Two probable `cargo deny` failures come with them: `tiny-keccak`
+   (CC0-1.0, not on the allow-list) and `webpki-roots` (CDLA-Permissive-2.0,
+   where deny.toml's exception names `webpki-root-certs`, a different crate).
+3. **`rvoip-infra-common`, a mandatory transitive dependency of both, installs
+   `mimalloc` as the process-wide `#[global_allocator]` by default.** Its own
+   comment says this happens *"only when this crate is used as a binary, not as
+   a library dependency"*; the `cfg` beneath it is
+   `#[cfg(not(feature = "no-global-allocator"))]`, which says nothing of the
+   kind. Linking it would swap the allocator of a real-time media process as a
+   side effect. It is opt-out-able, and only by reading the vendor's source.
+4. **It is tokio-timer-driven, and this is the one layer that is entirely
+   timers.** Every other protocol and DSP layer here is sans-IO with time as a
+   parameter, which is why a media bug is a unit test. Adopting a runtime-bound
+   timer manager would forfeit exactly that property for Timer G/H/I/J/K.
+
+Article XI's rule holds where its reason holds: adopt the codec math, because
+reimplementing it is a decade of field-found bugs. It does not extend to a
+dependency with 1,385 downloads whose value is a state machine the RFC prints in
+full. What MSS needs is closed and small — the **INVITE server transaction** and
+the **non-INVITE server transaction**, branch matching, and the §17 timers; no
+client transactions, no forking, no UAC. That is written here, sans-IO: bytes
+plus `now` in, actions and timer requests out. The syntax layer stays adopted.
 
 **GStreamer escape hatch:** `gstreamer-rs` bindings are first-class (GStreamer's own team ships Rust plugins upstream). An MSS variant embedding GStreamer per-session pipelines (`udpsrc → rtpjitterbuffer → decode → audioresample → appsink`, `audiomixer` for conferences) inherits hardened media code at the cost of carrying the GStreamer runtime. Decision: hand-roll the narrow audio-only pipeline; prototype both in Phase 0; keep GStreamer as the Phase-4 mixer fallback.
 

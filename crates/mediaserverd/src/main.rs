@@ -19,6 +19,7 @@ mod recording_uploads;
 mod registry_keeper;
 mod rtpengine_capability;
 mod session_store;
+mod sip_front_door;
 mod supervisor;
 mod tap_plane;
 mod tap_session;
@@ -57,7 +58,10 @@ const RECORDING_BUCKET_ENV: &str = "MSS_RECORDING_BUCKET";
 const CONFERENCE_LINGER_ENV: &str = "MSS_CONFERENCE_LINGER_SECS";
 const DEFAULT_CONFERENCE_LINGER: std::time::Duration = std::time::Duration::from_secs(0);
 const MEMBER_STATE_TTL_ENV: &str = "MSS_MEMBER_STATE_TTL_SECS";
+const SIP_LISTEN_ENV: &str = "MSS_SIP_LISTEN";
+const SIP_ADVERTISE_ENV: &str = "MSS_SIP_ADVERTISE";
 const DEFAULT_MEMBER_STATE_TTL: std::time::Duration = std::time::Duration::from_secs(0);
+const SIP_RETRY_AFTER: std::time::Duration = std::time::Duration::from_secs(4);
 const MEMBER_STATE_SWEEP: std::time::Duration = std::time::Duration::from_millis(500);
 const DEFAULT_POD_NAME: &str = "mediaserverd";
 
@@ -388,6 +392,18 @@ fn metrics_listen_address() -> Option<Result<SocketAddr, String>> {
     Some(configured.parse().map_err(|_| configured))
 }
 
+fn sip_listen_address() -> Option<Result<SocketAddr, String>> {
+    let configured = std::env::var(SIP_LISTEN_ENV).ok()?;
+    Some(configured.parse().map_err(|_| configured))
+}
+
+fn sip_advertised_address(listen: SocketAddr) -> Result<SocketAddr, String> {
+    match std::env::var(SIP_ADVERTISE_ENV) {
+        Ok(configured) => configured.parse().map_err(|_| configured),
+        Err(_) => Ok(listen),
+    }
+}
+
 fn auth_policy_from_env() -> AuthPolicy {
     match std::env::var(AUTH_TOKEN_ENV) {
         Ok(token) if !token.is_empty() => {
@@ -621,6 +637,49 @@ async fn serve_control_plane(
         "the control world checks member state leases on this interval; the mix thread keeps \
          no timer of its own"
     );
+
+    match sip_listen_address() {
+        Some(Ok(sip_listen)) => match sip_advertised_address(sip_listen) {
+            Ok(advertised) => {
+                let config = sip_front_door::FrontDoorConfig {
+                    listen: sip_listen,
+                    advertised,
+                    owner: owner.clone(),
+                    session_timers: sip_uas::SessionTimerPolicy::default(),
+                    retry_after: SIP_RETRY_AFTER,
+                };
+                let mut until_door_drains = controller.drain_watch();
+                tokio::spawn(sip_front_door::serve(
+                    config,
+                    Arc::clone(&controller),
+                    async move {
+                        let _ = until_door_drains.wait_for(|draining| *draining).await;
+                    },
+                ));
+            }
+            Err(configured) => {
+                error!(
+                    env = SIP_ADVERTISE_ENV,
+                    configured, "the advertised sip address must be ip:port; refusing to start"
+                );
+                return;
+            }
+        },
+        Some(Err(configured)) => {
+            error!(
+                env = SIP_LISTEN_ENV,
+                configured, "the sip listen address must be ip:port; refusing to start"
+            );
+            return;
+        }
+        None => {
+            info!(
+                env = SIP_LISTEN_ENV,
+                "no sip listen address configured; the front door stays shut and legs arrive \
+                 over the control API only"
+            );
+        }
+    }
 
     let auth = auth_policy_from_env();
     let mut until_draining = controller.drain_watch();

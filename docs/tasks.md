@@ -4093,6 +4093,57 @@ machine**, so no live call has been recorded to a filesystem store and no
 `file://` `UploadCompleted` has been seen on the bus — that is what a pilot owes
 this item.
 
+### 59. The SIP front door: transactions, dialogs and session timers — ✅ DONE (2026-08-30)
+
+The media plane answers SIP itself. `crates/sip-uas` grew from a parser into a
+**UAS**, and `crates/mediaserverd/src/sip_front_door.rs` put it on a socket.
+
+**Written, not adopted** — architecture §7 records the probe that reversed the
+recorded plan: there is no transaction crate to take (`rvoip-transaction-core`
+is deprecated), `rvoip-sip-dialog` + `rvoip-sip-transport` cost **59 new crates
+and 24 version skews**, two of them likely `cargo deny` failures, and
+`rvoip-infra-common` installs `mimalloc` as the process-wide
+`#[global_allocator]` by default with a comment that misdescribes its own `cfg`.
+Above all it is tokio-timer-driven, and this is the one layer that is entirely
+timers. `rvoip-sip-core` stays the syntax layer and is still the only dependency.
+
+**What landed**
+
+- **RFC 3261 §17 server transactions**, INVITE (with RFC 6026's `Accepted`
+  state) and non-INVITE: branch matching on the topmost Via, ACK keyed to its
+  INVITE, retransmission of a final on the doubling schedule to T2, timers
+  G/H/I/J/L, and the 481 for a CANCEL with nothing to cancel.
+- **RFC 3261 §12 dialogs**: id, tags, remote target, reversed route set, CSeq
+  ordering, and re-INVITE recognised as in-dialog.
+- **RFC 4028 session timers**: negotiation, 422 below Min-SE with our floor
+  stated, and expiry.
+- **The driver**: `MSS_SIP_LISTEN` / `MSS_SIP_ADVERTISE`, a non-blocking
+  `CreateSession` so the socket is never stalled, and the same
+  `SessionController` the gRPC service uses — one entrance, not two.
+
+**Two defects found and fixed while doing it.** `SimpleResponseBuilder::dialog_response`
+writes the literal To tag `"local-tag-value"`, so every concurrent call would
+have shared a dialog identity; the door and `Invite::answered_with` take the tag
+as a parameter instead. And `lab/sip_shim.py`'s replay cache has, in its own
+words, *"no timers"* — an INVITE it answers and never sees acknowledged holds an
+MSS session and a mixer slot forever. The door ends that session at 64×T1.
+
+**Verified.** 56 tests in `sip-uas` (including a deterministic 25 000-datagram
+mutation sweep) and 10 in `sip_front_door` over **real UDP sockets against the
+real `SessionController`** with a fake `MediaPlane`. Whole workspace green.
+
+**Done when** — met, except the last row: transport ✅, transactions ✅, dialogs
+✅, session timers ✅, re-INVITE's SIP half ✅, robustness sweep ✅, wired to
+`session-core` ✅, **met a real SIP endpoint ❌** (lab work, see below).
+
+**What this does not close.** A re-INVITE whose offer actually *changes* is
+still refused 488, because `session-core` has no renegotiation path — the SIP
+half of P3-2 is closed and the media half is not. There is no UAC, so an expired
+session ends the media and sends no BYE. UDP only. No metrics for the door. And
+no datagram in any of these tests came from FreeSWITCH, OpenSIPS or a
+softphone — pointing `lab/fs_control_drill.sh` at `MSS_SIP_LISTEN` instead of
+`lab/sip_shim.py` is the next lab run, and it is what retires the shim.
+
 ## Open defects and soft spots
 
 | # | Item | Where | Severity |
@@ -4139,7 +4190,7 @@ the worked example of each handoff.
 | H2 | **The deployed rtpengine version check** | `subscribe` verified against lab rtpengine 14.1.1.8; `lab/kernel_probe.sh` prints the finding on any host, and `lab/preflight.sh` prints it as one `rtpengine_version` line, and [deploy.md](deploy.md#first-day-on-real-gear--an-ordered-runbook) step 0 makes reading it the stopping condition when `ng_subscribe` fails | read the version from the process, the package or rtpengine's CLI interface (`--listen-cli`) on the target host. **It cannot be asked over NG** — rtpengine has no NG `version` command, in this build or upstream (item 23). If the deployed build lacks `subscribe`, the ingest model needs an upgrade path first |
 | H3 | **rtpengine-side per-tap cost on the target metal** | the MSS-side cost is measured, and since item 57 the rtpengine side is on **Prometheus**: every health probe samples NG `statistics` and exports `mss_rtpengine_tap_kernel_verdict{node,verdict}`, `mss_rtpengine_relayed_packets_kernel`/`_user`, `mss_rtpengine_media_kernel`/`_userspace`/`_mixed`, `mss_rtpengine_transcoded_media`, `mss_rtpengine_sessions_live` and `mss_rtpengine_sample_age_seconds`, with `MssTapsFellOutOfKernel` watching them. `lab/kernel_probe.sh` plus the read-only checklist in architecture §8.1 is the second instrument, sequenced as [deploy.md](deploy.md#first-day-on-real-gear--an-ordered-runbook) step 3 | read the three moments — baseline / taps-with-transcode / taps-without-transcode — off the metrics first, then confirm on the real box with the shell probe (it sees `controlstatistics.proxies` and the per-interface blocks, which MSS does not model). This sets the rtpengine capacity plan. D14 is fixed (item 25), so a pod restart mid-probe no longer pollutes the numbers |
 | H4 | **End-to-end barge-in through the integrator's stack** | every MSS-owned hop is measured: consumer `SpeechReport` → bus → `StopPlayback` at **p50 3.5 ms** (item 5), and inline `Clear` → silence at the peer's ear at **p50 12.2 ms**, one ptime (item 35); [deploy.md](deploy.md#first-day-on-real-gear--an-ordered-runbook) step 6 says to measure the whole path while the inline leg is first bridged | the tail is theirs: their event consumer (H1) and their prompt player. Measure the whole path against their perceptual budget |
-| H5 | **The SIP proxy's B2B integration for inline legs** | `CreateSession{kind=INLINE, sdp_offer}` returns a real SDP answer and the leg speaks and listens on real sockets; a `group` seats it in a conference; [deploy.md](deploy.md#high-availability-what-is-adoptable-and-what-is-not) records that an inline leg does **not** survive a pod loss, so recovery is call-control's. **A worked example of the plumbing now exists in-repo:** `lab/sip_shim.py` is a minimal UAS that answers a SIP INVITE with an MSS inline leg, and `lab/fs_control_drill.sh` drives a real FreeSWITCH B2BUA into it with `bypass_media` — four FreeSWITCH channels, `_undef_` RTP counters on every one, two callers hearing each other through MSS (lab.md, 2026-08-29) | the same plumbing from **their** proxy or B2BUA, with the parts the shim does not do: registration and authentication against it, re-INVITE (refused by name today, P3-2), transfer and hold. The lifecycle rule that a lone party is hung up is call control's too — [fs-orchestrator](https://github.com/lazyboson/fs-orchestrator) is the worked example, one inbound event socket for the whole switch |
+| H5 | **The SIP proxy's B2B integration for inline legs** | `CreateSession{kind=INLINE, sdp_offer}` returns a real SDP answer and the leg speaks and listens on real sockets; a `group` seats it in a conference; [deploy.md](deploy.md#high-availability-what-is-adoptable-and-what-is-not) records that an inline leg does **not** survive a pod loss, so recovery is call-control's. **A worked example of the plumbing now exists in-repo:** `lab/sip_shim.py` is a minimal UAS that answers a SIP INVITE with an MSS inline leg, and `lab/fs_control_drill.sh` drives a real FreeSWITCH B2BUA into it with `bypass_media` — four FreeSWITCH channels, `_undef_` RTP counters on every one, two callers hearing each other through MSS (lab.md, 2026-08-29) | the same plumbing from **their** proxy or B2BUA. Since [item 59](#59-the-sip-front-door-transactions-dialogs-and-session-timers--done-2026-08-30) MSS answers SIP itself on `MSS_SIP_LISTEN`, so the shim is no longer the only route in and the parts it never did — transactions, dialogs, session timers, in-dialog BYE — are now the media plane's. Still theirs: registration and authentication, and a re-INVITE that **changes** the offer (refused 488, P3-2's media half), transfer and hold. The lifecycle rule that a lone party is hung up is call control's too — [fs-orchestrator](https://github.com/lazyboson/fs-orchestrator) is the worked example, one inbound event socket for the whole switch |
 | H6 | **FS byte-parity against real production recordings** | item 31 measured a live call recorded both ways: container, channel layout and rms agree exactly, and a re-aligned 2 s window agrees on 1.0000 of samples at mean diff 0.6/32768; [deploy.md](deploy.md#first-day-on-real-gear--an-ordered-runbook) step 4 walks the recording checks, frozen identity first. It also established that **byte-parity at a fixed offset is not an achievable bar** — the two recorders conceal independently, so the inter-file offset wanders | a **two-party** comparison on their FreeSWITCH, with their codec, their pause contract, and a human listen. The lab's write side plays silence, so only one channel was truly compared |
 | H7 | **Retiring the legacy media path** | the workloads are served: fan-out, recording, inline legs, conferences, monitor/whisper/barge | the tenant decision to turn the old media bugs off (`record_session`, the audio fork, the conference-per-AI-interaction dummy leg), and to decommission whatever gateway service they run today. Rollback stays config-only while both paths are installed |
 | H8 | **A pilot, a stability period and UX sign-off** | metrics on `MSS_METRICS_LISTEN` with alert rules in `deploy/`, a soak harness (`lab/soak.py`) and an impairment matrix, plus deployable manifests: `deploy/k8s/` with both network shapes, probes, a drain-safe grace period and a `ServiceMonitor`/`PrometheusRule` generated from those alert rules (item 46) | run flagged tenants for the agreed period; watch the conference defects D16/D20/D21/D22 in the field, and confirm that the integrator's control plane really passes the caller's from-tag — without it every tap is `attribution=unknown` and its tracks are `leg_a`/`leg_b` (item 47); get a human to judge audio quality, which no automated assertion in this repository claims to have done |

@@ -11,6 +11,9 @@ name = "mediaserverd"
 path = "src/main.rs"
 
 [dependencies]
+sip-uas = { path = "../sip-uas" }
+tonic = "0.14.6"
+rvoip-sip-core = "0.3.7"
 media-core = { path = "../media-core" }
 rtpengine-ng = { path = "../rtpengine-ng" }
 protocol = { path = "../protocol" }
