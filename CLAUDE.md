@@ -158,9 +158,28 @@ tone-per-phase assertions at a ≥30:1 margin. **Opus ingest** landed via the
 kernel-module readiness ships with `lab/kernel_probe.sh` plus the on-metal
 checklist in architecture §8.1 — including the verdict that rtpengine's
 *transcoder*, not its relay, under-produces Opus (50.0 pkt/s native against
-3.8 transcoded). Nothing here has met a **SIP** endpoint on an inline leg, and
-no measurement in this repository has been judged by a human ear. What remains
-is therefore deployment work rather than engineering: see **Integration
-handoffs (deployment-gated)** in [docs/tasks.md](docs/tasks.md) for the eight,
-and the open defects D11, D16, D17, D20, D21 and D22 for what to watch in a
-pilot. The Phase 3/4 work is on branch **`feat/m6-autonomous`**, pending review.
+3.8 transcoded).
+
+**The media plane answers SIP itself (2026-08-30, [item 59](docs/tasks.md)).**
+`crates/sip-uas` grew from a parser into a **UAS** — RFC 3261 §17 transactions
+with RFC 6026's `Accepted` state, RFC 3261 §12 dialogs, RFC 4028 session
+timers — written rather than adopted, for the reasons architecture §7 records.
+`MSS_SIP_LISTEN` puts it on a socket, calling the same `SessionController` the
+gRPC service does, so it is a second entrance onto the existing nouns and never
+a parallel implementation. Answer-only is unchanged: no registrar, no routing,
+no forking, no UAC. `lab/sip_shim.py` is what this replaces, and it keeps its
+job until the lab drills are pointed at the new port.
+
+Still true: **no datagram has yet come from a real FreeSWITCH, OpenSIPS or
+softphone** — the front door's tests construct their own, over real sockets
+against the real controller — and no measurement in this repository has been
+judged by a human ear. A re-INVITE whose offer *changes* is refused 488, because
+`session-core` has no renegotiation path; that is P3-2's media half and the only
+part of re-INVITE still open. What remains is otherwise deployment work rather
+than engineering: see **Integration handoffs (deployment-gated)** in
+[docs/tasks.md](docs/tasks.md) for the eight, and the open defects **D6** (`play
+media` from-tag semantics unmeasured) and **D8** (no real pod placement, which
+is what an inline leg's room affinity needs) for what to watch in a pilot —
+D11, D16, D17, D20, D21 and D22 all closed in items 47–57. The Phase 3/4 work is
+on branch **`feat/m6-autonomous`** and the SIP work on **`feat/sip-uas`**, both
+pending review.

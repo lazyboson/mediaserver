@@ -232,12 +232,17 @@ one ptime, as the pacer's flush promised. Owed now: a SIP/B2B leg, codecs other
 than PCMU/8 kHz, and the integrator's own consumer half of barge-in.
 
 Work:
-- Inline RTP endpoint mode: answer OpenSIPS B2B INVITEs
-  (`X-Conversation-ID` / `X-ccId` correlation, `ua_session_reply` via MI)
-  with MSS-owned SDP; per-pod addressable RTP (hostNetwork/port range).
-  **The SDP answer and the media path exist; the SIP/B2B side is the
-  integrator's, and an inline leg is deliberately not adoptable across pods —
-  unlike a tap, its socket dies with its pod, so recovery is call control's.**
+- Inline RTP endpoint mode: answer INVITEs with MSS-owned SDP; per-pod
+  addressable RTP (hostNetwork/port range).
+  **Both halves now exist. The SDP answer and the media path landed in Phase 3;
+  since 2026-08-30 ([item 59](tasks.md)) MSS also answers the SIP itself on
+  `MSS_SIP_LISTEN` — a UAS with transactions, dialogs and session timers — so a
+  B2BUA can bridge straight to it and no SIP element in front is required.
+  What is still the integrator's: registration and authentication, and a
+  re-INVITE that *changes* the offer, which is refused 488 because
+  `session-core` has no renegotiation path (P3-2's media half). An inline leg
+  remains deliberately not adoptable across pods — unlike a tap, its socket
+  dies with its pod, so recovery is call control's.**
 - Full-duplex sessions: caller audio to bot, streaming TTS from bot to
   caller through the playout pacer; barge-in cut-through in MSS.
 - Pre-agent AI calls routed by OpenSIPS straight to MSS — FreeSWITCH
