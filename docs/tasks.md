@@ -1,10 +1,78 @@
-# Tasks — what is done, what is next
+# Tasks — what is left, and the record of what is done
 
 Living work list. [roadmap.md](roadmap.md) holds the *why* and the phase exit
 criteria; this file holds the *what next*, ordered, with a definition of done
 for each item. Update it in the same PR that changes the state of an item.
 
-Status as of **2026-08-27**.
+Status as of **2026-08-30**.
+
+---
+
+## What is left — read this first
+
+Everything after this section is the **record** of work already finished, kept
+because the evidence in it is the reason each decision stands. This section is
+the only part that describes work not yet done. Items are `L*` for engineering
+in this repository, `P*` for proof that needs a lab box, and `H*` for what is
+blocked on a deployment.
+
+### L — engineering, in this repository
+
+| # | Item | Why it matters | Done when |
+| --- | --- | --- | --- |
+| **L1** | **Opus egress** (item **16d**, *"still genuinely later"*) | `crates/media-core/src/encode.rs` refuses it by name — *"opus output is not built yet"*. The `opus-ffi` encoder exists and nothing wires it to the consumer encode path or the playout pacer. Opus is **ingest-only**, so an Opus-only consumer cannot be served and an inline leg cannot answer an Opus-only offer — which is every WebRTC browser that does not also offer G.711 | a consumer attaching with `format=opus` receives decodable Opus, an inline leg answers an Opus-only offer, and a replay test asserts the round trip |
+| **L2** | **Renegotiation for a changed offer** (P3-2's media half) | The SIP half is closed — the transaction and the dialog run correctly — but `session-core` cannot produce a second answer, so a re-INVITE whose offer differs is refused **488**. Hold with a changed media description, attended transfer and codec change all land here. **A warm transfer *is* an attended transfer**, so this is a conference case, not a peripheral one | `session-core` re-answers an existing inline session, the front door returns it, and tests cover hold (`a=sendonly`), resume, and a codec change |
+| **L3** | **Pod placement and room affinity** (defect **D8**) | `owner_pod` is a config string and there is no scheduler. A room is one pod's mix thread, so whoever opens a leg must already know which pod owns the room — over gRPC *or* over the SIP front door. This is the one that bites a multi-pod pilot | something decides placement — an MSS-side lookup, or a contract the caller follows that is written down — and a two-pod drill seats two legs of one `group` on one pod without the caller choosing |
+| **L4** | **DTMF generation** | `media-core/src/dtmf.rs` decodes only. MSS detects RFC 4733 and cannot send a digit, so it cannot drive an external IVR | an RFC 4733 event train, three end retransmissions included, is generated on an inline leg and a replay test asserts it |
+| **L5** | **Front door: metrics, and TCP/TLS** | Answered and refused are counted in a struct and logged at shutdown only — nothing reaches `/metrics`, so a pilot cannot see the door. `Reliability::Reliable` is implemented and tested but only UDP is bound | `mss_sip_*` counters exported with alert rules in `deploy/`, and a TCP listener bound and drilled |
+| **L6** | **Codec breadth — G.722, G.729** | `Encoding` is `Pcmu \| Pcma \| L16 \| Opus`. G.722 is common on modern desk phones and G.729 on trunks | each decoded at ingest and encoded at egress, **adopted not written** (Article XI), with `cargo deny` clean |
+| **L7** | **SRTP/DTLS in-process — decide, then build or close** | rtpengine terminates crypto at the edge today, which is right for the reference deployment. It is only needed if an inline leg must face a WebRTC endpoint with no rtpengine in front | either recorded in architecture §7 as a permanent non-goal, or built behind an FFI wrapper crate |
+| **L8** | **Conference feature tail** | Not built (Appendix B.2): member enumeration, room lock, moderator roles, floor control, per-member volume and energy thresholds. The matrix already carries a per-pair Q12 gain, so per-member volume is one metadata verb away | each is either a mix-matrix cell named by metadata, or recorded in Appendix B.2 as the controller's job |
+| **L9** | **AGC, DC filter, echo cancellation** | `mss_conference_clipped_samples_total` is the signal that a room wants AGC; nothing acts on it | decided, and if built then adopted per Article XI rather than hand-rolled |
+| **L10** | **D6 — `play media` from-tag semantics are unmeasured** | architecture §6's claim was retracted after the instrument turned out to be broken, and §6 must not be trusted until it is re-probed | re-probed on a live call and §6 either restored or corrected |
+| **L11** | **eBPF tap ingest — decide, do not build** (item **18**) | The open question is whether RTP can be mirrored to MSS by an eBPF program on the rtpengine host instead of NG `subscribe`. It is gated on a measurement nobody has taken: the userspace copy cost a `subscribe` imposes on the rtpengine host (handoff **H3**) | the measurement exists and item 18 records a decision — build, or close it as a non-goal |
+| **L12** | **TLS options** (item **52**, ⏸ parked) | Built and verified on branch `feat/tls-options` — tonic TLS and mTLS on the gRPC port, rskafka TLS/SASL, a TLS-capable Redis client, redacted URLs — and deliberately kept off `main` because the first deployment runs every hop inside one cluster. The security posture until then is network policy | a hop leaves the cluster, and the branch is rebased and merged. **The SIP front door is a new hop with the same question**, and it has no TLS at all (see L5) |
+| **L13** | **Spill journal retention** (item 30 / **D9**'s residual) | Skipped and failed spill journals stay on disk until an operator removes them; nothing expires them, so a pod that fails uploads repeatedly fills its spill volume | a retention rule exists and is documented in deploy.md, or the growth is bounded and alerted |
+
+### P — proof, needs a lab box
+
+| # | Item | Why it matters | Done when |
+| --- | --- | --- | --- |
+| **P1** | **Retire `lab/sip_shim.py`** | The front door does strictly more than the shim, but **no datagram from a real FreeSWITCH has ever reached it** — every test constructs its own. The shim is still the only proven path and both drills still reference it | `lab/fs_control_drill.sh` and `lab/fsless_call_drill.sh` point at `MSS_SIP_LISTEN`, the drill is green with the same assertions as the 2026-08-29 run, then `sip_shim.py` and `docker-compose.shim.yml` are deleted and `lab.md` records the run |
+| **P2** | **A live run of the conference member verbs** | `deaf`, `hold` and the coach shape (`mix_source=leg`) have item 40's in-process socket tests only — item 41's real-socket drill covers minus-self, monitor, whisper, barge and mute, and says so | the three-peer drill grows phases for deaf, hold and coach, green at the same margin |
+| **P3** | **A human listens** | **No measurement in this repository has been judged by ear.** Every assertion is a tone at a ratio; tones cannot hear distortion, clipping artefacts or a mix that is technically correct and unpleasant | somebody listens to a recorded conference and an inline leg and says whether it sounds right |
+| **P4** | **The filesystem recording store, on a live call** | Item 58's residual: `MSS_RECORDING_STORE=filesystem` is unit-verified on a temp directory, and the lab drill never ran because there was no Docker daemon on the machine | a live call recorded to a mounted tree, with a `file://` `UploadCompleted` seen on the bus |
+
+### Deliberate non-goals — these are not debt
+
+Recorded here so they stop being re-proposed. Each is a boundary the design
+picked on purpose, with the reason.
+
+- **No UAC.** MSS answers and never dials: no originate, no BYE, no
+  transfer initiation. An expired session timer ends the media and sends no
+  BYE, because tearing down a dialog is call control's.
+- **No registrar, no proxy, no routing, no forking.** A media server needs a
+  fraction of a proxy; the rest belongs to OpenSIPS or the integrator's stack.
+- **No video.** `m=video` is refused by name as `NonAudioMedia`.
+- **No in-band DTMF menus and no automatic enter/exit sounds.** Conference
+  control is API-first; MSS hands over digits and interprets none, and
+  play-into-room is a verb rather than a trigger (Appendix B.2).
+- **No cross-pod rooms, no multi-rate rooms.** A room is one pod's mix thread
+  at one rate and one ptime, capped at 32 members.
+- **No IVR, dialplan or scripting.** The state machine is the controller's; MSS
+  provides the primitives it calls.
+
+### H — blocked on a deployment
+
+Eight items, unchanged in shape and listed in full under **Integration handoffs
+(deployment-gated)** below. None of them can be closed from a lab. Two more
+buckets of externally-blocked work sit further down and are open too:
+**Waiting on other people (M2 close-out)** — the deployed rtpengine version, the
+rtpengine-side per-tap cost, and one `cachedb_redis` config block on somebody
+else's proxy — and **item 1**, the the legacy controller event translator, which is written and
+awaiting review and merge on their side.
+
+---
 
 ## Milestones
 
@@ -68,7 +136,9 @@ Status as of **2026-08-27**.
   (a **native** Opus call, libopus in the endpoints, so rtpengine transcodes
   nothing).
 
-## Next up — ordered
+## The record, items 1–9 — the original next-up list
+
+All of these are finished; the open list is **What is left** above.
 
 ### 1. the legacy controller event translator — ✅ WRITTEN, awaiting review and merge
 **State (2026-08-17):** implemented on the the legacy controller branch
@@ -276,7 +346,9 @@ vendors we know about.
 **Done when:** a consumer can request Opus and get it, verified by replay,
 with the build documented in CI and the Dockerfile.
 
-## The road from here — ordered handoff
+## The record, items 10–59 — everything since
+
+All of these are finished; the open list is **What is left** above.
 
 Items 1–9 above are M4 history; this section is the executable plan for
 whoever picks the project up next (human or AI session — it assumes no
