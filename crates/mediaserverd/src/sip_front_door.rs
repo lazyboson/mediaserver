@@ -1,3 +1,4 @@
+use call_events::{CallEvent, CallEventSink, EventKind};
 use control_api::proto;
 use control_api::proto::media_control_server::MediaControl;
 use control_api::SessionController;
@@ -41,6 +42,8 @@ impl FrontDoorConfig {
 
 struct DialogSession {
     external_id: String,
+    group: String,
+    from: String,
     sdp_offer: String,
     sdp_answer: String,
 }
@@ -48,6 +51,8 @@ struct DialogSession {
 struct PendingInvite {
     request: Box<SipRequest>,
     external_id: String,
+    group: String,
+    from: String,
     timer: SessionTimer,
     local_tag: String,
 }
@@ -70,13 +75,18 @@ pub struct FrontDoor {
     dialogs: Dialogs,
     pending: HashMap<TransactionKey, PendingInvite>,
     sessions: HashMap<DialogId, DialogSession>,
+    call_events: Option<Arc<dyn CallEventSink>>,
     tags_issued: u64,
     answered_calls: u64,
     refused_calls: u64,
 }
 
 impl FrontDoor {
-    pub fn new(config: FrontDoorConfig, controller: Arc<SessionController>) -> Self {
+    pub fn new(
+        config: FrontDoorConfig,
+        controller: Arc<SessionController>,
+        call_events: Option<Arc<dyn CallEventSink>>,
+    ) -> Self {
         let policy = config.session_timers;
         FrontDoor {
             config,
@@ -85,6 +95,7 @@ impl FrontDoor {
             dialogs: Dialogs::new(policy),
             pending: HashMap::new(),
             sessions: HashMap::new(),
+            call_events,
             tags_issued: 0,
             answered_calls: 0,
             refused_calls: 0,
@@ -102,6 +113,18 @@ impl FrontDoor {
             .map(|id| id.to_string())
             .unwrap_or_else(|| "unknown".to_string());
         format!("sip-{call_id}")
+    }
+
+    fn publish_call_event(&self, kind: EventKind, external_id: String, group: String, from: String) {
+        let Some(sink) = &self.call_events else {
+            return;
+        };
+        sink.publish(CallEvent {
+            kind,
+            external_id,
+            group,
+            from,
+        });
     }
 
     fn answer_with_sdp(
@@ -161,10 +184,18 @@ fn session_ref(external_id: &str) -> proto::SessionRef {
     }
 }
 
+fn from_user(request: &SipRequest) -> String {
+    request
+        .from()
+        .and_then(|from| from.address().uri.user.clone())
+        .unwrap_or_default()
+}
+
 pub async fn serve<Shutdown>(
     config: FrontDoorConfig,
     controller: Arc<SessionController>,
     shutdown: Shutdown,
+    call_events: Option<Arc<dyn CallEventSink>>,
 ) where
     Shutdown: std::future::Future<Output = ()> + Send,
 {
@@ -175,7 +206,7 @@ pub async fn serve<Shutdown>(
             return;
         }
     };
-    serve_on(socket, config, controller, shutdown).await;
+    serve_on(socket, config, controller, shutdown, call_events).await;
 }
 
 pub async fn serve_on<Shutdown>(
@@ -183,6 +214,7 @@ pub async fn serve_on<Shutdown>(
     config: FrontDoorConfig,
     controller: Arc<SessionController>,
     shutdown: Shutdown,
+    call_events: Option<Arc<dyn CallEventSink>>,
 ) where
     Shutdown: std::future::Future<Output = ()> + Send,
 {
@@ -193,7 +225,7 @@ pub async fn serve_on<Shutdown>(
         "the sip front door is answering INVITEs; the dialled user part is the group"
     );
 
-    let mut door = FrontDoor::new(config, controller);
+    let mut door = FrontDoor::new(config, controller, call_events);
     let (completions, mut completed) = mpsc::channel::<Completion>(COMPLETION_QUEUE);
     let started = Instant::now();
     let mut datagram = vec![0u8; DATAGRAM_CEILING];
@@ -249,6 +281,12 @@ pub async fn serve_on<Shutdown>(
                             call_id = id.call_id(),
                             external_id = session.external_id,
                             "the session timer ran out with no refresh; ending the media session"
+                        );
+                        door.publish_call_event(
+                            EventKind::Ended,
+                            session.external_id.clone(),
+                            session.group.clone(),
+                            session.from.clone(),
                         );
                         destroy(&door, session.external_id, &completions);
                     }
@@ -331,6 +369,12 @@ async fn run(
                             "no ACK ever arrived; ending the media session rather than leaking it"
                         );
                         door.dialogs.end(&id);
+                        door.publish_call_event(
+                            EventKind::Ended,
+                            session.external_id.clone(),
+                            session.group.clone(),
+                            session.from.clone(),
+                        );
                         destroy(door, session.external_id, completions);
                     }
                 } else if let Some(pending) = door.pending.remove(&key) {
@@ -365,6 +409,12 @@ async fn admit(
         Classification::InDialog { id, method } => match method {
             Method::Bye => {
                 if let Some(session) = door.sessions.remove(&id) {
+                    door.publish_call_event(
+                        EventKind::Ended,
+                        session.external_id.clone(),
+                        session.group.clone(),
+                        session.from.clone(),
+                    );
                     destroy(door, session.external_id, completions);
                 }
                 door.dialogs.end(&id);
@@ -417,6 +467,7 @@ async fn open_session(
             .unwrap_or_default();
     }
     let group = request.uri().user.clone().unwrap_or_default();
+    let from = from_user(&request);
     let offer = String::from_utf8_lossy(request.body()).to_string();
     if offer.trim().is_empty() {
         door.refused_calls += 1;
@@ -441,6 +492,8 @@ async fn open_session(
         PendingInvite {
             request: Box::new(request),
             external_id: external_id.clone(),
+            group: group.clone(),
+            from,
             timer,
             local_tag,
         },
@@ -521,6 +574,8 @@ async fn finish(door: &mut FrontDoor, socket: &UdpSocket, completion: Completion
                             id,
                             DialogSession {
                                 external_id: pending.external_id.clone(),
+                                group: pending.group.clone(),
+                                from: pending.from.clone(),
                                 sdp_offer: String::from_utf8_lossy(pending.request.body())
                                     .to_string(),
                                 sdp_answer,
@@ -528,6 +583,12 @@ async fn finish(door: &mut FrontDoor, socket: &UdpSocket, completion: Completion
                         );
                     }
                     door.answered_calls += 1;
+                    door.publish_call_event(
+                        EventKind::Answered,
+                        pending.external_id.clone(),
+                        pending.group.clone(),
+                        pending.from.clone(),
+                    );
                     response
                 }
                 Ok(_) => {
@@ -565,6 +626,7 @@ async fn finish(door: &mut FrontDoor, socket: &UdpSocket, completion: Completion
 #[cfg(test)]
 mod tests {
     use super::*;
+    use call_events::RecordingSink;
     use control_api::controller::{MediaPlane, MediaPlaneError, OpenedSession, PlaybackSource};
     use session_core::{AttachmentId, AttachmentView, PlaybackId, SessionId, SessionView};
 
@@ -669,6 +731,10 @@ a=ptime:20\r\na=sendrecv\r\n";
     }
 
     async fn door_and_caller() -> Caller {
+        door_and_caller_publishing(None).await
+    }
+
+    async fn door_and_caller_publishing(call_events: Option<Arc<dyn CallEventSink>>) -> Caller {
         let socket = UdpSocket::bind("127.0.0.1:0").await.expect("a door socket");
         let listen = socket.local_addr().expect("a bound address");
         let controller = Arc::new(
@@ -687,6 +753,7 @@ a=ptime:20\r\na=sendrecv\r\n";
             config,
             controller,
             std::future::pending::<()>(),
+            call_events,
         ));
         let caller = UdpSocket::bind("127.0.0.1:0")
             .await
@@ -799,6 +866,33 @@ Content-Length: {}\r\n\r\n{}",
             closed.starts_with("SIP/2.0 200 OK"),
             "bye answered: {closed}"
         );
+    }
+
+    #[tokio::test]
+    async fn an_answered_invite_then_bye_is_published_on_the_call_event_sink() {
+        let sink = Arc::new(RecordingSink::default());
+        let caller = door_and_caller_publishing(Some(sink.clone())).await;
+        caller
+            .say(message("INVITE", "z9hG4bK-1", "call-1", 1, None, "", OFFER))
+            .await;
+        let answer = caller.hear_final().await;
+        let tag = to_tag_of(&answer);
+        caller
+            .say(message("ACK", "z9hG4bK-2", "call-1", 1, Some(&tag), "", ""))
+            .await;
+        caller
+            .say(message("BYE", "z9hG4bK-3", "call-1", 2, Some(&tag), "", ""))
+            .await;
+        let closed = caller.hear_final().await;
+        assert!(closed.starts_with("SIP/2.0 200 OK"), "bye answered: {closed}");
+        let events = sink.snapshot();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].kind, call_events::EventKind::Answered);
+        assert_eq!(events[0].external_id, "sip-call-1");
+        assert_eq!(events[0].group, "7200");
+        assert_eq!(events[0].from, "caller");
+        assert_eq!(events[1].kind, call_events::EventKind::Ended);
+        assert_eq!(events[1].external_id, "sip-call-1");
     }
 
     #[tokio::test]

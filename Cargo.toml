@@ -8,6 +8,7 @@ members = [
     "crates/session-core",
     "crates/control-api",
     "crates/sip-uas",
+    "crates/call-events",
     "crates/mediaserverd",
 ]
 
