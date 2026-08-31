@@ -221,6 +221,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "call-events"
+version = "0.1.0"
+dependencies = [
+ "redis",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "cast"
 version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1312,6 +1324,7 @@ name = "mediaserverd"
 version = "0.1.0"
 dependencies = [
  "base64 0.23.1",
+ "call-events",
  "chrono",
  "control-api",
  "crossbeam-queue",

@@ -638,6 +638,25 @@ async fn serve_control_plane(
          no timer of its own"
     );
 
+    let call_events = match call_events::sink_from_env().await {
+        Ok(sink) => {
+            if sink.is_some() {
+                info!(
+                    stream_env = call_events::STREAM_ENV,
+                    "sip answer and bye are published on the call-event redis stream"
+                );
+            }
+            sink
+        }
+        Err(error) => {
+            error!(
+                %error,
+                "the call-event redis stream was configured and could not be reached; refusing to start"
+            );
+            return;
+        }
+    };
+
     match sip_listen_address() {
         Some(Ok(sip_listen)) => match sip_advertised_address(sip_listen) {
             Ok(advertised) => {
@@ -655,6 +674,7 @@ async fn serve_control_plane(
                     async move {
                         let _ = until_door_drains.wait_for(|draining| *draining).await;
                     },
+                    call_events,
                 ));
             }
             Err(configured) => {

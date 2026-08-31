@@ -4307,14 +4307,36 @@ and the dialog store (`next_deadline()`), capped by a 250 ms idle tick.
 | in-dialog request naming an unknown dialog | 481 |
 | anything unparsable | nothing at all |
 
-**Verified over real UDP sockets against the real `SessionController`** (ten
+**Verified over real UDP sockets against the real `SessionController`** (eleven
 tests, a fake `MediaPlane` supplying the SDP answer): the 100 then the 200
 carrying the plane's own SDP, two calls getting different To tags, BYE closing
 the leg, 481 for an unknown dialog, 422 below the floor, the negotiated
 `Session-Expires` and `Require: timer` on the answer, a refreshing re-INVITE
-answered and a changed one refused, OPTIONS, and four hostile datagrams followed
-by a call that still gets answered.
+answered and a changed one refused, OPTIONS, four hostile datagrams followed
+by a call that still gets answered, and a `call-events::RecordingSink` seeing
+`answered` then `ended` with `externalId=sip-<Call-ID>`, `group` = R-URI user,
+and `from` = From user.
 
 **Not yet done here:** no metrics are exported for the door (answered and
 refused are counted in the struct and logged at shutdown only), it is UDP only,
 and nothing in `deploy/` opens the port.
+
+## crates/call-events — SIP answer/BYE onto a Redis stream (stopgap)
+
+Call-control (agentswarm-voice) needs to hear SIP 200 and BYE without standing
+up Kafka. This crate is that publisher and nothing else: a `CallEventSink` trait,
+a Redis `XADD` implementation, and an in-memory `RecordingSink` for tests. The
+SIP front door holds `Option<Arc<dyn CallEventSink>>`. `mediaserverd` constructs
+it by default (`mss:call-events`) when Redis is configured (`sink_from_env`);
+Redis URL is `MSS_CALL_EVENT_REDIS_URL` or `MSS_REDIS_URL`. An empty
+`MSS_CALL_EVENT_STREAM` turns it off. The publish is fire-and-forget on a
+spawned task so the SIP socket is never stalled (Article I). Payload field
+names match the consumer: `kind` (`answered`/`ended`), `externalId`, `group`,
+`from`.
+
+**How to delete it.** Set `MSS_CALL_EVENT_STREAM` to empty. Then drop the
+workspace member, the `mediaserverd` dependency, the `call_events` argument on
+`sip_front_door::serve`, and the two env rows in deploy.md. Kafka `mss.events`
+does not yet carry a SessionOpened; that is the real replacement, not this
+crate growing a Kafka transport.
+
