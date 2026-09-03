@@ -132,7 +132,9 @@ can be neutralised in a ConfigMap without deleting it.
 | `MSS_CONTROL_LISTEN` | unset | `ip:port` for `MediaControl`, the `TelCompat` façade and the gRPC `MediaStream` data plane — **all three on one port**. Unset means the daemon starts, probes rtpengine and serves nothing ("idling"). A malformed value is refused at startup | always set it; `0.0.0.0:50051` in the manifests | M4 |
 | `MSS_METRICS_LISTEN` | unset | `ip:port` for `/metrics`, `/healthz` and `/readyz`. Unset means counters stay in the logs and the pod's probes have nothing to talk to. A bind failure here **refuses to start**, on purpose | always set it; `0.0.0.0:9464` in the manifests | M4 / [item 44](tasks.md) |
 | `MSS_SIP_LISTEN` | unset | `ip:port` the **SIP front door** answers INVITEs on (UDP). Unset means the door stays shut and inline legs arrive over the control API only, exactly as before. A malformed value is refused at startup | `0.0.0.0:5080` where a B2BUA bridges to MSS. **This is the one port a stranger can address**, so firewall it to the signalling elements that should reach it | [architecture §7](architecture.md) |
-| `MSS_SIP_ADVERTISE` | `MSS_SIP_LISTEN` | `ip:port` put in the `Contact` of every answer — where the peer sends its ACK and BYE. Defaults to the listen address, which is wrong behind NAT or a service IP | set it to the address the *peer* can reach when the pod's listen address is not routable from there | [architecture §7](architecture.md) |
+| `MSS_SIP_ADVERTISE` | `MSS_SIP_LISTEN` | `ip:port` put in the `Contact` of every answer and in the `Via` of the one request MSS sends, the in-dialog BYE — where the peer sends its ACK and BYE. Defaults to the listen address, which is wrong behind NAT or a service IP | set it to the address the *peer* can reach when the pod's listen address is not routable from there | [architecture §7](architecture.md) |
+| `MSS_SIP_ANSWER_MODE` | `immediate` | `immediate` answers every INVITE with 200 + SDP as soon as the media plane has a leg — today's behaviour, unchanged. `parked` sends 100 then **180 Ringing**, publishes `invited` on the call-event stream and waits for `AnswerSession` before the 200. An unrecognised value is refused at startup | `parked` when an external orchestrator owns the decision to answer — and it must be running, or every call rings until the park timeout | [item 60](tasks.md) |
+| `MSS_SIP_PARK_TIMEOUT_MS` | `60000` | Parked mode only: how long a call may sit at 180 with nobody calling `AnswerSession`. On expiry the door replies **480 Temporarily Unavailable**, publishes `ended` and ends the leg. `0` disables the timeout entirely, so a parked call rings until the caller gives up or `HangupSession` arrives. A non-numeric value is refused at startup | shorten it if your orchestrator is meant to answer fast and you would rather fail a call than ring forever; `0` only when something else is guaranteed to decide | [item 60](tasks.md) |
 | `MSS_AUTH_TOKEN` | unset | Bearer token every control- and data-plane caller must present. **Unset or empty = unauthenticated callers are accepted**, with a warning in the log | always set it, from a Secret | M4 |
 | `MSS_POD_NAME` | `mediaserverd` | The registry lease owner. Left at the default, every pod calls itself the same thing and adoption cannot tell them apart | never by hand — the manifests take it from `metadata.name` | M4 |
 | `RUST_LOG` | `info` | `tracing-subscriber` EnvFilter. Logs are JSON either way | `debug` while chasing something; per-module targets are cheaper than global debug | — |
@@ -162,7 +164,7 @@ can be neutralised in a ConfigMap without deleting it.
 | `MSS_DISCOVERY_REDIS_KEY_PREFIX` | unset (= off) | Turns on the **rtpengine node discovery map** below. When set, a `CreateSession` that names no `rtpengine_node` reads `<prefix><SIP Call-ID>` from Redis before falling back to `MSS_RTPENGINE_NODE`. One `GET` per create, nothing cached | set it once your proxy publishes the map; leave it unset and every session uses the default node | [item 50](tasks.md) |
 | `MSS_DISCOVERY_REDIS_URL` | unset (= `MSS_REDIS_URL`) | A **separate** Redis for the discovery map, for when the proxy publishes into its own instance. Unreachable at startup = discovery is switched off with a WARN, never a refusal to start | when the proxy's Redis is not the registry's. If neither this nor `MSS_REDIS_URL` is set, the prefix is ignored with a WARN | [item 50](tasks.md) |
 | `MSS_KAFKA_BROKERS` | unset | Comma-separated bootstrap brokers for `MediaEvent`. Unset = events stay in-process, so nothing downstream sees them. Set but naming no broker, or unreachable = **refuse to start** | always set it once anything consumes events | M4 |
-| `MSS_CALL_EVENT_STREAM` | `mss:call-events` | Redis stream name the SIP front door `XADD`s `answered`/`ended` JSON onto (`externalId`, `group` = dialled user, `from`). **On by default.** An empty value turns the publisher off. A configured Redis that is unreachable = **refuse to start**. No Redis URL at all = idle with a warning | empty string when call-control reads `mss.events`, then delete the crate | stopgap |
+| `MSS_CALL_EVENT_STREAM` | `mss:call-events` | Redis stream name the SIP front door `XADD`s its call-control JSON onto — `invited`, `answered`, `end_of_interaction` and `ended`, each with `externalId`, `group` = dialled user, `from`, and `reason` where there is one. **On by default.** An empty value turns the publisher off. A configured Redis that is unreachable = **refuse to start**. No Redis URL at all = idle with a warning. See [Call control over the event stream](#call-control-over-the-event-stream) | empty string when call-control reads `mss.events`, then delete the crate | stopgap |
 | `MSS_CALL_EVENT_REDIS_URL` | unset (= `MSS_REDIS_URL`) | Redis for that stream if it is not the session-registry instance | when call-control's Redis is separate from HA leases | stopgap |
 | `MSS_EVENTS_TOPIC` | `mss.events` | The topic events are published to | a per-environment topic name | M4 |
 | `MSS_EVENTS_PARTITIONS` | `4` | Partition count used when the topic has to be created. Events are keyed by `external_id`, so per-session order survives any partition count | more partitions for more consumer parallelism | M4 |
@@ -505,6 +507,62 @@ from-tags** tapped 1192 datagrams in 12 s with `attribution=explicit` and
 **refused** on the black-hole default (`no reply from rtpengine at
 172.31.99.199:22222 after 3 attempts`) rather than guessing; the BYE removed the
 key.
+
+## Call control over the event stream
+
+The SIP front door is the SIP endpoint; **the decision to answer and the
+decision to hang up can live outside this process.** An orchestrator that reads
+Redis stream `MSS_CALL_EVENT_STREAM` and calls `MediaControl` over gRPC drives
+the call, and MSS carries no call policy of its own. That is what
+`MSS_SIP_ANSWER_MODE=parked` turns on.
+
+Every entry on the stream is one field, `event`, holding JSON. `kind` names it:
+
+| Event out | When | Command back in |
+| --- | --- | --- |
+| `invited` | an INVITE was accepted into the parked state, after 100 Trying and 180 Ringing went out. **Parked mode only** | `AnswerSession(SessionRef)` to send the 200, or `HangupSession` to refuse it 480 |
+| `answered` | the 200 OK with SDP has been sent. Both modes | — |
+| `end_of_interaction` | the session's **authoritative** attachment reported `EndOfInteraction` — the voice-AI agent saying it is finished. `reason` is the report's own reason and may be absent. Published **once per session**, and MSS tears nothing down on it | `HangupSession(session, reason)` — this is the pairing that stops a caller sitting in silence after the agent's farewell |
+| `ended` | the leg is gone: the caller's BYE, a session-timer expiry, a CANCEL, an answer nobody acknowledged, a park timeout, or a `HangupSession` of your own | — |
+
+```json
+{"kind":"invited","externalId":"sip-<Call-ID>","group":"7200","from":"1001"}
+{"kind":"answered","externalId":"sip-<Call-ID>","group":"7200","from":"1001"}
+{"kind":"end_of_interaction","externalId":"sip-<Call-ID>","group":"7200","from":"1001","reason":"the caller said goodbye"}
+{"kind":"ended","externalId":"sip-<Call-ID>","group":"7200","from":"1001"}
+```
+
+`reason` is omitted when it is empty, so `answered` and `ended` are byte-for-byte
+what they were before this section existed — an existing consumer that parses
+only `answered` and `ended` keeps working, and must ignore kinds it does not know.
+
+**Both commands are idempotent, and both address the session the way every other
+RPC does** (`external_id` = `sip-<Call-ID>`, or the `session_id` from the
+`Session` message):
+
+- `AnswerSession` on an already-answered session returns that session unchanged.
+  On a session the front door does not hold — one created over gRPC, or a tap —
+  it is `FAILED_PRECONDITION`. On an unknown one, `NOT_FOUND`.
+- `HangupSession` sends an in-dialog **BYE** on an answered dialog and replies
+  **480** to a parked INVITE that was never answered. Either way the media
+  session ends immediately and `ended` is published; the BYE is retransmitted on
+  the RFC 3261 timers until the peer answers it or Timer F gives up at 64×T1, and
+  the call does not wait for that. A hangup of a call that is already gone is
+  `OK`, not an error, so a retry after a timeout is safe.
+- `SessionEnded` on Kafka `mss.events` carries the `reason` you passed, so an
+  orchestrated hangup is distinguishable from a caller's own BYE. An empty
+  `reason` becomes `hangup requested`.
+
+**In parked mode the media session exists before the answer.** MSS allocates the
+RTP port and builds the SDP answer when the INVITE arrives, so `AnswerSession`
+costs one datagram, and an orchestrator may `Attach` the voice-AI bridge — or
+anything else — while the call is still ringing. This is the seam an IVR between
+"invited" and "answered" will run in.
+
+**If nothing is listening, parked mode rings.** A deployment that sets
+`parked` without an orchestrator gets 180 on every call until
+`MSS_SIP_PARK_TIMEOUT_MS` runs out and each one is refused 480. Leave the
+variable at `immediate` until the orchestrator is deployed.
 
 ## Digit menus — drive them from the event bus
 

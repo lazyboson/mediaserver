@@ -4176,6 +4176,9 @@ the guidelines already impose on pacing.
 | Timer I — absorb ACK retransmissions | `absorb_until` on a `Confirmed` invite |
 | Timer J — absorb request retransmissions | `absorb_until` on a `Completed` non-invite |
 | Timer L (RFC 6026) — the `Accepted` state | `give_up_at` on an `Accepted` invite |
+| Timer E — retransmit a client request | `retransmit_at` on a `PlainClient` |
+| Timer F — give up on a client request | `give_up_at` on a `PlainClient` |
+| Timer K — absorb retransmitted final responses | `absorb_until` on a `PlainClient` |
 
 **Three decisions worth knowing.**
 
@@ -4198,6 +4201,45 @@ the guidelines already impose on pacing.
    the 487 itself. That is RFC 3261 §9.2's division of labour. The 100 Trying
    on an INVITE is automatic for the same reason.
 
+**The one client transaction, added 2026-09-03 ([item 60](tasks.md)).**
+`client.rs` is the RFC 3261 §17.1.2 **non-INVITE client** state machine and
+nothing else — trying / proceeding / completed, Timer E doubling to T2, Timer F
+at 64×T1, Timer K absorbing a retransmitted final response so the application
+sees one. `ClientTransactions::begin` **refuses `Method::Invite` by name**
+(`BeginError::InviteIsNotOurs`), so "MSS never dials" is a type-level property
+of the crate and not a convention:
+`the_media_plane_refuses_to_open_an_invite_client_transaction`. The same
+`Action`/`Event` vocabulary carries both directions; `Event` gained
+`Response` and `TimedOut`, and `Event::Request` gained the peer's source
+address, because a request MSS *sends* needs somewhere to send it and the
+transaction layer already knew where the request came from.
+
+`Dialogs::in_dialog_request(id, method, via_sent_by, branch)` builds it from
+dialog state: our tag becomes the `From` tag and the peer's the `To` tag (the
+reverse of the answer), the request-URI is the remote target, and the local CSeq
+is seeded from the INVITE's so the BYE is visibly `CSeq: N+1` rather than
+restarting at 1 in a sequence space the peer shares nothing with. Routing
+follows §12.2.1.1 both ways: a loose route set (`;lr`) becomes `Route` headers in
+the dialog's order with the remote target left in the request-URI, and a **strict**
+route set puts the first route in the request-URI and appends the remote target
+to the end — `a_strict_route_set_puts_the_first_route_in_the_request_uri_and_the_target_last`,
+because an SBC old enough to strict-route is exactly the peer this will meet
+first. There is deliberately no `Contact` on the BYE: it establishes nothing, and
+generating one would mean teaching a sans-IO crate the pod's advertised address.
+
+`rvoip-sip-core`'s builder needed one thing found by test rather than by reading:
+`TypedHeader::Other(HeaderName::Other("Route"), …)` is treated as a
+single-value header and **replaces** the previous one, so a two-hop route set
+silently became one hop. `HeaderName::Route` is on its appendable list and does
+the right thing. `a_loose_route_set_becomes_route_headers_and_leaves_the_request_uri_alone`
+is that lesson.
+
+`robustness.rs` now drives the mutated corpus at **both** layers — the sweep
+holds a live BYE client transaction so mutated responses reach the state machine
+rather than falling out of an empty map, and
+`the_client_layer_sees_the_mutated_responses_the_sweep_aims_at_it` fails if the
+corpus stops containing a response the layer matches.
+
 **What it does today**
 
 | | |
@@ -4217,6 +4259,8 @@ the guidelines already impose on pacing.
 | re-INVITE recognised as in-dialog, with the 500 + `Retry-After` for a second one | done |
 | session timers (RFC 4028) — negotiation, the 422 below Min-SE, expiry | done |
 | 481 for an in-dialog request naming a dialog that does not exist | done |
+| non-INVITE **client** transaction — trying / proceeding / completed, Timers E, F, K | done |
+| building an in-dialog request from dialog state, loose and strict routing | done |
 
 **What fixes what.** `lab/sip_shim.py` has a replay cache keyed on Call-ID and,
 in its own words, *"no timers"*. So it absorbs a retransmission correctly and
@@ -4248,9 +4292,11 @@ is that defect written as a test.
 
 **What it does not do yet, in the order it matters**
 
-1. **No UAC, deliberately.** No client transactions, no forking, no registrar,
-   no ability to send a BYE or a re-INVITE. This is the boundary the design
-   picked, not an omission: a media plane answers.
+1. **No UAC beyond the BYE, deliberately.** One non-INVITE client transaction
+   exists so a dialog MSS is already in can be ended from this side. There is no
+   INVITE client transaction — `begin` refuses the method — and so no forking, no
+   registrar, no re-INVITE and no way to originate a call. This is the boundary
+   the design picked: a media plane answers, and it may hang up what it answered.
 2. **A changed offer still has no answer.** The transaction and the dialog run
    correctly; `session-core` cannot renegotiate the RTP session, so hold with a
    changed media description, attended transfer and codec change are refused
@@ -4292,7 +4338,14 @@ and the dialog store (`next_deadline()`), capped by a 250 ms idle tick.
 
 | what arrives | what the door does |
 | --- | --- |
-| INVITE, no To tag | negotiate the session timer, then `CreateSession{kind=INLINE, group=<dialled user part>}`; answer 200 with the media plane's SDP, our Contact and a per-call To tag |
+| INVITE, no To tag, `immediate` mode | negotiate the session timer, then `CreateSession{kind=INLINE, group=<dialled user part>}`; answer 200 with the media plane's SDP, our Contact and a per-call To tag |
+| INVITE, no To tag, `parked` mode | the same `CreateSession`, then **180 Ringing** with that To tag and Contact, `invited` on the call-event stream, and the invite waits |
+| `AnswerSession` on a parked call | 200 with the SDP answer the media plane already built, the dialog is confirmed, `answered` published |
+| `AnswerSession` on a call already answered | the session unchanged, no second 200, no second `answered` |
+| `HangupSession` on an answered dialog | an in-dialog **BYE** to the peer's remote target, the media session ended with the caller's reason, `ended` published |
+| `HangupSession` on a parked invite | **480 Temporarily Unavailable**, the media session ended, `ended` published |
+| no `AnswerSession` within `MSS_SIP_PARK_TIMEOUT_MS` | the same 480 and the same teardown, reason `the park timeout ran out before anyone answered` |
+| the authoritative attachment reports `EndOfInteraction` | `end_of_interaction` published once, with the report's reason. **Nothing is torn down** |
 | INVITE below Min-SE | 422 with `Min-SE`, and no session is created |
 | INVITE with no SDP | 488 by name |
 | re-INVITE, offer unchanged or absent | 200 with the same SDP answer, session timer refreshed |
@@ -4307,19 +4360,78 @@ and the dialog store (`next_deadline()`), capped by a 250 ms idle tick.
 | in-dialog request naming an unknown dialog | 481 |
 | anything unparsable | nothing at all |
 
-**Verified over real UDP sockets against the real `SessionController`** (eleven
-tests, a fake `MediaPlane` supplying the SDP answer): the 100 then the 200
-carrying the plane's own SDP, two calls getting different To tags, BYE closing
-the leg, 481 for an unknown dialog, 422 below the floor, the negotiated
-`Session-Expires` and `Require: timer` on the answer, a refreshing re-INVITE
-answered and a changed one refused, OPTIONS, four hostile datagrams followed
-by a call that still gets answered, and a `call-events::RecordingSink` seeing
-`answered` then `ended` with `externalId=sip-<Call-ID>`, `group` = R-URI user,
-and `from` = From user.
+**Park and hangup, and five decisions worth knowing (2026-09-03, [item 60](tasks.md)).**
 
-**Not yet done here:** no metrics are exported for the door (answered and
-refused are counted in the struct and logged at shutdown only), it is UDP only,
-and nothing in `deploy/` opens the port.
+1. **A parked call has a media session already.** `CreateSession` runs when the
+   INVITE arrives in *both* modes; parked mode holds back only the 200. So the
+   RTP port is allocated and the SDP answer is built before the phone stops
+   ringing, `AnswerSession` costs one datagram, and an orchestrator can `Attach`
+   the voice-AI bridge to a call that is still ringing — which is the seam the
+   IVR between "invited" and "answered" will need. The alternative, deferring
+   `CreateSession` to `AnswerSession`, would have made the session
+   unaddressable while parked: there would be nothing for `SessionRef` to name
+   and nothing to attach to.
+2. **The 180 carries the tag the 200 will reuse.** An early dialog needs a To tag
+   and a Contact, and changing the tag at the 200 would look like a different
+   dialog to the peer. `answer_session_sends_the_two_hundred_with_the_media_planes_sdp_and_publishes_answered`
+   asserts the two tags are equal.
+3. **Idempotency is answered where the fact lives, not by a second lookup.**
+   `AnswerSession` on a call whose dialog already exists returns without touching
+   the transaction. `HangupSession` remembers a hung-up `external_id` for 64×T1
+   (`terminating`) so a retry arriving while the BYE is still in flight, or while
+   the media teardown is still spawned, is `OK` rather than a
+   `FAILED_PRECONDITION` won by a race. A hangup of a call the registry has never
+   heard of is `OK` too — "already ended" and "never existed" are the same answer
+   to a caller retrying after a timeout, and `AnswerSession` is where `NOT_FOUND`
+   still means something.
+4. **The BYE goes to the address the INVITE came from, not to a resolved URI.**
+   The request-URI and `Route` set are built from the dialog per RFC 3261, but the
+   datagram is sent to the peer's observed source address. There is no resolver in
+   this process, and behind NAT the observed address is the *correct* answer where
+   a resolved Contact would not be. `DialogSession` keeps it.
+5. **The hangup does not wait for the peer to agree.** `HangupSession` returns as
+   soon as the BYE is on the wire; the media session and the registry entry are
+   gone at that moment and `ended` is published then. The client transaction keeps
+   retransmitting in the door's own loop until a final response or Timer F, and a
+   peer that never answers costs a log line, not a held session —
+   `a_bye_nobody_ever_answers_is_given_up_on_and_the_session_is_already_gone`.
+
+**One defect fixed on the way.** `Event::AckNeverArrived` used to look for the
+orphaned session by `external_id.ends_with(key.branch())` — an `sip-<Call-ID>`
+against a Via branch, which never matches — so the documented "at 64×T1 the media
+session is destroyed rather than leaked" was not what the code did for a call
+that *had* been answered: the session leaked. The door now keeps
+`invite_of: TransactionKey → external_id`, populated when the answer goes out, and
+`an_answered_call_whose_ack_never_arrives_ends_rather_than_leaking` is the test
+that was missing. `Timings` moved onto `FrontDoorConfig` so that test can run on a
+50 ms T1 instead of 32 s of wall clock; production passes `Timings::default()`.
+
+**Verified over real UDP sockets against the real `SessionController`** (thirty
+tests, a fake `MediaPlane` supplying the SDP answer). The eleven that were there
+before are unchanged and still pass, which is how `immediate` mode is pinned:
+the 100 then the 200 carrying the plane's own SDP, two calls getting different To
+tags, BYE closing the leg, 481 for an unknown dialog, 422 below the floor, the
+negotiated `Session-Expires` and `Require: timer` on the answer, a refreshing
+re-INVITE answered and a changed one refused, OPTIONS, four hostile datagrams
+followed by a call that still gets answered, and a `call-events::RecordingSink`
+seeing `answered` then `ended`. Added: 100 then 180 then `invited` with no
+`answered` behind it, `AnswerSession` sending the 200 and publishing `answered`,
+ACK and BYE on a parked-then-answered call, the park timeout's 480 and `ended`
+with no session left behind, `0` disabling that timeout, the BYE's request-URI,
+Call-ID, tags, CSeq and branch, a 200 to the BYE ending the transaction and
+silencing it, the BYE repeated until answered, `HangupSession` refusing a parked
+invite 480 without a BYE, answering twice answering once, hanging up twice
+sending one BYE, `NOT_FOUND` for an unknown session and `FAILED_PRECONDITION` for
+a gRPC-created tap, a hangup of a vanished call accepted, `end_of_interaction`
+published once for the authoritative attachment and never for a non-authoritative
+one, and `immediate_mode_neither_rings_nor_publishes_invited`.
+
+**Not yet done here:** no metrics are exported for the door (answered, refused
+and hangups are counted in the struct and logged at shutdown only), it is UDP
+only, and nothing in `deploy/` opens the port. The `end_of_interaction` publish
+rides the controller's `broadcast` of `MediaEvent`, so a door that falls 256
+events behind logs the lag and may miss one — the fix is the same Kafka
+consumption that retires `call-events` altogether.
 
 ## crates/call-events — SIP answer/BYE onto a Redis stream (stopgap)
 
@@ -4333,6 +4445,30 @@ Redis URL is `MSS_CALL_EVENT_REDIS_URL` or `MSS_REDIS_URL`. An empty
 spawned task so the SIP socket is never stalled (Article I). Payload field
 names match the consumer: `kind` (`answered`/`ended`), `externalId`, `group`,
 `from`.
+
+**Four kinds, not two (2026-09-03, [item 60](tasks.md)).** `invited` (parked
+mode, after 100 and 180) and `end_of_interaction` (the authoritative
+attachment's report, once per session) joined `answered` and `ended`, and
+`CallEvent` gained `reason`. Two things keep the old consumers working, and both
+are tests: `EventKind` still serialises `rename_all = "lowercase"` so
+`answered`/`ended` are unchanged, with `#[serde(rename = "end_of_interaction")]`
+on the one variant lowercase would render `endofinteraction`; and `reason` is
+`#[serde(default, skip_serializing_if = "String::is_empty")]`, so an event with
+no reason is byte-for-byte what it was and a record written before the field
+existed still parses.
+`answered_json_matches_the_call_control_contract`,
+`end_of_interaction_serialises_snake_cased_and_carries_its_reason`,
+`an_empty_reason_is_left_off_the_wire_so_the_old_kinds_are_unchanged`,
+`every_kind_round_trips_through_the_wire_form` and
+`a_record_written_before_reason_existed_still_parses` are that contract.
+`CallIdentity { external_id, group, from }` was extracted at the same time
+because the front door was passing those three strings through five call sites
+by hand; `identity.event(kind)` and `identity.event_because(kind, reason)` are
+the only ways an event is built now.
+
+The command side of these events is `AnswerSession` and `HangupSession` on
+`MediaControl` — see the front-door section above and
+[deploy.md](deploy.md#call-control-over-the-event-stream).
 
 **How to delete it.** Set `MSS_CALL_EVENT_STREAM` to empty. Then drop the
 workspace member, the `mediaserverd` dependency, the `call_events` argument on
