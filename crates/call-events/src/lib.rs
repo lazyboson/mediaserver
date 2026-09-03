@@ -13,7 +13,10 @@ pub const DEFAULT_STREAM: &str = "mss:call-events";
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum EventKind {
+    Invited,
     Answered,
+    #[serde(rename = "end_of_interaction")]
+    EndOfInteraction,
     Ended,
 }
 
@@ -26,6 +29,31 @@ pub struct CallEvent {
     pub group: String,
     #[serde(default)]
     pub from: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct CallIdentity {
+    pub external_id: String,
+    pub group: String,
+    pub from: String,
+}
+
+impl CallIdentity {
+    pub fn event(&self, kind: EventKind) -> CallEvent {
+        self.event_because(kind, String::new())
+    }
+
+    pub fn event_because(&self, kind: EventKind, reason: String) -> CallEvent {
+        CallEvent {
+            kind,
+            external_id: self.external_id.clone(),
+            group: self.group.clone(),
+            from: self.from.clone(),
+            reason,
+        }
+    }
 }
 
 pub trait CallEventSink: Send + Sync {
@@ -170,36 +198,91 @@ impl CallEventSink for RecordingSink {
 mod tests {
     use super::*;
 
-    #[test]
-    fn answered_json_matches_the_call_control_contract() {
-        let event = CallEvent {
-            kind: EventKind::Answered,
+    fn identity() -> CallIdentity {
+        CallIdentity {
             external_id: "sip-abc".into(),
             group: "7200".into(),
             from: "1001".into(),
-        };
-        let raw = serde_json::to_string(&event).unwrap();
+        }
+    }
+
+    fn json_of(event: &CallEvent) -> String {
+        serde_json::to_string(event).unwrap()
+    }
+
+    #[test]
+    fn answered_json_matches_the_call_control_contract() {
         assert_eq!(
-            raw,
+            json_of(&identity().event(EventKind::Answered)),
             r#"{"kind":"answered","externalId":"sip-abc","group":"7200","from":"1001"}"#
         );
     }
 
     #[test]
+    fn ended_json_matches_the_call_control_contract() {
+        assert_eq!(
+            json_of(&identity().event(EventKind::Ended)),
+            r#"{"kind":"ended","externalId":"sip-abc","group":"7200","from":"1001"}"#
+        );
+    }
+
+    #[test]
+    fn invited_is_the_parked_kind_and_serialises_lowercase() {
+        assert_eq!(
+            json_of(&identity().event(EventKind::Invited)),
+            r#"{"kind":"invited","externalId":"sip-abc","group":"7200","from":"1001"}"#
+        );
+    }
+
+    #[test]
+    fn end_of_interaction_serialises_snake_cased_and_carries_its_reason() {
+        assert_eq!(
+            json_of(&identity().event_because(
+                EventKind::EndOfInteraction,
+                "the caller said goodbye".into()
+            )),
+            r#"{"kind":"end_of_interaction","externalId":"sip-abc","group":"7200","from":"1001","reason":"the caller said goodbye"}"#
+        );
+    }
+
+    #[test]
+    fn an_empty_reason_is_left_off_the_wire_so_the_old_kinds_are_unchanged() {
+        let event = identity().event_because(EventKind::EndOfInteraction, String::new());
+        assert_eq!(
+            json_of(&event),
+            r#"{"kind":"end_of_interaction","externalId":"sip-abc","group":"7200","from":"1001"}"#
+        );
+    }
+
+    #[test]
+    fn every_kind_round_trips_through_the_wire_form() {
+        for kind in [
+            EventKind::Invited,
+            EventKind::Answered,
+            EventKind::EndOfInteraction,
+            EventKind::Ended,
+        ] {
+            let event = identity().event_because(kind, "because".into());
+            let parsed: CallEvent = serde_json::from_str(&json_of(&event)).unwrap();
+            assert_eq!(parsed, event, "{kind:?} did not survive the round trip");
+        }
+    }
+
+    #[test]
+    fn a_record_written_before_reason_existed_still_parses() {
+        let parsed: CallEvent = serde_json::from_str(
+            r#"{"kind":"ended","externalId":"sip-abc","group":"7200","from":"1001"}"#,
+        )
+        .unwrap();
+        assert_eq!(parsed, identity().event(EventKind::Ended));
+        assert!(parsed.reason.is_empty());
+    }
+
+    #[test]
     fn recording_sink_keeps_publish_order() {
         let sink = RecordingSink::default();
-        sink.publish(CallEvent {
-            kind: EventKind::Answered,
-            external_id: "sip-abc".into(),
-            group: "7200".into(),
-            from: String::new(),
-        });
-        sink.publish(CallEvent {
-            kind: EventKind::Ended,
-            external_id: "sip-abc".into(),
-            group: "7200".into(),
-            from: String::new(),
-        });
+        sink.publish(identity().event(EventKind::Answered));
+        sink.publish(identity().event(EventKind::Ended));
         assert_eq!(sink.snapshot()[0].kind, EventKind::Answered);
         assert_eq!(sink.snapshot()[1].kind, EventKind::Ended);
     }
