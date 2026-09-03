@@ -60,10 +60,15 @@ pub enum RespondError {
 
 #[derive(Debug)]
 pub enum Event {
-    Request(Box<Request>),
+    Request {
+        request: Box<Request>,
+        from: SocketAddr,
+    },
+    Response(Box<Response>),
     Acknowledged,
     Cancelled,
     AckNeverArrived,
+    TimedOut,
     Terminated,
 }
 
@@ -73,12 +78,20 @@ pub enum Action {
     Deliver { key: TransactionKey, event: Event },
 }
 
-pub fn transaction_key(request: &Request) -> Option<TransactionKey> {
-    let via = request.first_via()?;
-    let branch = via.branch()?;
+pub fn key_parts(branch: String, sent_by: String, method: Method) -> Option<TransactionKey> {
     if !branch.starts_with(BRANCH_MAGIC_COOKIE) {
         return None;
     }
+    Some(TransactionKey {
+        branch,
+        sent_by,
+        method,
+    })
+}
+
+pub fn transaction_key(request: &Request) -> Option<TransactionKey> {
+    let via = request.first_via()?;
+    let branch = via.branch()?;
     let sent_by_header = via.0.first()?;
     let host = sent_by_header.sent_by_host.to_string();
     let sent_by = match sent_by_header.sent_by_port {
@@ -89,11 +102,7 @@ pub fn transaction_key(request: &Request) -> Option<TransactionKey> {
         Method::Ack => Method::Invite,
         other => other,
     };
-    Some(TransactionKey {
-        branch: branch.to_string(),
-        sent_by,
-        method,
-    })
+    key_parts(branch.to_string(), sent_by, method)
 }
 
 fn built_response(request: &Request, status: StatusCode) -> Vec<u8> {
@@ -223,7 +232,10 @@ impl InviteServer {
             send(remote, trying),
             Action::Deliver {
                 key,
-                event: Event::Request(Box::new(request.clone())),
+                event: Event::Request {
+                    request: Box::new(request.clone()),
+                    from: remote,
+                },
             },
         ];
         (invite, actions)
@@ -372,7 +384,10 @@ impl PlainServer {
         };
         let actions = vec![Action::Deliver {
             key,
-            event: Event::Request(Box::new(request.clone())),
+            event: Event::Request {
+                request: Box::new(request.clone()),
+                from: remote,
+            },
         }];
         (plain, actions)
     }
@@ -484,13 +499,22 @@ impl ServerTransactions {
         let Some(Message::Request(request)) = parse_without_trusting_the_network(datagram) else {
             return Vec::new();
         };
-        let Some(key) = transaction_key(&request) else {
+        self.on_request_message(&request, from, now)
+    }
+
+    pub fn on_request_message(
+        &mut self,
+        request: &Request,
+        from: SocketAddr,
+        now: Duration,
+    ) -> Vec<Action> {
+        let Some(key) = transaction_key(request) else {
             return Vec::new();
         };
         match request.method() {
-            Method::Ack => self.on_ack(&request, &key, now),
-            Method::Cancel => self.on_cancel(&request, key, from, now),
-            _ => self.on_request(&request, key, from),
+            Method::Ack => self.on_ack(request, &key, now),
+            Method::Cancel => self.on_cancel(request, key, from, now),
+            _ => self.on_request(request, key, from),
         }
     }
 
@@ -682,7 +706,7 @@ Content-Length: {}\r\n\r\n{}",
             .iter()
             .find_map(|action| match action {
                 Action::Deliver {
-                    event: Event::Request(request),
+                    event: Event::Request { request, .. },
                     ..
                 } => Some((**request).clone()),
                 _ => None,
@@ -696,7 +720,7 @@ Content-Length: {}\r\n\r\n{}",
             .find_map(|action| match action {
                 Action::Deliver {
                     key,
-                    event: Event::Request(_),
+                    event: Event::Request { .. },
                 } => Some(key.clone()),
                 _ => None,
             })
@@ -725,10 +749,12 @@ Content-Length: {}\r\n\r\n{}",
             .iter()
             .filter_map(|action| match action {
                 Action::Deliver { event, .. } => Some(match event {
-                    Event::Request(_) => "request",
+                    Event::Request { .. } => "request",
+                    Event::Response(_) => "response",
                     Event::Acknowledged => "acknowledged",
                     Event::Cancelled => "cancelled",
                     Event::AckNeverArrived => "ack-never-arrived",
+                    Event::TimedOut => "timed-out",
                     Event::Terminated => "terminated",
                 }),
                 _ => None,
