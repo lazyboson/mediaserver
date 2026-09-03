@@ -1,7 +1,8 @@
 use crate::convert::{
     attachment_id, capabilities, capabilities_wire, conference_wire, event_wire, format,
-    format_wire, member_state_wire, playback_id, selector, selector_wire, session_id, session_kind,
-    session_kind_wire, status_of, transport, transport_wire, unix_ms,
+    format_wire, hangup_reason, member_state_wire, playback_id, selector, selector_wire,
+    session_id, session_kind, session_kind_wire, status_of, transport, transport_wire, unix_ms,
+    DESTROY_REQUESTED,
 };
 use crate::proto;
 use crate::proto::media_control_server::{MediaControl, MediaControlServer};
@@ -11,7 +12,7 @@ use session_core::{
     SessionId, SessionKind, SessionRegistry, SessionView,
 };
 use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use tokio::sync::{broadcast, mpsc, watch};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
@@ -20,6 +21,21 @@ pub const WATCH_CAPACITY: usize = 256;
 
 pub trait EventSink: Send + Sync + 'static {
     fn accept(&self, event: MediaEvent);
+}
+
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum SipControlError {
+    #[error("{0} is not a call the sip front door holds")]
+    NotADoorSession(String),
+    #[error("the sip front door is not listening on this pod")]
+    DoorClosed,
+}
+
+#[tonic::async_trait]
+pub trait SipCallControl: Send + Sync + 'static {
+    async fn answer(&self, external_id: &str) -> Result<(), SipControlError>;
+
+    async fn hangup(&self, external_id: &str, reason: &str) -> Result<(), SipControlError>;
 }
 
 pub trait ObservationSink: Send + Sync + 'static {
@@ -163,6 +179,7 @@ pub struct SessionController {
     draining: Arc<watch::Sender<bool>>,
     media: Option<Arc<dyn MediaPlane>>,
     events: Option<Arc<dyn EventSink>>,
+    sip_call_control: OnceLock<Arc<dyn SipCallControl>>,
     owner: String,
 }
 
@@ -174,8 +191,19 @@ impl SessionController {
             draining: Arc::new(watch::Sender::new(false)),
             media: None,
             events: None,
+            sip_call_control: OnceLock::new(),
             owner: owner.into(),
         }
+    }
+
+    pub fn attach_sip_call_control(&self, door: Arc<dyn SipCallControl>) -> bool {
+        self.sip_call_control.set(door).is_ok()
+    }
+
+    fn sip_call_control(&self) -> Result<&Arc<dyn SipCallControl>, SipControlError> {
+        self.sip_call_control
+            .get()
+            .ok_or(SipControlError::DoorClosed)
     }
 
     pub fn with_event_sink(mut self, sink: Arc<dyn EventSink>) -> Self {
@@ -223,6 +251,22 @@ impl SessionController {
 
     pub fn holds_external_id(&self, external_id: &str) -> bool {
         self.lock().resolve(external_id).is_ok()
+    }
+
+    pub async fn end_session(&self, session: SessionId, reason: &str) -> Result<(), Status> {
+        self.session(session)?;
+        if let Some(media) = self.media.clone() {
+            if let Err(error) = media.close_session(session).await {
+                tracing::warn!(%session, %error, "the media plane could not close this session");
+            }
+        }
+        self.commit(|registry| registry.destroy_session(session, reason))?;
+        Ok(())
+    }
+
+    pub async fn end_session_named(&self, external_id: &str, reason: &str) -> Result<(), Status> {
+        let session = self.lock().resolve(external_id).map_err(status_of)?;
+        self.end_session(session, reason).await
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<MediaEvent> {
@@ -477,6 +521,20 @@ impl MediaControl for Arc<SessionController> {
         self.as_ref().destroy_session(request).await
     }
 
+    async fn answer_session(
+        &self,
+        request: Request<proto::SessionRef>,
+    ) -> Result<Response<proto::Session>, Status> {
+        self.as_ref().answer_session(request).await
+    }
+
+    async fn hangup_session(
+        &self,
+        request: Request<proto::HangupRequest>,
+    ) -> Result<Response<proto::Ack>, Status> {
+        self.as_ref().hangup_session(request).await
+    }
+
     async fn describe_session(
         &self,
         request: Request<proto::SessionRef>,
@@ -615,13 +673,41 @@ impl MediaControl for SessionController {
         request: Request<proto::SessionRef>,
     ) -> Result<Response<proto::Ack>, Status> {
         let session = self.resolve(Some(request.into_inner()))?;
-        self.session(session)?;
-        if let Some(media) = self.media.clone() {
-            if let Err(error) = media.close_session(session).await {
-                tracing::warn!(%session, %error, "the media plane could not close this session");
-            }
+        self.end_session(session, DESTROY_REQUESTED).await?;
+        Ok(Response::new(proto::Ack {}))
+    }
+
+    async fn answer_session(
+        &self,
+        request: Request<proto::SessionRef>,
+    ) -> Result<Response<proto::Session>, Status> {
+        let session = self.resolve(Some(request.into_inner()))?;
+        let external_id = self.session(session)?.external_id;
+        self.sip_call_control()
+            .map_err(|error| Status::failed_precondition(error.to_string()))?
+            .answer(&external_id)
+            .await
+            .map_err(|error| Status::failed_precondition(error.to_string()))?;
+        self.session_message(session).map(Response::new)
+    }
+
+    async fn hangup_session(
+        &self,
+        request: Request<proto::HangupRequest>,
+    ) -> Result<Response<proto::Ack>, Status> {
+        let message = request.into_inner();
+        let reason = hangup_reason(&message.reason);
+        let Ok(session) = self.resolve(message.session) else {
+            return Ok(Response::new(proto::Ack {}));
+        };
+        let external_id = self.session(session)?.external_id;
+        match self.sip_call_control() {
+            Ok(door) => door
+                .hangup(&external_id, &reason)
+                .await
+                .map_err(|error| Status::failed_precondition(error.to_string()))?,
+            Err(error) => return Err(Status::failed_precondition(error.to_string())),
         }
-        self.commit(|registry| registry.destroy_session(session, "destroy requested"))?;
         Ok(Response::new(proto::Ack {}))
     }
 

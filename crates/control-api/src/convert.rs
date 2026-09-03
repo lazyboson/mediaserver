@@ -10,6 +10,18 @@ use std::str::FromStr;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tonic::Status;
 
+pub const DESTROY_REQUESTED: &str = "destroy requested";
+pub const HANGUP_REQUESTED: &str = "hangup requested";
+
+pub fn hangup_reason(reason: &str) -> String {
+    let trimmed = reason.trim();
+    if trimmed.is_empty() {
+        HANGUP_REQUESTED.to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
 pub fn status_of(error: ControlError) -> Status {
     match error {
         ControlError::UnknownSession(_)
@@ -470,6 +482,35 @@ pub fn observed_lag_ms(observed_at: Option<&prost_types::Timestamp>) -> Option<i
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_hangup_that_names_no_reason_still_names_one_in_the_session_ended_event() {
+        assert_eq!(hangup_reason(""), HANGUP_REQUESTED);
+        assert_eq!(hangup_reason("   "), HANGUP_REQUESTED);
+    }
+
+    #[test]
+    fn a_hangup_reason_reaches_the_event_as_the_caller_wrote_it() {
+        assert_eq!(
+            hangup_reason("the agent said goodbye"),
+            "the agent said goodbye"
+        );
+        assert_eq!(hangup_reason("  trimmed  "), "trimmed");
+    }
+
+    #[test]
+    fn a_hangup_request_addresses_a_session_the_same_way_every_other_rpc_does() {
+        let message = proto::HangupRequest {
+            session: Some(proto::SessionRef {
+                id: Some(proto::session_ref::Id::ExternalId("sip-call-1".to_string())),
+            }),
+            reason: "the agent said goodbye".to_string(),
+        };
+        assert_eq!(
+            message.session.and_then(|reference| reference.id),
+            Some(proto::session_ref::Id::ExternalId("sip-call-1".to_string()))
+        );
+    }
 
     fn report(kind: proto::SpeechReportKind) -> proto::SpeechReport {
         proto::SpeechReport {
