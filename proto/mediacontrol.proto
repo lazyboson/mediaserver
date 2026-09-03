@@ -21,6 +21,22 @@ service MediaControl {
   rpc DestroySession(SessionRef) returns (Ack);
   rpc DescribeSession(SessionRef) returns (Session);
 
+  // Call control over the SIP front door. MSS is the SIP endpoint; the
+  // decision to answer and the decision to hang up belong to whatever
+  // consumes the call-event stream. Both are idempotent.
+  //
+  // AnswerSession sends the 200 OK with the SDP answer MSS already built,
+  // for a session the front door parked (MSS_SIP_ANSWER_MODE=parked). A
+  // session that is already answered comes back unchanged; one the front
+  // door does not hold is FAILED_PRECONDITION; an unknown one NOT_FOUND.
+  rpc AnswerSession(SessionRef) returns (Session);
+
+  // HangupSession ends the call from this side: an in-dialog BYE on an
+  // answered dialog, a 480 on a parked INVITE that was never answered.
+  // This BYE is the one client transaction the front door has — MSS still
+  // never sends an INVITE.
+  rpc HangupSession(HangupRequest) returns (Ack);
+
   rpc Attach(AttachRequest) returns (Attachment);
   rpc Detach(AttachmentRef) returns (Ack);
   rpc UpdateAttachment(UpdateAttachmentRequest) returns (Attachment);
@@ -179,6 +195,13 @@ message SessionRef {
     string session_id = 1;
     string external_id = 2;
   }
+}
+
+message HangupRequest {
+  SessionRef session = 1;
+  // Carried into the SessionEnded event as its reason, so an operator can
+  // tell an orchestrated hangup from a caller's own BYE. Empty is allowed.
+  string reason = 2;
 }
 
 // ------------------------------------------------------------- attachments

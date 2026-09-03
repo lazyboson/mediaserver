@@ -53,6 +53,20 @@ impl MediaControl for WireFacing {
         self.0.describe_session(request).await
     }
 
+    async fn answer_session(
+        &self,
+        request: Request<proto::SessionRef>,
+    ) -> Result<Response<proto::Session>, Status> {
+        self.0.answer_session(request).await
+    }
+
+    async fn hangup_session(
+        &self,
+        request: Request<proto::HangupRequest>,
+    ) -> Result<Response<proto::Ack>, Status> {
+        self.0.hangup_session(request).await
+    }
+
     async fn attach(
         &self,
         request: Request<proto::AttachRequest>,

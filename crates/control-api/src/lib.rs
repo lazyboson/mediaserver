@@ -18,7 +18,7 @@ pub mod telcompat;
 pub use auth::AuthPolicy;
 pub use controller::{
     EventSink, InlineEgressSink, MediaPlane, MediaPlaneError, ObservationSink, OpenedSession,
-    PlaybackSource, SessionController, StreamFrame,
+    PlaybackSource, SessionController, SipCallControl, SipControlError, StreamFrame,
 };
 pub use server::{
     serve_authenticated_until, serve_on, serve_on_until, serve_shared_until, WireFacing,
