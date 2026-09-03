@@ -60,6 +60,9 @@ const DEFAULT_CONFERENCE_LINGER: std::time::Duration = std::time::Duration::from
 const MEMBER_STATE_TTL_ENV: &str = "MSS_MEMBER_STATE_TTL_SECS";
 const SIP_LISTEN_ENV: &str = "MSS_SIP_LISTEN";
 const SIP_ADVERTISE_ENV: &str = "MSS_SIP_ADVERTISE";
+const SIP_ANSWER_MODE_ENV: &str = "MSS_SIP_ANSWER_MODE";
+const SIP_PARK_TIMEOUT_ENV: &str = "MSS_SIP_PARK_TIMEOUT_MS";
+const DEFAULT_SIP_PARK_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(60_000);
 const DEFAULT_MEMBER_STATE_TTL: std::time::Duration = std::time::Duration::from_secs(0);
 const SIP_RETRY_AFTER: std::time::Duration = std::time::Duration::from_secs(4);
 const MEMBER_STATE_SWEEP: std::time::Duration = std::time::Duration::from_millis(500);
@@ -404,6 +407,27 @@ fn sip_advertised_address(listen: SocketAddr) -> Result<SocketAddr, String> {
     }
 }
 
+fn sip_answer_mode() -> Result<sip_front_door::AnswerMode, String> {
+    let Ok(configured) = std::env::var(SIP_ANSWER_MODE_ENV) else {
+        return Ok(sip_front_door::AnswerMode::default());
+    };
+    sip_front_door::AnswerMode::from_configured(&configured).ok_or(configured)
+}
+
+fn sip_park_timeout() -> Result<std::time::Duration, String> {
+    let Ok(configured) = std::env::var(SIP_PARK_TIMEOUT_ENV) else {
+        return Ok(DEFAULT_SIP_PARK_TIMEOUT);
+    };
+    if configured.trim().is_empty() {
+        return Ok(DEFAULT_SIP_PARK_TIMEOUT);
+    }
+    configured
+        .trim()
+        .parse::<u64>()
+        .map(std::time::Duration::from_millis)
+        .map_err(|_| configured)
+}
+
 fn auth_policy_from_env() -> AuthPolicy {
     match std::env::var(AUTH_TOKEN_ENV) {
         Ok(token) if !token.is_empty() => {
@@ -657,6 +681,28 @@ async fn serve_control_plane(
         }
     };
 
+    let answer_mode = match sip_answer_mode() {
+        Ok(mode) => mode,
+        Err(configured) => {
+            error!(
+                env = SIP_ANSWER_MODE_ENV,
+                configured, "the sip answer mode is immediate or parked; refusing to start"
+            );
+            return;
+        }
+    };
+    let park_timeout = match sip_park_timeout() {
+        Ok(timeout) => timeout,
+        Err(configured) => {
+            error!(
+                env = SIP_PARK_TIMEOUT_ENV,
+                configured,
+                "the park timeout must be whole milliseconds, 0 to disable; refusing to start"
+            );
+            return;
+        }
+    };
+
     match sip_listen_address() {
         Some(Ok(sip_listen)) => match sip_advertised_address(sip_listen) {
             Ok(advertised) => {
@@ -666,6 +712,9 @@ async fn serve_control_plane(
                     owner: owner.clone(),
                     session_timers: sip_uas::SessionTimerPolicy::default(),
                     retry_after: SIP_RETRY_AFTER,
+                    answer_mode,
+                    park_timeout,
+                    timings: sip_uas::Timings::default(),
                 };
                 let mut until_door_drains = controller.drain_watch();
                 tokio::spawn(sip_front_door::serve(
