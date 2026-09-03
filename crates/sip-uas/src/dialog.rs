@@ -1,4 +1,4 @@
-use rvoip_sip_core::builder::SimpleResponseBuilder;
+use rvoip_sip_core::builder::{SimpleRequestBuilder, SimpleResponseBuilder};
 use rvoip_sip_core::prelude::{HeaderName, HeaderValue, Method, StatusCode, TypedHeader};
 use rvoip_sip_core::types::sip_request::Request;
 use rvoip_sip_core::types::sip_response::Response;
@@ -8,6 +8,8 @@ use std::time::Duration;
 pub const SESSION_EXPIRES: &str = "Session-Expires";
 pub const MIN_SE: &str = "Min-SE";
 pub const TIMER_OPTION_TAG: &str = "timer";
+pub const MAX_FORWARDS: u32 = 70;
+const LOOSE_ROUTE_PARAMETER: &str = "lr";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Refresher {
@@ -205,6 +207,9 @@ pub struct Dialog {
     id: DialogId,
     state: DialogState,
     remote_cseq: u32,
+    local_cseq: u32,
+    local_uri: String,
+    remote_uri: String,
     remote_target: Option<String>,
     route_set: Vec<String>,
     refresh_interval: Option<Duration>,
@@ -231,6 +236,60 @@ impl Dialog {
 
     pub fn expires_at(&self) -> Option<Duration> {
         self.expires_at
+    }
+
+    pub fn local_uri(&self) -> &str {
+        &self.local_uri
+    }
+
+    pub fn remote_uri(&self) -> &str {
+        &self.remote_uri
+    }
+
+    pub fn local_cseq(&self) -> u32 {
+        self.local_cseq
+    }
+
+    fn take_next_local_cseq(&mut self) -> u32 {
+        self.local_cseq = self.local_cseq.saturating_add(1);
+        self.local_cseq
+    }
+}
+
+fn bare_uri(address: &str) -> String {
+    let trimmed = address.trim();
+    match (trimmed.find('<'), trimmed.rfind('>')) {
+        (Some(open), Some(close)) if close > open => trimmed[open + 1..close].to_string(),
+        _ => trimmed.to_string(),
+    }
+}
+
+fn angle_bracketed(uri: &str) -> String {
+    format!("<{}>", bare_uri(uri))
+}
+
+fn is_loose_route(entry: &str) -> bool {
+    bare_uri(entry)
+        .split(';')
+        .skip(1)
+        .any(|parameter| parameter.trim().eq_ignore_ascii_case(LOOSE_ROUTE_PARAMETER))
+}
+
+fn routing(remote_target: &str, route_set: &[String]) -> (String, Vec<String>) {
+    match route_set.split_first() {
+        None => (bare_uri(remote_target), Vec::new()),
+        Some((first, _)) if is_loose_route(first) => (
+            bare_uri(remote_target),
+            route_set
+                .iter()
+                .map(|entry| angle_bracketed(entry))
+                .collect(),
+        ),
+        Some((first, rest)) => {
+            let mut routes: Vec<String> = rest.iter().map(|entry| angle_bracketed(entry)).collect();
+            routes.push(angle_bracketed(remote_target));
+            (bare_uri(first), routes)
+        }
     }
 }
 
@@ -368,6 +427,15 @@ impl Dialogs {
             id: id.clone(),
             state: DialogState::Confirmed,
             remote_cseq: cseq,
+            local_cseq: cseq,
+            local_uri: request
+                .to()
+                .map(|to| to.address().uri.to_string())
+                .unwrap_or_default(),
+            remote_uri: request
+                .from()
+                .map(|from| from.address().uri.to_string())
+                .unwrap_or_default(),
             remote_target: request.contact_uri(),
             route_set: route_set_of(request),
             refresh_interval,
@@ -389,6 +457,37 @@ impl Dialogs {
 
     pub fn end(&mut self, id: &DialogId) -> bool {
         self.dialogs.remove(id).is_some()
+    }
+
+    pub fn in_dialog_request(
+        &mut self,
+        id: &DialogId,
+        method: Method,
+        via_sent_by: &str,
+        branch: &str,
+    ) -> Option<Request> {
+        let dialog = self.dialogs.get_mut(id)?;
+        let cseq = dialog.take_next_local_cseq();
+        let target = dialog
+            .remote_target
+            .clone()
+            .unwrap_or_else(|| dialog.remote_uri.clone());
+        let (request_uri, routes) = routing(&target, &dialog.route_set);
+        let mut builder = SimpleRequestBuilder::new(method, &request_uri)
+            .ok()?
+            .from("", &dialog.local_uri, Some(&dialog.id.local_tag))
+            .to("", &dialog.remote_uri, Some(&dialog.id.remote_tag))
+            .call_id(&dialog.id.call_id)
+            .cseq(cseq)
+            .via(via_sent_by, "UDP", Some(branch))
+            .max_forwards(MAX_FORWARDS);
+        for route in routes {
+            builder = builder.header(TypedHeader::Other(
+                HeaderName::Route,
+                HeaderValue::Raw(route.into_bytes()),
+            ));
+        }
+        Some(builder.build())
     }
 
     pub fn next_deadline(&self) -> Option<Duration> {
