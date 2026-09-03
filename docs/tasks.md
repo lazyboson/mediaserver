@@ -24,7 +24,7 @@ blocked on a deployment.
 | **L2** | **Renegotiation for a changed offer** (P3-2's media half) | The SIP half is closed — the transaction and the dialog run correctly — but `session-core` cannot produce a second answer, so a re-INVITE whose offer differs is refused **488**. Hold with a changed media description, attended transfer and codec change all land here. **A warm transfer *is* an attended transfer**, so this is a conference case, not a peripheral one | `session-core` re-answers an existing inline session, the front door returns it, and tests cover hold (`a=sendonly`), resume, and a codec change |
 | **L3** | **Pod placement and room affinity** (defect **D8**) | `owner_pod` is a config string and there is no scheduler. A room is one pod's mix thread, so whoever opens a leg must already know which pod owns the room — over gRPC *or* over the SIP front door. This is the one that bites a multi-pod pilot | something decides placement — an MSS-side lookup, or a contract the caller follows that is written down — and a two-pod drill seats two legs of one `group` on one pod without the caller choosing |
 | **L4** | **DTMF generation** | `media-core/src/dtmf.rs` decodes only. MSS detects RFC 4733 and cannot send a digit, so it cannot drive an external IVR | an RFC 4733 event train, three end retransmissions included, is generated on an inline leg and a replay test asserts it |
-| **L5** | **Front door: metrics, and TCP/TLS** | Answered and refused are counted in a struct and logged at shutdown only — nothing reaches `/metrics`, so a pilot cannot see the door. `Reliability::Reliable` is implemented and tested but only UDP is bound | `mss_sip_*` counters exported with alert rules in `deploy/`, and a TCP listener bound and drilled |
+| **L5** | **Front door: metrics, and TCP/TLS** | Answered, refused and hangups are counted in a struct and logged at shutdown only — nothing reaches `/metrics`, so a pilot cannot see the door, and since [item 60](#60-call-control-over-the-event-stream-park-answer-hang-up--done-2026-09-03) it cannot see parked calls, park timeouts or BYEs that Timer F gave up on either. `Reliability::Reliable` is implemented and tested but only UDP is bound | `mss_sip_*` counters exported with alert rules in `deploy/`, and a TCP listener bound and drilled |
 | **L6** | **Codec breadth — G.722, G.729** | `Encoding` is `Pcmu \| Pcma \| L16 \| Opus`. G.722 is common on modern desk phones and G.729 on trunks | each decoded at ingest and encoded at egress, **adopted not written** (Article XI), with `cargo deny` clean |
 | **L7** | **SRTP/DTLS in-process — decide, then build or close** | rtpengine terminates crypto at the edge today, which is right for the reference deployment. It is only needed if an inline leg must face a WebRTC endpoint with no rtpengine in front | either recorded in architecture §7 as a permanent non-goal, or built behind an FFI wrapper crate |
 | **L8** | **Conference feature tail** | Not built (Appendix B.2): member enumeration, room lock, moderator roles, floor control, per-member volume and energy thresholds. The matrix already carries a per-pair Q12 gain, so per-member volume is one metadata verb away | each is either a mix-matrix cell named by metadata, or recorded in Appendix B.2 as the controller's job |
@@ -32,6 +32,8 @@ blocked on a deployment.
 | **L10** | **D6 — `play media` from-tag semantics are unmeasured** | architecture §6's claim was retracted after the instrument turned out to be broken, and §6 must not be trusted until it is re-probed | re-probed on a live call and §6 either restored or corrected |
 | **L11** | **eBPF tap ingest — decide, do not build** (item **18**) | The open question is whether RTP can be mirrored to MSS by an eBPF program on the rtpengine host instead of NG `subscribe`. It is gated on a measurement nobody has taken: the userspace copy cost a `subscribe` imposes on the rtpengine host (handoff **H3**) | the measurement exists and item 18 records a decision — build, or close it as a non-goal |
 | **L12** | **TLS options** (item **52**, ⏸ parked) | Built and verified on branch `feat/tls-options` — tonic TLS and mTLS on the gRPC port, rskafka TLS/SASL, a TLS-capable Redis client, redacted URLs — and deliberately kept off `main` because the first deployment runs every hop inside one cluster. The security posture until then is network policy | a hop leaves the cluster, and the branch is rebased and merged. **The SIP front door is a new hop with the same question**, and it has no TLS at all (see L5) |
+| **L14** | **The IVR between "invited" and "answered"** | [Item 60](#60-call-control-over-the-event-stream-park-answer-hang-up--done-2026-09-03) built the seam and nothing runs in it: a parked call has a media session, an RTP port and an SDP answer, but no audio flows until the 200, so a prompt-and-collect before answering has no path. Early media (183 + SDP) is the SIP half of that and is not built | a parked call can play a prompt and collect digits before it is answered, or the design records that the IVR runs after the answer and early media is a non-goal |
+| **L15** | **The orchestrator pairing is unproven end to end** | The call-event contract and both RPCs were built against a specification, not against a running consumer, and `parked` mode with nothing listening rings every call until the park timeout. The `end_of_interaction` → `HangupSession` pairing — the defect item 60 exists to fix — has never been driven by a real orchestrator | a real orchestrator answers and hangs up a call through the stream, and the silence-after-farewell defect is observed gone rather than argued gone |
 | **L13** | **Spill journal retention** (item 30 / **D9**'s residual) | Skipped and failed spill journals stay on disk until an operator removes them; nothing expires them, so a pod that fails uploads repeatedly fills its spill volume | a retention rule exists and is documented in deploy.md, or the growth is bounded and alerted |
 
 ### P — proof, needs a lab box
@@ -4215,6 +4217,65 @@ session ends the media and sends no BYE. UDP only. No metrics for the door. And
 no datagram in any of these tests came from FreeSWITCH, OpenSIPS or a
 softphone — pointing `lab/fs_control_drill.sh` at `MSS_SIP_LISTEN` instead of
 `lab/sip_shim.py` is the next lab run, and it is what retires the shim.
+
+### 60. Call control over the event stream: park, answer, hang up — ✅ DONE (2026-09-03)
+
+The front door answered every INVITE immediately and never sent a BYE, so an
+`END_OF_INTERACTION` from a voice-AI attachment tore nothing down: the caller sat
+in silence after the agent's farewell until they hung up themselves. This item
+moves the decision to answer and the decision to hang up **out of the media
+plane** and onto whatever reads `mss:call-events`, and gives the door the one
+client transaction that needs.
+
+**What landed**
+
+- **Two RPCs on `MediaControl`**, both idempotent and both addressing a session
+  the way every other RPC does: `AnswerSession(SessionRef) returns (Session)`
+  sends the 200 with the SDP answer the media plane already built;
+  `HangupSession(HangupRequest) returns (Ack)` sends an in-dialog **BYE** on an
+  answered dialog and **480 Temporarily Unavailable** on a parked INVITE, ending
+  the media session and publishing `ended` either way. `HangupRequest.reason`
+  becomes the `SessionEnded` reason, so an orchestrated hangup is
+  distinguishable from a caller's own BYE.
+- **`MSS_SIP_ANSWER_MODE`** = `immediate` (default, today's behaviour byte for
+  byte) or `parked`: 100, then **180 Ringing**, then `invited` on the stream, then
+  wait. **`MSS_SIP_PARK_TIMEOUT_MS`** (default `60000`, `0` disables) refuses an
+  unanswered park 480 and ends it.
+- **Two new call-event kinds**, back-compatibly: `invited` and
+  `end_of_interaction` — the latter published once per session when the
+  session's *authoritative* attachment reports it, carrying its reason, and
+  tearing nothing down. `answered` and `ended` are unchanged on the wire because
+  `reason` is skipped when empty.
+- **The one client transaction.** `crates/sip-uas/src/client.rs` is RFC 3261
+  §17.1.2 — Timer E doubling to T2, Timer F at 64×T1, Timer K absorbing a
+  retransmitted final — and `ClientTransactions::begin` **refuses
+  `Method::Invite` by name**, so "MSS never dials" is a property of the type and
+  not a convention. `Dialogs::in_dialog_request` builds the BYE from dialog
+  state with loose *and* strict routing per §12.2.1.1.
+
+**A defect found and fixed while doing it.** `Event::AckNeverArrived` looked the
+orphaned session up by `external_id.ends_with(key.branch())` — an `sip-<Call-ID>`
+against a Via branch, which never matches — so an *answered* call whose ACK never
+came leaked its media session, despite item 59 documenting the opposite. The door
+now keeps `invite_of: TransactionKey → external_id`, and the test that was
+missing exists.
+
+**Verified.** 70 tests in `sip-uas` (the mutation sweep now drives responses at
+the client layer too, with a live BYE transaction for them to match), 30 in
+`sip_front_door` over **real UDP sockets against the real `SessionController`** —
+the eleven that were there before unchanged, which is how `immediate` mode is
+pinned — 10 in `call-events`, and `convert.rs` for the new message. Whole
+workspace green: 356 in `mediaserverd`, clippy clean at `-D warnings`, zero
+comments in `crates`.
+
+**What this does not close.** No orchestrator exists in this repository — the
+contract is what was built against, and the pairing has not been driven by a
+real one. Still no INVITE client transaction, no registrar, no forking. Still no
+datagram from a real FreeSWITCH, OpenSIPS or softphone. `end_of_interaction`
+rides the controller's 256-deep `broadcast`, so a door that falls behind logs the
+lag and may miss one; the Kafka consumption that retires `crates/call-events`
+retires that too. No metrics for the door, still. And an IVR between "invited"
+and "answered" is the next thing this seam exists for, unbuilt.
 
 ## Open defects and soft spots
 
