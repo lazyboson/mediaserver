@@ -46,8 +46,21 @@ jobs:
           LOCK="$HOME/actions-runner-runner-pool/with-lock.sh"
           [ -x "$LOCK" ] || LOCK=""
           echo "LOCK=$LOCK" >> "$GITHUB_ENV"
-          D="$HOME/actions-runner-runner-pool/docker"
-          [ -d "$D" ] && echo "DOCKER_CONFIG=$D" >> "$GITHUB_ENV" || true
+          # One DOCKER_CONFIG per job. The runner-pool runners share
+          # ~/actions-runner-runner-pool/docker, and docker/login-action's post step runs
+          # `docker logout ghcr.io` against it, so a job waiting on the machine-wide
+          # build lock would lose its ghcr credential to whichever concurrent job
+          # finished first and then push anonymously (403).
+          SEED="$HOME/actions-runner-runner-pool/docker"
+          [ -d "$SEED" ] || exit 0
+          D="$SEED"
+          if [ -n "${RUNNER_TEMP:-}" ] && [ -f "$SEED/config.json" ]; then
+            D="$RUNNER_TEMP/docker-config"
+            mkdir -p "$D"
+            [ -f "$D/config.json" ] || cp "$SEED/config.json" "$D/config.json"
+            ln -sfn "$SEED/cli-plugins" "$D/cli-plugins"
+          fi
+          echo "DOCKER_CONFIG=$D" >> "$GITHUB_ENV"
 
       - uses: dtolnay/rust-toolchain@1.95.0
 
@@ -76,8 +89,21 @@ jobs:
 
       - name: docker environment
         run: |
-          D="$HOME/actions-runner-runner-pool/docker"
-          [ -d "$D" ] && echo "DOCKER_CONFIG=$D" >> "$GITHUB_ENV" || true
+          # One DOCKER_CONFIG per job. The runner-pool runners share
+          # ~/actions-runner-runner-pool/docker, and docker/login-action's post step runs
+          # `docker logout ghcr.io` against it, so a job waiting on the machine-wide
+          # build lock would lose its ghcr credential to whichever concurrent job
+          # finished first and then push anonymously (403).
+          SEED="$HOME/actions-runner-runner-pool/docker"
+          [ -d "$SEED" ] || exit 0
+          D="$SEED"
+          if [ -n "${RUNNER_TEMP:-}" ] && [ -f "$SEED/config.json" ]; then
+            D="$RUNNER_TEMP/docker-config"
+            mkdir -p "$D"
+            [ -f "$D/config.json" ] || cp "$SEED/config.json" "$D/config.json"
+            ln -sfn "$SEED/cli-plugins" "$D/cli-plugins"
+          fi
+          echo "DOCKER_CONFIG=$D" >> "$GITHUB_ENV"
 
       - name: Build and push image
         run: |
