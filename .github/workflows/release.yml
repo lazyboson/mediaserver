@@ -1,31 +1,61 @@
 name: Release
 
+# Runs on the self-hosted Apple-silicon Mac. Tag pushes only, never pull requests.
+# The release binary is built on macOS/aarch64; the shipped artifact for Linux
+# remains the linux/arm64 image built in the same job.
+
 on:
   push:
     tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      runner:
+        description: Runner pool (ubuntu-latest is the emergency fallback)
+        default: self-hosted
+        type: choice
+        options: [self-hosted, ubuntu-latest]
 
 env:
   CARGO_TERM_COLOR: always
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
+  CARGO_BUILD_JOBS: 4
+  CARGO_INCREMENTAL: 0
+  CARGO_NET_RETRY: 3
+  CARGO_PROFILE_DEV_DEBUG: 0
+  CARGO_PROFILE_TEST_DEBUG: 0
 
 permissions:
   contents: write
   packages: write
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   release:
-    runs-on: ubuntu-24.04-arm
+    runs-on: ${{ inputs.runner == 'ubuntu-latest' && fromJSON('["ubuntu-latest"]') || fromJSON('["self-hosted","macOS","ARM64","runner-pool"]') }}
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v7
+
+      - name: build environment
+        run: |
+          echo "CARGO_TARGET_DIR=$HOME/actions-runner-runner-pool/cache/target" >> "$GITHUB_ENV"
+          LOCK="$HOME/actions-runner-runner-pool/with-lock.sh"
+          [ -x "$LOCK" ] || LOCK=""
+          echo "LOCK=$LOCK" >> "$GITHUB_ENV"
+          D="$HOME/actions-runner-runner-pool/docker"
+          [ -d "$D" ] && echo "DOCKER_CONFIG=$D" >> "$GITHUB_ENV" || true
+
       - uses: dtolnay/rust-toolchain@1.95.0
-      - uses: Swatinem/rust-cache@v2
 
       - name: Test
-        run: cargo test --workspace
+        run: $LOCK cargo test --workspace
 
       - name: Build release binary
-        run: cargo build --workspace --release
+        run: $LOCK cargo build --workspace --release
 
       - name: Log in to GHCR
         uses: docker/login-action@v4
@@ -44,19 +74,19 @@ jobs:
             type=semver,pattern={{major}}.{{minor}}
             type=sha
 
+      - name: docker environment
+        run: |
+          D="$HOME/actions-runner-runner-pool/docker"
+          [ -d "$D" ] && echo "DOCKER_CONFIG=$D" >> "$GITHUB_ENV" || true
+
       - name: Build and push image
-        uses: docker/build-push-action@v7
-        with:
-          context: .
-          platforms: linux/arm64
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+        run: |
+          TAGS=""
+          for t in ${{ steps.meta.outputs.tags }}; do TAGS="$TAGS --tag $t"; done
+          $LOCK docker buildx build --platform linux/arm64 --push $TAGS .
 
       - name: GitHub release with binary
         uses: softprops/action-gh-release@v3
         with:
-          files: target/release/mediaserverd
+          files: ${{ env.CARGO_TARGET_DIR }}/release/mediaserverd
           generate_release_notes: true

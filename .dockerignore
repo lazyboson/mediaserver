@@ -1,6 +1,9 @@
 target
+target-*
 .git
 .github
 docs
 *.md
 *.tar.gz
+.env
+.env.*
