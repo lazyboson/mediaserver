@@ -319,7 +319,7 @@ async fn recording_and_streaming_share_one_session_but_only_one_is_authoritative
     assert_eq!(
         authoritative,
         vec![STREAM_LABEL],
-        "the recorder must never drive the legacy stream fsm"
+        "the recorder must never drive the legacy stream state machine"
     );
 }
 

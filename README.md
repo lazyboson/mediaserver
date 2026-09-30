@@ -39,7 +39,7 @@ until the softswitch does only call control, or nothing at all.
 - **Audio injection into tapped calls** via rtpengine `play media`
   (utterance-shaped; streaming TTS arrives with Phase 3 inline legs).
 - **A legacy façade** (`TelCompat`): serves a FreeSWITCH-controller-style
-  `the legacy verb API` verb API (`StartStream`/`StartRecording`/…) byte-compatibly on
+  verb API (`StartStream`/`StartRecording`/…) byte-compatibly on
   the same port, so an existing controller can be pointed at MSS by config
   flag and rolled back the same way. Optional — skip it if you have no such
   controller.
@@ -128,27 +128,6 @@ names, types, tests and `docs/`, enforced by CI) is
   three test altitudes and the lab that exists today.
 - [CLAUDE.md](CLAUDE.md) — orientation for AI-assisted sessions and new
   engineers.
-
-## Provenance and glossary
-
-MSS grew out of one production contact-center platform, and the design docs
-keep that history verbatim — it is where the requirements came from, and
-every design rule traces to a measured defect or probe. Internal component
-names you will meet in `docs/` map to generic roles:
-
-| Name in docs | Generic role |
-| --- | --- |
-| `the legacy controller` | the legacy telephony controller: drives FreeSWITCH over ESL, exposes the `the legacy verb API` gRPC API that `TelCompat` mirrors |
-| `the legacy verb API` / `the legacy verb API` | that controller's gRPC API (`proto/telcompat.proto` copies its shapes) |
-| `the legacy stream fsm` / `the application server` | the state machine and application server consuming the legacy fork events |
-| `the legacy media gateway` | the legacy per-call RTP↔WebSocket gateway MSS supersedes; source of the frozen Twilio-dialect bytes |
-| `the voice-AI orchestrator` | the voice-AI orchestrator that will switch from the legacy gateway to MSS in Phase 3 |
-| `uuid_audio_fork` | a fork of mod_audio_fork whose event vocabulary (`mod_audio_fork::*`) the event contract preserves |
-
-Nothing in the core depends on that platform. The compatibility surfaces
-(Twilio-dialect WS, `mod_audio_fork` event names, the `the legacy verb API` façade) are
-optional adapters: use them if you are migrating off a similar stack, ignore
-them if you are not.
 
 ## Development
 

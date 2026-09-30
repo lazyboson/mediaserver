@@ -723,7 +723,7 @@ journal to read, and the fact that this attach may take back its
 recording-group seat). A client that could set those could silence-pad any
 recording or claim another pod's seat in a recording group, so the guard sits
 on the wire: the keeper reaches the controller in-process and is unaffected,
-and the same refusal covers the legacy `the legacy verb API` façade, whose `StartStream`
+and the same refusal covers the legacy TelCompat façade, whose `StartStream`
 copies caller metadata straight through. If you are carrying your own
 namespaced keys, use anything but `mss.` — `tenant.`, your product's name,
 whatever — and nothing changes for you.
@@ -1130,7 +1130,7 @@ OpenSIPS → rtpengine → FreeSWITCH for the customer leg, a Go telephony
 controller driving FreeSWITCH over ESL, and a per-call RTP↔WebSocket gateway
 that MSS supersedes. The compatibility surfaces that shape exercises — the
 Twilio Media Streams websocket dialect, the `mod_audio_fork` event names, the
-the legacy verb API façade — are **optional adapters**, not part of the core.
+TelCompat façade — are **optional adapters**, not part of the core.
 
 Read it as an example of how the pieces fit, never as a requirement. Any
 deployment whose media anchors in rtpengine can run MSS with none of it.

@@ -20,19 +20,16 @@ injection) and finally conference mixing.
 ## The reference deployment it replaces parts of
 
 The project grew out of one production contact-center stack; that stack is
-the reference deployment, and its internal component names appear
-throughout the docs as concrete stand-ins for generic roles (full glossary
-in the [README](README.md#provenance-and-glossary)):
+the reference deployment the docs describe:
 
 - **Carrier → OpenSIPS → RTPEngine (kernel module) → FreeSWITCH** is the
   customer leg; agents connect via a registrar/OpenSIPS gateway + RTPEngine
   into the same FreeSWITCH.
-- **the legacy controller** (Go) is the legacy telephony controller: it drives FreeSWITCH
-  over ESL — IVR, the `<Stream>` verb state machine (`the legacy stream fsm`),
-  conference-based monitor/whisper, recording. Its `the legacy verb API` gRPC API is
-  the control surface our `TelCompat` façade mirrors byte-for-byte
-  (StartStream→CreateSession/Attach etc.).
-- **the legacy media gateway** (Go) is the legacy gateway this service supersedes: a
+- **The legacy controller** (Go) drives FreeSWITCH over ESL — IVR, the
+  `<Stream>` verb state machine, conference-based monitor/whisper,
+  recording. Its gRPC verb API is the control surface our `TelCompat`
+  façade mirrors byte-for-byte (StartStream→CreateSession/Attach etc.).
+- **The legacy media gateway** (Go) is what this service supersedes: a
   per-call RTP↔WebSocket pump behind an OpenSIPS B2B dummy leg +
   FreeSWITCH conference. Its audit produced our requirements delta
   (architecture doc §7.1) — every design rule here traces to a defect
@@ -45,7 +42,7 @@ in the [README](README.md#provenance-and-glossary)):
 
 None of the core depends on that platform: any deployment whose media
 anchors in rtpengine can run MSS, and the compatibility surfaces
-(Twilio-Media-Streams WS dialect, mod_audio_fork event names, the the legacy verb API
+(Twilio-Media-Streams WS dialect, mod_audio_fork event names, the TelCompat
 façade) are optional adapters.
 
 ## Binding documents (in order of authority)
@@ -94,7 +91,7 @@ placement a scheduling decision instead of an SDP-routing problem.
 - Taps are ears; inline legs are mouths. A subscription cannot inject
   audio; interactive voice-AI needs the Phase-3 inline leg.
 - Wire compatibility is frozen: the Twilio Media Streams dialect
-  (`crates/protocol/src/twilio.rs`), the the legacy stream fsm send_text events
+  (`crates/protocol/src/twilio.rs`), the legacy stream state machine's send_text events
   (`fork_events.rs`), and the recording identity scheme
   `${accountID}/${recordingID}.${format}` are contracts (Constitution,
   Article VII). Their serialization tests are the spec.

@@ -798,11 +798,11 @@ menu. Do not "harmonise" the two paths; the asymmetry is the point.
 - `twilio.rs` and `fork_events.rs` serialization tests are the contract
   (Constitution VII). Do not change shapes; add new versioned surfaces.
 - Every `Outbound` variant now has a byte-exact expected-JSON test
-  (`start/media/dtmf/mark/stop_matches_the legacy media gateway_bytes`), matching the
+  (`start/media/dtmf/mark/stop_matches_the_legacy_gateway_bytes`), matching the
   `fork_events` style. Previously only `Media` was covered, and only by
   field spot-checks — a frozen contract with four untested shapes.
 - **`mark` carries no `sequenceNumber`; `start`/`media`/`dtmf`/`stop` all
-  do.** Confirmed against the the legacy media gateway source: its mark echo is
+  do.** Confirmed against the legacy media gateway source: its mark echo is
   `{"event":"mark","streamSid":...,"mark":{"name":...}}`. The asymmetry is
   the contract, not an oversight, and
   `mark_omits_sequence_number_while_start_media_dtmf_stop_carry_it` exists
@@ -868,7 +868,7 @@ be exact — the room — is never adopted.
   resolved. `legacy_eligible` on each event is that attachment's flag, and
   `MediaEvent::legacy_name()` returns `None` for everything else — so an RTT
   service and a voice-AI bridge can both return transcripts while only one
-  drives `the legacy stream fsm`. Detaching frees the role for a successor.
+  drives the legacy stream state machine. Detaching frees the role for a successor.
 - **A consumer cannot forge event identity (§5.5).** This is why
   `ConsumerEvent` and `EventKind` are separate types rather than one: a far
   end can *claim* speech results, but `session`, `external_id`,
@@ -1176,7 +1176,7 @@ policy checks `ConsumerHello.token` on the data plane. Unset means open —
 the lab mode — and the daemon logs that loudly at startup.
 
 **`TelCompat` is deliberately not intercepted.** Its whole contract is that
-an unmodified the legacy controller client works byte-for-byte; the legacy controller sends no auth
+an unmodified legacy controller client works byte-for-byte; the legacy controller sends no auth
 metadata, so intercepting it would break the no-client-change property.
 The pilot fronts that surface with network policy; if the legacy controller ever grows an
 outbound interceptor, wiring the same `AuthPolicy` there is one line.
@@ -1572,12 +1572,12 @@ with the broker down.
 
 ### Resolving a call's participants without the discovery map (2026-08-17)
 
-The blocker on any the legacy controller integration was that a TelCompat caller knows only
+The blocker on any legacy controller integration was that a TelCompat caller knows only
 the FreeSWITCH channel uuid, while a tap needs the SIP call-id and the
 participants' from-tags — filed for months as "waiting on OpenSIPS to write a
 discovery map to Redis".
 
-It turns out not to need one. the legacy controller already has both facts on the channel:
+It turns out not to need one. The legacy controller already has both facts on the channel:
 `Variable_sip_call_id`, and the caller's tag inside `Variable_sip_full_from`.
 And rtpengine will name a call's participants itself — `query` returns
 `tags`, which is what `lab/call_watcher.py` has been doing all along. So:
@@ -1617,7 +1617,7 @@ fully-qualified method path, so `/protos.TelService/StartStream` is
 byte-identical to what the legacy controller already calls, and a per-tenant flag can point a
 client at `MSS` instead of `the legacy gRPC server` with **no client change** and roll
 back by pointing it back. Message shapes and field numbers are copied verbatim
-from the legacy controller's `the legacy verb API.proto`.
+from the legacy controller's verb API proto.
 
 Only the media subset is declared — stream, transcription, recording, playback
 stop. Originate, answer, hangup, bridge, conferences and IVR prompting stay on
@@ -1626,7 +1626,7 @@ is the honest answer rather than a silent success.
 
 The mapping (one test per row in `tests/telcompat.rs`):
 
-| the legacy verb API verb | MSS nouns |
+| legacy verb | MSS nouns |
 | --- | --- |
 | `StartStream` | `CreateSession{TAP}` if absent + `Attach{WS_TWILIO, SINK+EVENTS+INJECT, authoritative}` |
 | `StopStream` | `Detach`, and `DestroySession` when it was the last attachment |
@@ -1643,7 +1643,7 @@ Two things the tests caught, both worth keeping:
 - **Authoritative follows the session's purpose, not arrival order.** The first
   version claimed `authoritative: true` for every attachment, so a recorder
   joining a streamed call was refused with `AuthoritativeAlreadyBound`. The
-  fork produces the speech events the legacy stream fsm runs on; a recorder is a `SINK`
+  fork produces the speech events the legacy stream state machine runs on; a recorder is a `SINK`
   with no back-channel and must never claim them.
 - **One session serves both.** `StartStream` + `StartRecording` on the same
   channel produce one tap with two attachments, which is the whole point:
@@ -1651,11 +1651,11 @@ Two things the tests caught, both worth keeping:
 
 Both surfaces share one controller and one port (`server.rs`): the packages
 differ (`mss.v1` vs `protos`) so the method paths cannot collide, and
-`over_the_wire.rs` proves an unmodified the legacy controller client and the native API drive
+`over_the_wire.rs` proves an unmodified legacy controller client and the native API drive
 the same session over one socket. `SessionController` implements `MediaControl`
 for `Arc<Self>` so both services can hold it.
 
-Gap: session creation passes an empty `call_id`/`from_tags`, because the legacy verb API
+Gap: session creation passes an empty `call_id`/`from_tags`, because legacy verb API
 callers only know the channel uuid. **Resolved since 2026-08-17** (see
 "Resolving a call's participants without the discovery map" above): the caller
 passes the SIP call-id and the caller's from-tag as session metadata
@@ -2941,7 +2941,7 @@ never takes a lock and never waits on the control world.
 
 ### consumer_ws.rs — the first consumer bridge, and the speech path back
 - WebSocket client speaking the frozen Twilio dialect from
-  `protocol::twilio`, so a the legacy media gateway-compatible endpoint accepts it
+  `protocol::twilio`, so an endpoint compatible with the legacy media gateway accepts it
   unchanged. `MSS_CONSUMER_URL` turns it on; without it the tap behaves
   exactly as before. Since the hub landed it is just another subscriber:
   it consumes a `hub::Subscription` and reports the hub's per-consumer
@@ -3255,7 +3255,7 @@ The control-plane pieces are all wired: `MediaControl` + `TelCompat` +
 Kafka event pump on `MSS_KAFKA_BROKERS`, the Redis registry keeper on
 `MSS_REDIS_URL`, the metrics endpoint on `MSS_METRICS_LISTEN`, graceful
 drain on ctrl-c. Still open: billing-topic producers for phase 3
-(`LEGACY_MEDIA_GATEWAY_BILLING_TOPIC` / `KAFKA_VOICE_AI_AGENT_TOPIC` schemas).
+(the legacy gateway's billing topic / `KAFKA_VOICE_AI_AGENT_TOPIC` schemas).
 
 ## Phase-0 measurements so far (Article VIII)
 

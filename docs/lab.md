@@ -92,7 +92,7 @@ codec, per stream, omitting it when the offer has none.
 
 This was worth more than an unblocked lab. Answering with PCMU alone would
 have meant **no RFC 4733 packets on any tap**, so `firstDtmf` and
-`dtmfResult` — frozen the legacy stream fsm contracts (Constitution VII) — would have
+`dtmfResult` — frozen legacy stream state machine contracts (Constitution VII) — would have
 gone silently missing in Phase 1, with `StreamPipeline`'s detector wired to a
 payload type nothing was sending. It also means the telephone-event payload
 type is now taken from the offer instead of assuming 101, which is
@@ -262,12 +262,12 @@ against the real service.
 | what `twilio.rs` emitted (`audio/x-mulaw`, numeric `timestamp`) | `invalid_json`, **connection closed** |
 | what the legacy media gateway emits (`PCMU`, string `timestamp`) | accepted |
 
-1. **`timestamp` must be a string.** the legacy media gateway sends
+1. **`timestamp` must be a string.** The legacy media gateway sends
    `fmt.Sprintf("%d", ...)` (`pkg/mediaservice/client.go`) into a
    `Timestamp string` field, and the bridge unmarshals into a string too. A
    JSON number closes the connection. Our frozen test asserted the number.
 2. **`mediaFormat.encoding` must be `PCMU`, not `audio/x-mulaw`.**
-   the legacy media gateway sends `codec.GetName()`. The bridge branches on
+   The legacy media gateway sends `codec.GetName()`. The bridge branches on
    `encoding == "PCMU" || "PCMA"` to pick its TTS output format, so
    `audio/x-mulaw` silently yields 16 kHz PCM instead of mu-law — no error,
    just wrong audio.
@@ -393,7 +393,7 @@ synthetic lab:
   packet to Deepgram, so two interleaved tracks at 100 pkt/s transcribed as
   nothing. MSS now streams only the Customer track by default;
   `MSS_CONSUMER_TRACKS=both` restores dual-track for consumers that split
-  by track. the legacy media gateway only ever sent one track, so this is also the
+  by track. The legacy media gateway only ever sent one track, so this is also the
   wire-compatible behaviour.
 
 ## Findings resolved

@@ -76,13 +76,13 @@ pushed because a `&&` chain swallowed the failure.
 
 ## 5. Survey completely before making architecture claims
 
-An early the legacy controller survey used `ls | head` and missed `the legacy verb API`,
-`the voice-AI orchestrator` and five binaries — producing an integration design for
+An early survey of the legacy controller used `ls | head` and missed its verb
+API, the voice-AI orchestrator and five binaries — producing an integration design for
 a system that no longer existed. When a conclusion will shape design:
 enumerate fully (no `head` on the listing), check the branch is current
 (`git fetch` + rev-list), and state *what you read* alongside what you
 concluded. Look for existing seams before inventing one — `the legacy proto package`,
-`the legacy verb API.proto` and the Kafka event producer were all sitting there,
+the legacy verb API proto and the Kafka event producer were all sitting there,
 already shaped like the answer.
 
 ## 6. Make our side robust instead of steering the vendor

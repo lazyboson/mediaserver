@@ -16,7 +16,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn matches_the legacy stream fsm_wire_format() {
+    fn matches_legacy_fork_wire_format() {
         let ev = ForkEvent::DtmfResult {
             call_sid: "u-1".into(),
             digits: "42#".into(),

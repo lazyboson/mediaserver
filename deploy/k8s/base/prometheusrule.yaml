@@ -36,8 +36,8 @@ spec:
           annotations:
             summary: "MediaEvents are being dropped before reaching Kafka"
             description: >-
-              The event pump queue on {{ $labels.instance }} is full. the legacy stream fsm
-              decisions downstream are running on an incomplete event stream;
+              The event pump queue on {{ $labels.instance }} is full. Legacy stream
+              state machine decisions downstream are running on an incomplete event stream;
               the per-session gapless seq lets consumers see the holes.
 
         - alert: MssEventPublishFailing

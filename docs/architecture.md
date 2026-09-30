@@ -4,12 +4,11 @@
 **Date:** 2026-08-13 (rev. 2 — language decision locked)
 **Status:** Accepted — implementation scaffolded in this repo
 **Reader's note:** this is the original internal design record, kept
-verbatim as the project's decision history. Component names like `the legacy controller`,
-`the legacy media gateway`, `the legacy verb API`, `the voice-AI orchestrator` and `the application server` refer to
-the reference deployment this project grew out of — a contact-center
-platform whose FreeSWITCH-centric media path MSS replaces. The
-[README glossary](../README.md#provenance-and-glossary) maps each name to
-its generic role; nothing in the design depends on that specific platform.
+as the project's decision history. Components are named by their generic
+roles (the legacy controller, the legacy media gateway, the application
+server, the voice-AI orchestrator) in the reference deployment this project
+grew out of — a contact-center platform whose FreeSWITCH-centric media path
+MSS replaces. Nothing in the design depends on that specific platform.
 **Decision inputs:** Ingest = RTPEngine tap/forwarding · Build = new purpose-built service in **Rust** (single language, single codebase) · Scope = phased (fork/streaming → recording → playback/injection → full media plane)
 
 ---
@@ -34,7 +33,7 @@ The target end-state removes all of the passive-listening load from FS in Phase 
 Two hard truths this document designs around:
 
 1. **A tap is listen-only.** RTPEngine subscriptions give you a one-way copy of media. Passive consumers (RTT, ASR, transcription, recording, analytics, supervisor listen) are perfectly served. Interactive consumers (a voice-AI agent that *talks back*) need an injection path. Phase 3 handles this by making the MSS an *inline* RTP endpoint for interactive sessions (the same B2B INVITE pattern the legacy media gateway uses today, minus the conference), while keeping the tap for everything passive. RTPEngine's `play media` exists but is file/blob-oriented (ffmpeg-decodable inputs), not a streaming TTS pipe — suitable for prompts/MOH, not for live bot speech.
-2. **the legacy media gateway is a seed, not a foundation.** It proves the concept (Go process terminates RTP, negotiates SDP, bridges to a bot over WSS) but a code audit shows it is a single-consumer, single-codec-family, no-jitter-buffer pump with hardcoded 20 ms pacing and per-pod pinned state. Section 7 catalogs exactly what a purpose-built MSS must do differently — that list is effectively the requirements delta.
+2. **The legacy media gateway is a seed, not a foundation.** It proves the concept (Go process terminates RTP, negotiates SDP, bridges to a bot over WSS) but a code audit shows it is a single-consumer, single-codec-family, no-jitter-buffer pump with hardcoded 20 ms pacing and per-pod pinned state. Section 7 catalogs exactly what a purpose-built MSS must do differently — that list is effectively the requirements delta.
 
 ---
 
@@ -55,31 +54,31 @@ flowchart LR
     RE1 -->|customer leg RTP| FS[FreeSWITCH]
     RE2 -->|agent leg RTP| FS
 
-    TEL[the legacy gRPC server<br/>the legacy verb API gRPC ~40 RPCs] <-->|ESL 8021<br/>events plain ALL| FS
+    TEL[the legacy gRPC server<br/>verb API gRPC ~40 RPCs] <-->|ESL 8021<br/>events plain ALL| FS
     TEL -->|"Events{repeated string}<br/>keyed by UUID + OTel"| K[(Kafka eventTopic)]
-    K --> APP[the application server<br/>consumer group 'eventHandler'<br/>the legacy stream fsm · recording · webhooks]
-    APP -->|the legacy verb API gRPC| TEL
+    K --> APP[application server<br/>consumer group 'eventHandler'<br/>stream state machine · recording · webhooks]
+    APP -->|verb API gRPC| TEL
 
     FS -->|"uuid_audio_fork (WS)"| ASR["ASR / RTT / voice-AI<br/>(one mechanism since<br/>the Deepgram move)"]
     FS -->|record_session → file → SQS| S3[(S3)]
     FS -->|"dummy leg INVITE<br/>X-Conversation-ID, X-ccId"| OSB2B[OpenSIPS B2B]
-    OSB2B -->|E_UA_SESSION event +<br/>ua_session_reply MI| MG[the legacy media gateway<br/>RTP ⇄ WSS pump]
+    OSB2B -->|E_UA_SESSION event +<br/>ua_session_reply MI| MG[legacy media gateway<br/>RTP ⇄ WSS pump]
     MG -->|Twilio Media Streams<br/>dialect over WSS| VAI[Voice AI agent /<br/>web streaming]
     FS -.->|"conference mixer<br/>(per AI interaction +<br/>monitor/coach)"| FS
 ```
 
 Key structural facts pulled from the two repos:
 
-- **the legacy controller is seven binaries, not one.** `the legacy gRPC server` owns the ESL socket and exposes `the legacy verb API.proto` over gRPC; `the application server` consumes events from Kafka; `the parser server`, `the executor server`, `the resource server`, `the voice server`, `the application worker` sit around them. The media surface is already service-oriented — which is why MSS can slot in behind a tenant flag.
+- **The legacy controller is seven binaries, not one.** `the legacy gRPC server` owns the ESL socket and exposes the legacy verb API proto over gRPC; the application server consumes events from Kafka; `the parser server`, `the executor server`, `the resource server`, `the voice server`, `the application worker` sit around them. The media surface is already service-oriented — which is why MSS can slot in behind a tenant flag.
 - **the legacy gRPC server → FS is a single long-lived inbound ESL socket** (`eventsocket.Dial`, singleton via `sync.Once`), subscribed with `events plain ALL`, and the event fan-out **drops events when the subscriber channel is full**. Every media feature adds event volume to this one pipe.
-- **Events leave the legacy gRPC server on Kafka.** `pkg/the legacy verb API/eventproducer` marshals each eventMap into `Events{repeated string}`, keys the message by call UUID and injects OTel context; `the application server` reads it as consumer group `eventHandler`. Per-call ordering, replay and multi-consumer fan-out are therefore already solved by the bus — the reason MSS publishes events rather than streaming them (§5.4).
+- **Events leave the legacy gRPC server on Kafka.** Its event producer marshals each eventMap into `Events{repeated string}`, keys the message by call UUID and injects OTel context; the application server reads it as consumer group `eventHandler`. Per-call ordering, replay and multi-consumer fan-out are therefore already solved by the bus — the reason MSS publishes events rather than streaming them (§5.4).
 - **ASR moved from Google to Deepgram, and became the fork.** `PlayAndDetectSpeechWithGSR` now calls `initiateStream(...)` instead of `uuid_google_transcribe2` (the old call is commented out in `fs_api.go`). RTT, gather-ASR and the voice-AI fork are one mechanism, and the module now emits `mod_audio_fork::{start_of_transcript, partial_speech_result, end_of_utterance, first_transcript}` — a continuous interim-results stream, not one event per finished utterance.
 - **`mod_audio_fork` is a translator, not a pipe.** `FsEventSink::Emit` converts each WebSocket message from the far end into an FS CUSTOM event (`mod_audio_fork::<name>`, `Unique-ID` + `Fork-ID` headers, JSON in the body). Consumers never touch Kafka — the contract MSS must preserve (§5.5).
-- **The voice-AI path is a Rube Goldberg of media hops:** the legacy controller `CreateParticipant` runs `bgapi originate {…, origination_uuid, absolute_codec_string, sip_h_X-Conversation-ID…}<dest> &conference('<name>'@default++flags{…})` — i.e., FS dials a *dummy leg* toward OpenSIPS B2B purely so that the conference's mixed audio flows to the legacy media gateway, which answers via `ua_session_reply` and pumps RTP→WSS to the bot. One AI interaction = 1 conference mixer + 1 extra leg + 1 RTP termination, all for what is conceptually "copy this call's audio to a websocket."
-- **Forking is FS-resident:** `bgapi uuid_audio_fork <uuid> start <wsURL> <mixType> <samplingRate> <streamSid> <accID> <callSid> <track> <metadataJSON>` (your forked mod_audio_fork with 4 custom positional args) and `uuid_google_transcribe2 … start` each attach a media bug to the channel. `the legacy stream fsm` then choreographs `pause/resume/send_text` around FS `playback`/`break` timing.
+- **The voice-AI path is a Rube Goldberg of media hops:** the legacy controller's `CreateParticipant` runs `bgapi originate {…, origination_uuid, absolute_codec_string, sip_h_X-Conversation-ID…}<dest> &conference('<name>'@default++flags{…})` — i.e., FS dials a *dummy leg* toward OpenSIPS B2B purely so that the conference's mixed audio flows to the legacy media gateway, which answers via `ua_session_reply` and pumps RTP→WSS to the bot. One AI interaction = 1 conference mixer + 1 extra leg + 1 RTP termination, all for what is conceptually "copy this call's audio to a websocket."
+- **Forking is FS-resident:** `bgapi uuid_audio_fork <uuid> start <wsURL> <mixType> <samplingRate> <streamSid> <accID> <callSid> <track> <metadataJSON>` (your forked mod_audio_fork with 4 custom positional args) and `uuid_google_transcribe2 … start` each attach a media bug to the channel. The legacy stream state machine then choreographs `pause/resume/send_text` around FS `playback`/`break` timing.
 - **Recording is FS-resident:** `record_session` media bugs writing to a shared filesystem, with recording identity encoded in the file path (`${accountID}/${recordingID}.${fileFormat}`), uploaded via SQS jobs, callbacks driven by FS RECORD_START/STOP events.
 - **Monitor/whisper is conference-resident:** supervisor joins the conference muted, then `bgapi conference '<name>' relate <datumIds> <relatedIds> nospeak` isolates who hears whom; coach = unmute while nospeak-related to the customer.
-- **the legacy media gateway is per-call pinned:** symmetric-RTP latching (client address learned from first inbound packet), one UDP port per call from a 35000–65000 pool, ~7 goroutines per call, all session state in-process; Redis only for bookkeeping. No jitter buffer, no RTCP, no SRTP, transcoding limited to µ-law↔A-law, Opus is passthrough-only, and the playout pacer is a hardcoded 20 ms ticker regardless of negotiated ptime.
+- **The legacy media gateway is per-call pinned:** symmetric-RTP latching (client address learned from first inbound packet), one UDP port per call from a 35000–65000 pool, ~7 goroutines per call, all session state in-process; Redis only for bookkeeping. No jitter buffer, no RTCP, no SRTP, transcoding limited to µ-law↔A-law, Opus is passthrough-only, and the playout pacer is a hardcoded 20 ms ticker regardless of negotiated ptime.
 
 ### Why FreeSWITCH is the bottleneck
 
@@ -101,9 +100,9 @@ flowchart LR
     RE1 -->|RTP| FS[FreeSWITCH<br/>IVR + call control only]
     RE2 -->|RTP| FS
 
-    subgraph the legacy controller [the legacy controller]
-        TEL[the legacy gRPC server<br/>the legacy verb API gRPC]
-        APP[the application server<br/>the legacy stream fsm · recording · webhooks]
+    subgraph legacy [legacy controller]
+        TEL[the legacy gRPC server<br/>verb API gRPC]
+        APP[application server<br/>stream state machine · recording · webhooks]
         SHIM[events translator<br/>typed → positional eventMap]
     end
     TEL <-->|ESL| FS
@@ -131,7 +130,7 @@ flowchart LR
     KM --> SHIM
     SHIM -->|"Events{repeated string}<br/>mod_audio_fork::* names"| KE[(Kafka eventTopic)]
     KE --> APP
-    APP -->|the legacy verb API gRPC| TEL
+    APP -->|verb API gRPC| TEL
     CTRL <-->|session registry + leases<br/>call-id → node + tags| R[(Redis)]
 ```
 
@@ -142,11 +141,11 @@ Three properties this diagram is drawn to make explicit, each argued in §5:
 - **Consumers never touch Kafka.** They speak their attachment's transport;
   MSS is the sole producer of a session's events.
 - **Exactly one attachment is authoritative** — only its events become the
-  legacy `mod_audio_fork::*` names that drive `the legacy stream fsm`.
+  legacy `mod_audio_fork::*` names that drive the legacy stream state machine.
 
 ### 3.1 Components
 
-**Session Controller** — the control plane. Exposes the `MediaControl` gRPC API over the Session / Attachment / Playback nouns defined in §5.1 (a `TelCompat` façade translates the legacy controller's the legacy verb API verbs, §5.6). It owns the RTPEngine interaction: for each tap it sends `subscribe request {call-id, from-tag | from-tags, …}` to the RTPEngine instance anchoring that call, receives rtpengine's `a=sendonly` SDP offer, allocates a local RTP port, and replies with `subscribe answer` (`a=recvonly`) — optionally requesting a codec on the subscription leg so rtpengine transcodes at the tap (e.g., ask for PCMU even if the leg is Opus). Teardown is `unsubscribe`. This is the same mechanism SIPREC recording servers use with rtpengine, so it is a stable, supported surface.
+**Session Controller** — the control plane. Exposes the `MediaControl` gRPC API over the Session / Attachment / Playback nouns defined in §5.1 (a `TelCompat` façade translates the legacy controller's verbs, §5.6). It owns the RTPEngine interaction: for each tap it sends `subscribe request {call-id, from-tag | from-tags, …}` to the RTPEngine instance anchoring that call, receives rtpengine's `a=sendonly` SDP offer, allocates a local RTP port, and replies with `subscribe answer` (`a=recvonly`) — optionally requesting a codec on the subscription leg so rtpengine transcodes at the tap (e.g., ask for PCMU even if the leg is Opus). Teardown is `unsubscribe`. This is the same mechanism SIPREC recording servers use with rtpengine, so it is a stable, supported surface.
 
 **SIP front door** — the second entrance onto exactly the same nouns, and optional: `MSS_SIP_LISTEN` (UDP) answers an INVITE by calling the Session Controller's own `CreateSession{kind=INLINE, group=<dialled user part>}`, one function call earlier than the gRPC service does. It is a UAS — transactions, dialogs, offer/answer and session timers, with no registrar, no routing and no forking — so "answer-only" is unchanged as a property of the design: **MSS answers, it never dials.** It is a control-plane Tokio task that never touches a media thread, and the `CreateSession` it makes is spawned so the socket is never stalled behind it. A deployment that drives MSS entirely over gRPC leaves the variable unset and the door shut. Because it is the one port a stranger can address, it is its own trust boundary and carries no bearer check of its own (§7, deploy.md). The door's lifecycle events `XADD` a tiny JSON record onto Redis stream `mss:call-events` by default (`crates/call-events`) whenever `MSS_REDIS_URL` or `MSS_CALL_EVENT_REDIS_URL` is set; that crate is a stopgap until call-control consumes `mss.events` on Kafka. An empty `MSS_CALL_EVENT_STREAM` turns the publisher off without a rebuild.
 
@@ -162,7 +161,7 @@ Three properties this diagram is drawn to make explicit, each argued in §5:
 - *WebSocket, Twilio Media Streams dialect* — wire-compatible with what the legacy media gateway sends today (`start/media/dtmf/stop/mark` out, `media/mark/clear/endOfInteraction` in), so existing bot/ASR endpoints migrate with zero changes.
 - *Recording sink* — PCM → stereo WAV/OGG segmenter honoring the existing `${accountID}/${recordingID}.${fileFormat}` identity contract, uploading directly to S3 (no shared filesystem, no SQS hop — or keep SQS initially for compatibility). S3 stays the **default**; a **shared filesystem** every recording pod mounts is the configured alternative (`MSS_RECORDING_STORE=filesystem`, item 58) for a deployment that has no object store or whose recording pickup already watches a mounted tree — the same identity, the same sink trait, one variable, and `file://` rather than `s3://` in the event.
 
-**State & events** — session registry in Redis (which pod owns which session, attachment list, status) with CAS-safe updates and ownership leases. Media events go to Kafka `mss.events` as typed `MediaEvent`, translated into the legacy `eventTopic` format by a shim in the legacy controller (§5.4); billing/lifecycle events reuse `LEGACY_MEDIA_GATEWAY_BILLING_TOPIC` / `KAFKA_VOICE_AI_AGENT_TOPIC` schemas so downstream consumers don't change.
+**State & events** — session registry in Redis (which pod owns which session, attachment list, status) with CAS-safe updates and ownership leases. Media events go to Kafka `mss.events` as typed `MediaEvent`, translated into the legacy `eventTopic` format by a shim in the legacy controller (§5.4); billing/lifecycle events reuse `the legacy gateway's billing topic` / `KAFKA_VOICE_AI_AGENT_TOPIC` schemas so downstream consumers don't change.
 
 ### 3.2 Why tap-based ingest scales better than everything you do today
 
@@ -179,7 +178,7 @@ Sequence for a Phase-1 tap (e.g., the legacy controller wants RTT on a live call
 
 ```mermaid
 sequenceDiagram
-    participant CG as the legacy controller (the legacy verb API)
+    participant CG as legacy controller (verb API)
     participant MSS as MSS Controller
     participant RE as RTPEngine (anchoring the call)
     participant RTT as RTT consumer
@@ -211,17 +210,17 @@ Design details:
 
 ## 5. The MSS interface
 
-Verified against the legacy controller `development` (2026-08-16). Three facts reshape this
+Verified against the legacy controller's `development` branch (2026-08-16). Three facts reshape this
 section from what an earlier draft assumed:
 
-- **the legacy controller is service-oriented already.** `cmd/the legacy gRPC server` exposes
-  `pkg/the legacy verb API/proto/the legacy verb API.proto` (~40 RPCs) over gRPC; `cmd/the application server`
+- **The legacy controller is service-oriented already.** `cmd/the legacy gRPC server` exposes
+  its verb API proto (~40 RPCs) over gRPC; the application server
   is a separate process.
 - **Events travel on Kafka, not ESL, once they leave the legacy gRPC server.**
-  `pkg/the legacy verb API/eventproducer` subscribes to the ESL stream and publishes
+  Its event producer subscribes to the ESL stream and publishes
   every event to a Kafka topic as `Events{repeated string events}` — the
   positional eventMap indexed by `constants.MapKeyIndex` — keyed by call
-  UUID, with OpenTelemetry context injected. `the application server` consumes it as a
+  UUID, with OpenTelemetry context injected. The application server consumes it as a
   consumer group (`sarama.NewConsumerGroup(..., "eventHandler")`).
 - **ASR is no longer a separate mechanism.** Commit *"moved asr from google
   to deepgram"* rewired `PlayAndDetectSpeechWithGSR` from
@@ -233,7 +232,7 @@ section from what an earlier draft assumed:
 
 ### 5.1 Design rule: nouns, not FreeSWITCH verbs
 
-MSS does **not** mirror `the legacy verb API.proto`. Those names — `StreamPause`,
+MSS does **not** mirror the legacy verb API proto. Those names — `StreamPause`,
 `StreamSendText`, `StartCallTranscription` — describe *how FreeSWITCH does
 it*, and Phase 3/4 (inline legs, mixing, whisper) do not fit that
 vocabulary. MSS exposes a small noun-oriented API, and a thin compatibility
@@ -274,7 +273,7 @@ Note the absences: no Pause/Resume RPCs (that is
 sink), no transcription API (an attachment with an ASR sink). Fewer verbs,
 more nouns, is what buys the future phases.
 
-**Dual addressing is mandatory.** the legacy controller keys everything by channel UUID
+**Dual addressing is mandatory.** The legacy controller keys everything by channel UUID
 because FreeSWITCH owns the channel; MSS keys by (call-id, from-tags,
 rtpengine node) because rtpengine does. Every request carries
 `external_id` (the legacy controller's `request_uuid`), and MSS resolves it through the
@@ -313,12 +312,12 @@ back-channel at all).
 Fan-out creates a problem the legacy design never had. There was exactly
 **one** fork per call, so "the fork's events" *were* "the call's events" —
 identity came free. With N consumers it does not: if an RTT service and a
-voice-AI bridge both return `first_transcript`, `the legacy stream fsm` sees two, and a
+voice-AI bridge both return `first_transcript`, the legacy stream state machine sees two, and a
 state machine driven twice corrupts the call silently.
 
 So: every event carries `attachment_id`, and exactly **one attachment per
 session is marked authoritative**. Only its events are rendered into the
-legacy `mod_audio_fork::*` names that drive `the legacy stream fsm`. Others still reach
+legacy `mod_audio_fork::*` names that drive the legacy stream state machine. Others still reach
 `mss.events` (analytics, debugging, future consumers) but never the FSM.
 A second authoritative attach is rejected, not silently resolved.
 
@@ -330,9 +329,9 @@ created the session.
 
 ### 5.4 Commands over gRPC, events over Kafka
 
-Events must **not** stream back over gRPC. the legacy controller's consumption is a Kafka
+Events must **not** stream back over gRPC. The legacy controller's consumption is a Kafka
 consumer group, which already solves durably what a gRPC event stream would
-reintroduce badly: fan-out to multiple the application server instances, per-call
+reintroduce badly: fan-out to multiple application server instances, per-call
 ordering (key = UUID), consumer restart without loss, backpressure, replay.
 
 ```
@@ -346,7 +345,7 @@ MSS ──Kafka "mss.events"──▶ translator ──Kafka "eventTopic"──�
   is MSS's long-term contract and the only format MSS knows.
 - **`eventTopic`** — the existing legacy topic, untouched. A thin Go
   translator renders the positional `Events{repeated string}` that
-  `the application server` already parses.
+  the application server already parses.
 
 **The translator lives in the legacy controller, not MSS.** The legacy format *is*
 `constants.MapKeyIndex` — a positional index table defined in Go — plus
@@ -405,13 +404,13 @@ therefore sits on the barge-in critical path. Nothing can route around it
 to go faster, which makes the `partial_speech_result` → `StopPlayback`
 cut-through a **Phase-1 measurement**, not a Phase-3 nicety.
 
-### 5.6 Compatibility façade: the legacy verb API verbs onto MSS nouns
+### 5.6 Compatibility façade: legacy verbs onto MSS nouns
 
-A `TelCompat` service reuses `the legacy verb API.proto`'s message shapes verbatim, so a
+A `TelCompat` service reuses the legacy verb API's message shapes verbatim, so a
 tenant flag routes calls to `the legacy gRPC server` or `MSS` with **no client
 change** and rollback is a config flip.
 
-| the legacy verb API RPC today (→ FS) | MSS nouns |
+| legacy verb API RPC today (→ FS) | MSS nouns |
 | --- | --- |
 | `StartStream(ws_url, track, stream_sid…)` | `CreateSession{TAP}` + `Attach{WS_TWILIO, SINK+EVENTS+INJECT}` |
 | `StopStream` | `Detach` (+ `DestroySession` if last) |
@@ -422,7 +421,7 @@ change** and rollback is a config flip.
 | `StartRecording(acc_id, record_id, format, channels)` | `Attach{FILE_S3, SINK}` |
 | `StopRecording` | `Detach` |
 
-`the legacy stream fsm` carries over unchanged: it keeps driving FS `playback`/`break`
+The legacy stream state machine carries over unchanged: it keeps driving FS `playback`/`break`
 for prompts while pausing/resuming the *MSS attachment* instead of the FS
 media bug. `PlayBackStopEvent` still originates from FS in Phases 1-2, so
 the "stop playback → wait → resume fork" sequencing is unaffected.
@@ -492,11 +491,11 @@ Rule of thumb for the end-state: **taps for ears, inline legs for mouths.** Pass
 
 ## 7. Lessons from the legacy media gateway: the build checklist
 
-### 7.1 Requirements delta from the the legacy media gateway audit
+### 7.1 Requirements delta from the legacy media gateway audit
 
-The audit of `the legacy media gateway` produced a concrete list of what the purpose-built service must do differently. Treat this as hard requirements:
+The audit of the legacy media gateway produced a concrete list of what the purpose-built service must do differently. Treat this as hard requirements:
 
-| # | the legacy media gateway today | MSS requirement |
+| # | Legacy media gateway today | MSS requirement |
 | --- | --- | --- |
 | 1 | No jitter buffer; packets forwarded in arrival order; seq/timestamp ignored | Proper jitter buffer per ingest stream: reorder, dedupe, loss detection, bounded delay (start ~40–60 ms adaptive), PLC for G.711 |
 | 2 | Hardcoded 20 ms ticker regardless of negotiated ptime; drift never corrected | Pacing derived from negotiated ptime; wall-clock-anchored scheduler (send when `t0 + n·ptime` passes), not a naive ticker |
@@ -505,7 +504,7 @@ The audit of `the legacy media gateway` produced a concrete list of what the pur
 | 5 | Transcode = µ-law↔A-law only; no resampling; Opus passthrough; codec mismatch silently passes garbage | Full pipeline: G.711/G.722/Opus decode+encode, 8k/16k/48k resample, L16 output; reject-or-transcode, never pass mismatched bytes |
 | 6 | Port pool O(N)-under-mutex, one port per call, no RTCP | Free-list/bitmap allocator O(1); RTCP optional but socket pair reserved; `SO_REUSEPORT` + `recvmmsg` batching instead of per-call read goroutine spin loops (50 syscalls/sec/call today) |
 | 7 | Redis session JSON read-modify-write, no CAS → lost updates | Versioned writes (WATCH/Lua or per-field hashes) |
-| 8 | Per-datagram goroutine for OpenSIPS events → INVITE/BYE races per b2b key | Per-session serialized event queues (the legacy controller's the legacy stream fsm sharding pattern is the right one) |
+| 8 | Per-datagram goroutine for OpenSIPS events → INVITE/BYE races per b2b key | Per-session serialized event queues (the legacy controller's stream-state-machine sharding pattern is the right one) |
 | 9 | `ptime=0` parse path → integer divide-by-zero panic; answers Opus with no rtpmap; strips telephone-event from answers | Hardened SDP handling (or lean on rtpengine to normalize — subscription SDP comes from rtpengine, which is well-formed) |
 | 10 | Pod-crash "recovery" is billing bookkeeping only; orphaned legs never torn down | Session registry with ownership leases; on pod death, controller re-establishes taps on a healthy pod (subscriptions are re-creatable — a *huge* HA advantage over inline legs) and tears down orphaned rtpengine subscriptions |
 | 11 | JSON + base64 per 20 ms frame per consumer | Binary gRPC frames natively; base64/JSON only on the WS-compat adapter |
@@ -553,7 +552,7 @@ The audit of `the legacy media gateway` produced a concrete list of what the pur
 
 - **Placement:** the controller assigns each new session to a pod (least-loaded / consistent-hash on call-id). Because taps are pull-initiated, no ingress SDP routing problem exists for passive sessions. Inline legs (Phase 3) still need pod-addressable RTP — same hostNetwork/port-range exposure the legacy media gateway uses today (35000–65000/udp per pod), or a small dedicated port range per pod.
 - **Autoscaling:** HPA on active-session count + CPU; graceful drain = stop accepting sessions, let existing ones end (calls are minutes-long, so scale-in is slow by nature — plan for it).
-- **HA:** ownership leases in Redis (TTL'd, renewed by heartbeat). On pod loss: passive taps are *re-subscribed* from another pod within a second or two (audio gap, session survives — dramatically better than today, where a the legacy media gateway pod crash orphans the call until the B2B leg times out); inline sessions fail like any media endpoint failure and need call-control-level recovery.
+- **HA:** ownership leases in Redis (TTL'd, renewed by heartbeat). On pod loss: passive taps are *re-subscribed* from another pod within a second or two (audio gap, session survives — dramatically better than today, where a legacy media gateway pod crash orphans the call until the B2B leg times out); inline sessions fail like any media endpoint failure and need call-control-level recovery.
 - **Kernel-module note:** RTPEngine's kernel fast path keeps doing the primary A↔B forwarding; each subscription adds userspace work on the rtpengine host (packet copy + optional transcode). Capacity-plan rtpengine for "every call tapped" — measure, and scale rtpengine horizontally (you already run multiple instances; taps go to the instance owning the call). What decides whether a tap stays on the kernel path is **transcoding**, not tapping — see §8.1 for the eligibility checklist and the on-metal probes.
 - **Observability:** per-session/per-consumer metrics (ingest loss %, jitter, queue depth, consumer lag, injected-audio underruns), pprof, and RTP-level counters exported to Prometheus. Silent-drop counters (today's `"queue full, dropping"` logs) must be first-class metrics with alerts.
 
@@ -651,7 +650,7 @@ flowchart TD
 
 **Phase 2 — Recording.** Per-leg taps → stereo segmenter → S3. Preserve: `${accountID}/${recordingID}.${fileFormat}` identity, `recordStart/recordStop/recordPause/uploadCompleted` callback semantics (incl. pause = segment + defer + accumulate duration), SQS pipeline if downstream depends on it (or bypass to direct S3 and keep only the callback contract). Hold/pause state now comes from the legacy controller events rather than FS media-bug state — the legacy controller already tracks `HoldState`/`PauseState` in Redis. *Retires `record_session` bugs and the FS shared-filesystem dependency.*
 
-**Phase 3 — Interactive media.** Inline MSS legs for voice-AI: OpenSIPS routes (pre-agent AI) or the legacy controller bridges (mid-call transfer) the leg straight to MSS — no conference, no dummy leg. Streaming TTS in over gRPC, jitter-buffered playout, barge-in cut-through in MSS. the voice-AI orchestrator's `callthe legacy media gateway` becomes `callMSS` (same create-conversation-then-INVITE handshake — keep the `X-Conversation-ID` correlation). Prompt/MOH injection into tapped calls via rtpengine `play media` where file-shaped audio suffices. *Retires the conference-per-AI-interaction and the the legacy media gateway service itself (MSS supersedes it).*
+**Phase 3 — Interactive media.** Inline MSS legs for voice-AI: OpenSIPS routes (pre-agent AI) or the legacy controller bridges (mid-call transfer) the leg straight to MSS — no conference, no dummy leg. Streaming TTS in over gRPC, jitter-buffered playout, barge-in cut-through in MSS. The voice-AI orchestrator's gateway call becomes an MSS call (same create-conversation-then-INVITE handshake — keep the `X-Conversation-ID` correlation). Prompt/MOH injection into tapped calls via rtpengine `play media` where file-shaped audio suffices. *Retires the conference-per-AI-interaction and the legacy media gateway service itself (MSS supersedes it).*
 
 **Phase 4 — Full media plane (roadmap).** MSS grows an N-way mixer: conferences as first-class MSS sessions built from per-participant inline legs + per-listener mix matrices. Monitor = subscriber on the hub (no leg at all — a supervisor "listening" is just a consumer); whisper = injection routed only into the agent's mix (a mix-matrix entry, replacing `relate … nospeak`); barge = flip the matrix. This is the hardest phase (mixing quality, conference-scale fan-in, and the long tail of conference features: enter/exit sounds, member controls, conference recording) and should only start once Phases 1–3 are boringly stable. If the hand-rolled mixer disappoints, the fallback is embedding GStreamer per-session pipelines via `gstreamer-rs` (`rtpjitterbuffer` → decode → `audiomixer`) — first-class Rust bindings, twenty years of hardened mixing code (see Appendix A). It is also optional: FS-as-conference-appliance behind an MSS media plane is a legitimate stable end-state.
 
@@ -667,10 +666,10 @@ flowchart TD
 2. **rtpengine CPU headroom.** Subscriptions bypass the kernel fast path for the copied stream. If "every call tapped" doubles rtpengine userspace load, you may need to grow the rtpengine tier — still far cheaper than growing FS, but measure in Phase 0.
 3. **Call→rtpengine discovery.** Needs a reliable mapping (OpenSIPS writes call-id → rtpengine-node + tags to Redis at setup). Get this into the OpenSIPS config early; everything else depends on it.
 4. **Forked mod_audio_fork consumers.** Your ASR services consume a *custom* fork dialect (extra positional args, specific metadata JSON). The WS-compat adapter must replicate it exactly — pull the fork's source to spec the wire format before Phase 1.
-5. **the legacy stream fsm timing.** Pause/resume of the MSS consumer replaces pause/resume of the FS media bug. Latency differs slightly (network hop vs in-process bug). Validate barge-in feel (prompt-echo suppression) under load in Phase 1 pilots.
+5. **Legacy stream state machine timing.** Pause/resume of the MSS consumer replaces pause/resume of the FS media bug. Latency differs slightly (network hop vs in-process bug). Validate barge-in feel (prompt-echo suppression) under load in Phase 1 pilots.
 6. **Recording compliance.** Recording via tap changes the failure domain: if the MSS pod dies, recording gaps until re-subscribe. If you have zero-gap compliance requirements for some tenants, keep `record_session` as a per-tenant fallback through Phase 2, or run dual-recording during the transition.
 7. **Sizing assumptions.** The per-pod session estimates in §8 are engineering estimates; the Phase-0 benchmark exists to replace them with numbers before you commit capacity plans.
-8. **Fan-out has no single event source.** N attachments can each claim to be "the call's speech events" and double-drive `the legacy stream fsm`. Mitigation: exactly one `authoritative` attachment per session, every event carries `attachment_id`, and a second authoritative attach is rejected (§5.3).
+8. **Fan-out has no single event source.** N attachments can each claim to be "the call's speech events" and double-drive the legacy stream state machine. Mitigation: exactly one `authoritative` attachment per session, every event carries `attachment_id`, and a second authoritative attach is rejected (§5.3).
 9. **MSS is a single writer on the barge-in path.** Consumers cannot route around it (§5.5), so the `partial_speech_result` → `StopPlayback` cut-through — including the Kafka hop — must be measured before Phase-1 pilots. Co-locate the events translator with the legacy gRPC server; if measurement demands it, fall back to a gRPC stream *for speech events only*, keeping recording/lifecycle on Kafka.
 10. **Team surface area.** You'll operate a new stateful-ish media tier. Mitigation: passive taps are stateless-recoverable (re-subscribe), which makes the Phase 1–2 service much more forgiving to operate than a B2BUA; the genuinely stateful part (inline legs) arrives only in Phase 3, after the team has operational experience.
 
@@ -832,7 +831,7 @@ private when the whisperer detaches.
 ### B.3 ADAPTER — one integrator's conference RPCs onto these verbs
 
 **This table is reference-deployment material, not part of the core design.**
-The worked example is the reference stack's telephony controller (the legacy controller), whose
+The worked example is the reference stack's telephony controller, whose
 conference surface is described as **14 RPCs**; its IDL is not in this repo, so
 the rows below are named **by function** and the exact RPC names are
 *unknown-by-name here* — rename the left column when the IDL is at hand. Any
@@ -884,4 +883,4 @@ records still do.
 - [SIPREC with RTPEngine — subscribe-based media forking walkthrough (incl. transcoding on subscription legs)](https://cloudtelcohub.com/posts/siprec-with-rtpengine/)
 - [OpenSIPS SIPREC module docs](https://opensips.org/docs/modules/3.6.x/siprec) · [OpenSIPS rtp_relay module](https://opensips.org/docs/modules/3.2.x/rtp_relay.html) · [OpenSIPS + RTPEngine subscribe support discussion](https://github.com/OpenSIPS/opensips/issues/2732)
 - [OpenSIPS 3.1 enhanced media capabilities](https://blog.opensips.org/2020/03/26/enhanced-media-capabilities-in-opensips-3-1/) · [Media re-anchoring in OpenSIPS 3.2](https://blog.opensips.org/2021/06/09/media-re-anchoring-using-opensips-3-2/)
-- Codebase analysis: `the legacy media gateway` (engine/call/streaming, codec, opensips MI, rtp, mediaservice, conversation, kafkamanager, api, config) and `Telephony/the legacy controller` (telephony/freeswitch fs_api/fs_conf_api/fs_conn, the legacy stream fsm, the voice-AI orchestrator, monitorCoachHandler, receventhandler, the legacy verb API) — August 2026 working copies.
+- Codebase analysis: the legacy media gateway (engine/call/streaming, codec, opensips MI, rtp, mediaservice, conversation, kafkamanager, api, config) and the legacy controller (FreeSWITCH ESL/API layers, the stream state machine, the voice-AI orchestrator, monitor/coach and recording-event handlers, the verb API) — August 2026 working copies.

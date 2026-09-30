@@ -1,6 +1,6 @@
 """Asks the real stream-llm-bridge which wire shape it accepts.
 
-crates/protocol/src/twilio.rs claims to be the legacy media gateway-compatible, and its
+crates/protocol/src/twilio.rs claims to be compatible with the legacy media gateway, and its
 serialization tests are treated as the spec. This checks that claim against
 the service that has to parse it, the same way ng_answer_probe.py checked
 rtpengine instead of trusting the NG documentation.

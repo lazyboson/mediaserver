@@ -1,7 +1,7 @@
 // MSS control plane — the noun-oriented API from docs/architecture.md §5.1,
 // and the event schema from §5.4.
 //
-// This is deliberately NOT a mirror of the legacy the legacy verb API.proto: those names
+// This is deliberately NOT a mirror of the legacy controller's verb API: those names
 // (StreamPause, StreamSendText, StartCallTranscription) describe how
 // FreeSWITCH does it, and Phase 3/4 — inline legs, mixing, whisper — do not
 // fit that vocabulary. TelCompat (§5.6) speaks the legacy controller's verbs
@@ -240,7 +240,7 @@ message AttachRequest {
   AudioFormat format = 5;
   // Exactly one attachment per session may be authoritative (§5.3). Only its
   // events are rendered into the legacy mod_audio_fork::* names that drive
-  // the legacy stream fsm; a second authoritative attach is rejected, not resolved.
+  // the legacy stream state machine; a second authoritative attach is rejected, not resolved.
   bool authoritative = 6;
   string label = 7;
   string endpoint = 8;                // ws url / grpc target / s3 prefix
@@ -368,7 +368,8 @@ message MediaEvent {
   uint64 seq = 4;
   google.protobuf.Timestamp at = 5;
   // False for every non-authoritative attachment: the event still reaches
-  // mss.events for analytics and debugging, but must never drive the legacy stream fsm.
+  // mss.events for analytics and debugging, but must never drive the legacy
+  // stream state machine.
   bool legacy_eligible = 6;
   // Which kind of session emitted this: a consumer of mss.events can tell a
   // tap's events from an inline leg's without asking the API.

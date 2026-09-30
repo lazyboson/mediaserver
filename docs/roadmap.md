@@ -118,9 +118,9 @@ Work:
   10 s. It also showed that the dead pod's rtpengine subscription is left
   behind (D14). Still to come: the translator in the legacy controller that renders
   `mss.events` onto the existing `eventTopic` in the positional format
-  `the application server` already consumes (§5.4 — written on the legacy controller branch
+  the application server already consumes (§5.4 — written on a legacy controller branch
   `feature/legacy-translator`, awaiting review and merge).
-- `TelCompat` façade: `the legacy verb API.proto` message shapes verbatim, so a
+- `TelCompat` façade: the legacy verb API's message shapes verbatim, so a
   per-tenant flag routes `StartStream`/`StartRecording`/
   `StartCallTranscription` to `the legacy gRPC server` or `MSS` with no client
   change and rollback by config (§5.6).
@@ -129,10 +129,10 @@ Work:
   fork, so RTT, gather and the voice-AI feed are one mechanism. The
   vocabulary to emit is `mod_audio_fork::{start_of_transcript,
   partial_speech_result, end_of_utterance, first_transcript}`.
-- the legacy verb API parity: `StartStream/StopStream/StreamPause/StreamResume/
+- Legacy verb API parity: `StartStream/StopStream/StreamPause/StreamResume/
   StreamSendText/StartCallTranscription` route to MSS behind a per-tenant
   feature flag; mod_audio_fork stays installed for rollback.
-- the legacy stream fsm keeps driving FS playback; it pauses/resumes the MSS consumer
+- The legacy stream state machine keeps driving FS playback; it pauses/resumes the MSS consumer
   instead of the FS media bug — validate barge-in timing in pilot.
 
 Exit criteria: measured `partial_speech_result` → `StopPlayback`
@@ -155,7 +155,7 @@ Work:
 - Preserve recording identity `${accountID}/${recordingID}.${format}` and
   the `recordStart/recordStop/recordPause/uploadCompleted` callback
   semantics, including pause = segment + defer + accumulated duration.
-- Hold/pause state consumed from the legacy controller events (Redis), not FS media-bug
+- Hold/pause state consumed from the legacy controller's events (Redis), not FS media-bug
   state.
 - Compliance option: per-tenant dual-recording (FS + MSS) during
   transition; keep `record_session` as fallback until sign-off.
@@ -176,7 +176,7 @@ itself, so an adopter on **any** pod finishes what a dead pod started (item 53,
 closing D9 but for retention and a live drill nobody has run).
 Hold/pause arrives as `UpdateAttachment{paused}` (which now reaches the media
 world at all) rather than from Redis; the legacy controller drives it through
-`TelCompat`. Dual recording remains a the legacy controller per-tenant flag and nothing here
+`TelCompat`. Dual recording remains a legacy controller per-tenant flag and nothing here
 prevents it.
 
 Exit criteria: byte-comparable recordings vs FS output across codec/hold/
@@ -247,7 +247,7 @@ Work:
   caller through the playout pacer; barge-in cut-through in MSS.
 - Pre-agent AI calls routed by OpenSIPS straight to MSS — FreeSWITCH
   never touches them.
-- the voice-AI orchestrator switches `callthe legacy media gateway` → MSS create-conversation
+- The voice-AI orchestrator switches its gateway call → MSS create-conversation
   API (same handshake, `X-API-REQUEST-TYPE: internal` semantics).
 - Prompt/MOH injection into tapped calls via rtpengine `play media`
   where file-shaped audio suffices.
@@ -255,7 +255,7 @@ Work:
 
 Exit criteria: AI interactions run without any FS conference or dummy
 leg; the legacy media gateway receives zero traffic; billing/disconnect event parity
-on `LEGACY_MEDIA_GATEWAY_BILLING_TOPIC` / `KAFKA_VOICE_AI_AGENT_TOPIC` verified.
+on the legacy gateway's billing topic / `KAFKA_VOICE_AI_AGENT_TOPIC` verified.
 
 ## Phase 4 — Full media plane
 

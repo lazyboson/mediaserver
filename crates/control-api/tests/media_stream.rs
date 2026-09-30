@@ -625,7 +625,7 @@ async fn the_shared_secret_guards_media_control_and_the_consumer_hello() {
 }
 
 #[tokio::test]
-async fn legacy_the legacy verb API_verbs_stay_open_because_their_clients_cannot_change() {
+async fn legacy_telcompat_verbs_stay_open_because_their_clients_cannot_change() {
     use control_api::telcompat_proto::tel_service_client::TelServiceClient;
     use control_api::telcompat_proto::StreamRequest;
 

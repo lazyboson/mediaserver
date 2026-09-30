@@ -1,4 +1,4 @@
-// TelCompat — the legacy telephony controller's the legacy verb API verbs, served by MSS
+// TelCompat — the legacy telephony controller's verb API, served by MSS
 // (architecture.md §5.6).
 //
 // The package and service name are `protos.TelService` deliberately: gRPC
@@ -7,9 +7,9 @@
 // what lets a per-tenant flag point a client at MSS instead of the legacy gRPC server
 // with **no client change**, and roll back by pointing it back.
 //
-// SOURCE OF TRUTH: the legacy controller's the legacy verb API.proto (in the reference
-// deployment: the legacy controller pkg/the legacy verb API/proto/the legacy verb API.proto). Message shapes and
-// field numbers are copied verbatim; only the subset MSS can serve is declared.
+// SOURCE OF TRUTH: the legacy controller's verb API proto. Message shapes
+// and field numbers are copied verbatim; only the subset MSS can serve is
+// declared.
 // Everything else — originate, answer, hangup, bridge, conferences, IVR
 // prompting — stays on FreeSWITCH, and a client that calls one of those on this
 // server correctly gets UNIMPLEMENTED rather than a silent success.
@@ -55,7 +55,7 @@ message StreamRequest {
   string track = 9;
   string data = 10;
   string play_file = 11;
-  // google.protobuf.Struct in the legacy verb API; MSS only needs it as attachment
+  // google.protobuf.Struct in the legacy API; MSS only needs it as attachment
   // metadata, and a string map is what the attachment stores.
   map<string, string> metadata = 12;
 }

@@ -146,7 +146,7 @@ single binary), MinIO (S3 API), a stub WebSocket ASR server and a stub gRPC
 RTT sink that both record what they received. Build this when M4 lands the
 fan-out hub, not before — none of it has a caller today.
 
-**Tier 3 — FreeSWITCH + the legacy controller.** Needed only for Phase-1 parity: the legacy stream fsm
+**Tier 3 — FreeSWITCH + legacy controller.** Needed only for Phase-1 parity: the legacy stream state machine
 pause/resume choreography and barge-in timing
 ([architecture.md §10 risk 5](architecture.md)). Heavy to stand up, and
 worth deferring until there is an MSS consumer to compare against.
@@ -414,7 +414,7 @@ is this document's own argument for the metal rig, now with a number on it.
 
 ## What each phase needs
 
-| Phase | Tier 1 | Tier 2 | Tier 3 (FS+the legacy controller) | Tier 4 | Benchmark rig |
+| Phase | Tier 1 | Tier 2 | Tier 3 (FS + legacy controller) | Tier 4 | Benchmark rig |
 | --- | --- | --- | --- | --- | --- |
 | 0 — spike | ✅ | — | — | — | ✅ required |
 | 1 — passive fan-out | ✅ | ✅ | ✅ parity | ✅ | re-run |

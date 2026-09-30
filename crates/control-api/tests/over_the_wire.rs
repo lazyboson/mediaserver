@@ -234,7 +234,7 @@ async fn a_watch_on_one_session_ends_when_that_session_does() {
 }
 
 #[tokio::test]
-async fn one_port_serves_both_the_new_api_and_the_legacy_the legacy verb API_verbs() {
+async fn one_port_serves_both_the_new_api_and_the_legacy_telcompat_verbs() {
     use control_api::telcompat_proto::tel_service_client::TelServiceClient;
     use control_api::telcompat_proto::StreamRequest;
 

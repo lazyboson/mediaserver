@@ -71,7 +71,7 @@ Eight items, unchanged in shape and listed in full under **Integration handoffs
 buckets of externally-blocked work sit further down and are open too:
 **Waiting on other people (M2 close-out)** — the deployed rtpengine version, the
 rtpengine-side per-tap cost, and one `cachedb_redis` config block on somebody
-else's proxy — and **item 1**, the the legacy controller event translator, which is written and
+else's proxy — and **item 1**, the legacy controller's event translator, which is written and
 awaiting review and merge on their side.
 
 ---
@@ -142,9 +142,9 @@ awaiting review and merge on their side.
 
 All of these are finished; the open list is **What is left** above.
 
-### 1. the legacy controller event translator — ✅ WRITTEN, awaiting review and merge
-**State (2026-08-17):** implemented on the the legacy controller branch
-`feature/legacy-translator` as `pkg/the legacy verb API/msstranslator`, **local and
+### 1. Legacy controller event translator — ✅ WRITTEN, awaiting review and merge
+**State (2026-08-17):** implemented on the legacy controller's branch
+`feature/legacy-translator` as an `msstranslator` package, **local and
 uncommitted by instruction**. Pure `Render` plus a Kafka consumer on its own
 group (`mssEventTranslator`), wired into `cmd/the legacy gRPC server` behind
 `MSS_EVENTS_TOPIC` so an unconfigured deployment is unchanged. 15 unit cases
@@ -162,8 +162,8 @@ Remaining: review, commit, merge, and a pilot tenant.
 forwards every record today, and its `MarkMessage`/auto-commit loop can
 already replay one on a rebalance.
 
-### 1b. (original description, for reference) the legacy controller event translator
-**Where:** the `the legacy controller` repo, not here (architecture §5.4 — the positional
+### 1b. (original description, for reference) Legacy controller event translator
+**Where:** the legacy controller's repo, not here (architecture §5.4 — the positional
 format *is* `constants.MapKeyIndex`, a Go constant table; encoding it in Rust
 would couple MSS to a file that changes without our knowing).
 **What:** ~200-line Go consumer: read typed `MediaEvent`, drop anything with
@@ -172,7 +172,7 @@ would couple MSS to a file that changes without our knowing).
 context.
 **Why now:** MSS publishes events nothing consumes yet. Until this exists no
 tenant can be flipped, so it gates everything else in Phase 1.
-**Done when:** `the application server` drives `the legacy stream fsm` from an MSS-tapped call with
+**Done when:** the application server drives the legacy stream state machine from an MSS-tapped call with
 `mod_audio_fork` uninvolved, and the event-name mapping table in
 `proto/mediacontrol.proto` matches the shim one-for-one.
 
@@ -181,7 +181,7 @@ Landed in `crates/control-api/src/telcompat.rs` with
 `proto/telcompat.proto` declaring `protos.TelService` so the method paths match
 the legacy controller's byte for byte. Serves stream/recording/playback verbs onto the nouns,
 one test per mapping row, both surfaces on one port, proven over a real socket
-with a generated the legacy controller client. `StartCallTranscription` returns `UNIMPLEMENTED`
+with a generated legacy controller client. `StartCallTranscription` returns `UNIMPLEMENTED`
 by design (the ASR endpoint is not in its request message).
 **No longer blocked (2026-08-17):** a TelCompat session has only the channel
 uuid, but MSS resolves the rest itself — the caller passes the SIP call-id and
@@ -191,7 +191,7 @@ now an optimisation, not a prerequisite (see the M2 close-out list below).
 
 ### 2b. (original description, for reference) `TelCompat` façade
 **Where:** `crates/control-api`.
-**What:** a second gRPC service reusing `the legacy verb API.proto` message shapes
+**What:** a second gRPC service reusing the legacy verb API's message shapes
 verbatim — `StartStream`, `StopStream`, `StreamPause`, `StreamResume`,
 `StreamSendText`, `StreamPlayFile`, `StartCallTranscription`,
 `StartRecording`, `StopRecording` — translated onto Session/Attachment/
@@ -307,7 +307,7 @@ stays with the WS bridge. This was proved on a **live tapped call** in item 10
 wrong `authorization: Bearer …` → `UNAUTHENTICATED`) and verifies
 `ConsumerHello.token` on `MediaStream` (constant-time comparison). Unset env
 = open lab mode, logged loudly at startup. **`TelCompat` is deliberately not
-intercepted**: its contract is byte-identical the legacy controller clients with no client
+intercepted**: its contract is byte-identical legacy controller clients with no client
 change, and the legacy controller does not send metadata — the pilot fronts it with network
 policy instead. `mss_ctl` sends the bearer when `MSS_AUTH_TOKEN` is set.
 
@@ -490,7 +490,7 @@ p95 4.78 / 4.38 ms over two runs of 10 live iterations** (the earlier ~3.2 ms
 figure was the pre-D19 `PlaybackStarted` trigger). The Kafka hop makes the budget
 and the gRPC-for-speech-events fallback stays unbuilt. What remains for the
 Phase-1 exit criterion is not ours to measure: the **integrator's consumer
-half** (the the legacy controller translator merge, still external) plus the two gaps named in
+half** (the legacy controller's translator merge, still external) plus the two gaps named in
 item 5 — of which the missing consumer→MSS speech-report wire (D19) is now
 **fixed and measured** (item 28), leaving the audible cut inside rtpengine.
 
@@ -508,9 +508,9 @@ before the remainder is counted `abandoned`). New series:
 `deploy/prometheus-alerts.yaml`. `mss_events_failed_total` now counts failed
 **attempts**, not lost events.
 **Semantics shipped: at-least-once.** A retry after an ambiguous failure can
-duplicate a record, so **the the legacy controller translator must treat `(external_id,
-seq)` as idempotent**. Checked in the translator's source on the legacy controller branch
-`feature/legacy-translator` (`pkg/the legacy verb API/msstranslator/consumer.go`,
+duplicate a record, so **the legacy controller's translator must treat `(external_id,
+seq)` as idempotent**. Checked in the translator's source on the legacy controller's branch
+`feature/legacy-translator` (`msstranslator/consumer.go`,
 read not run): it dedupes nothing — `handle` renders and forwards every
 record — but it is *already* an at-least-once consumer, because it
 `MarkMessage`s after handling and sarama auto-commits, so a rebalance or
@@ -2951,7 +2951,7 @@ two-leg call built to reproduce the inversion — caller `zz-caller`, callee
 
 **Decisions.** (1) Event payload track names follow attribution too, so nothing
 in MSS's own vocabulary claims a direction the session cannot back up; the frozen
-WS dialect and the legacy `the legacy stream fsm` event names are unaffected (they carry no
+WS dialect and the legacy stream state machine's event names are unaffected (they carry no
 track). (2) `Attribution` is **not** persisted in the session store: a session
 created without from-tags is not rebuildable (`is_rebuildable()` requires them),
 and one created with them re-derives `explicit` on the adopting pod. (3) The
@@ -3038,7 +3038,7 @@ gapless and every record is `attachment: none`.
 
 **What it does not do.** MSS still interprets no digit — no menu, no collection,
 no inter-digit timer, no `#` terminator, and the frozen `firstDtmf`/`dtmfResult`
-`the legacy stream fsm` events remain a consumer-side concern. An integrator building a menu
+The legacy stream state machine's events remain a consumer-side concern. An integrator building a menu
 consumes `mss.events` and calls the API, which is item 40's decision unchanged.
 Nothing rate-limits digits: a stuck endpoint blasting end packets at distinct
 timestamps would publish one event each, bounded only by the queue's drop
@@ -3614,7 +3614,7 @@ key constants moved to `session-core/src/metadata.rs` (control-api cannot see
 nothing else moved. **`mss.` rather than `mss.recording.` was verified safe**:
 a session-core test pins every client-facing key this API documents — the eight
 telcompat/Twilio keys and the six `mix_*`/`member_*` verbs — as still allowed.
-**The `the legacy verb API` façade needed the guard too and is not covered by `WireFacing`**:
+**The TelCompat façade needed the guard too and is not covered by `WireFacing`**:
 it is served over the same socket but calls the controller *in-process*, and
 `stream_metadata` copies caller metadata straight through, so
 `TelCompat::attach_sink` — the single funnel for every façade attach — checks it
@@ -4313,7 +4313,7 @@ FreeSWITCH, its metal, its tenants, its sign-off. They are listed here so no
 future session mistakes them for unfinished engineering. MSS is a generic
 media plane: any deployment whose media anchors in rtpengine can integrate it,
 and the compatibility surfaces (the Twilio Media Streams dialect, the
-`mod_audio_fork` event names, the the legacy verb API façade) are **optional adapters**. The
+`mod_audio_fork` event names, the TelCompat façade) are **optional adapters**. The
 reference deployment named in [CLAUDE.md](../CLAUDE.md) appears below only as
 the worked example of each handoff.
 
