@@ -143,10 +143,9 @@ awaiting review and merge on their side.
 All of these are finished; the open list is **What is left** above.
 
 ### 1. Legacy controller event translator — ✅ WRITTEN, awaiting review and merge
-**State (2026-08-17):** implemented on the legacy controller's branch
-`feature/legacy-translator` as an `msstranslator` package, **local and
+**State (2026-08-17):** implemented on the legacy translator branch as an `msstranslator` package, **local and
 uncommitted by instruction**. Pure `Render` plus a Kafka consumer on its own
-group (`mssEventTranslator`), wired into `cmd/the legacy gRPC server` behind
+group (`mssEventTranslator`), wired into the legacy controller's gRPC server behind
 `MSS_EVENTS_TOPIC` so an unconfigured deployment is unchanged. 15 unit cases
 plus a broker-backed test (`-tags=integration`, `MSS_TEST_BROKERS`) that
 publishes a MediaEvent and reads the legacy event back off the target topic:
@@ -198,7 +197,7 @@ verbatim — `StartStream`, `StopStream`, `StreamPause`, `StreamResume`,
 Playback per the §5.6 table, setting `authoritative` from the verb that
 created the session.
 **Why now:** it is the migration switch: a tenant flag routes the legacy controller to
-`the legacy gRPC server` or `MSS` with no client change and rollback by config.
+its own gRPC server or to MSS with no client change and rollback by config.
 **Done when:** the mapping table is executable (one test per row), and a
 `StartStream` call produces the same session/attachment shape as the
 equivalent native calls.
@@ -509,8 +508,8 @@ before the remainder is counted `abandoned`). New series:
 **attempts**, not lost events.
 **Semantics shipped: at-least-once.** A retry after an ambiguous failure can
 duplicate a record, so **the legacy controller's translator must treat `(external_id,
-seq)` as idempotent**. Checked in the translator's source on the legacy controller's branch
-`feature/legacy-translator` (`msstranslator/consumer.go`,
+seq)` as idempotent**. Checked in the translator's source on the legacy translator branch
+(`msstranslator/consumer.go`,
 read not run): it dedupes nothing — `handle` renders and forwards every
 record — but it is *already* an at-least-once consumer, because it
 `MarkMessage`s after handling and sarama auto-commits, so a rebalance or

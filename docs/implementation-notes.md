@@ -1615,7 +1615,7 @@ The migration switch. `proto/telcompat.proto` declares
 **`package protos; service TelService`** deliberately: gRPC routes on the
 fully-qualified method path, so `/protos.TelService/StartStream` is
 byte-identical to what the legacy controller already calls, and a per-tenant flag can point a
-client at `MSS` instead of `the legacy gRPC server` with **no client change** and roll
+client at MSS instead of the legacy controller's gRPC server with **no client change** and roll
 back by pointing it back. Message shapes and field numbers are copied verbatim
 from the legacy controller's verb API proto.
 

@@ -54,7 +54,7 @@ flowchart LR
     RE1 -->|customer leg RTP| FS[FreeSWITCH]
     RE2 -->|agent leg RTP| FS
 
-    TEL[the legacy gRPC server<br/>verb API gRPC ~40 RPCs] <-->|ESL 8021<br/>events plain ALL| FS
+    TEL[legacy gRPC server<br/>verb API gRPC ~40 RPCs] <-->|ESL 8021<br/>events plain ALL| FS
     TEL -->|"Events{repeated string}<br/>keyed by UUID + OTel"| K[(Kafka eventTopic)]
     K --> APP[application server<br/>consumer group 'eventHandler'<br/>stream state machine · recording · webhooks]
     APP -->|verb API gRPC| TEL
@@ -69,9 +69,9 @@ flowchart LR
 
 Key structural facts pulled from the two repos:
 
-- **The legacy controller is seven binaries, not one.** `the legacy gRPC server` owns the ESL socket and exposes the legacy verb API proto over gRPC; the application server consumes events from Kafka; `the parser server`, `the executor server`, `the resource server`, `the voice server`, `the application worker` sit around them. The media surface is already service-oriented — which is why MSS can slot in behind a tenant flag.
-- **the legacy gRPC server → FS is a single long-lived inbound ESL socket** (`eventsocket.Dial`, singleton via `sync.Once`), subscribed with `events plain ALL`, and the event fan-out **drops events when the subscriber channel is full**. Every media feature adds event volume to this one pipe.
-- **Events leave the legacy gRPC server on Kafka.** Its event producer marshals each eventMap into `Events{repeated string}`, keys the message by call UUID and injects OTel context; the application server reads it as consumer group `eventHandler`. Per-call ordering, replay and multi-consumer fan-out are therefore already solved by the bus — the reason MSS publishes events rather than streaming them (§5.4).
+- **The legacy controller is seven binaries, not one.** Its gRPC server owns the ESL socket and exposes the legacy verb API proto over gRPC; the application server consumes events from Kafka; a parser, an executor, a resource server, a voice server and the application worker sit around them. The media surface is already service-oriented — which is why MSS can slot in behind a tenant flag.
+- **The legacy controller's gRPC server → FS is a single long-lived inbound ESL socket** (`eventsocket.Dial`, singleton via `sync.Once`), subscribed with `events plain ALL`, and the event fan-out **drops events when the subscriber channel is full**. Every media feature adds event volume to this one pipe.
+- **Events leave the legacy controller's gRPC server on Kafka.** Its event producer marshals each eventMap into `Events{repeated string}`, keys the message by call UUID and injects OTel context; the application server reads it as consumer group `eventHandler`. Per-call ordering, replay and multi-consumer fan-out are therefore already solved by the bus — the reason MSS publishes events rather than streaming them (§5.4).
 - **ASR moved from Google to Deepgram, and became the fork.** `PlayAndDetectSpeechWithGSR` now calls `initiateStream(...)` instead of `uuid_google_transcribe2` (the old call is commented out in `fs_api.go`). RTT, gather-ASR and the voice-AI fork are one mechanism, and the module now emits `mod_audio_fork::{start_of_transcript, partial_speech_result, end_of_utterance, first_transcript}` — a continuous interim-results stream, not one event per finished utterance.
 - **`mod_audio_fork` is a translator, not a pipe.** `FsEventSink::Emit` converts each WebSocket message from the far end into an FS CUSTOM event (`mod_audio_fork::<name>`, `Unique-ID` + `Fork-ID` headers, JSON in the body). Consumers never touch Kafka — the contract MSS must preserve (§5.5).
 - **The voice-AI path is a Rube Goldberg of media hops:** the legacy controller's `CreateParticipant` runs `bgapi originate {…, origination_uuid, absolute_codec_string, sip_h_X-Conversation-ID…}<dest> &conference('<name>'@default++flags{…})` — i.e., FS dials a *dummy leg* toward OpenSIPS B2B purely so that the conference's mixed audio flows to the legacy media gateway, which answers via `ua_session_reply` and pumps RTP→WSS to the bot. One AI interaction = 1 conference mixer + 1 extra leg + 1 RTP termination, all for what is conceptually "copy this call's audio to a websocket."
@@ -101,7 +101,7 @@ flowchart LR
     RE2 -->|RTP| FS
 
     subgraph legacy [legacy controller]
-        TEL[the legacy gRPC server<br/>verb API gRPC]
+        TEL[legacy gRPC server<br/>verb API gRPC]
         APP[application server<br/>stream state machine · recording · webhooks]
         SHIM[events translator<br/>typed → positional eventMap]
     end
@@ -213,10 +213,10 @@ Design details:
 Verified against the legacy controller's `development` branch (2026-08-16). Three facts reshape this
 section from what an earlier draft assumed:
 
-- **The legacy controller is service-oriented already.** `cmd/the legacy gRPC server` exposes
-  its verb API proto (~40 RPCs) over gRPC; the application server
+- **The legacy controller is service-oriented already.** Its gRPC server exposes
+  the verb API (~40 RPCs); the application server
   is a separate process.
-- **Events travel on Kafka, not ESL, once they leave the legacy gRPC server.**
+- **Events travel on Kafka, not ESL, once they leave the legacy controller's gRPC server.**
   Its event producer subscribes to the ESL stream and publishes
   every event to a Kafka topic as `Events{repeated string events}` — the
   positional eventMap indexed by `constants.MapKeyIndex` — keyed by call
@@ -383,7 +383,7 @@ message MediaEvent {
 a message the far end sent on the WebSocket into a FreeSWITCH CUSTOM event
 with subclass `mod_audio_fork::<name>`, stamps `Unique-ID` and `Fork-ID`,
 carries the JSON in the event body, and hands it to FS — from where
-the legacy gRPC server lifts it to Kafka. **The bridge has never known Kafka exists.**
+the legacy controller's gRPC server lifts it to Kafka. **The bridge has never known Kafka exists.**
 
 MSS occupies exactly that position, and the rule generalises:
 
@@ -407,7 +407,7 @@ cut-through a **Phase-1 measurement**, not a Phase-3 nicety.
 ### 5.6 Compatibility façade: legacy verbs onto MSS nouns
 
 A `TelCompat` service reuses the legacy verb API's message shapes verbatim, so a
-tenant flag routes calls to `the legacy gRPC server` or `MSS` with **no client
+tenant flag routes calls to the legacy controller's gRPC server or to MSS with **no client
 change** and rollback is a config flip.
 
 | legacy verb API RPC today (→ FS) | MSS nouns |
@@ -670,7 +670,7 @@ flowchart TD
 6. **Recording compliance.** Recording via tap changes the failure domain: if the MSS pod dies, recording gaps until re-subscribe. If you have zero-gap compliance requirements for some tenants, keep `record_session` as a per-tenant fallback through Phase 2, or run dual-recording during the transition.
 7. **Sizing assumptions.** The per-pod session estimates in §8 are engineering estimates; the Phase-0 benchmark exists to replace them with numbers before you commit capacity plans.
 8. **Fan-out has no single event source.** N attachments can each claim to be "the call's speech events" and double-drive the legacy stream state machine. Mitigation: exactly one `authoritative` attachment per session, every event carries `attachment_id`, and a second authoritative attach is rejected (§5.3).
-9. **MSS is a single writer on the barge-in path.** Consumers cannot route around it (§5.5), so the `partial_speech_result` → `StopPlayback` cut-through — including the Kafka hop — must be measured before Phase-1 pilots. Co-locate the events translator with the legacy gRPC server; if measurement demands it, fall back to a gRPC stream *for speech events only*, keeping recording/lifecycle on Kafka.
+9. **MSS is a single writer on the barge-in path.** Consumers cannot route around it (§5.5), so the `partial_speech_result` → `StopPlayback` cut-through — including the Kafka hop — must be measured before Phase-1 pilots. Co-locate the events translator with the legacy controller's gRPC server; if measurement demands it, fall back to a gRPC stream *for speech events only*, keeping recording/lifecycle on Kafka.
 10. **Team surface area.** You'll operate a new stateful-ish media tier. Mitigation: passive taps are stateless-recoverable (re-subscribe), which makes the Phase 1–2 service much more forgiving to operate than a B2BUA; the genuinely stateful part (inline legs) arrives only in Phase 3, after the team has operational experience.
 
 ---

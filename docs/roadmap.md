@@ -118,11 +118,11 @@ Work:
   10 s. It also showed that the dead pod's rtpengine subscription is left
   behind (D14). Still to come: the translator in the legacy controller that renders
   `mss.events` onto the existing `eventTopic` in the positional format
-  the application server already consumes (§5.4 — written on a legacy controller branch
-  `feature/legacy-translator`, awaiting review and merge).
+  the application server already consumes (§5.4 — written on the legacy translator branch, awaiting review and
+  merge).
 - `TelCompat` façade: the legacy verb API's message shapes verbatim, so a
   per-tenant flag routes `StartStream`/`StartRecording`/
-  `StartCallTranscription` to `the legacy gRPC server` or `MSS` with no client
+  `StartCallTranscription` to the legacy controller's gRPC server or to MSS with no client
   change and rollback by config (§5.6).
 - **ASR arrives with streaming, not separately.** Since the legacy controller moved ASR
   from Google to Deepgram, `PlayAndDetectSpeechWithGSR` *is* the audio

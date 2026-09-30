@@ -81,7 +81,7 @@ API, the voice-AI orchestrator and five binaries — producing an integration de
 a system that no longer existed. When a conclusion will shape design:
 enumerate fully (no `head` on the listing), check the branch is current
 (`git fetch` + rev-list), and state *what you read* alongside what you
-concluded. Look for existing seams before inventing one — `the legacy proto package`,
+concluded. Look for existing seams before inventing one — the legacy controller's own proto package,
 the legacy verb API proto and the Kafka event producer were all sitting there,
 already shaped like the answer.
 

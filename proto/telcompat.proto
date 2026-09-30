@@ -4,8 +4,8 @@
 // The package and service name are `protos.TelService` deliberately: gRPC
 // routes on the fully-qualified method path, so `/protos.TelService/StartStream`
 // must be byte-identical to what the legacy controller already calls. That is
-// what lets a per-tenant flag point a client at MSS instead of the legacy gRPC server
-// with **no client change**, and roll back by pointing it back.
+// what lets a per-tenant flag point a client at MSS instead of the legacy
+// controller's gRPC server with **no client change**, and roll back by pointing it back.
 //
 // SOURCE OF TRUTH: the legacy controller's verb API proto. Message shapes
 // and field numbers are copied verbatim; only the subset MSS can serve is
