@@ -1,9 +1,9 @@
 name: CI
 
-# Runs on the self-hosted Apple-silicon Mac (see ~/actions-runner-runner-pool/README.md).
-# Trade-off: PR CI compiles and tests on macOS/aarch64, not linux/amd64.
-# The shipping gate stays the linux/arm64 image build in image-main.yml/release.yml.
-# The build needs cmake, make and a C++ compiler on the host for opus-ffi.
+# Runs on GitHub-hosted runners. PR CI compiles and tests on linux/amd64;
+# the shipping gate stays the linux/arm64 image build in image-main.yml/release.yml.
+# The build needs cmake, make and a C++ compiler on the host for opus-ffi
+# (present on ubuntu-latest).
 
 on:
   push:
@@ -12,21 +12,17 @@ on:
   pull_request:
     paths-ignore: ['docs/**', '**/*.md']
   workflow_dispatch:
-    inputs:
-      runner:
-        description: Runner pool (ubuntu-latest is the emergency fallback)
-        default: self-hosted
-        type: choice
-        options: [self-hosted, ubuntu-latest]
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -D warnings
-  CARGO_BUILD_JOBS: 4
   CARGO_INCREMENTAL: 0
   CARGO_NET_RETRY: 3
   CARGO_PROFILE_DEV_DEBUG: 0
@@ -35,7 +31,7 @@ env:
 jobs:
   guidelines:
     name: No-comments policy
-    runs-on: ${{ inputs.runner == 'ubuntu-latest' && fromJSON('["ubuntu-latest"]') || fromJSON('["self-hosted","macOS","ARM64","runner-pool"]') }}
+    runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
@@ -52,137 +48,58 @@ jobs:
 
   lint:
     name: Format & clippy
-    runs-on: ${{ inputs.runner == 'ubuntu-latest' && fromJSON('["ubuntu-latest"]') || fromJSON('["self-hosted","macOS","ARM64","runner-pool"]') }}
+    runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v7
-      - name: build environment
-        run: |
-          echo "CARGO_TARGET_DIR=$HOME/actions-runner-runner-pool/cache/target" >> "$GITHUB_ENV"
-          LOCK="$HOME/actions-runner-runner-pool/with-lock.sh"
-          [ -x "$LOCK" ] || LOCK=""
-          echo "LOCK=$LOCK" >> "$GITHUB_ENV"
-          # One DOCKER_CONFIG per job. The runner-pool runners share
-          # ~/actions-runner-runner-pool/docker, and docker/login-action's post step runs
-          # `docker logout ghcr.io` against it, so a job waiting on the machine-wide
-          # build lock would lose its ghcr credential to whichever concurrent job
-          # finished first and then push anonymously (403).
-          SEED="$HOME/actions-runner-runner-pool/docker"
-          [ -d "$SEED" ] || exit 0
-          D="$SEED"
-          if [ -n "${RUNNER_TEMP:-}" ] && [ -f "$SEED/config.json" ]; then
-            D="$RUNNER_TEMP/docker-config"
-            mkdir -p "$D"
-            [ -f "$D/config.json" ] || cp "$SEED/config.json" "$D/config.json"
-            ln -sfn "$SEED/cli-plugins" "$D/cli-plugins"
-          fi
-          echo "DOCKER_CONFIG=$D" >> "$GITHUB_ENV"
       - uses: dtolnay/rust-toolchain@1.95.0
         with:
           components: rustfmt, clippy
-      - run: $LOCK cargo fmt --all --check
-      - run: $LOCK cargo clippy --all-targets -- -D warnings
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      - run: cargo clippy --all-targets -- -D warnings
 
   test:
     name: Test
-    runs-on: ${{ inputs.runner == 'ubuntu-latest' && fromJSON('["ubuntu-latest"]') || fromJSON('["self-hosted","macOS","ARM64","runner-pool"]') }}
+    runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v7
-      - name: build environment
-        run: |
-          echo "CARGO_TARGET_DIR=$HOME/actions-runner-runner-pool/cache/target" >> "$GITHUB_ENV"
-          LOCK="$HOME/actions-runner-runner-pool/with-lock.sh"
-          [ -x "$LOCK" ] || LOCK=""
-          echo "LOCK=$LOCK" >> "$GITHUB_ENV"
-          # One DOCKER_CONFIG per job. The runner-pool runners share
-          # ~/actions-runner-runner-pool/docker, and docker/login-action's post step runs
-          # `docker logout ghcr.io` against it, so a job waiting on the machine-wide
-          # build lock would lose its ghcr credential to whichever concurrent job
-          # finished first and then push anonymously (403).
-          SEED="$HOME/actions-runner-runner-pool/docker"
-          [ -d "$SEED" ] || exit 0
-          D="$SEED"
-          if [ -n "${RUNNER_TEMP:-}" ] && [ -f "$SEED/config.json" ]; then
-            D="$RUNNER_TEMP/docker-config"
-            mkdir -p "$D"
-            [ -f "$D/config.json" ] || cp "$SEED/config.json" "$D/config.json"
-            ln -sfn "$SEED/cli-plugins" "$D/cli-plugins"
-          fi
-          echo "DOCKER_CONFIG=$D" >> "$GITHUB_ENV"
       - uses: dtolnay/rust-toolchain@1.95.0
-      - run: $LOCK cargo test --workspace
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --workspace
 
   build:
     name: Release build
-    runs-on: ${{ inputs.runner == 'ubuntu-latest' && fromJSON('["ubuntu-latest"]') || fromJSON('["self-hosted","macOS","ARM64","runner-pool"]') }}
+    runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v7
-      - name: build environment
-        run: |
-          echo "CARGO_TARGET_DIR=$HOME/actions-runner-runner-pool/cache/target" >> "$GITHUB_ENV"
-          LOCK="$HOME/actions-runner-runner-pool/with-lock.sh"
-          [ -x "$LOCK" ] || LOCK=""
-          echo "LOCK=$LOCK" >> "$GITHUB_ENV"
-          # One DOCKER_CONFIG per job. The runner-pool runners share
-          # ~/actions-runner-runner-pool/docker, and docker/login-action's post step runs
-          # `docker logout ghcr.io` against it, so a job waiting on the machine-wide
-          # build lock would lose its ghcr credential to whichever concurrent job
-          # finished first and then push anonymously (403).
-          SEED="$HOME/actions-runner-runner-pool/docker"
-          [ -d "$SEED" ] || exit 0
-          D="$SEED"
-          if [ -n "${RUNNER_TEMP:-}" ] && [ -f "$SEED/config.json" ]; then
-            D="$RUNNER_TEMP/docker-config"
-            mkdir -p "$D"
-            [ -f "$D/config.json" ] || cp "$SEED/config.json" "$D/config.json"
-            ln -sfn "$SEED/cli-plugins" "$D/cli-plugins"
-          fi
-          echo "DOCKER_CONFIG=$D" >> "$GITHUB_ENV"
       - uses: dtolnay/rust-toolchain@1.95.0
-      - run: $LOCK cargo build --workspace --release
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --workspace --release
       - uses: actions/upload-artifact@v7
         with:
           name: mediaserverd-${{ github.sha }}
-          path: ${{ env.CARGO_TARGET_DIR }}/release/mediaserverd
+          path: target/release/mediaserverd
           retention-days: 7
 
   docker:
     name: Docker build
-    runs-on: ${{ inputs.runner == 'ubuntu-latest' && fromJSON('["ubuntu-latest"]') || fromJSON('["self-hosted","macOS","ARM64","runner-pool"]') }}
+    runs-on: ubuntu-24.04-arm
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v7
-      - name: docker environment
-        run: |
-          # One DOCKER_CONFIG per job. The runner-pool runners share
-          # ~/actions-runner-runner-pool/docker, and docker/login-action's post step runs
-          # `docker logout ghcr.io` against it, so a job waiting on the machine-wide
-          # build lock would lose its ghcr credential to whichever concurrent job
-          # finished first and then push anonymously (403).
-          SEED="$HOME/actions-runner-runner-pool/docker"
-          [ -d "$SEED" ] || exit 0
-          D="$SEED"
-          if [ -n "${RUNNER_TEMP:-}" ] && [ -f "$SEED/config.json" ]; then
-            D="$RUNNER_TEMP/docker-config"
-            mkdir -p "$D"
-            [ -f "$D/config.json" ] || cp "$SEED/config.json" "$D/config.json"
-            ln -sfn "$SEED/cli-plugins" "$D/cli-plugins"
-          fi
-          echo "DOCKER_CONFIG=$D" >> "$GITHUB_ENV"
+      - uses: docker/setup-buildx-action@v3
       - name: build image
-        run: |
-          LOCK="$HOME/actions-runner-runner-pool/with-lock.sh"
-          [ -x "$LOCK" ] || LOCK=""
-          $LOCK docker buildx build --platform linux/arm64 --tag mediaserverd:ci --load .
+        run: docker buildx build --platform linux/arm64 --tag mediaserverd:ci --load .
 
   deny:
     name: Licenses & advisories (cargo-deny)
-    runs-on: ${{ inputs.runner == 'ubuntu-latest' && fromJSON('["ubuntu-latest"]') || fromJSON('["self-hosted","macOS","ARM64","runner-pool"]') }}
+    runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7
-      # cargo-deny-action is a Docker container action and cannot run on a
-      # macOS runner; the binary is installed on the host instead.
-      - run: cargo deny check all
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check all

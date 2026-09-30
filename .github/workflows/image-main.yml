@@ -1,18 +1,12 @@
 name: image-main
 
-# Image build runs on the self-hosted Apple-silicon Mac and is the linux/arm64
+# Image build runs on a GitHub-hosted arm64 runner and is the linux/arm64
 # shipping gate. Push events only, never pull requests.
 
 on:
   push:
     branches: [main]
   workflow_dispatch:
-    inputs:
-      runner:
-        description: Runner pool (ubuntu-latest is the emergency fallback)
-        default: self-hosted
-        type: choice
-        options: [self-hosted, ubuntu-latest]
 
 permissions:
   contents: read
@@ -24,27 +18,11 @@ concurrency:
 
 jobs:
   image:
-    runs-on: ${{ inputs.runner == 'ubuntu-latest' && fromJSON('["ubuntu-latest"]') || fromJSON('["self-hosted","macOS","ARM64","runner-pool"]') }}
+    runs-on: ubuntu-24.04-arm
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v7
-      - name: docker environment
-        run: |
-          # One DOCKER_CONFIG per job. The runner-pool runners share
-          # ~/actions-runner-runner-pool/docker, and docker/login-action's post step runs
-          # `docker logout ghcr.io` against it, so a job waiting on the machine-wide
-          # build lock would lose its ghcr credential to whichever concurrent job
-          # finished first and then push anonymously (403).
-          SEED="$HOME/actions-runner-runner-pool/docker"
-          [ -d "$SEED" ] || exit 0
-          D="$SEED"
-          if [ -n "${RUNNER_TEMP:-}" ] && [ -f "$SEED/config.json" ]; then
-            D="$RUNNER_TEMP/docker-config"
-            mkdir -p "$D"
-            [ -f "$D/config.json" ] || cp "$SEED/config.json" "$D/config.json"
-            ln -sfn "$SEED/cli-plugins" "$D/cli-plugins"
-          fi
-          echo "DOCKER_CONFIG=$D" >> "$GITHUB_ENV"
+      - uses: docker/setup-buildx-action@v3
       - uses: docker/login-action@v4
         with:
           registry: ghcr.io
@@ -52,8 +30,6 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
       - name: build and push image
         run: |
-          LOCK="$HOME/actions-runner-runner-pool/with-lock.sh"
-          [ -x "$LOCK" ] || LOCK=""
-          $LOCK docker buildx build --platform linux/arm64 --push \
+          docker buildx build --platform linux/arm64 --push \
             --tag ghcr.io/${{ github.repository }}:latest \
             --tag ghcr.io/${{ github.repository }}:${{ github.sha }} .
