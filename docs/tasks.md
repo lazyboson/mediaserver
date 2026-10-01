@@ -35,6 +35,8 @@ blocked on a deployment.
 | **L14** | **The IVR between "invited" and "answered"** | [Item 60](#60-call-control-over-the-event-stream-park-answer-hang-up--done-2026-09-03) built the seam and nothing runs in it: a parked call has a media session, an RTP port and an SDP answer, but no audio flows until the 200, so a prompt-and-collect before answering has no path. Early media (183 + SDP) is the SIP half of that and is not built | a parked call can play a prompt and collect digits before it is answered, or the design records that the IVR runs after the answer and early media is a non-goal |
 | **L15** | **The orchestrator pairing is unproven end to end** | The call-event contract and both RPCs were built against a specification, not against a running consumer, and `parked` mode with nothing listening rings every call until the park timeout. The `end_of_interaction` → `HangupSession` pairing — the defect item 60 exists to fix — has never been driven by a real orchestrator | a real orchestrator answers and hangs up a call through the stream, and the silence-after-farewell defect is observed gone rather than argued gone |
 | **L13** | **Spill journal retention** (item 30 / **D9**'s residual) | Skipped and failed spill journals stay on disk until an operator removes them; nothing expires them, so a pod that fails uploads repeatedly fills its spill volume | a retention rule exists and is documented in deploy.md, or the growth is bounded and alerted |
+| **L16** | **Idempotency keys on every mutating RPC** | Only `CreateSession`, `Attach`, `UpdateAttachment` and `StartPlayback` carry an `idempotency_key` (`proto/mediacontrol.proto`). `DestroySession`, `AnswerSession`, `HangupSession`, `Detach`, `SendToAttachment` and `StopPlayback` cannot be deduplicated, so a client retrying after a lost reply can repeat a BYE or a stop, or get an error back for an operation that actually succeeded | every mutating RPC is deduplicable by key, or each one left out is recorded here with the reason its replay is harmless |
+| **L17** | **Trace context on `mss.events`** | The event pump publishes with `headers: Default::default()` (`crates/mediaserverd/src/event_pump.rs`), so no OpenTelemetry context crosses Kafka and a consumer cannot join an event to the RPC or call that caused it | published events carry a W3C `traceparent` header, or a decision not to is recorded here |
 
 ### P — proof, needs a lab box
 
@@ -50,9 +52,12 @@ blocked on a deployment.
 Recorded here so they stop being re-proposed. Each is a boundary the design
 picked on purpose, with the reason.
 
-- **No UAC.** MSS answers and never dials: no originate, no BYE, no
-  transfer initiation. An expired session timer ends the media and sends no
-  BYE, because tearing down a dialog is call control's.
+- **No UAC beyond the BYE.** MSS answers and never dials: no originate, no
+  re-INVITE, no transfer initiation. The one client transaction is the
+  in-dialog BYE `HangupSession` sends when call control asks for it
+  ([item 60](#60-call-control-over-the-event-stream-park-answer-hang-up--done-2026-09-03)).
+  An expired session timer ends the media and sends no BYE, because tearing
+  down a dialog is call control's.
 - **No registrar, no proxy, no routing, no forking.** A media server needs a
   fraction of a proxy; the rest belongs to OpenSIPS or the integrator's stack.
 - **No video.** `m=video` is refused by name as `NonAudioMedia`.

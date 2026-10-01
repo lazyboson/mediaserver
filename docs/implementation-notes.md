@@ -833,7 +833,9 @@ have no observation to make. It is deliberately **not** persisted in
 with them re-derives `Explicit` on the adopting pod.
 
 `SessionRegistry` is the MediaControl API of architecture.md §5.1 as a pure
-state machine: no sockets, no async, no clock of its own. The tonic service
+state machine: no sockets, no async, and no clock for its rules — the one
+wall-clock read is the `opened_at` stamp below (`SystemTime::now()` in
+`create_session`), which no rule depends on. The tonic service
 and the Redis registry are shells around it, which is what makes every rule
 below testable without a lab (Constitution, Article III).
 
@@ -878,7 +880,9 @@ be exact — the room — is never adopted.
 - **`first_final` is tracked per attachment**, not per session: it means
   "the first final transcript of this fork", which is what
   `mod_audio_fork::first_transcript` meant. Two attachments each get one.
-- **Idempotency (§5.1).** Every mutating spec carries an optional key. A
+- **Idempotency (§5.1).** The create-shaped specs (session, attachment,
+  attachment update, playback) carry an optional key; the remaining mutating
+  RPCs cannot be deduplicated yet (tasks.md L16). A
   replay returns the original id; the same key with a *different* request
   fingerprint is `IdempotencyConflict` rather than silently handing back the
   wrong resource. Fingerprints deliberately exclude the key itself.
@@ -899,7 +903,8 @@ be exact — the room — is never adopted.
   consumer can *detect* a drop rather than infer it. The shell is expected
   to `drain_events()` every tick, which keeps this far from the cap.
 - Idempotency cache `IDEMPOTENCY_CAPACITY` (4096) with FIFO eviction. A
-  sans-IO core has no clock, so it cannot expire by TTL; if the shell wants
+  sans-IO core reads no clock for its rules (only the `opened_at` stamp), so
+  it cannot expire by TTL; if the shell wants
   time-based expiry it must drive it.
 
 ### Known gaps (M4) — all three closed, kept for the reasoning
@@ -1183,6 +1188,61 @@ outbound interceptor, wiring the same `AuthPolicy` there is one line.
 A shared static secret is the v1: per-attachment minted tokens (so a
 data-plane consumer never holds the control-plane credential) are the
 natural next step and would ride the provisional `Attachment` proto.
+
+### telcompat.rs — the legacy controller's verbs, served by MSS (§5.6)
+
+The migration switch. `proto/telcompat.proto` declares
+**`package protos; service TelService`** deliberately: gRPC routes on the
+fully-qualified method path, so `/protos.TelService/StartStream` is
+byte-identical to what the legacy controller already calls, and a per-tenant flag can point a
+client at MSS instead of the legacy controller's gRPC server with **no client change** and roll
+back by pointing it back. Message shapes and field numbers are copied verbatim
+from the legacy controller's verb API proto.
+
+Only the media subset is declared — stream, transcription, recording, playback
+stop. Originate, answer, hangup, bridge, conferences and IVR prompting stay on
+FreeSWITCH, and a client calling one of those here gets `UNIMPLEMENTED`, which
+is the honest answer rather than a silent success.
+
+The mapping (one test per row in `tests/telcompat.rs`):
+
+| legacy verb | MSS nouns |
+| --- | --- |
+| `StartStream` | `CreateSession{TAP}` if absent + `Attach{WS_TWILIO, SINK+EVENTS+INJECT, authoritative}` |
+| `StopStream` | `Detach`, and `DestroySession` when it was the last attachment |
+| `StreamPause` / `StreamResume` | `UpdateAttachment{paused}` |
+| `StreamSendText` | `SendToAttachment` |
+| `StreamPlayFile` | `StartPlayback{file, requested_by: the fork}` |
+| `StartRecording` | `Attach{FILE_S3, SINK}`, endpoint `${accountID}/${recordingID}.${format}` |
+| `StopRecording` | `Detach` (+ `DestroySession` if last) |
+| `StopPlayback` | `StopPlayback` — the barge-in primitive |
+| `StartCallTranscription` | **`UNIMPLEMENTED`**, deliberately: since the Deepgram move transcription *is* the fork, and the tenant's ASR endpoint is not in `PlayAndGatherRequest`. Callers use `StartStream` with `ws_url` until that config is plumbed. Inventing an endpoint here would fail at connect time instead of at the call. |
+
+Two things the tests caught, both worth keeping:
+
+- **Authoritative follows the session's purpose, not arrival order.** The first
+  version claimed `authoritative: true` for every attachment, so a recorder
+  joining a streamed call was refused with `AuthoritativeAlreadyBound`. The
+  fork produces the speech events the legacy stream state machine runs on; a recorder is a `SINK`
+  with no back-channel and must never claim them.
+- **One session serves both.** `StartStream` + `StartRecording` on the same
+  channel produce one tap with two attachments, which is the whole point:
+  today those are two FreeSWITCH mechanisms.
+
+Both surfaces share one controller and one port (`server.rs`): the packages
+differ (`mss.v1` vs `protos`) so the method paths cannot collide, and
+`over_the_wire.rs` proves an unmodified legacy controller client and the native API drive
+the same session over one socket. `SessionController` implements `MediaControl`
+for `Arc<Self>` so both services can hold it.
+
+Gap: session creation passes an empty `call_id`/`from_tags`, because legacy verb API
+callers only know the channel uuid. **Resolved since 2026-08-17** (see
+"Resolving a call's participants without the discovery map" under
+`crates/mediaserverd` below): the caller
+passes the SIP call-id and the caller's from-tag as session metadata
+(`sipCallId` / `callerFromTag`, both already on the FreeSWITCH channel) and
+`TapPlane` asks rtpengine's `query` for the rest, so a TelCompat-created session
+taps without the OpenSIPS→Redis discovery map.
 
 ### Known gaps (M4)
 
@@ -1608,60 +1668,6 @@ Consequence for the roadmap: the OpenSIPS→Redis discovery map is no longer on
 the critical path for a pilot. It is still the better long-term answer — it
 avoids a `query` per tap and works when MSS never sees the channel — but it is
 now an optimisation rather than a blocker.
-
-### telcompat.rs — the legacy controller's verbs, served by MSS (§5.6)
-
-The migration switch. `proto/telcompat.proto` declares
-**`package protos; service TelService`** deliberately: gRPC routes on the
-fully-qualified method path, so `/protos.TelService/StartStream` is
-byte-identical to what the legacy controller already calls, and a per-tenant flag can point a
-client at MSS instead of the legacy controller's gRPC server with **no client change** and roll
-back by pointing it back. Message shapes and field numbers are copied verbatim
-from the legacy controller's verb API proto.
-
-Only the media subset is declared — stream, transcription, recording, playback
-stop. Originate, answer, hangup, bridge, conferences and IVR prompting stay on
-FreeSWITCH, and a client calling one of those here gets `UNIMPLEMENTED`, which
-is the honest answer rather than a silent success.
-
-The mapping (one test per row in `tests/telcompat.rs`):
-
-| legacy verb | MSS nouns |
-| --- | --- |
-| `StartStream` | `CreateSession{TAP}` if absent + `Attach{WS_TWILIO, SINK+EVENTS+INJECT, authoritative}` |
-| `StopStream` | `Detach`, and `DestroySession` when it was the last attachment |
-| `StreamPause` / `StreamResume` | `UpdateAttachment{paused}` |
-| `StreamSendText` | `SendToAttachment` |
-| `StreamPlayFile` | `StartPlayback{file, requested_by: the fork}` |
-| `StartRecording` | `Attach{FILE_S3, SINK}`, endpoint `${accountID}/${recordingID}.${format}` |
-| `StopRecording` | `Detach` (+ `DestroySession` if last) |
-| `StopPlayback` | `StopPlayback` — the barge-in primitive |
-| `StartCallTranscription` | **`UNIMPLEMENTED`**, deliberately: since the Deepgram move transcription *is* the fork, and the tenant's ASR endpoint is not in `PlayAndGatherRequest`. Callers use `StartStream` with `ws_url` until that config is plumbed. Inventing an endpoint here would fail at connect time instead of at the call. |
-
-Two things the tests caught, both worth keeping:
-
-- **Authoritative follows the session's purpose, not arrival order.** The first
-  version claimed `authoritative: true` for every attachment, so a recorder
-  joining a streamed call was refused with `AuthoritativeAlreadyBound`. The
-  fork produces the speech events the legacy stream state machine runs on; a recorder is a `SINK`
-  with no back-channel and must never claim them.
-- **One session serves both.** `StartStream` + `StartRecording` on the same
-  channel produce one tap with two attachments, which is the whole point:
-  today those are two FreeSWITCH mechanisms.
-
-Both surfaces share one controller and one port (`server.rs`): the packages
-differ (`mss.v1` vs `protos`) so the method paths cannot collide, and
-`over_the_wire.rs` proves an unmodified legacy controller client and the native API drive
-the same session over one socket. `SessionController` implements `MediaControl`
-for `Arc<Self>` so both services can hold it.
-
-Gap: session creation passes an empty `call_id`/`from_tags`, because legacy verb API
-callers only know the channel uuid. **Resolved since 2026-08-17** (see
-"Resolving a call's participants without the discovery map" above): the caller
-passes the SIP call-id and the caller's from-tag as session metadata
-(`sipCallId` / `callerFromTag`, both already on the FreeSWITCH channel) and
-`TapPlane` asks rtpengine's `query` for the rest, so a TelCompat-created session
-taps without the OpenSIPS→Redis discovery map.
 
 ### inline_leg.rs — the egress pump (item 33, Phase 3, 2026-08-23)
 
@@ -4275,8 +4281,9 @@ is that defect written as a test.
    answer-only media plane that made itself the refresher would have to send
    re-INVITEs, which is a UAC. So a `Session-Expires: 1800;refresher=uas` is
    answered `refresher=uac`, and on expiry the door **ends the media session and
-   does not send a BYE** — tearing down the dialog is call control's, and MSS
-   has no UAC to do it with. `a_session_expires_above_the_floor_is_negotiated_with_the_caller_refreshing`.
+   does not send a BYE** — tearing down the dialog is call control's. MSS has
+   no UAC beyond the BYE: its one non-INVITE client transaction ends a dialog
+   only when call control asks (`HangupSession`, item 60), never on its own timer. `a_session_expires_above_the_floor_is_negotiated_with_the_caller_refreshing`.
 5. **A re-INVITE whose offer is unchanged is answered with the session's
    existing SDP answer.** That covers the session-timer refresh and the
    re-INVITE-to-refresh case completely. An offer that actually differs is still

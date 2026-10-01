@@ -47,9 +47,11 @@ Work:
   244 ns/packet, ~41k taps/core pipeline-only); the socket path and the
   rtpengine-side delta still need the namespace rig.
 - Decide call→rtpengine-node discovery (recommended: OpenSIPS writes
-  call-id → node + tags to Redis at call setup). **Open** — a polling
-  stand-in (`lab/call_watcher.py`) works in the lab; the Redis design
-  needs agreement with the OpenSIPS config owners.
+  call-id → node + tags to Redis at call setup). **MSS side built
+  (2026-08-26, [tasks.md](tasks.md) item 51)** — `crates/mediaserverd/src/discovery.rs`
+  reads the map, `mss_discovery_*` counts hits, misses and errors, and
+  `lab/node_discovery_drill.sh` proves it live. **Open (org-side)** — the
+  proxy half needs agreement with the OpenSIPS config owners.
 
 Exit criteria: WAV artifact from a real tapped call; measured per-tap
 cost on both MSS and rtpengine sides; discovery mechanism agreed with the

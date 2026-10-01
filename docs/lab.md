@@ -242,9 +242,10 @@ the ASR feed**, which is a property worth keeping.
 ## Against the real stream-llm-bridge
 
 `lab/docker-compose.yml` runs the actual service (`stream-llm-bridge:local`,
-built from that repo) with `USE_LLM=false`, so ElevenLabs speaks
-`WELCOME_MESSAGE` the moment `start` arrives. Keys live in `lab/.env`, which
-is gitignored. The mock moved behind `--profile mock` for offline work.
+built from that repo) behind `--profile real`, with `USE_LLM=false`, so
+ElevenLabs speaks `WELCOME_MESSAGE` the moment `start` arrives. Keys live in
+`lab/.env`, which is gitignored. Without the profile the default `bridge`
+service is the checked-in `mock_bridge.py`, for offline work.
 
 A silent-endpoint run (`PUMP_SILENCE=1`, so only injected audio is audible)
 ends with `caller_ear.wav` carrying **real speech** — syllable bursts with
@@ -417,11 +418,11 @@ synthetic lab:
 1. **The `mix` flag is untested.** `SubscribeRequest` supports it and the
    architecture proposes it for cheap supervisor listen, but no lab run has
    asked for a mixed mono feed.
-2. **`stop media` cut-through latency is unmeasured.** It is the barge-in
-   primitive for `play media` injection — how fast an utterance stops once
-   the caller starts talking decides whether utterance-shaped bot speech
-   feels interactive or not. The probe issues `stop media` but does not
-   time it.
+2. ~~**`stop media` cut-through latency is unmeasured.**~~ **Measured
+   2026-08-23** by `lab/barge_drill.sh` (see the barge drill below): a
+   consumer `SpeechReport` to an acked `StopPlayback`, which sends NG
+   `stop media`, at **p50 3.54–3.98 ms, p95 under 4.8 ms**. That interval
+   ends at the ack, not at the last injected packet reaching the caller.
 3. **Injected audio arrives alongside the peer's, not instead of it.** In
    the targeted run the caller received 245 packets, 100 of them the
    injected tone and the rest the callee's silence, so `play media` did not

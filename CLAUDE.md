@@ -82,7 +82,8 @@ consumer I/O) and dedicated real-time OS threads for the packet path
 joined only by bounded lock-free queues — the media world never waits on
 the control world. All protocol/DSP logic is sans-IO (pure state machines,
 time as a parameter) so every media bug is reproducible by packet replay
-in a unit test. Taps are pull-initiated (MSS asks rtpengine to send it a
+in a unit test; `session-core` is sans-IO too but reads the wall clock for a
+session's `opened_at`. Taps are pull-initiated (MSS asks rtpengine to send it a
 copy), which makes passive sessions re-subscribable after a pod loss and
 placement a scheduling decision instead of an SDP-routing problem.
 
@@ -164,7 +165,7 @@ timers — written rather than adopted, for the reasons architecture §7 records
 `MSS_SIP_LISTEN` puts it on a socket, calling the same `SessionController` the
 gRPC service does, so it is a second entrance onto the existing nouns and never
 a parallel implementation. Answer-only is unchanged: no registrar, no routing,
-no forking, no UAC. `lab/sip_shim.py` is what this replaces, and it keeps its
+no forking, and no UAC beyond the in-dialog BYE. `lab/sip_shim.py` is what this replaces, and it keeps its
 job until the lab drills are pointed at the new port.
 
 Still true: **no datagram has yet come from a real FreeSWITCH, OpenSIPS or

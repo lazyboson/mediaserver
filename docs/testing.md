@@ -226,13 +226,20 @@ injected **at the endpoint** rather than on the tap link, because this box's
 kernel has no netem (see below): uniform loss at 1% and 5% (reported loss
 1.06% and 5.01%, `frames_concealed` equal to `jitter_lost` to the packet),
 reorder inside the buffer depth (zero loss, zero late) and arrival jitter
-(zero loss, zero late). Two rows are still replay-only for a reason worth
-knowing: **duplication cannot be injected from the endpoint at all** —
+(zero loss, zero late). Two rows stayed replay-only from that box for a reason
+worth knowing: **duplication cannot be injected from the endpoint at all** —
 rtpengine absorbs the duplicate before the subscription sees it, measured — and
 burst loss and reorder-beyond-depth need the correlated/large-delay shapes only
 netem produces. Nothing has judged the concealment **perceptually** yet;
 `lab/ear_intelligibility_probe.py` under burst loss is still the cheap version
 of that, and still unrun.
+
+**Tap link (2026-08-28, a second box with netem).** `lab/netem.sh` on the
+tap link ran every row of the matrix ([lab.md](lab.md), "The impairment
+matrix, on the tap link at last"), so no row is replay-only any more:
+duplicates do reach the tap (131 deduped under `duplicate 1%`), and
+reorder-beyond-depth produces late drops (3, then 7 at `delay 120ms 60ms`),
+with `frames_concealed` equal to `jitter_lost` in every row.
 
 Every lab run in this matrix should dump its datagram log. The interesting
 ones become permanent replay fixtures, which is how an impairment scenario
@@ -375,7 +382,7 @@ folds in fixed overhead and flatters the result.
 | WAV artifact from a real tapped call | Existing docker lab | ✅ done 2026-08-14; a real-softphone call via OpenSIPS 2026-08-15 |
 | Measured per-tap cost, MSS side | `mss` namespace, slope across steps | 🔶 WSL2 rough shape 2026-08-16, see below |
 | Measured per-tap cost, rtpengine side | `rtpe` namespace, delta vs step 0 | ⬜ |
-| Discovery mechanism agreed | Organizational — OpenSIPS config owners | ⬜ prototyped in the lab (`call_watcher.py` polls rtpengine; the real design stays OpenSIPS → Redis) |
+| Discovery mechanism agreed | Organizational — OpenSIPS config owners | ⬜ agreement pending; MSS's half of the OpenSIPS → Redis map is built (tasks item 51, `discovery.rs`) and lab-proven by `lab/node_discovery_drill.sh` |
 
 ### The WSL2 rough shape, recorded
 

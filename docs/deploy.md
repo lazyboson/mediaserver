@@ -835,8 +835,12 @@ source of truth: it works as a plain Prometheus `rule_files:` entry, and
 `deploy/k8s/base/prometheusrule.yaml` for the Prometheus Operator, so the two
 cannot drift (the diff the script produces **is** the drift check). Every
 silent-drop counter has an alert — Constitution, Article VIII: a drop is a
-first-class metric, never a silence. The thresholds are Phase-1 starting points;
-tune them against your own baseline.
+first-class metric, never a silence. Two refusal counters carry no alert on
+purpose, because neither is silent: `mss_recording_group_joins_refused_total`
+is an explicit error to the caller, and
+`mss_recording_spill_lost_ownership_total` is the benign half of spill
+adoption (actual loss alerts via `MssRecordingFramesLostOnAdopt`). The
+thresholds are Phase-1 starting points; tune them against your own baseline.
 
 The `ServiceMonitor` scrapes every 15 s, because the rules use `rate(…[5m])`
 windows and anything slower makes a short drop burst invisible. It selects by

@@ -88,6 +88,67 @@ groups:
             The controller is producing events faster than they are drained.
             This should be unreachable in normal operation; treat as a bug.
 
+      - alert: MssDtmfEventsDropping
+        expr: rate(mss_dtmf_events_dropped_total[5m]) > 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "DTMF presses are being dropped before reaching the event bus"
+          description: >-
+            The DTMF event queue on {{ $labels.instance }} is full. Consumers
+            still receive the digits in-band, but mss.events is missing
+            presses, so anything driven off the bus sees an incomplete entry.
+
+      - alert: MssInlineEgressDropping
+        expr: rate(mss_inline_egress_dropped_samples_total[5m]) > 0
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "An inline leg is dropping outbound audio"
+          description: >-
+            {{ $labels.instance }} is dropping the oldest samples from at least
+            one inline egress ring. The producer is feeding audio faster than
+            the leg plays it; the peer hears gaps in the prompt or bot speech.
+
+      - alert: MssConferenceFramesRefused
+        expr: rate(mss_conference_frames_refused_total[5m]) > 0
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "A conference mix is refusing member frames"
+          description: >-
+            {{ $labels.instance }}'s mix matrix refused frames, for frame size
+            or a stale membership handle. That member's audio is missing from
+            the mix while this fires.
+
+      - alert: MssInlineEgressRefusing
+        expr: rate(mss_inline_egress_chunks_refused_total[5m]) > 0
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "An inline leg is refusing inbound audio chunks"
+          description: >-
+            {{ $labels.instance }} could not queue audio chunks because an
+            inline egress queue was full. The producer's audio is being
+            discarded before it reaches the leg; the peer hears gaps.
+
+      - alert: MssRecordingFramesLostOnAdopt
+        expr: rate(mss_recording_frames_lost_on_adopt_total[5m]) > 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "An adopted recording lost frames from the dead pod"
+          description: >-
+            {{ $labels.instance }} adopted a recording from a dead pod but
+            could not read back all the frames that pod held. The affected
+            recording has a gap; check the spill volume and the dead pod's
+            disk.
+
   - name: mss-media-quality
     rules:
       - alert: MssTapLegStalled
@@ -131,6 +192,20 @@ groups:
           description: >-
             Sustained loss at this level is audible and degrades ASR accuracy.
             Compare against rtpengine-side counters to localize the hop.
+
+      - alert: MssJitterLateDropsHigh
+        expr: >-
+          rate(mss_jitter_late_drops_total[5m])
+            / clamp_min(rate(mss_ingest_datagrams_total[5m]), 1) > 0.01
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "More than 1% of tap packets arrive too late to play"
+          description: >-
+            Packets are reaching the jitter buffer after their playout slot
+            and are discarded, which is audible like loss but is not counted
+            as loss. Delay variation on the tap link exceeds the buffer depth.
 
   - name: mss-registry
     rules:

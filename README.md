@@ -86,7 +86,7 @@ synthetic callers and mock consumers) lives in [`lab/`](docs/lab.md).
 | `crates/opus-ffi` | Safe wrapper over **libopus** (vendored, statically linked). The only crate here that contains FFI `unsafe`; every other crate forbids it. |
 | `crates/rtpengine-ng` | **Sans-IO** rtpengine NG protocol client: bencode, `subscribe request/answer`, `unsubscribe`, `play media`/`stop media`, `query`, subscription SDP. |
 | `crates/protocol` | Frozen consumer wire dialects: Twilio Media Streams JSON and `audio_fork` send_text control events. The serialization tests are the spec. |
-| `crates/session-core` | **Sans-IO** control-plane state machine: sessions, attachments, playbacks, events — capability authorization, one authoritative attachment per session, idempotent retries. |
+| `crates/session-core` | **Sans-IO** control-plane state machine: sessions, attachments, playbacks, events — capability authorization, one authoritative attachment per session, idempotent retries. No sockets and no async; unlike the protocol/DSP cores it does read the wall clock, stamping each session's `opened_at` with `SystemTime::now()`. |
 | `crates/control-api` | The network surface: `MediaControl` + `MediaStream` + `TelCompat` gRPC services over `session-core`. Pure-Rust protobuf build (no `protoc`). |
 | `crates/sip-uas` | Sans-IO SIP UAS: transactions, dialogs, session timers, and one client transaction — the in-dialog BYE. It refuses to open an INVITE client transaction by name, so "MSS answers, it never dials" is a property of the type. No sockets. |
 | `crates/call-events` | Stopgap Redis-stream publisher for the SIP front door's call-control events — `invited`, `answered`, `end_of_interaction`, `ended` on `mss:call-events` by default, paired with the `AnswerSession`/`HangupSession` RPCs ([deploy.md](docs/deploy.md#call-control-over-the-event-stream)). Idle if the stream env is emptied or Redis is unset. Delete when Kafka `mss.events` is the bus. |
@@ -100,7 +100,8 @@ synthetic callers and mock consumers) lives in [`lab/`](docs/lab.md).
    blocks on the control world.
 2. **Sans-IO cores.** Protocol/DSP logic takes packets and instants as
    parameters and returns values, so every media bug is reproducible by
-   packet replay in a unit test.
+   packet replay in a unit test. (The control-plane `session-core` is
+   sans-IO but not clockless: it stamps `opened_at` from the wall clock.)
 3. **No per-packet allocation** on the hot path after session setup.
 4. **No panics on network input.** Malformed RTP/bencode/JSON is an error
    value.

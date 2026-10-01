@@ -151,7 +151,7 @@ Three properties this diagram is drawn to make explicit, each argued in §5:
 
 **The door has exactly one client transaction, and it is a BYE.** `MSS_SIP_ANSWER_MODE=parked` moves the decision to answer and the decision to hang up out of the media plane and onto whatever reads that stream: the door sends 100 then **180 Ringing**, publishes `invited`, and waits for `AnswerSession` before the 200 — while the media session, its RTP port and its SDP answer already exist, so answering costs one datagram and an attachment can be bound to a ringing call. `HangupSession` then sends an in-dialog BYE (a client transaction proper: RFC 3261 §17.1.2 retransmission to Timer F, routed on the dialog's remote target and reversed `Record-Route` set) or replies 480 to an INVITE that was never answered. That BYE is the whole of the UAC surface, deliberately: it ends a dialog MSS is already in, it does not start one, and there is still no INVITE, no registrar and no forking. `MSS_SIP_ANSWER_MODE=immediate` is the default and is the behaviour above, unchanged. The pairing the design exists for is `end_of_interaction` out, `HangupSession` in — the voice-AI agent's farewell no longer leaves a caller in silence, and the media plane still decides nothing about the call. The command/event table is in [deploy.md](deploy.md#call-control-over-the-event-stream).
 
-**Ingest / codec pipeline** — per subscribed stream: UDP socket → RTP depacketization → **jitter buffer** (sequence reorder, loss detection, PLC — G.711 Appendix I for G.711, libopus's own for Opus) → decode to linear PCM → resample (8 kHz ↔ 16 kHz ↔ 48 kHz) → per-consumer re-encode (L16/16k for ASR, PCMU/8k for Twilio-dialect consumers, Opus for bandwidth-sensitive consumers). One decode per stream, N encodes shared across consumers wanting the same format.
+**Ingest / codec pipeline** — per subscribed stream: UDP socket → RTP depacketization → **jitter buffer** (sequence reorder, loss detection, PLC — G.711 Appendix I for G.711, libopus's own for Opus) → decode to linear PCM → resample (8 kHz ↔ 16 kHz ↔ 48 kHz) → per-consumer re-encode (L16/16k for ASR, PCMU/8k for Twilio-dialect consumers; Opus output for bandwidth-sensitive consumers is not built yet — Opus is decode-only today). One decode per stream, N encodes shared across consumers wanting the same format.
 
 **Fan-out hub** — per session, an in-process pub/sub: one ingest (or two, customer + agent leg), N subscribers. Subscribers attach/detach mid-call. Each subscriber has an independent queue with drop-oldest backpressure and per-subscriber metrics, so one slow ASR endpoint can't stall the RTT stream (a failure mode the legacy media gateway has today — its mark-echo write blocks the RTP pacer).
 
@@ -159,7 +159,7 @@ Three properties this diagram is drawn to make explicit, each argued in §5:
 
 - *gRPC bidirectional stream* — the new native interface (frame contract in §5.8). Server-side streaming of audio frames + events; client → server messages carry control (marks/clear) and, where the attachment declares `INJECT`, audio.
 - *WebSocket, Twilio Media Streams dialect* — wire-compatible with what the legacy media gateway sends today (`start/media/dtmf/stop/mark` out, `media/mark/clear/endOfInteraction` in), so existing bot/ASR endpoints migrate with zero changes.
-- *Recording sink* — PCM → stereo WAV/OGG segmenter honoring the existing `${accountID}/${recordingID}.${fileFormat}` identity contract, uploading directly to S3 (no shared filesystem, no SQS hop — or keep SQS initially for compatibility). S3 stays the **default**; a **shared filesystem** every recording pod mounts is the configured alternative (`MSS_RECORDING_STORE=filesystem`, item 58) for a deployment that has no object store or whose recording pickup already watches a mounted tree — the same identity, the same sink trait, one variable, and `file://` rather than `s3://` in the event.
+- *Recording sink* — PCM → stereo WAV segmenter (OGG is not built) honoring the existing `${accountID}/${recordingID}.${fileFormat}` identity contract, uploading directly to S3 (no shared filesystem, no SQS hop — or keep SQS initially for compatibility). S3 stays the **default**; a **shared filesystem** every recording pod mounts is the configured alternative (`MSS_RECORDING_STORE=filesystem`, item 58) for a deployment that has no object store or whose recording pickup already watches a mounted tree — the same identity, the same sink trait, one variable, and `file://` rather than `s3://` in the event.
 
 **State & events** — session registry in Redis (which pod owns which session, attachment list, status) with CAS-safe updates and ownership leases. Media events go to Kafka `mss.events` as typed `MediaEvent`, translated into the legacy `eventTopic` format by a shim in the legacy controller (§5.4); billing/lifecycle events reuse `the legacy gateway's billing topic` / `KAFKA_VOICE_AI_AGENT_TOPIC` schemas so downstream consumers don't change.
 
@@ -280,8 +280,13 @@ rtpengine node) because rtpengine does. Every request carries
 OpenSIPS → Redis map — the discovery item still open in M2 and now on the
 critical path for all of this.
 
-Every mutating RPC takes an idempotency key: a retry during pod loss must
-not double-attach or double-record.
+The mutating RPCs that create something take an idempotency key —
+`CreateSession`, `Attach`, `UpdateAttachment` and `StartPlayback` — so a
+retry during pod loss does not double-attach or double-record. The rest
+(`DestroySession`, `AnswerSession`, `HangupSession`, `Detach`,
+`SendToAttachment`, `StopPlayback`) carry none yet and cannot be
+deduplicated; closing that gap is tracked future work in
+[tasks.md](tasks.md).
 
 ### 5.2 Attachments: capability is declared, not assumed
 
@@ -341,8 +346,10 @@ MSS ──Kafka "mss.events"──▶ translator ──Kafka "eventTopic"──�
 ```
 
 - **`mss.events`** — MSS's own topic, typed protobuf `MediaEvent`, keyed by
-  `external_id`, sequence-numbered per session, OTel context injected. This
-  is MSS's long-term contract and the only format MSS knows.
+  `external_id`, sequence-numbered per session. OTel context injection is
+  planned, not present: records go out with empty headers today (tracked in
+  [tasks.md](tasks.md)). This is MSS's long-term contract and the only
+  format MSS knows.
 - **`eventTopic`** — the existing legacy topic, untouched. A thin Go
   translator renders the positional `Events{repeated string}` that
   the application server already parses.
@@ -431,14 +438,16 @@ the "stop playback → wait → resume fork" sequencing is unaffected.
 The test of whether the abstraction is real is that later phases add no
 RPCs:
 
-- **Phase 3 inline leg** — `CreateSession{INLINE}`; the voice agent becomes
-  `Attach{DUPLEX}`, the same attachment with direction flipped; streaming
-  TTS is `StartPlayback{stream}`.
-- **Phase 4 conference** — `CreateSession{MIX}`; each participant is
-  `Attach{RTP_INLINE, DUPLEX}`; **monitor** is `Attach{SINK}` on a mixed
-  selector with *no SIP leg at all*; **whisper** is
-  `StartPlayback{target: member_id}`; **barge** is
-  `UpdateAttachment{selector}`. The mix matrix is attachment config.
+- **Phase 3 inline leg** — `CreateSession{INLINE}`; the voice agent is an
+  ordinary attachment that also declares `INJECT`, streaming into the leg
+  full duplex; streaming TTS is `StartPlayback{stream}`.
+- **Phase 4 conference** — each participant is an inline leg,
+  `CreateSession{INLINE, group=<room>}`, and the room itself may be
+  `CreateSession{MIX, group}`; **monitor** is `Attach{SINK}` on the `mixed`
+  selector with *no SIP leg at all*; **whisper** is `mix_target=<member>`
+  metadata on an `INJECT` attachment; **barge** is `mix_target=all` via
+  `UpdateAttachment` metadata. The mix matrix is attachment config
+  (Appendix B).
 - **A new consumer type** (different ASR vendor, analytics sink) is a new
   transport enum value plus a config blob. No API change.
 
@@ -455,9 +464,10 @@ message ServerToConsumer {
   oneof msg {
     StreamStart start = 1;   // session ids, tracks, AudioFormat{encoding, sample_rate_hz, channels, ptime_ms}
     AudioFrame frame = 2;    // track, seq, pts_ms, payload (raw, NOT base64)
-    DtmfEvent dtmf = 3;
-    TextEvent text = 4;      // send_text passthrough
+    DtmfFrame dtmf = 3;
+    TextFrame text = 4;      // send_text passthrough
     StreamStop stop = 5;
+    Mark mark = 6;
   }
 }
 message ConsumerToServer {
@@ -466,6 +476,7 @@ message ConsumerToServer {
     AudioFrame inject = 2;   // only honored when the attachment declared INJECT
     Mark mark = 3;
     Clear clear = 4;
+    SpeechReport report = 5;
   }
 }
 ```
@@ -515,10 +526,10 @@ Each of these traces to a measured defect or failure mode in the class of per-ca
 **The two-world architecture (non-negotiable):**
 
 - **Control world — Tokio.** Session API (tonic gRPC + REST), RTPEngine NG client, Redis session registry, Kafka producers, consumer WebSocket/gRPC I/O. Async is the right tool here; nothing in this world touches a packet deadline.
-- **Media world — dedicated OS threads.** One worker thread per core (pinned), each owning its sessions end-to-end: UDP sockets (`recvmmsg` batched), jitter buffers, codec state, fan-out queues, playout pacing. Wall-clock-anchored deadlines (`t0 + n·ptime`, never naive tickers), zero heap allocation per packet, no locks on the packet path — sessions are pinned to one worker so there is no cross-thread packet handoff.
+- **Media world — dedicated OS threads.** One worker thread per core (sized by `available_parallelism()`; not pinned to a core today — pinning is design intent), each owning its sessions end-to-end: UDP sockets (one `recv_from` per datagram per socket today; `recvmmsg` batching is design intent, not built), jitter buffers, codec state, fan-out queues, playout pacing. Wall-clock-anchored deadlines (`t0 + n·ptime`, never naive tickers), zero heap allocation per packet, no locks on the packet path — sessions are pinned to one worker so there is no cross-thread packet handoff.
 - The worlds communicate over bounded lock-free queues; the media world never blocks on the control world.
 
-**Sans-IO cores.** All protocol and DSP logic (RTP, jitter, G.711, DTMF, NG bencode, consumer dialects) is written as pure state machines with time as an explicit parameter — no sockets, no clocks, no async in those crates. This is the answer to "it's a media service, we can't see it": every core is testable by replaying captured pcaps byte-for-byte, and production incidents reduce to "capture, replay, fix, add the capture as a regression test."
+**Sans-IO cores.** All protocol and DSP logic (RTP, jitter, G.711, DTMF, NG bencode, consumer dialects) is written as pure state machines with time as an explicit parameter — no sockets, no clocks, no async in those crates. (`session-core` is not clockless: its registry stamps a session's `opened_at` with `SystemTime::now()`.) This is the answer to "it's a media service, we can't see it": every core is testable by replaying captured pcaps byte-for-byte, and production incidents reduce to "capture, replay, fix, add the capture as a regression test."
 
 **Supervision.** Tokio tasks die silently on panic; a media session whose pump died must never mean a silently dead call. Every session gets an audio-flow watchdog (no frames emitted for N ms while nominally flowing → stalled event → tap re-subscribe), join-handle supervision on every spawned task, and per-session heartbeats exported as metrics.
 
@@ -680,7 +691,7 @@ FreeSWITCH itself wraps C libraries (libopus, spandsp, libsndfile, ffmpeg) and o
 | FS capability we use today | What it actually is | Rust path | Build from scratch? |
 | --- | --- | --- | --- |
 | G.711 µ/A-law | Table lookup | in-tree (~150 lines) | Trivial |
-| Opus encode/decode (+PLC/FEC) | libopus (same lib FS uses) | `opusic-sys` bindings, vendored and statically linked | No |
+| Opus decode (+PLC/FEC); encode not built yet | libopus (same lib FS uses) | `opusic-sys` bindings, vendored and statically linked | No |
 | G.722 | spandsp/libg722 | FFI, or small Rust ports | No |
 | Resampling 8k/16k/48k | DSP | `rubato` (pure Rust) or libsoxr FFI | No |
 | Jitter buffer + reorder | Policy code | pieces exist (str0m, webrtc-rs); NetEQ-class is C++ FFI | **Yes (~1k lines) — and we want to own it** |
@@ -739,15 +750,16 @@ probe of those crates before taking them changed the decision. Four findings:
    timers.** Every other protocol and DSP layer here is sans-IO with time as a
    parameter, which is why a media bug is a unit test. Adopting a runtime-bound
    timer manager would forfeit exactly that property for Timer G/H/I/J/L.
-   (Timer K bounds a *client* transaction, and there is no UAC here, so it is
-   out of scope by construction rather than unbuilt.)
+   (Timer K bounds a *client* transaction; the one client transaction here,
+   the in-dialog BYE, is written sans-IO like the rest.)
 
 Article XI's rule holds where its reason holds: adopt the codec math, because
 reimplementing it is a decade of field-found bugs. It does not extend to a
 dependency with 1,385 downloads whose value is a state machine the RFC prints in
 full. What MSS needs is closed and small — the **INVITE server transaction** and
-the **non-INVITE server transaction**, branch matching, and the §17 timers; no
-client transactions, no forking, no UAC. That is written here, sans-IO: bytes
+the **non-INVITE server transaction**, branch matching, and the §17 timers; one
+client transaction, the in-dialog BYE (RFC 3261 §17.1.2, retransmitted to Timer
+F), and no INVITE client transaction, no forking. That is written here, sans-IO: bytes
 plus `now` in, actions and timer requests out. The syntax layer stays adopted.
 
 **GStreamer escape hatch:** `gstreamer-rs` bindings are first-class (GStreamer's own team ships Rust plugins upstream). An MSS variant embedding GStreamer per-session pipelines (`udpsrc → rtpjitterbuffer → decode → audioresample → appsink`, `audiomixer` for conferences) inherits hardened media code at the cost of carrying the GStreamer runtime. Decision: hand-roll the narrow audio-only pipeline; prototype both in Phase 0; keep GStreamer as the Phase-4 mixer fallback.
@@ -841,7 +853,7 @@ column is the whole conference surface MSS has.
 | 1 | Create conference / open room | `CreateSession{kind=MIX, group}`, or nothing at all — `CreateSession{INLINE, group}` opens it lazily | **implemented** | map create to the room session when the room will be recorded or monitored as a whole; otherwise to a no-op that remembers the room name. Either way, do not add a room noun |
 | 2 | Add participant (dial into the room) | `CreateSession{INLINE, group, sdp_offer}` | **implemented** (MSS half) | the dial is the integrator's: its proxy/controller routes a leg to MSS with the room as `group` |
 | 3 | Remove participant / kick | `DestroySession` | **implemented** | the SIP leg is the integrator's to tear down; MSS unseats and stops mixing |
-| 4 | List participants / room state | `DescribeSession` per session, `SessionCreated`/`SessionEnded` on the bus, `mss_conference_members_live` | **mappable** | keep the roster in the controller; add a `ListSessions{group}` filter only if a UI needs MSS as the source of truth |
+| 4 | List participants / room state | `DescribeSession` per session, `SessionEnded` on the bus, `mss_conference_members_live` | **mappable** | keep the roster in the controller; add a `ListSessions{group}` filter only if a UI needs MSS as the source of truth |
 | 5 | Mute participant | `member_mute=on`, optionally with `member_state_ttl_ms` | **implemented** | send a lease from a UI and refresh it while the UI is open, so a controller that dies leaves the member muted for one lease and not for the room |
 | 6 | Unmute participant | `member_mute=off` | **implemented** | still the only way to lift a mute *early*; a lease lifts it by itself |
 | 7 | Deafen / undeafen participant | `member_deaf=on\|off` | **implemented** | the same lease applies |
@@ -851,7 +863,7 @@ column is the whole conference surface MSS has.
 | 11 | Barge (full-duplex join) | `mix_target=all` | **implemented** | it is a metadata flip on the same attachment, so barge-in is not a re-INVITE |
 | 12 | Play prompt / announcement into the room | `StartPlayback{target_tag="all"}` | **implemented** | enter/exit sounds are the integrator's trigger on the event stream (§B.2) |
 | 13 | Record the conference | `Attach{FILE_S3, only="mixed"}` on the room session (room) or a recording group (per participant) | **implemented** | both shapes may run at once, under the frozen identity, and both anchor on the conference's open. Attach the room object to the **room session**, not to a member, or it ends when that member does |
-| 14 | In-conference DTMF control menu | none by design | **not planned** | map digits to these API calls in the integrator; MSS hands over the digits on the consumer stream and interprets none of them. The digits do **not** reach `mss.events` today (tasks.md D21) |
+| 14 | In-conference DTMF control menu | none by design | **not planned** | map digits to these API calls in the integrator; MSS hands over the digits on the consumer stream and interprets none of them. Every digit is also published to `mss.events` as a `Dtmf` `MediaEvent` (tasks.md D21, closed by item 48) |
 
 Two soft spots an adapter author must know. First, member state still has **no
 owner** — the API models neither the caller nor a session as the holder of a
