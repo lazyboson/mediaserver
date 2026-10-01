@@ -97,7 +97,7 @@ flowchart LR
         REG --- RE2[RTPEngine 1..n]
     end
 
-    RE1 -->|RTP| FS[FreeSWITCH<br/>IVR + call control only]
+    RE1 -->|RTP| FS[FreeSWITCH<br/>IVR + call control only<br/>still the call's RTP anchor until Phase 4]
     RE2 -->|RTP| FS
 
     subgraph legacy [legacy controller]
@@ -167,7 +167,7 @@ Three properties this diagram is drawn to make explicit, each argued in §5:
 
 - **Pull, not push.** The MSS *initiates* the subscription toward rtpengine. Session placement is a scheduling decision made by your control plane (any pod with capacity takes the session), not a consequence of SDP routing. This kills the hardest scaling problem the legacy media gateway has — OpenSIPS must route the B2B INVITE to a specific pod whose `RTP_IP` is routable — and replaces it with "pod X asks rtpengine to send to pod X's address." **This paragraph is about taps.** An *inline* leg has always been pod-bound — a conference is one pod's mix thread, so whoever opens the leg must pick the pod that owns the room, whether it calls `CreateSession` over gRPC or sends an INVITE to the SIP front door. The front door moves that routing decision from the API caller to whatever routes the INVITE; it does not create the problem and does not solve it. Placement is **D8** in [tasks.md](tasks.md), and it is unowned.
 - **No FS involvement at all** for passive consumers. No media bug, no dummy leg, no conference, no ESL traffic. FS capacity planning decouples from AI/ASR adoption.
-- **RTPEngine does the copy where the packets already are.** The kernel module keeps forwarding the primary media path; the subscription adds one userspace copy per tap on the rtpengine host. This is the same work rtpengine does for SIPREC deployments at scale. (Benchmark note: subscription legs are handled in userspace, so budget rtpengine CPU headroom — see §9 risks.)
+- **RTPEngine does the copy where the packets already are.** The kernel module keeps forwarding the primary media path; the subscription adds a copy per tap on the rtpengine host — in-kernel when the tap is untranscoded, in userspace when transcoding is requested (what decides it is transcoding, not tapping: see §8.1). This is the same work rtpengine does for SIPREC deployments at scale. (Benchmark note: a transcoded subscription leg runs in userspace, so budget rtpengine CPU headroom — see §9 risks.)
 - **N consumers, one tap.** Today three consumers of the same call's audio = three separate FS mechanisms (audio_fork WS + transcribe bug + conference leg). In the MSS it's one subscription, one decode, three subscribers on the hub.
 
 ---
