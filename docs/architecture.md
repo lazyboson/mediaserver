@@ -489,26 +489,24 @@ Rule of thumb for the end-state: **taps for ears, inline legs for mouths.** Pass
 
 ---
 
-## 7. Lessons from the legacy media gateway: the build checklist
+## 7. The build checklist
 
-### 7.1 Requirements delta from the legacy media gateway audit
+### 7.1 Hard requirements
 
-The audit of the legacy media gateway produced a concrete list of what the purpose-built service must do differently. Treat this as hard requirements:
+Each of these traces to a measured defect or failure mode in the class of per-call media pumps this service replaces. Treat them as hard requirements:
 
-| # | Legacy media gateway today | MSS requirement |
-| --- | --- | --- |
-| 1 | No jitter buffer; packets forwarded in arrival order; seq/timestamp ignored | Proper jitter buffer per ingest stream: reorder, dedupe, loss detection, bounded delay (start ~40–60 ms adaptive), PLC for G.711 |
-| 2 | Hardcoded 20 ms ticker regardless of negotiated ptime; drift never corrected | Pacing derived from negotiated ptime; wall-clock-anchored scheduler (send when `t0 + n·ptime` passes), not a naive ticker |
-| 3 | Mark-echo WS write inline on the pacing goroutine (2 s timeout) can stall audio | Strict isolation: pacing loop never does network I/O with unbounded/blocking semantics; all consumer I/O behind per-consumer queues |
-| 4 | Single consumer per session, hard-wired | Fan-out hub, N consumers, attach/detach mid-call, per-consumer format + backpressure |
-| 5 | Transcode = µ-law↔A-law only; no resampling; Opus passthrough; codec mismatch silently passes garbage | Full pipeline: G.711/G.722/Opus decode+encode, 8k/16k/48k resample, L16 output; reject-or-transcode, never pass mismatched bytes |
-| 6 | Port pool O(N)-under-mutex, one port per call, no RTCP | Free-list/bitmap allocator O(1); RTCP optional but socket pair reserved; `SO_REUSEPORT` + `recvmmsg` batching instead of per-call read goroutine spin loops (50 syscalls/sec/call today) |
-| 7 | Redis session JSON read-modify-write, no CAS → lost updates | Versioned writes (WATCH/Lua or per-field hashes) |
-| 8 | Per-datagram goroutine for OpenSIPS events → INVITE/BYE races per b2b key | Per-session serialized event queues (the legacy controller's stream-state-machine sharding pattern is the right one) |
-| 9 | `ptime=0` parse path → integer divide-by-zero panic; answers Opus with no rtpmap; strips telephone-event from answers | Hardened SDP handling (or lean on rtpengine to normalize — subscription SDP comes from rtpengine, which is well-formed) |
-| 10 | Pod-crash "recovery" is billing bookkeeping only; orphaned legs never torn down | Session registry with ownership leases; on pod death, controller re-establishes taps on a healthy pod (subscriptions are re-creatable — a *huge* HA advantage over inline legs) and tears down orphaned rtpengine subscriptions |
-| 11 | JSON + base64 per 20 ms frame per consumer | Binary gRPC frames natively; base64/JSON only on the WS-compat adapter |
-| 12 | No SRTP/DTLS/ICE | Fine to keep out of MSS: rtpengine terminates crypto at the edge; subscription legs are plaintext RTP on the private network. Revisit only if taps cross trust boundaries |
+1. Proper jitter buffer per ingest stream: reorder, dedupe, loss detection, bounded delay (start ~40–60 ms adaptive), PLC for G.711.
+2. Pacing derived from negotiated ptime; wall-clock-anchored scheduler (send when `t0 + n·ptime` passes), never a naive ticker.
+3. Strict isolation: the pacing loop never does network I/O with unbounded or blocking semantics; all consumer I/O behind per-consumer queues.
+4. Fan-out hub: N consumers per session, attach/detach mid-call, per-consumer format + backpressure.
+5. Full codec pipeline: G.711/G.722/Opus decode+encode, 8k/16k/48k resample, L16 output; reject-or-transcode, never pass mismatched bytes.
+6. Free-list/bitmap port allocator O(1); RTCP optional but socket pair reserved; `SO_REUSEPORT` + `recvmmsg` batching, never a per-call read loop.
+7. Versioned registry writes (WATCH/Lua or per-field hashes) — no read-modify-write lost updates.
+8. Per-session serialized event queues — signalling events for one session are never handled concurrently.
+9. Hardened SDP handling (or lean on rtpengine to normalize — subscription SDP comes from rtpengine, which is well-formed).
+10. Session registry with ownership leases; on pod death, the controller re-establishes taps on a healthy pod (subscriptions are re-creatable — a *huge* HA advantage over inline legs) and tears down orphaned rtpengine subscriptions.
+11. Binary gRPC frames natively; base64/JSON only on the WS-compat adapter.
+12. SRTP/DTLS/ICE stay out of MSS: rtpengine terminates crypto at the edge, and subscription legs are plaintext RTP on the private network. Revisit only if taps cross trust boundaries.
 
 ### 7.2 Language decision: Rust
 
@@ -883,4 +881,3 @@ records still do.
 - [SIPREC with RTPEngine — subscribe-based media forking walkthrough (incl. transcoding on subscription legs)](https://cloudtelcohub.com/posts/siprec-with-rtpengine/)
 - [OpenSIPS SIPREC module docs](https://opensips.org/docs/modules/3.6.x/siprec) · [OpenSIPS rtp_relay module](https://opensips.org/docs/modules/3.2.x/rtp_relay.html) · [OpenSIPS + RTPEngine subscribe support discussion](https://github.com/OpenSIPS/opensips/issues/2732)
 - [OpenSIPS 3.1 enhanced media capabilities](https://blog.opensips.org/2020/03/26/enhanced-media-capabilities-in-opensips-3-1/) · [Media re-anchoring in OpenSIPS 3.2](https://blog.opensips.org/2021/06/09/media-re-anchoring-using-opensips-3-2/)
-- Codebase analysis: the legacy media gateway (engine/call/streaming, codec, opensips MI, rtp, mediaservice, conversation, kafkamanager, api, config) and the legacy controller (FreeSWITCH ESL/API layers, the stream state machine, the voice-AI orchestrator, monitor/coach and recording-event handlers, the verb API) — August 2026 working copies.
